@@ -15,7 +15,19 @@ current install, swaps in the new build, and restarts services.
    gh auth login   # choose: github.com, HTTPS, browser
    ```
 
-### Run it
+### Run it (one-click)
+
+Double-click the **Update Sno-Haus AP** shortcut on your desktop. UAC prompts
+for admin; click Yes. The updater window opens, shows what changed, and asks
+**Install? (Y/N)**.
+
+To create the desktop shortcut (one-time):
+
+```powershell
+C:\snohaus-ap-git\scripts\Install-DesktopShortcut.ps1
+```
+
+### Run it (manual)
 
 Right-click PowerShell -> **Run as Administrator**, then:
 
