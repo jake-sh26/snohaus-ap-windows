@@ -1,0 +1,2304 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import type { Server } from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import {
+  smartMatchVendor,
+  resolveShipToStore,
+  createMagicCode,
+  verifyMagicCode,
+  createSession,
+  getSession,
+  deleteSession,
+  listInvoices,
+  getInvoice,
+  getLineItems,
+  getAuditLog,
+  appendAuditLog,
+  updateInvoice,
+  setLineItemStore,
+  replaceInvoiceLineItems,
+  listRules,
+  createRule,
+  updateRule,
+  deleteRule,
+  listAliases,
+  createAlias,
+  deleteAlias,
+  deleteAliasByLowerName,
+  searchQboVendors,
+  listInvoiceNotes,
+  createInvoiceNote,
+  PDF_FILES_MAP,
+  rankVendorSuggestions,
+  backfillVendorAliasesFromPostedInvoices,
+  listSkipSenders,
+  addSkipSender,
+  extractBareEmail,
+  skipSenderAndRejectInvoice,
+  removeSkipSender,
+  listSkippedUploads,
+  getSkippedUpload,
+  markSkippedUploadRestored,
+  deleteSkippedUpload,
+  countActiveSkippedUploads,
+  // New for combined patch
+  listAppUsers,
+  getAppUserByEmail,
+  getAppUserById,
+  createAppUser,
+  updateAppUser,
+  setAppUserPassword,
+  deleteAppUser,
+} from "./storage";
+import {
+  isGoogleConfigured,
+  getDriveAuthUrl,
+  getSsoAuthUrl,
+  exchangeCodeForTokens,
+  exchangeSsoCode,
+  setDriveTokens,
+  clearDriveTokens,
+  getDriveStatus,
+  generateOAuthState,
+  verifyOAuthState,
+} from "./google-oauth";
+import {
+  runLocalBackupWithTracking,
+  runDriveDailyBackup,
+  runDriveWeeklyFullBackup,
+  getBackupStatus,
+  listLocalBackups,
+  BACKUP_DIR,
+} from "./backups";
+import {
+  getArchiveStatus,
+  runPdfArchive,
+} from "./pdf-archive";
+import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
+import { processInvoicePdf, normalizeDueDate } from "./invoice-pipeline";
+import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms } from "./llm-parser";
+import {
+  listVendorGroups, getVendorGroup, createVendorGroup, updateVendorGroup, deleteVendorGroup,
+  addGroupMember, updateGroupMember, deleteGroupMember,
+  findGroupForVendor, suggestGroupMember, autoDetectGroup,
+} from "./vendor-groups";
+import { getAcumaticaStatus, runAcumaticaPullNow, getAcumaticaErrorLog, clearAcumaticaErrorLog } from "./acumatica";
+import multer from "multer";
+import { imageBufferToPdf, looksLikeImage, sniffImageKind } from "./image-to-pdf";
+
+const uploadHandler = multer({
+  storage: multer.memoryStorage(),
+  // 50MB / 20 files — generous so a multi-page mailed invoice scan never trips the cap.
+  limits: { fileSize: 50 * 1024 * 1024, files: 20 },
+  // No fileFilter — we accept anything here and validate by sniffing the actual
+  // file bytes (%PDF- magic) inside the route handler. This makes us robust to:
+  //   - browsers sending odd mimetypes (text/plain, octet-stream, empty)
+  //   - filenames with uppercase .PDF or no extension at all
+  //   - drag-and-drop variations across Chrome / Edge / Firefox
+});
+import { ALLOWED_EMAILS, STORES } from "@shared/schema";
+import { getQboStatus, getAuthUrl, exchangeCode, disconnectQbo, searchBills, searchPayments, createBill, createVendorCredit, syncQboVendorsFromApi, lastVendorSyncAge, getQboErrorLog, clearQboErrorLog } from "./qbo";
+import { getGmailStatus, pollNow, pollWithRetry, testGmailConnection, clearGmailErrorLog, reingestEmails } from "./gmail";
+
+declare global {
+  namespace Express {
+    interface Request {
+      email?: string;
+      userRole?: 'admin' | 'user';
+      userName?: string | null;
+    }
+  }
+}
+
+function authMiddleware(req: Request, res: Response, next: NextFunction) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+  const token = auth.slice(7);
+  const session = getSession(token);
+  if (!session) {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+  req.email = session.email;
+  // Load role from app_users (falls back to 'admin' for existing users not yet in the table)
+  try {
+    const appUser = getAppUserByEmail(session.email);
+    req.userRole = (appUser?.role as 'admin' | 'user') || 'admin';
+    req.userName = appUser?.name || null;
+  } catch {
+    req.userRole = 'admin'; // safe fallback
+  }
+  next();
+}
+
+function adminMiddleware(req: Request, res: Response, next: NextFunction) {
+  authMiddleware(req, res, () => {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+    next();
+  });
+}
+
+function buildQboBillPayload(invoice: any, lineItems: any[]): any {
+  // Build a representative QBO Bill payload showing how lines distribute across inventory accounts.
+  const storeAccount = (key: string) => STORES.find((s) => s.key === key) || STORES[0];
+
+  let routing: any = {};
+  try { routing = invoice.routing_data ? JSON.parse(invoice.routing_data) : {}; } catch {}
+
+  const lines: any[] = [];
+
+  if (invoice.routing_mode === "single_store") {
+    const store = routing.store || invoice.ship_to_store || "greenvale";
+    const acc = storeAccount(store);
+    const subtotal = (invoice.total || 0) - (invoice.freight || 0);
+    if (subtotal !== 0) {
+      lines.push({
+        DetailType: "AccountBasedExpenseLineDetail",
+        Amount: Number(subtotal.toFixed(2)),
+        Description: `Inventory — ${acc.label}`,
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+        },
+      });
+    }
+    if (invoice.freight && invoice.freight !== 0) {
+      lines.push({
+        DetailType: "AccountBasedExpenseLineDetail",
+        Amount: Number(invoice.freight.toFixed(2)),
+        Description: `Freight (landed cost) — ${acc.label}`,
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+        },
+      });
+    }
+  } else if (invoice.routing_mode === "percent_split") {
+    const splits = routing.percentages || { greenvale: 100, hempstead: 0, huntington: 0 };
+    const subtotal = (invoice.total || 0) - (invoice.freight || 0);
+    for (const key of ["greenvale", "hempstead", "huntington"] as const) {
+      const pct = splits[key] || 0;
+      if (pct === 0) continue;
+      const acc = storeAccount(key);
+      const amt = Number(((subtotal * pct) / 100).toFixed(2));
+      lines.push({
+        DetailType: "AccountBasedExpenseLineDetail",
+        Amount: amt,
+        Description: `Inventory — ${acc.label} (${pct}%)`,
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+        },
+      });
+      if (invoice.freight && invoice.freight !== 0) {
+        const fAmt = Number(((invoice.freight * pct) / 100).toFixed(2));
+        lines.push({
+          DetailType: "AccountBasedExpenseLineDetail",
+          Amount: fAmt,
+          Description: `Freight (pro-rata ${pct}%) — ${acc.label}`,
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+          },
+        });
+      }
+    }
+  } else if (invoice.routing_mode === "line_item_split") {
+    // Group line items by store_assignment
+    const storeTotals: Record<string, number> = {};
+    for (const li of lineItems) {
+      const store = li.store_assignment || routing.default_store || invoice.ship_to_store || "greenvale";
+      const amt = li.amount || 0;
+      storeTotals[store] = (storeTotals[store] || 0) + amt;
+    }
+    for (const [key, amt] of Object.entries(storeTotals)) {
+      const acc = storeAccount(key);
+      lines.push({
+        DetailType: "AccountBasedExpenseLineDetail",
+        Amount: Number(amt.toFixed(2)),
+        Description: `Inventory (line items) — ${acc.label}`,
+        AccountBasedExpenseLineDetail: {
+          AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+        },
+      });
+    }
+    // Pro-rata freight by line subtotals
+    if (invoice.freight && invoice.freight !== 0) {
+      const totalAssigned = Object.values(storeTotals).reduce((a: number, b: number) => a + b, 0) || 1;
+      for (const [key, amt] of Object.entries(storeTotals)) {
+        const acc = storeAccount(key);
+        const fAmt = Number((((amt as number) / totalAssigned) * invoice.freight).toFixed(2));
+        lines.push({
+          DetailType: "AccountBasedExpenseLineDetail",
+          Amount: fAmt,
+          Description: `Freight (pro-rata) — ${acc.label}`,
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+          },
+        });
+      }
+    }
+  }
+
+  // v8.4.5: discount lines — when the user has elected to take the early-pay
+  // discount, or the invoice carries a net_with_discount kind (automatic per
+  // spec), append negative line(s) against the same inventory accounts used
+  // above. Pro-rata split across stores. Discount applies to (total − freight).
+  // Never reduces freight. Records 1 negative line per store with the same
+  // AccountRef as the corresponding positive inventory line.
+  if (invoice.discount_applied && invoice.discount_terms_pct && invoice.discount_kind) {
+    const pct = Number(invoice.discount_terms_pct) || 0;
+    const subtotal = (invoice.total || 0) - (invoice.freight || 0);
+    const discountTotal = (subtotal * pct) / 100;
+    if (discountTotal > 0) {
+      const desc = `${pct}% terms discount`;
+      if (invoice.routing_mode === "percent_split") {
+        const splits = routing.percentages || { greenvale: 100, hempstead: 0, huntington: 0 };
+        for (const key of ["greenvale", "hempstead", "huntington"] as const) {
+          const sharePct = splits[key] || 0;
+          if (sharePct === 0) continue;
+          const acc = storeAccount(key);
+          const amt = Number(((discountTotal * sharePct) / 100).toFixed(2));
+          lines.push({
+            DetailType: "AccountBasedExpenseLineDetail",
+            Amount: -amt,
+            Description: `${desc} — ${acc.label} (${sharePct}%)`,
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+            },
+          });
+        }
+      } else if (invoice.routing_mode === "line_item_split") {
+        // Same pro-rata weighting as the positive lines.
+        const storeTotals: Record<string, number> = {};
+        for (const li of lineItems) {
+          const store = li.store_assignment || routing.default_store || invoice.ship_to_store || "greenvale";
+          storeTotals[store] = (storeTotals[store] || 0) + (li.amount || 0);
+        }
+        const totalAssigned = Object.values(storeTotals).reduce((a: number, b: number) => a + b, 0) || 1;
+        for (const [key, amt] of Object.entries(storeTotals)) {
+          const acc = storeAccount(key);
+          const share = Number((((amt as number) / totalAssigned) * discountTotal).toFixed(2));
+          if (share === 0) continue;
+          lines.push({
+            DetailType: "AccountBasedExpenseLineDetail",
+            Amount: -share,
+            Description: `${desc} — ${acc.label}`,
+            AccountBasedExpenseLineDetail: {
+              AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+            },
+          });
+        }
+      } else {
+        // single_store
+        const store = routing.store || invoice.ship_to_store || "greenvale";
+        const acc = storeAccount(store);
+        lines.push({
+          DetailType: "AccountBasedExpenseLineDetail",
+          Amount: -Number(discountTotal.toFixed(2)),
+          Description: `${desc} — ${acc.label}`,
+          AccountBasedExpenseLineDetail: {
+            AccountRef: { value: acc.qbo_account_id, name: acc.qbo_account_name },
+          },
+        });
+      }
+    }
+  }
+
+  // v8.4.5: when discount is applied, the bill total drops by the discount
+  // amount and (for early_pay) the due_date shifts to the discount window.
+  const discountActive = !!(invoice.discount_applied && invoice.discount_terms_pct && invoice.discount_kind);
+  const discountAmount = discountActive
+    ? (((invoice.total || 0) - (invoice.freight || 0)) * Number(invoice.discount_terms_pct)) / 100
+    : 0;
+  const effectiveTotal = Number(((invoice.total || 0) - discountAmount).toFixed(2));
+  const effectiveDueDate =
+    discountActive && invoice.discount_kind === "early_pay" && invoice.discount_due_date
+      ? invoice.discount_due_date
+      : invoice.due_date;
+
+  return {
+    VendorRef: invoice.vendor_qbo_id
+      ? { value: invoice.vendor_qbo_id, name: invoice.vendor_qbo_name }
+      : null,
+    TxnDate: invoice.invoice_date,
+    DueDate: effectiveDueDate,
+    DocNumber: invoice.invoice_number,
+    TotalAmt: effectiveTotal,
+    PrivateNote: invoice.notes || undefined,
+    Line: lines,
+  };
+}
+
+// Round 7 follow-up: shared helper that runs the QBO duplicate check against a
+// single invoice. Returns the updated invoice plus whether a dup was found and
+// the matching Bill/Payment metadata. Reused by:
+//   POST /api/invoices/:id/recheck-duplicate (manual)
+//   POST /api/invoices/:id/reparse           (auto, after fields change)
+//   POST /api/invoices/:id/rematch-vendor    (auto, after vendor changes)
+// Always idempotent — doesn't mutate status, only updates the dup flag + notes.
+async function runDuplicateCheck(invoiceId: string, actorEmail: string): Promise<{
+  invoice: any;
+  found: boolean;
+  bill: { id: string | null; total: number; balance: number; paid_label: string } | null;
+  payment_id: string | null;
+  note: string | null;
+  reason?: string;
+}> {
+  const inv = getInvoice(invoiceId);
+  if (!inv) return { invoice: null, found: false, bill: null, payment_id: null, note: null, reason: "not found" };
+  try {
+    const status = getQboStatus();
+    if (!status.connected || !inv.invoice_number) {
+      const updated = updateInvoice(inv.id, {
+        duplicate_check_status: "clean",
+        duplicate_check_at: new Date().toISOString(),
+      });
+      return { invoice: updated, found: false, bill: null, payment_id: null, note: null, reason: !status.connected ? "qbo not connected" : "no invoice number" };
+    }
+    const bills = await searchBills([inv.invoice_number]);
+    const payments = await searchPayments([inv.invoice_number]);
+    if (bills.length > 0 || payments.length > 0) {
+      const firstBill = bills[0];
+      const billId = firstBill?.Id || null;
+      const total = Number(firstBill?.TotalAmt || 0);
+      const balance = Number(firstBill?.Balance ?? total);
+      let paidLabel = "";
+      if (firstBill) {
+        if (balance <= 0.005) paidLabel = " \u2014 PAID";
+        else if (balance < total) paidLabel = ` \u2014 partially paid ($${balance.toFixed(2)} open)`;
+        else paidLabel = " \u2014 unpaid";
+      }
+      const paymentId = payments[0]?.Id || null;
+      const vendorMismatch =
+        inv.vendor_qbo_id &&
+        ((bills.length > 0 && !bills.some((b: any) => b.VendorRef?.value === inv.vendor_qbo_id)) ||
+          (payments.length > 0 && !payments.some((p: any) => p.EntityRef?.value === inv.vendor_qbo_id)));
+      const note = [
+        bills.length > 0 ? `Bill #${billId} exists in QBO${paidLabel}` : null,
+        payments.length > 0 ? `BillPayment #${paymentId} found` : null,
+        vendorMismatch ? "(vendor ID differs \u2014 verify manually)" : null,
+      ].filter(Boolean).join("; ");
+      const updated = updateInvoice(inv.id, {
+        duplicate_check_status: "duplicate_found",
+        duplicate_check_at: new Date().toISOString(),
+        notes: note,
+      });
+      try {
+        appendAuditLog(inv.id, "duplicate_check", { status: inv.duplicate_check_status }, { status: "duplicate_found", note }, actorEmail);
+      } catch {}
+      return {
+        invoice: updated,
+        found: true,
+        bill: { id: billId, total, balance, paid_label: paidLabel.trim() },
+        payment_id: paymentId,
+        note,
+      };
+    }
+    const updated = updateInvoice(inv.id, {
+      duplicate_check_status: "clean",
+      duplicate_check_at: new Date().toISOString(),
+    });
+    try {
+      appendAuditLog(inv.id, "duplicate_check", { status: inv.duplicate_check_status }, { status: "clean" }, actorEmail);
+    } catch {}
+    return { invoice: updated, found: false, bill: null, payment_id: null, note: null };
+  } catch (err: any) {
+    console.error("[runDuplicateCheck] error:", err.message);
+    return { invoice: inv, found: false, bill: null, payment_id: null, note: null, reason: `error: ${err.message}` };
+  }
+}
+
+// ---- Password auth helpers ----
+// Supports multiple users via LOGIN_USERS env var (comma-separated email:salt:hash triples)
+// Falls back to single user via LOGIN_PASSWORD_SALT + LOGIN_PASSWORD_HASH + LOGIN_EMAIL
+// Last resort: the jake@snohaus.com / skiing18 credentials baked in.
+function buildPasswordRecords(): Record<string, { salt: string; hash: string }> {
+  const records: Record<string, { salt: string; hash: string }> = {};
+
+  // Multi-user: LOGIN_USERS=email1:salt1:hash1,email2:salt2:hash2
+  const loginUsers = process.env.LOGIN_USERS;
+  if (loginUsers) {
+    for (const entry of loginUsers.split(",")) {
+      const parts = entry.trim().split(":");
+      if (parts.length === 3) {
+        const [email, salt, hash] = parts;
+        records[email.toLowerCase()] = { salt, hash };
+      }
+    }
+    if (Object.keys(records).length > 0) return records;
+  }
+
+  // Single user via individual env vars
+  const singleEmail = process.env.LOGIN_EMAIL;
+  const singleSalt = process.env.LOGIN_PASSWORD_SALT;
+  const singleHash = process.env.LOGIN_PASSWORD_HASH;
+  if (singleEmail && singleSalt && singleHash) {
+    records[singleEmail.toLowerCase()] = { salt: singleSalt, hash: singleHash };
+    return records;
+  }
+
+  // Hardcoded fallback: jake@snohaus.com / skiing18
+  records["jake@snohaus.com"] = {
+    salt: "5cdc5ff936fec8452272a753eacebebe",
+    hash: "0e435278b5825d2524fd594a957a963251ad4f247b5e05cf9065763316e831be94fdf5d83578c4774d994d45fe263646ea36c584f5af05eaa4feca73353e4c40",
+  };
+  return records;
+}
+
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  // ---- Auth ----
+  // Simple in-memory rate limit: 5 attempts per email per 15min
+  const authAttempts = new Map<string, number[]>();
+  function checkRateLimit(key: string, max = 5, windowMs = 15 * 60 * 1000): boolean {
+    const now = Date.now();
+    const arr = (authAttempts.get(key) || []).filter(t => now - t < windowMs);
+    if (arr.length >= max) return false;
+    arr.push(now);
+    authAttempts.set(key, arr);
+    return true;
+  }
+
+  const PASSWORD_RECORDS = buildPasswordRecords();
+
+  function verifyPassword(email: string, password: string): boolean {
+    const rec = PASSWORD_RECORDS[email.toLowerCase()];
+    if (!rec) return false;
+    const salt = Buffer.from(rec.salt, "hex");
+    const expected = Buffer.from(rec.hash, "hex");
+    const actual = crypto.scryptSync(password, salt, expected.length);
+    if (actual.length !== expected.length) return false;
+    return crypto.timingSafeEqual(actual, expected);
+  }
+
+  // Also verify against app_users table (new) with its own password hash
+  function verifyPasswordFromAppUsers(email: string, password: string): boolean {
+    try {
+      const user = getAppUserByEmail(email);
+      if (!user || !user.enabled) return false;
+      if (!user.password_hash) return false;
+      // Support two formats:
+      // 1. salt:hash (scrypt) — new format from password set via app
+      // 2. raw hash — migrated from env (no salt in app_users)
+      if (user.password_salt) {
+        const salt = Buffer.from(user.password_salt, "hex");
+        const expected = Buffer.from(user.password_hash, "hex");
+        const actual = crypto.scryptSync(password, salt, expected.length);
+        return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+      } else {
+        // Hash only — compare directly (may be a raw hex scrypt hash from old env)
+        // Try matching against env-based records for backwards compat
+        return verifyPassword(email, password);
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  app.post("/api/auth/login", (req, res) => {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email and password required" });
+    }
+    if (!checkRateLimit(`login:${email}`, 5, 15 * 60 * 1000)) {
+      return res.status(429).json({ message: "Too many attempts. Try again in 15 minutes." });
+    }
+    // Check app_users first (new), then fall back to env-based auth (backwards compat)
+    const appUser = getAppUserByEmail(email);
+    let authed = false;
+    if (appUser && appUser.enabled) {
+      authed = verifyPasswordFromAppUsers(email, password);
+    } else if (!appUser) {
+      // User not in app_users yet — fall back to env-based
+      authed = ALLOWED_EMAILS.includes(email) && verifyPassword(email, password);
+    } else {
+      // User in app_users but disabled
+      return res.status(401).json({ message: "Account disabled" });
+    }
+    if (!authed) {
+      // Generic message — don't reveal which field was wrong
+      return res.status(401).json({ message: "Invalid email or password" });
+    }
+    // Update last_login_at
+    if (appUser) {
+      try { updateAppUser(appUser.id, { last_login_at: new Date().toISOString() }); } catch {}
+    }
+    const token = createSession(email);
+    console.log(`[AUTH] Login success for ${email}`);
+    res.json({ token, email });
+  });
+
+  app.post("/api/auth/logout", authMiddleware, (req, res) => {
+    const auth = req.headers.authorization!;
+    deleteSession(auth.slice(7));
+    res.json({ ok: true });
+  });
+
+  app.get("/api/me", authMiddleware, (req, res) => {
+    res.json({ email: req.email, role: req.userRole || 'admin', name: req.userName || null });
+  });
+
+  // ---- Health ----
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", version: "1.0.0", app: "snohaus-ap-windows" });
+  });
+
+  // ---- Invoices ----
+  app.get("/api/invoices", authMiddleware, (req, res) => {
+    const filters: any = {};
+    if (req.query.status && req.query.status !== "all") filters.status = req.query.status;
+    if (req.query.vendor_qbo_id) filters.vendor_qbo_id = req.query.vendor_qbo_id;
+    if (req.query.ship_to_store) filters.ship_to_store = req.query.ship_to_store;
+    if (req.query.confidence) filters.confidence = req.query.confidence;
+    if (req.query.doc_type === "invoices" || req.query.doc_type === "credits") filters.doc_type = req.query.doc_type;
+    const list = listInvoices(filters);
+    const enriched = list.map((inv) => ({ ...inv, line_items: getLineItems(inv.id) }));
+    res.json(enriched);
+  });
+
+  app.get("/api/invoices/:id", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const lineItems = getLineItems(inv.id);
+    const audit = getAuditLog(inv.id);
+    // Find applicable rule by vendor
+    let rule = null;
+    if (inv.vendor_qbo_id) {
+      rule = listRules().find((r) => r.vendor_qbo_id === inv.vendor_qbo_id) || null;
+    }
+    res.json({ ...inv, line_items: lineItems, audit_log: audit, vendor_rule: rule });
+  });
+
+  // ---- Authenticated PDF access via signed short-lived token ----
+  const PDF_TOKEN_TTL_MS = 5 * 60 * 1000;
+  const PDF_SECRET = process.env.PDF_SIGNING_SECRET || crypto.randomBytes(32).toString('hex');
+  function signPdfToken(invoiceId: string, sessionToken: string): { token: string; expires: number } {
+    const expires = Date.now() + PDF_TOKEN_TTL_MS;
+    const payload = `${invoiceId}.${expires}.${sessionToken.slice(-12)}`;
+    const sig = crypto.createHmac('sha256', PDF_SECRET).update(payload).digest('hex').slice(0, 24);
+    return { token: `${expires}.${sig}`, expires };
+  }
+  function verifyPdfToken(invoiceId: string, sessionToken: string, t: string): boolean {
+    const [expStr, sig] = t.split('.');
+    if (!expStr || !sig) return false;
+    const exp = parseInt(expStr, 10);
+    if (!Number.isFinite(exp) || exp < Date.now()) return false;
+    const payload = `${invoiceId}.${exp}.${sessionToken.slice(-12)}`;
+    const expected = crypto.createHmac('sha256', PDF_SECRET).update(payload).digest('hex').slice(0, 24);
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  }
+
+  app.get("/api/invoices/:id/pdf-token", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const sessionToken = req.headers.authorization!.slice(7);
+    const { token, expires } = signPdfToken(inv.id, sessionToken);
+    res.json({ token, expires, url: `/api/invoices/${inv.id}/pdf?t=${token}&s=${encodeURIComponent(sessionToken)}` });
+  });
+
+  app.get("/api/invoices/:id/pdf", (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).send("Not found");
+    const t = String(req.query.t || "");
+    const sessionToken = String(req.query.s || "");
+    const sess = sessionToken ? getSession(sessionToken) : null;
+    if (!sess) return res.status(401).send("Unauthorized");
+    if (!verifyPdfToken(inv.id, sessionToken, t)) return res.status(401).send("Bad or expired link");
+
+    // Look up PDF filename: check source_file map first, then try pdf_url directly
+    const filename = PDF_FILES_MAP[inv.source_file] || inv.pdf_url || null;
+    if (!filename) return res.status(404).send("PDF not found");
+    const baseDir = path.resolve(__dirname, "..", "private_assets");
+    const fullPath = path.resolve(baseDir, filename);
+    if (!fullPath.startsWith(baseDir + path.sep) && fullPath !== baseDir) {
+      return res.status(400).send("Invalid path");
+    }
+    if (!fs.existsSync(fullPath)) return res.status(404).send("PDF missing on disk");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+    res.setHeader("Cache-Control", "private, no-cache");
+    fs.createReadStream(fullPath).pipe(res);
+  });
+
+  app.patch("/api/invoices/:id", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const before = { ...inv };
+    // v8: allow editing invoice_number / invoice_date / due_date so OCR fixes
+    // don't require re-uploading the PDF.
+    const allowed = ["routing_mode", "routing_data", "total", "freight", "notes", "invoice_number", "invoice_date", "due_date"];
+    const patch: any = {};
+    for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
+    if (patch.routing_data && typeof patch.routing_data !== "string") patch.routing_data = JSON.stringify(patch.routing_data);
+    // Trim invoice_number; treat empty string as null so dedup doesn't match "".
+    if ("invoice_number" in patch) {
+      const v = typeof patch.invoice_number === "string" ? patch.invoice_number.trim() : patch.invoice_number;
+      patch.invoice_number = v === "" ? null : v;
+    }
+    const updated = updateInvoice(inv.id, patch);
+    if (Array.isArray(req.body.line_items)) {
+      for (const li of req.body.line_items) {
+        if (li.id) setLineItemStore(li.id, li.store_assignment ?? null);
+      }
+    }
+    appendAuditLog(inv.id, "edit", before, updated, req.email!);
+    const final = getInvoice(inv.id);
+    res.json({ ...final, line_items: getLineItems(inv.id) });
+  });
+
+  app.post("/api/invoices/:id/approve", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    if (inv.vendor_match_status === "unmatched") {
+      return res.status(400).json({ message: "Vendor must be matched before approval" });
+    }
+    if (inv.duplicate_check_status === "duplicate_found") {
+      return res.status(400).json({ message: "Resolve duplicate before approving" });
+    }
+    if ((!inv.total || inv.total === 0) && !inv.is_credit) {
+      return res.status(400).json({ message: "Total cannot be zero" });
+    }
+    const updated = updateInvoice(inv.id, {
+      status: "approved_local",
+      approved_by: req.email,
+      approved_at: new Date().toISOString(),
+    });
+    appendAuditLog(inv.id, "approve", inv, updated, req.email!);
+    const lineItems = getLineItems(inv.id);
+    const payload = buildQboBillPayload(updated, lineItems);
+    res.json({ invoice: { ...updated, line_items: lineItems }, qbo_payload: payload });
+  });
+
+  app.post("/api/invoices/:id/mark-posted", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const updated = updateInvoice(inv.id, {
+      status: "posted_qbo",
+      qbo_bill_id: req.body?.qbo_bill_id || null,
+    });
+    appendAuditLog(inv.id, "mark_posted", inv, updated, req.email!);
+    res.json(updated);
+  });
+
+  app.post("/api/invoices/:id/reject", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const updated = updateInvoice(inv.id, { status: "rejected", notes: req.body?.reason || inv.notes });
+    appendAuditLog(inv.id, "reject", inv, updated, req.email!);
+    res.json(updated);
+  });
+
+  app.post("/api/invoices/:id/restore", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    if (inv.status !== "rejected") {
+      return res.status(400).json({ message: `Can only restore rejected invoices (current status: ${inv.status})` });
+    }
+    const updated = updateInvoice(inv.id, { status: "pending_review" });
+    appendAuditLog(inv.id, "restore", inv, updated, req.email!);
+    res.json(updated);
+  });
+
+  // Real QBO duplicate check — queries Bills and Payments from QBO if connected,
+  // otherwise falls back to marking clean. Returns the same dup_check shape used
+  // by reparse/rematch so the client can pop the auto-complete modal uniformly.
+  app.post("/api/invoices/:id/recheck-duplicate", authMiddleware, async (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const dupCheck = await runDuplicateCheck(inv.id, req.email!);
+    if (!dupCheck.invoice) return res.status(404).json({ message: "Not found" });
+    res.json({ ...dupCheck.invoice, dup_check: dupCheck });
+  });
+
+  // v8: Internal fuzzy duplicate check — scans the local DB for invoices with
+  // OCR-similar invoice numbers (Levenshtein ≤ 2 on normalized strings) for the
+  // same vendor, plus total/date proximity. Used when Jake edits the invoice
+  // number in the drawer to catch "this is actually invoice #1024 we already
+  // ingested as #1O24" cases.
+  app.post("/api/invoices/:id/recheck-duplicates", authMiddleware, async (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+
+    // 1) Run the existing QBO check so the UI gets a unified result.
+    const qboDup = await runDuplicateCheck(inv.id, req.email!);
+
+    // 2) Internal fuzzy scan.
+    let internalMatch: { id: string; invoice_number: string | null; total: number | null; invoice_date: string | null; vendor_qbo_name: string | null; confidence: number; reason: string } | null = null;
+    try {
+      const { findDuplicateInvoice } = await import("./dup-detector");
+      const Database = (await import("better-sqlite3")).default;
+      const path = await import("node:path");
+      const db = new Database(path.resolve(process.cwd(), "data.db"));
+      try {
+        const hit = findDuplicateInvoice(db, {
+          vendorQboId: inv.vendor_qbo_id,
+          vendorRawName: inv.vendor_raw_name,
+          invoiceNumber: inv.invoice_number,
+          total: inv.total,
+          invoiceDate: inv.invoice_date,
+        }, { excludeId: inv.id });
+        if (hit) {
+          internalMatch = {
+            id: hit.id,
+            invoice_number: hit.invoice_number,
+            total: hit.total,
+            invoice_date: hit.invoice_date,
+            vendor_qbo_name: hit.vendor_qbo_name,
+            confidence: hit.confidence,
+            reason: hit.reason,
+          };
+        }
+      } finally {
+        db.close();
+      }
+    } catch (err: any) {
+      console.warn("[recheck-duplicates] fuzzy scan failed:", err.message);
+    }
+
+    // 3) Persist the fuzzy hint (or clear it) on the invoice itself.
+    const fuzzyHintJson = internalMatch && internalMatch.confidence < 90
+      ? JSON.stringify({
+          matched_invoice_id: internalMatch.id,
+          matched_invoice_number: internalMatch.invoice_number,
+          confidence: internalMatch.confidence,
+          reason: internalMatch.reason,
+        })
+      : null;
+    updateInvoice(inv.id, { fuzzy_dup_hint: fuzzyHintJson });
+
+    const final = getInvoice(inv.id);
+    res.json({
+      ...final,
+      dup_check: qboDup,
+      internal_fuzzy_match: internalMatch,
+    });
+  });
+
+  app.post("/api/invoices/:id/assign-vendor", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const { vendor_qbo_id, vendor_name, save_as_alias } = req.body;
+    if (!vendor_qbo_id || !vendor_name) return res.status(400).json({ message: "vendor_qbo_id and vendor_name required" });
+    const before = { ...inv };
+    // Per Jake: always learn the alias so future invoices with the same raw name auto-match.
+    // save_as_alias defaults true; only false if explicitly passed false (kept for back-compat).
+    const learn = save_as_alias !== false;
+    const updated = updateInvoice(inv.id, {
+      vendor_qbo_id,
+      vendor_qbo_name: vendor_name,
+      vendor_match_status: learn ? "aliased" : "matched",
+    });
+    let alias_saved = false;
+    let alias_skip_reason: string | null = null;
+    if (learn && inv.vendor_raw_name) {
+      try {
+        createAlias({
+          alias: inv.vendor_raw_name,
+          vendor_qbo_id,
+          vendor_name,
+          note: `Set by ${req.email} on ${new Date().toLocaleDateString()}`,
+        } as any);
+        alias_saved = true;
+      } catch (e: any) {
+        alias_skip_reason = e.message || "unknown";
+        console.warn(`[assign-vendor] alias save skipped: ${alias_skip_reason}`);
+      }
+    } else if (learn && !inv.vendor_raw_name) {
+      alias_skip_reason = "no vendor_raw_name on invoice (likely an LLM parse failure)";
+    }
+    appendAuditLog(inv.id, "assign_vendor", before, { ...updated, alias_saved, alias_skip_reason }, req.email!);
+    res.json(updated);
+  });
+
+  // v8.4.5: toggle the early-pay discount on/off for an invoice that has
+  // discount_kind = 'early_pay'. For 'net_with_discount' the discount is
+  // automatic per spec and this endpoint refuses to flip it off. Audit-logged.
+  app.post("/api/invoices/:id/discount-applied", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    if (!inv.discount_kind || !inv.discount_terms_pct) {
+      return res.status(400).json({ message: "No discount detected on this invoice" });
+    }
+    const applied = !!req.body?.applied;
+    if (inv.discount_kind === "net_with_discount" && !applied) {
+      return res.status(400).json({
+        message: "This discount is automatic per terms and cannot be removed",
+      });
+    }
+    if (inv.status !== "pending_review" && inv.status !== "receiving" && inv.status !== "quarantined") {
+      return res.status(400).json({ message: `Cannot toggle discount when status is ${inv.status}` });
+    }
+    const before = {
+      discount_applied: inv.discount_applied,
+    };
+    const updated = updateInvoice(inv.id, { discount_applied: applied ? 1 : 0 } as any);
+    try {
+      appendAuditLog(inv.id, "discount_toggled", before, {
+        discount_applied: applied ? 1 : 0,
+        discount_kind: inv.discount_kind,
+        discount_terms_pct: inv.discount_terms_pct,
+        discount_due_date: inv.discount_due_date,
+      } as any, req.email!);
+    } catch {}
+    res.json(updated);
+  });
+
+  // Re-run the LLM parser on an existing invoice's stored PDF.
+  // Useful when an earlier parse hit max_tokens or a transient API error and
+  // left the invoice with vendor_raw_name=null.
+  app.post("/api/invoices/:id/reparse", authMiddleware, async (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    if (!isLlmParserEnabled()) return res.status(400).json({ message: "LLM parser is not enabled" });
+
+    const filename = PDF_FILES_MAP[inv.source_file] || inv.pdf_url || null;
+    if (!filename) return res.status(404).json({ message: "PDF not found for this invoice" });
+    const baseDir = path.resolve(__dirname, "..", "private_assets");
+    const fullPath = path.resolve(baseDir, filename);
+    if (!fullPath.startsWith(baseDir + path.sep) && fullPath !== baseDir) {
+      return res.status(400).json({ message: "Invalid PDF path" });
+    }
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ message: "PDF missing on disk" });
+
+    const before = { ...inv };
+    const buf = fs.readFileSync(fullPath);
+    clearLastLlmFailure();
+    let llmResult: any = null;
+    let failure: string | null = null;
+    try {
+      llmResult = await parseInvoiceWithLLM(buf, {
+        subject: inv.email_subject || null,
+        from: inv.email_from || null,
+        body: null,
+      });
+    } catch (e: any) {
+      failure = `threw: ${e.message}`;
+    }
+    if (!llmResult && !failure) failure = getLastLlmFailure() || "unknown LLM failure";
+
+    if (!llmResult) {
+      // Persist failure reason but keep current invoice fields
+      updateInvoice(inv.id, { parse_failure_reason: failure } as any);
+      try {
+        appendAuditLog(inv.id, "llm_parse", null, { ok: false, reason: failure, manual_reparse: true } as any, req.email!);
+      } catch {}
+      return res.status(502).json({ message: failure, ok: false });
+    }
+
+    // Apply parsed fields. We preserve the user's existing vendor mapping unless
+    // the invoice currently has no vendor and the LLM gives us a raw name.
+    const patch: any = {
+      parse_failure_reason: null,
+      parse_confidence: llmResult.parse_confidence || "medium",
+      document_type: llmResult.document_type || null,
+      store_hint: llmResult.store_hint || null,
+      llm_notes: llmResult.notes || null,
+      already_paid: llmResult.already_paid ? 1 : 0,
+      line_items_json: JSON.stringify(llmResult.line_items || []),
+      bill_kind: llmResult.bill_kind || null,
+      is_credit: llmResult.is_credit ? 1 : 0,
+    };
+    // Only fill in fields that were missing — never overwrite user-edited values.
+    if (!inv.vendor_raw_name && llmResult.vendor_raw_name) patch.vendor_raw_name = llmResult.vendor_raw_name;
+    if (!inv.invoice_number && llmResult.invoice_number) patch.invoice_number = llmResult.invoice_number;
+    if (!inv.invoice_date && llmResult.invoice_date) patch.invoice_date = llmResult.invoice_date;
+    if ((inv.total == null || inv.total === 0) && llmResult.total != null) patch.total = llmResult.total;
+    if ((inv.freight == null || inv.freight === 0) && llmResult.freight != null) patch.freight = llmResult.freight;
+    // v8.4.4: due_date fill-in on reparse — uses parser's deterministic Net-N
+    // fallback. Run normalizeDueDate against the effective invoice_date so
+    // "Net 30" style strings still resolve if the LLM put terms there.
+    if (!inv.due_date) {
+      const effectiveInvoiceDate = patch.invoice_date || inv.invoice_date || llmResult.invoice_date || null;
+      const normalized = normalizeDueDate(llmResult.due_date, effectiveInvoiceDate);
+      const fromTerms = !normalized && effectiveInvoiceDate
+        ? computeDueDateFromTerms(effectiveInvoiceDate, llmResult.payment_terms || llmResult.payment_method || null)
+        : null;
+      const finalDue = normalized || fromTerms;
+      if (finalDue) patch.due_date = finalDue;
+    }
+
+    // v8.4.5: discount fields. Only fill when the invoice has no discount_kind
+    // yet — never overwrite a user toggle/applied state. For net_with_discount
+    // the discount is automatic per spec, so flip applied=1 when first detected.
+    if (!inv.discount_kind && llmResult.discount_kind) {
+      patch.discount_terms_pct = llmResult.discount_terms_pct ?? null;
+      patch.discount_days = llmResult.discount_days ?? null;
+      patch.discount_due_date = llmResult.discount_due_date ?? null;
+      patch.discount_kind = llmResult.discount_kind;
+      patch.discount_warning = llmResult.discount_warning ?? null;
+      if (llmResult.discount_kind === "net_with_discount") patch.discount_applied = 1;
+    }
+
+    // Round 7 follow-up: if the invoice has no QBO vendor yet, run vendor
+    // matching using the freshly-parsed (or pre-existing) raw name. Smart
+    // match first, then LLM fallback. Never overwrite a user-set vendor.
+    if (!inv.vendor_qbo_id) {
+      const candidateRawName = patch.vendor_raw_name || inv.vendor_raw_name || llmResult.vendor_raw_name || null;
+      if (candidateRawName) {
+        const local = smartMatchVendor(candidateRawName);
+        if (local?.vendor_qbo_id) {
+          patch.vendor_qbo_id = local.vendor_qbo_id;
+          patch.vendor_qbo_name = local.vendor_qbo_name;
+          patch.vendor_match_status = local.vendor_match_status;
+        } else if (isVendorMatcherLlmEnabled()) {
+          try {
+            const llmMatch = await matchVendorWithLlm(candidateRawName);
+            if (llmMatch?.vendor_qbo_id && llmMatch.confidence === "high") {
+              patch.vendor_qbo_id = llmMatch.vendor_qbo_id;
+              patch.vendor_qbo_name = llmMatch.vendor_qbo_name;
+              patch.vendor_match_status = "aliased";
+              try {
+                learnVendorAlias(candidateRawName, llmMatch.vendor_qbo_id, llmMatch.vendor_qbo_name || "", "learned-from-llm-high-confidence");
+              } catch {}
+            }
+          } catch {}
+        }
+      }
+    }
+
+    const updated = updateInvoice(inv.id, patch);
+
+    // Round 7 follow-up: persist line items into invoice_line_items so the
+    // drawer's "Line items" routing tab is enabled. Carries existing
+    // store_assignment values forward when description+amount match.
+    try {
+      if (Array.isArray(llmResult.line_items)) {
+        replaceInvoiceLineItems(inv.id, llmResult.line_items as any);
+      }
+    } catch (e) {
+      console.warn(`[reparse] line-item persist failed for ${inv.id}:`, (e as Error).message);
+    }
+
+    try {
+      appendAuditLog(inv.id, "llm_parse", before, {
+        ok: true,
+        manual_reparse: true,
+        vendor_raw_name: llmResult.vendor_raw_name,
+        invoice_number: llmResult.invoice_number,
+        total: llmResult.total,
+        line_item_count: Array.isArray(llmResult.line_items) ? llmResult.line_items.length : 0,
+      } as any, req.email!);
+    } catch {}
+    // Round 7 follow-up: now that fields may have changed (invoice number,
+    // vendor), re-run the QBO dup check. If it finds a match, the response
+    // includes dup_check.found=true so the client can pop the auto-complete
+    // confirmation modal.
+    let dupCheck: Awaited<ReturnType<typeof runDuplicateCheck>> | null = null;
+    if (updated && updated.status === "pending_review") {
+      dupCheck = await runDuplicateCheck(inv.id, req.email!);
+    }
+    const finalInv = dupCheck?.invoice || updated;
+    res.json({ ok: true, invoice: finalInv, dup_check: dupCheck });
+  });
+
+  app.post("/api/invoices/:id/remove-vendor", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const before = { ...inv };
+    const updated = updateInvoice(inv.id, {
+      vendor_qbo_id: null,
+      vendor_qbo_name: null,
+      vendor_match_status: "unmatched",
+    });
+    let alias_deleted = false;
+    if (inv.vendor_raw_name) {
+      const removed = deleteAliasByLowerName(inv.vendor_raw_name);
+      alias_deleted = removed > 0;
+    }
+    appendAuditLog(inv.id, "remove_vendor", before, { ...updated, alias_deleted }, req.email!);
+    res.json({ ...updated, alias_deleted });
+  });
+
+  // Round 7 follow-up: Re-match vendor — re-runs the smart matcher (and LLM
+  // fallback if enabled) against the invoice's stored vendor_raw_name without
+  // re-parsing the PDF. Cheap, fast, and useful when the matcher has been
+  // improved or new aliases have been added since the original parse. Will not
+  // overwrite a vendor that the user has already manually assigned.
+  app.post("/api/invoices/:id/rematch-vendor", authMiddleware, async (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    if (inv.vendor_qbo_id) {
+      return res.status(400).json({ message: "Vendor already matched. Click Remove first if you want to re-match." });
+    }
+    const rawName = inv.vendor_raw_name || null;
+    if (!rawName) {
+      return res.status(400).json({ message: "No vendor name on file to match against. Try Reparse first." });
+    }
+    const before = { ...inv };
+    const patch: any = {};
+    let source: "smart" | "llm" | "none" = "none";
+    const local = smartMatchVendor(rawName);
+    if (local?.vendor_qbo_id) {
+      patch.vendor_qbo_id = local.vendor_qbo_id;
+      patch.vendor_qbo_name = local.vendor_qbo_name;
+      patch.vendor_match_status = local.vendor_match_status;
+      source = "smart";
+    } else if (isVendorMatcherLlmEnabled()) {
+      try {
+        const llmMatch = await matchVendorWithLlm(rawName);
+        if (llmMatch?.vendor_qbo_id && llmMatch.confidence === "high") {
+          patch.vendor_qbo_id = llmMatch.vendor_qbo_id;
+          patch.vendor_qbo_name = llmMatch.vendor_qbo_name;
+          patch.vendor_match_status = "aliased";
+          source = "llm";
+          try {
+            learnVendorAlias(rawName, llmMatch.vendor_qbo_id, llmMatch.vendor_qbo_name || "", "learned-from-llm-high-confidence");
+          } catch {}
+        }
+      } catch {}
+    }
+    if (!patch.vendor_qbo_id) {
+      return res.json({ ok: false, matched: false, message: `No match found for "${rawName}". Use Change vendor to pick manually.`, invoice: inv });
+    }
+    const updated = updateInvoice(inv.id, patch);
+    try {
+      appendAuditLog(inv.id, "rematch_vendor", before, { ...updated, source } as any, req.email!);
+    } catch {}
+    // Round 7 follow-up: vendor changed, so re-check for QBO duplicates.
+    let dupCheck: Awaited<ReturnType<typeof runDuplicateCheck>> | null = null;
+    if (updated && updated.status === "pending_review") {
+      dupCheck = await runDuplicateCheck(inv.id, req.email!);
+    }
+    const finalInv = dupCheck?.invoice || updated;
+    res.json({ ok: true, matched: true, source, invoice: finalInv, dup_check: dupCheck });
+  });
+
+  app.get("/api/invoices/:id/qbo-payload", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    res.json(buildQboBillPayload(inv, getLineItems(inv.id)));
+  });
+
+  // Post invoice directly to QBO as a Bill
+  app.post("/api/invoices/:id/post-to-qbo", authMiddleware, async (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+
+    const qboStatus = getQboStatus();
+    if (!qboStatus.connected) {
+      return res.status(503).json({ message: "QuickBooks is not connected. Go to Settings → QuickBooks to connect." });
+    }
+
+    try {
+      const lineItems = getLineItems(inv.id);
+      const billPayload = buildQboBillPayload(inv, lineItems);
+      const isCredit = !!inv.is_credit;
+      // Vendor credits use a separate QBO entity (/vendorcredit) — same line structure but
+      // posted as a reduction of vendor balance. Bills go to /bill.
+      // VendorCredit does NOT accept DueDate or TotalAmt (read-only) — strip them.
+      // Also use a positive Amount per QBO convention (entity type implies the sign).
+      let payload = billPayload;
+      if (isCredit) {
+        const { DueDate, TotalAmt, ...rest } = billPayload as any;
+        payload = {
+          ...rest,
+          Line: (billPayload.Line || []).map((l: any) => ({
+            ...l,
+            Amount: Math.abs(Number(l.Amount) || 0),
+          })),
+        };
+        // Strip null/empty fields that QBO VendorCredit rejects (DocNumber=null, VendorRef=null, etc.)
+        for (const key of Object.keys(payload)) {
+          if (payload[key] === null || payload[key] === "" || payload[key] === undefined) {
+            delete payload[key];
+          }
+        }
+      }
+      console.log(`[post-to-qbo] sending ${isCredit ? "VendorCredit" : "Bill"} payload:`, JSON.stringify(payload, null, 2));
+      const result = isCredit ? await createVendorCredit(payload) : await createBill(payload);
+      const docId = isCredit
+        ? (result?.VendorCredit?.Id || result?.Id || null)
+        : (result?.Bill?.Id || result?.Id || null);
+      const updated = updateInvoice(inv.id, {
+        status: "posted_qbo",
+        qbo_bill_id: docId,
+      });
+      appendAuditLog(inv.id, isCredit ? "post_vendor_credit_to_qbo" : "post_to_qbo", inv, updated, req.email!);
+      res.json({ invoice: updated, qbo_bill_id: docId, qbo_doc_id: docId, is_credit: isCredit });
+    } catch (err: any) {
+      console.error(`[post-to-qbo] Error (${inv.is_credit ? "vendor_credit" : "bill"}):`, err.message);
+      // Auto-revert to pending_review so the user isn't stranded in approved_local with no retry path.
+      // The audit log records the failed post + revert.
+      try {
+        const reverted = updateInvoice(inv.id, {
+          status: "pending_review",
+          approved_by: null,
+          approved_at: null,
+        });
+        appendAuditLog(inv.id, "post_to_qbo_failed_reverted", inv, reverted, req.email!);
+      } catch (revertErr: any) {
+        console.error("[post-to-qbo] Failed to revert status:", revertErr.message);
+      }
+      res.status(500).json({ message: `QBO posting failed: ${err.message}`, reverted_to_pending: true });
+    }
+  });
+
+  // Manual revert from approved_local back to pending_review (e.g. user wants to make edits)
+  app.post("/api/invoices/:id/revert-to-pending", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    if (inv.status === "posted_qbo") {
+      return res.status(400).json({ message: "Cannot revert: invoice is already posted to QBO" });
+    }
+    const updated = updateInvoice(inv.id, {
+      status: "pending_review",
+      approved_by: null,
+      approved_at: null,
+    });
+    appendAuditLog(inv.id, "revert_to_pending", inv, updated, req.email!);
+    res.json(updated);
+  });
+
+  // ---- Rules ----
+  app.get("/api/rules", authMiddleware, (_req, res) => res.json(listRules()));
+  app.post("/api/rules", authMiddleware, (req, res) => {
+    const data = { ...req.body };
+    if (data.split_data && typeof data.split_data !== "string") data.split_data = JSON.stringify(data.split_data);
+    res.json(createRule(data));
+  });
+  app.patch("/api/rules/:id", authMiddleware, (req, res) => {
+    const data = { ...req.body };
+    if (data.split_data && typeof data.split_data !== "string") data.split_data = JSON.stringify(data.split_data);
+    res.json(updateRule(parseInt(req.params.id), data));
+  });
+  app.delete("/api/rules/:id", authMiddleware, (req, res) => {
+    deleteRule(parseInt(req.params.id));
+    res.json({ ok: true });
+  });
+
+  // ---- Aliases ----
+  app.get("/api/aliases", authMiddleware, (_req, res) => res.json(listAliases()));
+  app.post("/api/aliases", authMiddleware, (req, res) => {
+    try {
+      res.json(createAlias(req.body));
+    } catch (e: any) {
+      res.status(400).json({ message: e.message || "Failed to create alias" });
+    }
+  });
+  app.delete("/api/aliases/:id", authMiddleware, (req, res) => {
+    deleteAlias(parseInt(req.params.id));
+    res.json({ ok: true });
+  });
+
+  // ---- QBO vendor list (local JSON) ----
+  app.get("/api/qbo-vendors", authMiddleware, (req, res) => {
+    const q = String(req.query.q || "");
+    const limit = Math.min(Number(req.query.limit) || 500, 2000);
+    res.json(searchQboVendors(q, limit));
+  });
+
+  // Vendor suggestions for an unmatched invoice. Returns up to 5 ranked candidates,
+  // first by local token-overlap, then asks Claude (if enabled) for an additional pick.
+  app.get("/api/invoices/:id/vendor-suggestions", authMiddleware, async (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const raw = inv.vendor_raw_name || "";
+    const local = rankVendorSuggestions(raw, 5);
+    let llmSuggestion: any = null;
+    if (isVendorMatcherLlmEnabled() && raw && local.length === 0) {
+      try {
+        const r = await matchVendorWithLlm(raw);
+        if (r) {
+          llmSuggestion = {
+            vendor_qbo_id: r.vendor_qbo_id,
+            vendor_qbo_name: r.vendor_qbo_name,
+            confidence: r.confidence,
+            reasoning: r.reasoning,
+            alternatives: r.alternatives,
+          };
+        }
+      } catch {}
+    }
+    res.json({ raw_name: raw, local_suggestions: local, llm_suggestion: llmSuggestion });
+  });
+
+  // ---- Manual PDF upload (for mailed paper invoices or one-offs) ----
+  // Accepts up to 10 PDFs at once via multipart/form-data, runs each through the
+  // same parse → match → dedup → QBO-check pipeline as Gmail polling.
+  // Round 7 follow-up: dedicated upload diagnostics endpoint. Accepts ANY POST,
+  // logs every header + every form-data part (file or value) to server.log AND
+  // returns the same data in the JSON response so we can paste it back. No auth
+  // required so we can hit it with curl. Use this to isolate whether "No file
+  // received" is a client problem (browser / DevTools UI), a network problem
+  // (proxy / ngrok stripping multipart), or a server problem (multer config).
+  app.post("/api/debug/upload-echo", (req, res, next) => {
+    const handler = uploadHandler.any();
+    handler(req, res, (err: any) => {
+      const headers = Object.fromEntries(
+        Object.entries(req.headers).map(([k, v]) => [k, String(v).slice(0, 500)])
+      );
+      const filesArr = ((req as any).files as Express.Multer.File[]) || [];
+      const files = (Array.isArray(filesArr) ? filesArr : []).map(f => ({
+        fieldname: f.fieldname,
+        originalname: f.originalname,
+        mimetype: f.mimetype,
+        size: f.size,
+        first_bytes: (f.buffer ? f.buffer.slice(0, 16).toString("hex") : null),
+      }));
+      const body_keys = Object.keys(req.body || {});
+      const out = {
+        ok: !err,
+        multer_error: err ? { code: err.code || null, field: err.field || null, message: err.message || String(err) } : null,
+        method: req.method,
+        url: req.url,
+        headers,
+        file_count: files.length,
+        files,
+        body_keys,
+        body_preview: Object.fromEntries(body_keys.slice(0, 10).map(k => [k, String((req.body as any)[k]).slice(0, 200)])),
+      };
+      console.log(`[upload-echo] ${JSON.stringify(out)}`);
+      res.status(200).json(out);
+    });
+  });
+
+  app.post("/api/invoices/upload", authMiddleware, (req, res, next) => {
+    // Round 7 follow-up: log Content-Type + length for any upload attempt so we
+    // can diagnose “No file received” errors. Multer requires multipart/form-data
+    // with a boundary; if the browser/proxy strips it we want to know.
+    const ct = req.headers["content-type"] || "";
+    const cl = req.headers["content-length"] || "0";
+    console.log(`[upload] incoming content-type="${ct}" content-length=${cl}`);
+    // Accept files under ANY field name. multer.any() is the most tolerant
+    // mode — if a file part is in the form-data, multer extracts it regardless
+    // of field name. Server then logs which field names came through so we can
+    // diagnose any client-side mismatch.
+    const handler = uploadHandler.any();
+    handler(req, res, (err: any) => {
+      if (err) {
+        const msg = err?.code === "LIMIT_FILE_SIZE" ? "File too large (50MB max per file)"
+                  : err?.code === "LIMIT_FILE_COUNT" ? "Too many files (20 max per upload)"
+                  : err?.code === "LIMIT_UNEXPECTED_FILE" ? `Unexpected form field “${err.field}” (expected “files” or “file”)`
+                  : (err.message || "Upload error");
+        console.log(`[upload] multer error: ${err?.code || ""} ${msg}`);
+        return res.status(400).json({ message: msg, code: err?.code || null });
+      }
+      next();
+    });
+  }, async (req, res) => {
+    // multer.any() returns an array directly under req.files.
+    const filesArr = ((req as any).files as Express.Multer.File[]) || [];
+    const files: Express.Multer.File[] = Array.isArray(filesArr) ? filesArr : [];
+    if (files.length > 0) {
+      console.log(`[upload] field names received: ${[...new Set(files.map(f => f.fieldname))].join(", ")}`);
+    }
+    if (!files || files.length === 0) {
+      const ct = req.headers["content-type"] || "";
+      const cl = req.headers["content-length"] || "0";
+      const isMultipart = ct.toString().toLowerCase().includes("multipart/form-data");
+      const hasBoundary = ct.toString().toLowerCase().includes("boundary=");
+      console.log(`[upload] no files received. multipart=${isMultipart} boundary=${hasBoundary} cl=${cl} body-keys=${Object.keys(req.body || {}).join(",") || "(none)"}`);
+      let detail = "No file received.";
+      if (!isMultipart) detail += ` Content-Type was "${ct || "(missing)"}" — expected multipart/form-data.`;
+      else if (!hasBoundary) detail += ` Content-Type "${ct}" missing boundary parameter — the form data is malformed.`;
+      else if (cl === "0" || cl === 0) detail += ` Content-Length is 0 — the request had no body.`;
+      else detail += " Try the file picker instead of drag-and-drop, or check the server log for diagnostics.";
+      return res.status(400).json({
+        message: detail,
+        diagnostic: { content_type: ct, content_length: cl, multipart: isMultipart, has_boundary: hasBoundary },
+      });
+    }
+    console.log(`[upload] received ${files.length} file(s): ${files.map(f => `${f.originalname || "(unnamed)"} (${f.mimetype || "?"}, ${f.size}b)`).join(", ")}`);
+
+    // Sniff each file's first 5 bytes for the %PDF- magic header. If a file
+    // doesn't look like a real PDF, reject up front with a useful message so
+    // we don't waste an LLM call on a Word doc / zip / image.
+    const isPdfBuffer = (buf: Buffer) => {
+      if (!buf || buf.length < 5) return false;
+      // Most PDFs start with %PDF- at byte 0. Some have a small UTF-8 BOM or
+      // whitespace prefix — scan the first 1KB to be safe.
+      const head = buf.slice(0, Math.min(buf.length, 1024)).toString("binary");
+      return head.includes("%PDF-");
+    };
+
+    const results: any[] = [];
+    const rejected: Array<{ filename: string; reason: string }> = [];
+    for (const f of files) {
+      let pdfBuffer: Buffer = f.buffer;
+      let pdfFilename: string = f.originalname || "upload.pdf";
+      let convertedFromImage = false;
+
+      // If it's not already a PDF but it IS an image (JPG/PNG/HEIC),
+      // convert image → single-page PDF on the fly so the rest of the
+      // pipeline (parser, archive, Drive backup) keeps treating it as a PDF.
+      if (!isPdfBuffer(f.buffer)) {
+        if (looksLikeImage(f.buffer)) {
+          try {
+            const kind = sniffImageKind(f.buffer);
+            console.log(`[upload] converting image (${kind}) → PDF: ${f.originalname || "(unnamed)"}`);
+            pdfBuffer = await imageBufferToPdf(f.buffer, f.originalname || "upload");
+            // Rename the file to .pdf so downstream code is consistent.
+            const stem = (f.originalname || "upload").replace(/\.(heic|heif|jpe?g|png)$/i, "");
+            pdfFilename = `${stem}.pdf`;
+            convertedFromImage = true;
+          } catch (convErr: any) {
+            rejected.push({
+              filename: f.originalname || "(unnamed)",
+              reason: convErr.message || "Image conversion failed",
+            });
+            continue;
+          }
+        } else {
+          rejected.push({
+            filename: f.originalname || "(unnamed)",
+            reason: `Not a PDF or supported image (got ${f.mimetype || "unknown type"}, ${f.size} bytes). Accepted: PDF, JPG, PNG, HEIC.`,
+          });
+          continue;
+        }
+      }
+      try {
+        const r = await processInvoicePdf({
+          pdfBuffer,
+          originalFilename: pdfFilename,
+          source: convertedFromImage ? "manual-upload-image" : "manual-upload",
+          sourceType: convertedFromImage ? "image_ocr" : "pdf",
+          emailFrom: req.email || null,
+          emailSubject: convertedFromImage
+            ? `Manual upload (image): ${f.originalname}`
+            : `Manual upload: ${f.originalname}`,
+          emailDate: new Date().toISOString(),
+          emailBody: null,
+        });
+        results.push({ filename: pdfFilename, original_filename: f.originalname, converted_from_image: convertedFromImage, ...r });
+      } catch (err: any) {
+        results.push({ filename: pdfFilename, status: "error", invoice_id: null, reason: err.message });
+      }
+    }
+
+    // If every file was rejected as non-PDF, surface that as a 400 so the toast says why.
+    if (results.length === 0 && rejected.length > 0) {
+      return res.status(400).json({
+        message: rejected.length === 1
+          ? `${rejected[0].filename}: ${rejected[0].reason}`
+          : `None of the ${rejected.length} files were valid PDF or image uploads.`,
+        rejected,
+      });
+    }
+
+    res.json({
+      uploaded: files.length,
+      results,
+      rejected: rejected.length ? rejected : undefined,
+    });
+  });
+
+  // ---- Acumatica (Winter Sports Retailers) on-demand pull ----
+  app.get("/api/acumatica/status", authMiddleware, (_req, res) => {
+    res.json({ ...getAcumaticaStatus(), error_log: getAcumaticaErrorLog(20) });
+  });
+
+  app.post("/api/acumatica/clear-error-log", authMiddleware, (_req, res) => {
+    clearAcumaticaErrorLog();
+    res.json({ ok: true });
+  });
+  app.post("/api/acumatica/run-now", authMiddleware, async (req, res) => {
+    try {
+      // ?debug=1 triggers a one-shot diagnostic run that dumps a screenshot,
+      // iframe HTML, and DOM probe to ./debug/ then bails before per-row clicks.
+      const debug = req.query?.debug === "1" || req.query?.debug === "true";
+      const r = await runAcumaticaPullNow({ debug });
+      res.json(r);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // One-time backfill: scan posted invoices and seed vendor_aliases.
+  app.post("/api/vendor-aliases/backfill", authMiddleware, (_req, res) => {
+    try {
+      const result = backfillVendorAliasesFromPostedInvoices();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/qbo-accounts", authMiddleware, (_req, res) => {
+    res.json(STORES.map((s) => ({
+      id: s.qbo_account_id,
+      name: s.qbo_account_name,
+      store_key: s.key,
+      store_label: s.label,
+    })));
+  });
+
+  // ---- Smart re-match: backfill vendor + store on existing pending_review invoices ----
+  // Only touches invoices that are still pending_review (won't disturb approved/posted/rejected).
+  // Will not overwrite a vendor or store that the user has already set manually.
+  app.post("/api/invoices/rematch-all", authMiddleware, (_req, res) => {
+    const all = listInvoices({}).filter((i) => i.status === "pending_review");
+    let vendorMatched = 0;
+    let storeAssigned = 0;
+    const updates: Array<{ id: string; vendor?: string; store?: string }> = [];
+    for (const inv of all) {
+      const patch: any = {};
+      // Vendor: only re-match if currently unmatched
+      if (inv.vendor_match_status === "unmatched") {
+        const m = smartMatchVendor(inv.vendor_raw_name);
+        if (m) {
+          patch.vendor_qbo_id = m.vendor_qbo_id;
+          patch.vendor_qbo_name = m.vendor_qbo_name;
+          patch.vendor_match_status = m.vendor_match_status;
+          vendorMatched++;
+        }
+      }
+      // Store: only assign if currently null/empty (don't overwrite a user choice)
+      if (!inv.ship_to_store) {
+        const newVendorId = patch.vendor_qbo_id || inv.vendor_qbo_id;
+        const store = resolveShipToStore((inv as any).store_hint, newVendorId);
+        if (store) {
+          patch.ship_to_store = store;
+          patch.routing_data = JSON.stringify({ store });
+          storeAssigned++;
+        }
+      }
+      if (Object.keys(patch).length > 0) {
+        updateInvoice(inv.id, patch);
+        updates.push({ id: inv.id, vendor: patch.vendor_qbo_name, store: patch.ship_to_store });
+      }
+    }
+    console.log(`[rematch-all] matched ${vendorMatched} vendors, assigned ${storeAssigned} stores across ${updates.length} invoices`);
+    res.json({
+      total_pending: all.length,
+      vendor_matched: vendorMatched,
+      store_assigned: storeAssigned,
+      updated: updates,
+    });
+  });
+
+  // ---- QBO OAuth ----
+  app.get("/api/qbo/status", authMiddleware, (_req, res) => {
+    res.json({ ...getQboStatus(), error_log: getQboErrorLog(20) });
+  });
+
+  app.post("/api/qbo/clear-error-log", authMiddleware, (_req, res) => {
+    clearQboErrorLog();
+    res.json({ ok: true });
+  });
+
+  app.get("/api/qbo/connect", (req, res) => {
+    // Accept token via query param since this is a top-level browser redirect
+    // (browsers can't attach Authorization header to a window.location navigation)
+    const token = String(req.query.t || "");
+    const session = token ? getSession(token) : null;
+    if (!session) {
+      return res.status(401).send("Unauthorized — please sign in to the dashboard first");
+    }
+    const state = crypto.randomBytes(16).toString("hex");
+    const url = getAuthUrl(state);
+    pendingOAuthStates.set(state, Date.now() + 10 * 60 * 1000);
+    res.redirect(url);
+  });
+
+  app.get("/api/qbo/callback", async (req, res) => {
+    const { code, realmId, state } = req.query as Record<string, string>;
+    if (!code || !realmId) {
+      return res.status(400).send("Missing code or realmId");
+    }
+    // Optional state check
+    if (state && pendingOAuthStates.has(state)) {
+      pendingOAuthStates.delete(state);
+    }
+    try {
+      await exchangeCode(code, realmId, state);
+      // Redirect back to the app's settings page
+      res.redirect("/#/settings");
+    } catch (err: any) {
+      console.error("[qbo/callback] Error:", err.message);
+      res.status(500).send(`QBO auth failed: ${err.message}`);
+    }
+  });
+
+  app.post("/api/qbo/disconnect", authMiddleware, (_req, res) => {
+    disconnectQbo();
+    res.json({ ok: true });
+  });
+
+  // QBO vendor cache info (for Settings page)
+  app.get("/api/qbo/vendors/status", authMiddleware, (_req, res) => {
+    res.json(lastVendorSyncAge());
+  });
+
+  // Manual sync trigger — also runs in background every 24h on server start.
+  app.post("/api/qbo/vendors/sync", authMiddleware, async (_req, res) => {
+    try {
+      const r = await syncQboVendorsFromApi();
+      res.json({ ok: true, ...r });
+    } catch (err: any) {
+      console.error("[/api/qbo/vendors/sync] failed:", err.message);
+      res.status(500).json({ ok: false, message: err.message });
+    }
+  });
+
+  // ---- Gmail ----
+  app.get("/api/gmail/status", authMiddleware, (_req, res) => {
+    res.json(getGmailStatus());
+  });
+
+  app.post("/api/gmail/poll-now", authMiddleware, async (_req, res) => {
+    try {
+      // v8.3: manual poll-now also gets the auto-retry on transient errors
+      const result = await pollWithRetry();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // v8.3: Reingest emails matching a filter (e.g. resurface a credit memo that
+  // was silently skipped by the old Stage 1 keyword list). Body params:
+  //   { fromContains?: string, subjectContains?: string, sinceDays?: number }
+  app.post("/api/gmail/reingest", adminMiddleware, async (req, res) => {
+    try {
+      const { fromContains, subjectContains, sinceDays } = req.body || {};
+      if (!fromContains && !subjectContains) {
+        return res.status(400).json({ message: "Provide at least fromContains or subjectContains" });
+      }
+      const result = await reingestEmails({
+        fromContains: fromContains ? String(fromContains) : undefined,
+        subjectContains: subjectContains ? String(subjectContains) : undefined,
+        sinceDays: sinceDays ? parseInt(String(sinceDays), 10) : 30,
+      });
+      res.json({
+        cleared_count: result.cleared.length,
+        cleared: result.cleared,
+        new_invoices: result.poll.new_invoices,
+        errors: result.poll.errors,
+      });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // Lightweight credential test — connect, list folders, disconnect.
+  // Used by the "Test connection" button on the Settings page.
+  app.post("/api/gmail/test-connection", authMiddleware, async (_req, res) => {
+    try {
+      const result = await testGmailConnection();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // Clear the Gmail recent-errors log (used by Settings page "Clear log" button).
+  app.post("/api/gmail/clear-error-log", authMiddleware, (_req, res) => {
+    clearGmailErrorLog();
+    res.json({ ok: true });
+  });
+
+  // ---- Digest (with bucket counts) ----
+  app.get("/api/digest", authMiddleware, (_req, res) => {
+    const all = listInvoices();
+    const today = new Date().toISOString().slice(0, 10);
+    // weekStart = Monday-based week start (00:00:00)
+    const now = new Date();
+    const dow = now.getDay(); // 0=Sun..6=Sat
+    const daysSinceMon = (dow + 6) % 7;
+    const weekStart = new Date(now);
+    weekStart.setHours(0, 0, 0, 0);
+    weekStart.setDate(weekStart.getDate() - daysSinceMon);
+    const weekStartIso = weekStart.toISOString();
+
+    const pending = all.filter((i) => i.status === "pending_review");
+    const oldestPending = pending.reduce<number | null>((acc, i) => {
+      if (!i.created_at) return acc;
+      const ts = new Date(i.created_at).getTime();
+      if (Number.isNaN(ts)) return acc;
+      return acc === null || ts < acc ? ts : acc;
+    }, null);
+
+    const digest = {
+      // legacy fields kept for back-compat
+      pending_review: pending.length,
+      approved_local: all.filter((i) => i.status === "approved_local").length,
+      posted_today: all.filter((i) => i.status === "posted_qbo" && (i.approved_at || "").slice(0, 10) === today).length,
+      needs_vendor: all.filter((i) => i.vendor_match_status === "unmatched").length,
+      low_confidence: all.filter((i) => i.parse_confidence === "low" && i.status === "pending_review").length,
+      total_pending_amount: pending.reduce((s, i) => s + (i.total || 0), 0),
+      // NEW: bucket workflow counts
+      inbox_count: pending.length,
+      receiving_count: all.filter((i) => i.status === "receiving").length,
+      // Problem bucket is MANUAL ONLY: only count invoices Jake explicitly filed there.
+      problem_count: all.filter((i) => i.status === "quarantined").length,
+      skipped_count: countActiveSkippedUploads(),
+      // NEW: dashboard metrics
+      oldest_pending_age_hours: oldestPending ? Math.floor((Date.now() - oldestPending) / (1000 * 60 * 60)) : null,
+      posted_this_week_amount: all.filter((i) => i.status === "posted_qbo" && (i.approved_at || "") >= weekStartIso).reduce((s, i) => s + (i.total || 0), 0),
+      pending_approval_amount: pending.reduce((s, i) => s + (i.total || 0), 0),
+    };
+    res.json(digest);
+  });
+
+  // ===== Skipped Uploads (Round 7) =====
+  // List all skipped uploads (active by default; pass ?include_restored=1 to see all).
+  app.get("/api/skipped", authMiddleware, (req, res) => {
+    const includeRestored = String(req.query.include_restored || "") === "1";
+    const rows = listSkippedUploads({ includeRestored });
+    res.json(rows);
+  });
+
+  // View the kept PDF for a skipped upload. Uses a signed token (same scheme
+  // as invoice PDFs) so the <iframe>/<a> works without an Authorization header.
+  app.get("/api/skipped/:id/pdf-token", authMiddleware, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const row = getSkippedUpload(id);
+    if (!row) return res.status(404).json({ message: "Not found" });
+    const sessionToken = req.headers.authorization!.slice(7);
+    const { token, expires } = signPdfToken(`skipped:${row.id}`, sessionToken);
+    res.json({ token, expires, url: `/api/skipped/${row.id}/pdf?t=${token}&s=${encodeURIComponent(sessionToken)}` });
+  });
+
+  app.get("/api/skipped/:id/pdf", (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const row = getSkippedUpload(id);
+    if (!row) return res.status(404).send("Not found");
+    const t = String(req.query.t || "");
+    const sessionToken = String(req.query.s || "");
+    const sess = sessionToken ? getSession(sessionToken) : null;
+    if (!sess) return res.status(401).send("Unauthorized");
+    if (!verifyPdfToken(`skipped:${row.id}`, sessionToken, t)) return res.status(401).send("Bad or expired link");
+    if (!row.pdf_url) return res.status(404).send("PDF not found");
+    const baseDir = path.resolve(__dirname, "..", "private_assets");
+    const fullPath = path.resolve(baseDir, row.pdf_url);
+    if (!fullPath.startsWith(baseDir + path.sep) && fullPath !== baseDir) {
+      return res.status(400).send("Invalid path");
+    }
+    if (!fs.existsSync(fullPath)) return res.status(404).send("PDF missing on disk");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${row.original_filename || row.pdf_url}"`);
+    res.setHeader("Cache-Control", "private, no-cache");
+    fs.createReadStream(fullPath).pipe(res);
+  });
+
+  // Restore a skipped upload as a real invoice. Re-runs the pipeline on the
+  // same PDF, but with FORCE_REAL_INVOICE=1 so even if the LLM still flags it
+  // as a non-invoice, we keep it as a normal pending_review invoice.
+  app.post("/api/skipped/:id/restore", authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const row = getSkippedUpload(id);
+    if (!row) return res.status(404).json({ message: "Not found" });
+    if (row.restored_invoice_id) {
+      return res.status(400).json({ message: "Already restored", invoice_id: row.restored_invoice_id });
+    }
+    if (!row.pdf_url) return res.status(400).json({ message: "No PDF on file" });
+    const baseDir = path.resolve(__dirname, "..", "private_assets");
+    const fullPath = path.resolve(baseDir, row.pdf_url);
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ message: "PDF missing on disk" });
+    let buf: Buffer;
+    try { buf = fs.readFileSync(fullPath); }
+    catch (e: any) { return res.status(500).json({ message: `Read failed: ${e.message}` }); }
+
+    // Force-process: temporarily set env flag, run pipeline, then unset.
+    const prevForce = process.env.FORCE_REAL_INVOICE;
+    process.env.FORCE_REAL_INVOICE = "1";
+    let result;
+    try {
+      result = await processInvoicePdf({
+        pdfBuffer: buf,
+        originalFilename: row.original_filename || row.pdf_url,
+        source: `restore-from-skipped:${row.id}`,
+        emailFrom: row.email_from || undefined,
+        emailSubject: row.email_subject || undefined,
+        emailDate: row.email_date || undefined,
+      });
+    } finally {
+      if (prevForce === undefined) delete process.env.FORCE_REAL_INVOICE;
+      else process.env.FORCE_REAL_INVOICE = prevForce;
+    }
+
+    if (result.status !== "ingested" && result.status !== "duplicate_internal" && result.status !== "duplicate_qbo") {
+      return res.status(502).json({ message: `Restore failed: ${result.reason || result.status}` });
+    }
+    if (result.invoice_id) {
+      markSkippedUploadRestored(row.id, result.invoice_id);
+      try { appendAuditLog(result.invoice_id, "restore_from_skipped", { skipped_id: row.id, llm_document_type: row.llm_document_type, llm_skip_reason: row.llm_skip_reason }, { invoice_id: result.invoice_id }, req.email!); } catch {}
+    }
+    res.json({ ok: true, invoice_id: result.invoice_id, status: result.status, reason: result.reason });
+  });
+
+  // Permanently delete a skipped upload (and its PDF on disk).
+  app.delete("/api/skipped/:id", authMiddleware, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const row = getSkippedUpload(id);
+    if (!row) return res.status(404).json({ message: "Not found" });
+    if (row.restored_invoice_id) {
+      return res.status(400).json({ message: "Already restored — manage from invoices instead" });
+    }
+    if (row.pdf_url) {
+      const baseDir = path.resolve(__dirname, "..", "private_assets");
+      const fullPath = path.resolve(baseDir, row.pdf_url);
+      if (fullPath.startsWith(baseDir + path.sep) && fs.existsSync(fullPath)) {
+        try { fs.unlinkSync(fullPath); } catch {}
+      }
+    }
+    deleteSkippedUpload(id);
+    res.json({ ok: true });
+  });
+
+  // ---- Current user (validate token, used on cold-start) ----
+  app.get("/api/me", authMiddleware, (req, res) => {
+    res.json({ email: req.email });
+  });
+
+  // ---- All invoices (full search/filter) ----
+  app.get("/api/all-invoices", authMiddleware, (req, res) => {
+    const { q, vendor_qbo_id, status, ship_to_store, doc_type } = req.query as Record<string, string | undefined>;
+    let list = listInvoices({
+      status: status && status !== "all" ? status : undefined,
+      vendor_qbo_id: vendor_qbo_id && vendor_qbo_id !== "all" ? vendor_qbo_id : undefined,
+      ship_to_store: ship_to_store && ship_to_store !== "all" ? ship_to_store : undefined,
+      doc_type: doc_type === "invoices" || doc_type === "credits" ? doc_type : undefined,
+    });
+    if (q && q.trim()) {
+      const needle = q.trim().toLowerCase();
+      list = list.filter((i) =>
+        (i.vendor_qbo_name || "").toLowerCase().includes(needle) ||
+        (i.vendor_raw_name || "").toLowerCase().includes(needle) ||
+        (i.invoice_number || "").toLowerCase().includes(needle)
+      );
+    }
+    res.json(list);
+  });
+
+  // ---- Buckets: move invoice to receiving / quarantined / pending_review ----
+  app.post("/api/invoices/:id/bucket", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    const target = String((req.body && req.body.status) || "").trim();
+    const ALLOWED = ["receiving", "quarantined", "pending_review"];
+    if (!ALLOWED.includes(target)) return res.status(400).json({ message: `bucket must be one of ${ALLOWED.join(", ")}` });
+    const before = { ...inv };
+    const updated = updateInvoice(inv.id, { status: target } as any);
+    appendAuditLog(inv.id, `bucket:${target}`, before, updated, req.email!);
+    // record the action in the notes log too, for audit history
+    const reason = String((req.body && req.body.reason) || "").trim();
+    createInvoiceNote(inv.id, req.email || null, reason ? `Moved to ${target}: ${reason}` : `Moved to ${target}`);
+    res.json(updated);
+  });
+
+  // ---- Bulk actions ----
+  // Body: { ids: string[], action: "posted" | "quarantined" | "pending_review" | "receiving" | "rejected" }
+  // Returns: { updated: number, failed: { id, reason }[] }
+  app.post("/api/invoices/bulk-action", authMiddleware, (req, res) => {
+    const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.map((x: any) => String(x)) : [];
+    const action = String(req.body?.action || "").trim();
+    const ALLOWED = ["posted", "quarantined", "pending_review", "receiving", "rejected"];
+    if (!ALLOWED.includes(action)) {
+      return res.status(400).json({ message: `action must be one of ${ALLOWED.join(", ")}` });
+    }
+    if (ids.length === 0) {
+      return res.status(400).json({ message: "ids array required" });
+    }
+    let updated = 0;
+    const failed: { id: string; reason: string }[] = [];
+    for (const id of ids) {
+      try {
+        const inv = getInvoice(id);
+        if (!inv) { failed.push({ id, reason: "not found" }); continue; }
+        const before = { ...inv };
+        const patch: any = { status: action };
+        if (action === "posted") {
+          // Mark as locally-confirmed posted (no QBO API call — use single-invoice post-to-qbo for that).
+          patch.posted_at = inv.posted_at || new Date().toISOString();
+        }
+        const after = updateInvoice(id, patch);
+        appendAuditLog(id, `bulk:${action}`, before, after, req.email!);
+        createInvoiceNote(id, req.email || null, `Bulk action: ${action}`);
+        updated++;
+      } catch (e: any) {
+        failed.push({ id, reason: e?.message || "unknown error" });
+      }
+    }
+    res.json({ updated, failed, total: ids.length });
+  });
+
+  // ---- Invoice notes (append-only log) ----
+  app.get("/api/invoices/:id/notes", authMiddleware, (req, res) => {
+    res.json(listInvoiceNotes(req.params.id));
+  });
+
+  app.post("/api/invoices/:id/notes", authMiddleware, (req, res) => {
+    const text = String((req.body && req.body.text) || "").trim();
+    if (!text) return res.status(400).json({ message: "text required" });
+    if (!getInvoice(req.params.id)) return res.status(404).json({ message: "Invoice not found" });
+    const note = createInvoiceNote(req.params.id, req.email || null, text);
+    res.json(note);
+  });
+
+  // ===== Skip Senders (Round 6) =====
+  // GET   /api/skip-senders                     -> list
+  // POST  /api/skip-senders                     -> add { match_type, match_value, vendor_name? }
+  // DELETE /api/skip-senders/:id                -> remove
+  // POST  /api/invoices/:id/skip-sender         -> add sender from this invoice + reject this invoice
+  app.get("/api/skip-senders", authMiddleware, (_req, res) => {
+    res.json(listSkipSenders());
+  });
+  app.post("/api/skip-senders", authMiddleware, (req, res) => {
+    const r = addSkipSender({
+      match_type: req.body?.match_type,
+      match_value: req.body?.match_value,
+      vendor_name: req.body?.vendor_name || null,
+      added_by: req.email || null,
+    });
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    res.json({ ok: true, id: r.id });
+  });
+  app.delete("/api/skip-senders/:id", authMiddleware, (req, res) => {
+    const ok = removeSkipSender(Number(req.params.id));
+    res.json({ ok });
+  });
+
+  // Drawer action: "Skip this sender going forward".
+  // Body: { match_type: 'email'|'domain', confirm: 'SKIP' }
+  // Adds the invoice's vendor email/domain to skip list, rejects the current invoice.
+  app.post("/api/invoices/:id/skip-sender", authMiddleware, (req, res) => {
+    if (req.body?.confirm !== "SKIP") {
+      return res.status(400).json({ error: "Must confirm by typing SKIP" });
+    }
+    const match_type = req.body?.match_type;
+    if (match_type !== "email" && match_type !== "domain") {
+      return res.status(400).json({ error: "match_type must be 'email' or 'domain'" });
+    }
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+    const sender = (inv as any).email_from || "";
+    if (!sender) return res.status(400).json({ error: "This invoice has no sender email — add it from Settings instead" });
+
+    // email_from is often "Display Name" <user@host.com> — extract the bare email.
+    const bare = extractBareEmail(sender);
+    if (!bare) {
+      return res.status(400).json({ error: "Could not parse a valid email from this invoice's sender — add the rule manually from Settings" });
+    }
+    let value = bare;
+    if (match_type === "domain") {
+      const at = bare.indexOf("@");
+      if (at < 0) return res.status(400).json({ error: "Sender is not a valid email" });
+      value = bare.slice(at + 1);
+    }
+
+    // All four writes (skip rule, status update, audit log, note) happen in one
+    // transaction so a partial failure can't leave the skip rule persisted with
+    // the invoice still marked pending_review.
+    const result = skipSenderAndRejectInvoice({
+      invoiceId: req.params.id,
+      matchType: match_type,
+      rawSender: sender,
+      matchValue: value,
+      vendorName: (inv as any).vendor_qbo_name || (inv as any).vendor_raw_name || null,
+      userEmail: req.email || null,
+    });
+    if (!result.ok) {
+      return res.status(500).json({ error: result.error || "Failed to skip sender" });
+    }
+    res.json({
+      ok: true,
+      match_type,
+      match_value: value,
+      skip_rule_already_existed: !!result.alreadyExisted,
+    });
+  });
+
+  // ===== Vendor Groups (Round 7) =====
+  // Parent companies that ship invoices for multiple sub-brands. Drawer uses
+  // these to disambiguate which brand to attribute the inventory to.
+  app.get("/api/vendor-groups", authMiddleware, (_req, res) => {
+    res.json(listVendorGroups());
+  });
+  app.post("/api/vendor-groups", authMiddleware, (req, res) => {
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ message: "name required" });
+    res.json(createVendorGroup({
+      name,
+      parent_qbo_id: req.body?.parent_qbo_id || null,
+      parent_qbo_name: req.body?.parent_qbo_name || null,
+    }));
+  });
+  app.patch("/api/vendor-groups/:id", authMiddleware, (req, res) => {
+    const updated = updateVendorGroup(Number(req.params.id), req.body || {});
+    if (!updated) return res.status(404).json({ message: "Not found" });
+    res.json(updated);
+  });
+  app.delete("/api/vendor-groups/:id", authMiddleware, (req, res) => {
+    res.json(deleteVendorGroup(Number(req.params.id)));
+  });
+  app.post("/api/vendor-groups/:id/members", authMiddleware, (req, res) => {
+    const groupId = Number(req.params.id);
+    if (!getVendorGroup(groupId)) return res.status(404).json({ message: "Group not found" });
+    const vendor_qbo_id = String(req.body?.vendor_qbo_id || "").trim();
+    const vendor_qbo_name = String(req.body?.vendor_qbo_name || "").trim();
+    if (!vendor_qbo_id || !vendor_qbo_name) return res.status(400).json({ message: "vendor_qbo_id and vendor_qbo_name required" });
+    res.json(addGroupMember({
+      group_id: groupId,
+      vendor_qbo_id,
+      vendor_qbo_name,
+      brand_keywords: req.body?.brand_keywords || null,
+    }));
+  });
+  app.patch("/api/vendor-groups/members/:memberId", authMiddleware, (req, res) => {
+    const updated = updateGroupMember(Number(req.params.memberId), req.body || {});
+    if (!updated) return res.status(404).json({ message: "Not found" });
+    res.json(updated);
+  });
+  app.delete("/api/vendor-groups/members/:memberId", authMiddleware, (req, res) => {
+    res.json(deleteGroupMember(Number(req.params.memberId)));
+  });
+
+  // Per-invoice: returns the matching group (if any) + scored member suggestions
+  // based on the invoice's PDF text and parsed line items. Drawer calls this to
+  // render the brand picker.
+  app.get("/api/invoices/:id/vendor-group", authMiddleware, (req, res) => {
+    const inv = getInvoice(req.params.id);
+    if (!inv) return res.status(404).json({ message: "Not found" });
+    // Build haystack first — used either way.
+    const lineItems: any[] = (() => {
+      try { return JSON.parse((inv as any).line_items_json || "[]"); } catch { return []; }
+    })();
+    const haystackParts = [
+      inv.vendor_raw_name || "",
+      inv.email_subject || "",
+      (inv as any).llm_notes || "",
+      ...lineItems.map((li: any) => `${li.description || ""} ${li.sku || ""} ${li.brand || ""}`),
+    ];
+    const haystack = haystackParts.join("\n");
+    // Path 1: matched vendor IS in a group → return that group.
+    const direct = findGroupForVendor(inv.vendor_qbo_id);
+    if (direct) {
+      const suggestions = suggestGroupMember(direct, haystack);
+      return res.json({ group: direct, suggestions, source: "vendor_match" });
+    }
+    // Path 2: no direct match — auto-detect via PDF text scan across all groups.
+    const auto = autoDetectGroup(haystack);
+    if (auto) {
+      return res.json({ group: auto.group, suggestions: auto.suggestions, source: "auto_detect" });
+    }
+    res.json({ group: null, suggestions: [], source: "none" });
+  });
+
+  // ===== Feature 4: Google OAuth Routes =====
+
+  app.get("/api/auth/google/login", (req, res) => {
+    if (!isGoogleConfigured()) {
+      return res.status(503).json({ message: "Google OAuth not configured" });
+    }
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI_PROD || process.env.GOOGLE_REDIRECT_URI_LOCAL || `http://localhost:${process.env.PORT || 5000}/api/auth/google/callback`;
+    const state = generateOAuthState("sso");
+    const url = getSsoAuthUrl(redirectUri, state);
+    res.redirect(url);
+  });
+
+  app.get("/api/auth/google/callback", async (req, res) => {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+    const error = String(req.query.error || "");
+
+    if (error) {
+      return res.redirect("/login?error=google_denied");
+    }
+    if (!verifyOAuthState(state, "sso")) {
+      return res.redirect("/login?error=invalid_state");
+    }
+    if (!code) {
+      return res.redirect("/login?error=no_code");
+    }
+
+    try {
+      const redirectUri = process.env.GOOGLE_REDIRECT_URI_PROD || process.env.GOOGLE_REDIRECT_URI_LOCAL || `http://localhost:${process.env.PORT || 5000}/api/auth/google/callback`;
+      const { email } = await exchangeSsoCode(code, redirectUri);
+      const normalizedEmail = email.toLowerCase();
+
+      // Look up user in app_users
+      const appUser = getAppUserByEmail(normalizedEmail);
+      if (!appUser || !appUser.enabled) {
+        return res.redirect("/login?error=access_denied");
+      }
+
+      // Update last_login_at
+      try { updateAppUser(appUser.id, { last_login_at: new Date().toISOString() }); } catch {}
+
+      const token = createSession(normalizedEmail);
+      console.log(`[AUTH] Google SSO login success for ${normalizedEmail}`);
+
+      // Redirect to app with token in query string so client can store it
+      res.redirect(`/login?sso_token=${encodeURIComponent(token)}&email=${encodeURIComponent(normalizedEmail)}`);
+    } catch (e: any) {
+      console.error("[AUTH] Google SSO callback error:", e.message);
+      res.redirect("/login?error=sso_failed");
+    }
+  });
+
+  // Drive connect: accepts Bearer header OR ?t= query param (browser redirect can't set headers)
+  app.get("/api/auth/drive/connect", (req, res) => {
+    // Auth via ?t= param (browser redirect from Settings page)
+    const tParam = String(req.query.t || "");
+    let authed = false;
+    let isAdmin = false;
+    if (tParam) {
+      const sess = getSession(tParam);
+      if (sess) {
+        try {
+          const appUser = getAppUserByEmail(sess.email);
+          isAdmin = (appUser?.role || 'admin') === 'admin';
+        } catch { isAdmin = true; }
+        authed = true;
+      }
+    } else {
+      // Fall back to Bearer header
+      const auth = req.headers.authorization;
+      if (auth?.startsWith("Bearer ")) {
+        const sess = getSession(auth.slice(7));
+        if (sess) {
+          try {
+            const appUser = getAppUserByEmail(sess.email);
+            isAdmin = (appUser?.role || 'admin') === 'admin';
+          } catch { isAdmin = true; }
+          authed = true;
+        }
+      }
+    }
+    if (!authed) return res.status(401).json({ message: "Unauthorized" });
+    if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
+    if (!isGoogleConfigured()) {
+      return res.status(503).json({ message: "Google OAuth not configured" });
+    }
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI_PROD || process.env.GOOGLE_REDIRECT_URI_LOCAL || `http://localhost:${process.env.PORT || 5000}/api/auth/drive/callback`;
+    // Replace the SSO callback with drive callback
+    const driveRedirectUri = redirectUri.replace("/auth/google/callback", "/auth/drive/callback");
+    const state = generateOAuthState("drive");
+    const url = getDriveAuthUrl(driveRedirectUri, state);
+    res.redirect(url);
+  });
+
+  app.get("/api/auth/drive/callback", async (req, res) => {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+    const error = String(req.query.error || "");
+
+    if (error) {
+      return res.redirect("/settings?error=drive_denied&tab=backups");
+    }
+    if (!verifyOAuthState(state, "drive")) {
+      return res.redirect("/settings?error=invalid_state&tab=backups");
+    }
+    if (!code) {
+      return res.redirect("/settings?error=no_code&tab=backups");
+    }
+
+    try {
+      const redirectUri = process.env.GOOGLE_REDIRECT_URI_PROD || process.env.GOOGLE_REDIRECT_URI_LOCAL || `http://localhost:${process.env.PORT || 5000}/api/auth/drive/callback`;
+      const driveRedirectUri = redirectUri.replace("/auth/google/callback", "/auth/drive/callback");
+      const tokens = await exchangeCodeForTokens(code, driveRedirectUri);
+
+      // Get the email of the Drive account for display purposes
+      let grantedEmail: string | undefined;
+      try {
+        const { google } = await import("googleapis");
+        const oauth2 = (await import("./google-oauth")).getOAuth2Client(driveRedirectUri);
+        oauth2.setCredentials(tokens as any);
+        const people = google.oauth2({ version: "v2", auth: oauth2 });
+        const info = await people.userinfo.get();
+        grantedEmail = info.data.email || undefined;
+      } catch {}
+
+      setDriveTokens(tokens, grantedEmail);
+      console.log(`[AUTH] Drive connected for ${grantedEmail || "unknown"}`);
+      res.redirect("/settings?drive_connected=1&tab=backups");
+    } catch (e: any) {
+      console.error("[AUTH] Drive callback error:", e.message);
+      res.redirect("/settings?error=drive_failed&tab=backups");
+    }
+  });
+
+  app.post("/api/auth/drive/disconnect", adminMiddleware, (req, res) => {
+    clearDriveTokens();
+    res.json({ ok: true });
+  });
+
+  app.get("/api/auth/drive/status", authMiddleware, (req, res) => {
+    const status = getDriveStatus();
+    res.json({ ...status, configured: isGoogleConfigured() });
+  });
+
+  // ===== v8: In-app log viewer (admin only) =====
+  // Reads the tail of <cwd>/logs/app.log produced by app-logger.ts. The
+  // Settings → Logs tab uses this with auto-refresh so Jake can debug a
+  // failing upload or a Gmail poll glitch without RDPing into the box.
+  app.get("/api/admin/logs", adminMiddleware, async (req, res) => {
+    const linesParam = parseInt((req.query.lines as string) || "200", 10);
+    const maxLines = isNaN(linesParam) ? 200 : Math.max(10, Math.min(2000, linesParam));
+    try {
+      const { tailAppLog } = await import("./app-logger");
+      const result = tailAppLog(maxLines);
+      res.json({
+        path: result.path,
+        size: result.size,
+        lines: result.lines,
+        line_count: result.lines.length,
+        max_lines: maxLines,
+        fetched_at: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message || "failed to read log" });
+    }
+  });
+
+  // ===== Feature 5: Users Routes (admin only) =====
+
+  app.get("/api/users", adminMiddleware, (req, res) => {
+    const users = listAppUsers();
+    // Don't expose password hashes to clients
+    res.json(users.map(u => ({ ...u, password_hash: undefined, password_salt: undefined })));
+  });
+
+  app.post("/api/users", adminMiddleware, (req, res) => {
+    const { email, name, role, enabled } = req.body || {};
+    if (!email) return res.status(400).json({ message: "email required" });
+    if (role && !['admin', 'user'].includes(role)) return res.status(400).json({ message: "role must be admin or user" });
+    try {
+      const user = createAppUser({
+        email: String(email).trim().toLowerCase(),
+        name: name || null,
+        role: role || 'user',
+        enabled: enabled !== undefined ? (enabled ? 1 : 0) : 1,
+      });
+      res.json({ ...user, password_hash: undefined, password_salt: undefined });
+    } catch (e: any) {
+      if (/UNIQUE/i.test(e.message)) return res.status(400).json({ message: "Email already exists" });
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.patch("/api/users/:id", adminMiddleware, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { name, role, enabled } = req.body || {};
+    const updates: any = {};
+    if (name !== undefined) updates.name = name;
+    if (role !== undefined) {
+      if (!['admin', 'user'].includes(role)) return res.status(400).json({ message: "role must be admin or user" });
+      updates.role = role;
+    }
+    if (enabled !== undefined) updates.enabled = enabled ? 1 : 0;
+    const user = updateAppUser(id, updates);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json({ ...user, password_hash: undefined, password_salt: undefined });
+  });
+
+  app.post("/api/users/:id/password", adminMiddleware, (req, res) => {
+    const id = parseInt(req.params.id);
+    const { password } = req.body || {};
+    if (!password || password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
+    const user = getAppUserById(id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const salt = crypto.randomBytes(16);
+    const hash = crypto.scryptSync(password, salt, 32);
+    setAppUserPassword(id, salt.toString("hex"), hash.toString("hex"));
+    res.json({ ok: true });
+  });
+
+  app.delete("/api/users/:id", adminMiddleware, (req, res) => {
+    const id = parseInt(req.params.id);
+    // Block deleting self
+    const reqUser = req.email ? getAppUserByEmail(req.email) : null;
+    if (reqUser && reqUser.id === id) return res.status(400).json({ message: "Cannot delete yourself" });
+    const ok = deleteAppUser(id);
+    if (!ok) return res.status(404).json({ message: "User not found" });
+    res.json({ ok: true });
+  });
+
+  // ===== Feature 2: Backup Routes =====
+
+  app.get("/api/backups/status", authMiddleware, (_req, res) => {
+    res.json(getBackupStatus());
+  });
+
+  app.post("/api/backups/run", adminMiddleware, async (req, res) => {
+    const kind = String(req.body?.kind || "");
+    if (!kind) return res.status(400).json({ message: "kind required" });
+    try {
+      if (kind === "local_hourly") {
+        await runLocalBackupWithTracking();
+      } else if (kind === "drive_daily_db") {
+        await runDriveDailyBackup();
+      } else if (kind === "drive_weekly_full") {
+        await runDriveWeeklyFullBackup();
+      } else {
+        return res.status(400).json({ message: `Unknown backup kind: ${kind}` });
+      }
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.get("/api/backups/list", authMiddleware, async (_req, res) => {
+    const localBackups = listLocalBackups();
+    const driveStatus = getDriveStatus();
+    res.json({ local: localBackups, drive_connected: driveStatus.connected });
+  });
+
+  // Download backup: supports ?t= query param for browser link clicks
+  app.get("/api/backups/download/:filename", (req, res) => {
+    // Auth via Bearer header or ?t= param
+    const tParam = String(req.query.t || "");
+    const auth = req.headers.authorization;
+    let isAdmin = false;
+    const tokenToCheck = tParam || (auth?.startsWith("Bearer ") ? auth.slice(7) : "");
+    if (tokenToCheck) {
+      const sess = getSession(tokenToCheck);
+      if (sess) {
+        try {
+          const appUser = getAppUserByEmail(sess.email);
+          isAdmin = (appUser?.role || 'admin') === 'admin';
+        } catch { isAdmin = true; }
+      }
+    }
+    if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
+    const filename = path.basename(req.params.filename); // sanitize
+    if (!filename.endsWith(".db.gz")) {
+      return res.status(400).json({ message: "Invalid file type" });
+    }
+    const filePath = path.join(BACKUP_DIR, filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ message: "File not found" });
+    }
+    res.setHeader("Content-Type", "application/gzip");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    fs.createReadStream(filePath).pipe(res);
+  });
+
+  // ===== Feature 3: Archive Routes =====
+
+  app.get("/api/archive/status", authMiddleware, (_req, res) => {
+    res.json(getArchiveStatus());
+  });
+
+  app.post("/api/archive/run", adminMiddleware, async (_req, res) => {
+    try {
+      const result = await runPdfArchive();
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  return httpServer;
+}
+
+// Helper to extract auth token from request (for OAuth redirects)
+function getAuthToken(req: Request): string | null {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith("Bearer ")) return auth.slice(7);
+  return null;
+}
+
+// Short-lived in-memory state store for OAuth
+const pendingOAuthStates = new Map<string, number>();
+// Cleanup expired states every 5 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, exp] of pendingOAuthStates) {
+    if (exp < now) pendingOAuthStates.delete(k);
+  }
+}, 5 * 60 * 1000);

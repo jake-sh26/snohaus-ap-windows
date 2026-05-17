@@ -1,0 +1,15 @@
+{
+  "name": "Sno-Haus AP",
+  "short_name": "Sno-Haus AP",
+  "description": "Sno-Haus accounts payable dashboard",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/favicon.jpg", "sizes": "192x192", "type": "image/jpeg" },
+    { "src": "/favicon.jpg", "sizes": "512x512", "type": "image/jpeg" }
+  ]
+}

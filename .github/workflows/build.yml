@@ -1,0 +1,51 @@
+name: Build install package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run check
+
+      - name: Build client + server
+        run: npm run build
+
+      - name: Compute version tag
+        id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          DATE=$(date +%Y%m%d)
+          echo "tag=${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Package install zip
+        working-directory: dist
+        run: zip -rq "../snohaus_ap_${{ steps.tag.outputs.tag }}.zip" public/ index.cjs
+
+      - name: Upload install zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: snohaus_ap_${{ steps.tag.outputs.tag }}
+          path: snohaus_ap_*.zip
+          retention-days: 90
+          if-no-files-found: error

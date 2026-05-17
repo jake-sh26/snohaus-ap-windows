@@ -1,0 +1,302 @@
+{
+  "invoices": [
+    {
+      "source_file": "2f730d0ff5_Invoice_70125204.txt",
+      "vendor": {
+        "qbo_id": "50",
+        "qbo_name": "Bogner of America"
+      },
+      "ship_to_store": "huntington",
+      "invoice_number": "70125204",
+      "invoice_date": "03/11/2026",
+      "due_date": null,
+      "total": -306.0,
+      "line_items": [],
+      "freight": 0.0,
+      "is_credit": true,
+      "parse_confidence": "high"
+    },
+    {
+      "source_file": "3cfa043ce9_NYS229_Inv_8514109_60097.txt",
+      "vendor": {
+        "qbo_id": "172",
+        "qbo_name": "Treasure Garden"
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "8514109",
+      "invoice_date": "4/10/2026",
+      "due_date": null,
+      "total": 13967.69,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "high"
+    },
+    {
+      "source_file": "4a68bce824_INV773046.txt",
+      "vendor": {
+        "qbo_id": "338",
+        "qbo_name": "Revo"
+      },
+      "ship_to_store": "huntington",
+      "invoice_number": "INV773046",
+      "invoice_date": "09-15-2025",
+      "due_date": null,
+      "total": 1913.2,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "low",
+      "notes": "OCR extracted (scanned PDF) \u2014 verify totals before approving"
+    },
+    {
+      "source_file": "67a5baa741_INV773611.txt",
+      "vendor": {
+        "qbo_id": "338",
+        "qbo_name": "Revo"
+      },
+      "ship_to_store": "hempstead",
+      "invoice_number": "INV773611",
+      "invoice_date": null,
+      "due_date": null,
+      "total": 2950.8,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "low",
+      "notes": "OCR extracted (scanned PDF) \u2014 verify totals before approving"
+    },
+    {
+      "source_file": "7ddc36ec3e_INV773048.txt",
+      "vendor": {
+        "qbo_id": "338",
+        "qbo_name": "Revo"
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "INV773048",
+      "invoice_date": "09-15-2025",
+      "due_date": null,
+      "total": 1913.2,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "low",
+      "notes": "OCR extracted (scanned PDF) \u2014 verify totals before approving"
+    },
+    {
+      "source_file": "a1d78c88d4_NYS229_Inv_8515011_40516.txt",
+      "vendor": {
+        "qbo_id": "172",
+        "qbo_name": "Treasure Garden"
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "8515011",
+      "invoice_date": "4/16/2026",
+      "due_date": null,
+      "total": 212.82,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "high"
+    },
+    {
+      "source_file": "a5424e2279_INV773047.txt",
+      "vendor": {
+        "qbo_id": "338",
+        "qbo_name": "Revo"
+      },
+      "ship_to_store": "hempstead",
+      "invoice_number": "INV773047",
+      "invoice_date": "09-15-2025",
+      "due_date": null,
+      "total": 1913.2,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "low",
+      "notes": "OCR extracted (scanned PDF) \u2014 verify totals before approving"
+    },
+    {
+      "source_file": "adf8fc0afa_Thule_Inc_INVOICE__126048140_-_703459_1.txt",
+      "vendor": {
+        "qbo_id": "106",
+        "qbo_name": "Thule Inc."
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "126048140",
+      "invoice_date": "2026-04-22",
+      "due_date": "2026-05-22",
+      "total": 22.0,
+      "line_items": [],
+      "freight": 12.0,
+      "parse_confidence": "high"
+    },
+    {
+      "source_file": "b062c961b5_INV773594.txt",
+      "vendor": {
+        "qbo_id": "338",
+        "qbo_name": "Revo"
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "INV773594",
+      "invoice_date": null,
+      "due_date": null,
+      "total": 2950.8,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "low",
+      "notes": "OCR extracted (scanned PDF) \u2014 verify totals before approving"
+    },
+    {
+      "source_file": "d8e861fa72_Invoice_INV-01070_for_Sno-Haus.txt",
+      "vendor": {
+        "qbo_id": "272",
+        "qbo_name": "Royal Teak"
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "INV-01070",
+      "invoice_date": "04/23/2026",
+      "due_date": "04/24/2026",
+      "total": 3067.0,
+      "line_items": [
+        {
+          "sku": "MIATB",
+          "description": "Miami Table-Rectangular 43x24x17",
+          "qty": 1.0,
+          "unit_price": 0.0,
+          "amount": 0.0
+        },
+        {
+          "sku": "MIAST",
+          "description": "Miami Side Table Square",
+          "qty": 2.0,
+          "unit_price": 129.0,
+          "amount": 258.0
+        },
+        {
+          "sku": "MIAOTFO",
+          "description": "Miami Ottoman / FRAME ONLY",
+          "qty": 1.0,
+          "unit_price": 176.0,
+          "amount": 176.0
+        },
+        {
+          "sku": "COA3FO",
+          "description": "Coastal Sofa / 3-Seater FRAME ONLY",
+          "qty": 1.0,
+          "unit_price": 529.0,
+          "amount": 529.0
+        },
+        {
+          "sku": "COACHFO",
+          "description": "Coastal Chair / FRAME ONLY",
+          "qty": 2.0,
+          "unit_price": 264.0,
+          "amount": 528.0
+        },
+        {
+          "sku": "DSCW",
+          "description": "Seat and back in Sunbrella Canvas Natural with",
+          "qty": 5.0,
+          "unit_price": 164.0,
+          "amount": 820.0
+        },
+        {
+          "sku": "DSCOW",
+          "description": "Deep Seating Ottoman Cushion Sunbrella",
+          "qty": 1.0,
+          "unit_price": 89.0,
+          "amount": 89.0
+        }
+      ],
+      "freight": 667.0,
+      "parse_confidence": "high"
+    },
+    {
+      "source_file": "d9891a3e38_F3082196.txt",
+      "vendor": {
+        "qbo_id": "326",
+        "qbo_name": "Nikkie",
+        "alias_from": "N-Brands"
+      },
+      "ship_to_store": "greenvale",
+      "invoice_number": "F3082196",
+      "invoice_date": "09/04/2026",
+      "due_date": null,
+      "total": 606.32,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "high"
+    },
+    {
+      "source_file": "e943e02995_INV773612.txt",
+      "vendor": {
+        "qbo_id": "338",
+        "qbo_name": "Revo"
+      },
+      "ship_to_store": "huntington",
+      "invoice_number": "INV773612",
+      "invoice_date": null,
+      "due_date": null,
+      "total": 2950.8,
+      "line_items": [],
+      "freight": 0.0,
+      "parse_confidence": "low",
+      "notes": "OCR extracted (scanned PDF) \u2014 verify totals before approving"
+    }
+  ],
+  "rules": [
+    {
+      "vendor_qbo_id": "272",
+      "vendor_name": "Royal Teak",
+      "rule_type": "100_percent",
+      "store": "greenvale",
+      "note": "Default to Greenvale; split per-line when multi-store"
+    },
+    {
+      "vendor_qbo_id": "106",
+      "vendor_name": "Thule Inc.",
+      "rule_type": "100_percent",
+      "store": "greenvale",
+      "note": "Bike racks, ship to Greenvale"
+    },
+    {
+      "vendor_qbo_id": "172",
+      "vendor_name": "Treasure Garden",
+      "rule_type": "100_percent",
+      "store": "greenvale",
+      "note": "Patio umbrellas, Greenvale"
+    },
+    {
+      "vendor_qbo_id": "326",
+      "vendor_name": "Nikkie",
+      "rule_type": "100_percent",
+      "store": "greenvale",
+      "note": "Aliased from N-Brands; ski apparel"
+    },
+    {
+      "vendor_qbo_id": "50",
+      "vendor_name": "Bogner of America",
+      "rule_type": "review",
+      "store": null,
+      "note": "Always review \u2014 multi-store apparel"
+    },
+    {
+      "vendor_qbo_id": "338",
+      "vendor_name": "Revo",
+      "rule_type": "review",
+      "store": null,
+      "note": "OCR low-confidence, always verify totals"
+    }
+  ],
+  "aliases": [
+    {
+      "alias": "N-Brands",
+      "alias_lower": "n-brands",
+      "vendor_qbo_id": "326",
+      "vendor_name": "Nikkie",
+      "note": "Set by Jake 4/27/26"
+    },
+    {
+      "alias": "B Robinson LLC",
+      "alias_lower": "b robinson",
+      "vendor_qbo_id": "338",
+      "vendor_name": "Revo",
+      "note": "Parent company"
+    }
+  ]
+}

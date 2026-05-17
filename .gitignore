@@ -1,0 +1,48 @@
+# --- Dependencies & build output ---
+node_modules/
+dist/
+.vite/
+
+# --- SQLite database files (production data) ---
+data.db
+data.db-shm
+data.db-wal
+data.db-journal
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Customer / vendor data (real invoice PDFs) ---
+# Contain vendor account numbers, pricing, customer addresses — never commit.
+# But keep the directory itself in the repo so the app finds it at runtime.
+# (attached_assets/ holds the logo and IS committed.)
+private_assets/*
+!private_assets/.gitkeep
+
+# --- Logs & OS noise ---
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- Test / debug artifacts ---
+*.tmp
+*.bak
+/tmp/
+test-output/
+
+# --- Sandbox-only experimental files (keep local, not in repo) ---
+# Pattern matches one-off debug scripts dropped into the project root.
+/debug-*.ts
+/debug-*.js
+/test-*.ts
+/test-*.js
+/inspect-*.ts
