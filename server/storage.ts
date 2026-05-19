@@ -2138,3 +2138,176 @@ export function createInvoiceNote(invoiceId: string, userEmail: string | null, t
   ).get(invoiceId, userEmail, text, new Date().toISOString()) as InvoiceNote;
 }
 
+
+// ============================================================================
+// RBAC HELPERS (PR #7)
+// ----------------------------------------------------------------------------
+// CRUD helpers for roles, permissions, role_permissions, user_roles.
+// All idempotent for upserts where possible. System roles get extra guarding
+// at the API layer.
+// ============================================================================
+
+export type RoleRow = {
+  id: number;
+  name: string;
+  description: string | null;
+  is_system: number;
+  created_at: string | null;
+};
+
+export type PermissionRow = {
+  id: number;
+  key: string;
+  module: string;
+  label: string;
+  description: string | null;
+};
+
+export type UserRoleRow = {
+  id: number;
+  user_id: number;
+  role_id: number;
+  entity_id_scope: number | null;
+  created_at: string | null;
+};
+
+export type PayrollEntityRow = {
+  id: number;
+  location: string;
+  legal_name: string;
+  cadence: string;
+  adp_company_code: string | null;
+  commissions_enabled: number;
+  pms_enabled: number;
+  tips_enabled: number;
+  easyrent_enabled: number;
+  spif_enabled: number;
+  active: number;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+// ----- Read helpers -----
+
+export function listRoles(): RoleRow[] {
+  return sqlite.prepare(`SELECT * FROM roles ORDER BY is_system DESC, name ASC`).all() as RoleRow[];
+}
+
+export function getRoleById(id: number): RoleRow | null {
+  return (sqlite.prepare(`SELECT * FROM roles WHERE id = ? LIMIT 1`).get(id) as RoleRow) || null;
+}
+
+export function getRoleByName(name: string): RoleRow | null {
+  return (sqlite.prepare(`SELECT * FROM roles WHERE name = ? LIMIT 1`).get(name) as RoleRow) || null;
+}
+
+export function listPermissions(): PermissionRow[] {
+  return sqlite.prepare(`SELECT * FROM permissions ORDER BY module ASC, key ASC`).all() as PermissionRow[];
+}
+
+export function listPermissionsForRole(roleId: number): PermissionRow[] {
+  return sqlite.prepare(`
+    SELECT p.* FROM permissions p
+    JOIN role_permissions rp ON rp.permission_id = p.id
+    WHERE rp.role_id = ?
+    ORDER BY p.module, p.key
+  `).all(roleId) as PermissionRow[];
+}
+
+export function listUserRolesForUser(userId: number): Array<UserRoleRow & { role_name: string; role_is_system: number }> {
+  return sqlite.prepare(`
+    SELECT ur.*, r.name AS role_name, r.is_system AS role_is_system
+    FROM user_roles ur
+    JOIN roles r ON r.id = ur.role_id
+    WHERE ur.user_id = ?
+    ORDER BY r.name ASC
+  `).all(userId) as any[];
+}
+
+export function listAllUserRoles(): Array<UserRoleRow & { user_email: string; role_name: string; entity_location: string | null }> {
+  return sqlite.prepare(`
+    SELECT
+      ur.*,
+      u.email AS user_email,
+      r.name AS role_name,
+      e.location AS entity_location
+    FROM user_roles ur
+    JOIN app_users u ON u.id = ur.user_id
+    JOIN roles r ON r.id = ur.role_id
+    LEFT JOIN payroll_entities e ON e.id = ur.entity_id_scope
+    ORDER BY u.email, r.name
+  `).all() as any[];
+}
+
+export function listPayrollEntities(): PayrollEntityRow[] {
+  return sqlite.prepare(
+    `SELECT * FROM payroll_entities WHERE active = 1 ORDER BY location ASC`
+  ).all() as PayrollEntityRow[];
+}
+
+// ----- Write helpers -----
+
+export function createRole(name: string, description: string | null): RoleRow {
+  const now = new Date().toISOString();
+  const info = sqlite.prepare(
+    `INSERT INTO roles (name, description, is_system, created_at) VALUES (?, ?, 0, ?)`
+  ).run(name, description, now);
+  return getRoleById(Number(info.lastInsertRowid))!;
+}
+
+export function updateRole(id: number, patch: { name?: string; description?: string | null }): RoleRow | null {
+  const role = getRoleById(id);
+  if (!role) return null;
+  const next = {
+    name: patch.name ?? role.name,
+    description: patch.description !== undefined ? patch.description : role.description,
+  };
+  sqlite.prepare(`UPDATE roles SET name = ?, description = ? WHERE id = ?`)
+    .run(next.name, next.description, id);
+  return getRoleById(id);
+}
+
+export function deleteRole(id: number): boolean {
+  const role = getRoleById(id);
+  if (!role) return false;
+  if (role.is_system) return false; // guarded at API layer too
+  sqlite.prepare(`DELETE FROM roles WHERE id = ?`).run(id);
+  return true;
+}
+
+/**
+ * Replace a role's permission set with the given list of permission keys.
+ * Atomic — wraps INSERT+DELETE in a transaction so a failure leaves the role's
+ * old permissions intact.
+ */
+export function setRolePermissions(roleId: number, permissionKeys: string[]): void {
+  const txn = sqlite.transaction((keys: string[]) => {
+    sqlite.prepare(`DELETE FROM role_permissions WHERE role_id = ?`).run(roleId);
+    const ins = sqlite.prepare(`
+      INSERT OR IGNORE INTO role_permissions (role_id, permission_id)
+      SELECT ?, id FROM permissions WHERE key = ?
+    `);
+    for (const k of keys) ins.run(roleId, k);
+  });
+  txn(permissionKeys);
+}
+
+/**
+ * Replace a user's role assignments with the given list. Each entry is
+ * (role_id, entity_id_scope | null). Atomic.
+ */
+export function setUserRoles(
+  userId: number,
+  assignments: Array<{ role_id: number; entity_id_scope: number | null }>
+): void {
+  const now = new Date().toISOString();
+  const txn = sqlite.transaction((items: typeof assignments) => {
+    sqlite.prepare(`DELETE FROM user_roles WHERE user_id = ?`).run(userId);
+    const ins = sqlite.prepare(`
+      INSERT OR IGNORE INTO user_roles (user_id, role_id, entity_id_scope, created_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const a of items) ins.run(userId, a.role_id, a.entity_id_scope, now);
+  });
+  txn(assignments);
+}

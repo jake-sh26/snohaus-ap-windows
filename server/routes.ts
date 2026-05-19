@@ -51,7 +51,22 @@ import {
   updateAppUser,
   setAppUserPassword,
   deleteAppUser,
+  // RBAC (PR #7)
+  listRoles,
+  getRoleById,
+  getRoleByName,
+  createRole,
+  updateRole,
+  deleteRole,
+  setRolePermissions,
+  listPermissions,
+  listPermissionsForRole,
+  listAllUserRoles,
+  listUserRolesForUser,
+  setUserRoles,
+  listPayrollEntities,
 } from "./storage";
+import { getUserPermissions, requirePermission } from "./rbac";
 import {
   isGoogleConfigured,
   getDriveAuthUrl,
@@ -106,6 +121,7 @@ declare global {
   namespace Express {
     interface Request {
       email?: string;
+      userId?: number;
       userRole?: 'admin' | 'user';
       userName?: string | null;
     }
@@ -123,9 +139,10 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
     return res.status(401).json({ message: "Invalid or expired token" });
   }
   req.email = session.email;
-  // Load role from app_users (falls back to 'admin' for existing users not yet in the table)
+  // Load role + id from app_users (falls back to 'admin' for existing users not yet in the table)
   try {
     const appUser = getAppUserByEmail(session.email);
+    req.userId = appUser?.id;
     req.userRole = (appUser?.role as 'admin' | 'user') || 'admin';
     req.userName = appUser?.name || null;
   } catch {
@@ -537,7 +554,151 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.get("/api/me", authMiddleware, (req, res) => {
-    res.json({ email: req.email, role: req.userRole || 'admin', name: req.userName || null });
+    // Resolve full RBAC permissions for the frontend. Permissions are returned
+    // as an array of {key, entity_id_scope} pairs; the client uses this to
+    // show/hide UI affordances. Legacy admins automatically have the Owner
+    // role (assigned in seedRbacBaseline()) so this works for everyone.
+    let permissions: Array<{ key: string; entity_id_scope: number | null }> = [];
+    let roles: Array<{ id: number; name: string; entity_id_scope: number | null }> = [];
+    if (req.userId) {
+      permissions = getUserPermissions(req.userId);
+      roles = listUserRolesForUser(req.userId).map((r) => ({
+        id: r.role_id, name: r.role_name, entity_id_scope: r.entity_id_scope,
+      }));
+    }
+    res.json({
+      email: req.email,
+      role: req.userRole || 'admin',
+      name: req.userName || null,
+      user_id: req.userId,
+      permissions,
+      roles,
+    });
+  });
+
+  // ============================================================================
+  // SETTINGS — RBAC management (PR #7)
+  // ----------------------------------------------------------------------------
+  // Read endpoints: anyone with users.view (Owner only by default) can list.
+  // Write endpoints: users.manage required (Owner only by default).
+  // System roles cannot be deleted or renamed; their permissions can be edited
+  // via the same endpoint (so the Owner can grant the Manager role additional
+  // permissions as the app grows).
+  // ============================================================================
+
+  app.get("/api/settings/permissions", authMiddleware, requirePermission("users.view"), (_req, res) => {
+    const all = listPermissions();
+    // Group by module for nicer frontend rendering.
+    const grouped: Record<string, typeof all> = {};
+    for (const p of all) {
+      if (!grouped[p.module]) grouped[p.module] = [];
+      grouped[p.module].push(p);
+    }
+    res.json({ permissions: all, grouped });
+  });
+
+  app.get("/api/settings/entities", authMiddleware, requirePermission("users.view"), (_req, res) => {
+    res.json(listPayrollEntities());
+  });
+
+  app.get("/api/settings/roles", authMiddleware, requirePermission("users.view"), (_req, res) => {
+    const roles = listRoles();
+    const withPerms = roles.map((r) => ({
+      ...r,
+      permissions: listPermissionsForRole(r.id).map((p) => p.key),
+    }));
+    res.json(withPerms);
+  });
+
+  app.post("/api/settings/roles", authMiddleware, requirePermission("users.manage"), (req, res) => {
+    const { name, description, permissions } = req.body || {};
+    if (!name || typeof name !== "string") return res.status(400).json({ message: "name is required" });
+    if (getRoleByName(name)) return res.status(409).json({ message: "A role with that name already exists" });
+    const role = createRole(name, description ?? null);
+    if (Array.isArray(permissions) && permissions.length > 0) {
+      setRolePermissions(role.id, permissions);
+    }
+    res.json({ ...role, permissions: listPermissionsForRole(role.id).map((p) => p.key) });
+  });
+
+  app.patch("/api/settings/roles/:id", authMiddleware, requirePermission("users.manage"), (req, res) => {
+    const id = Number(req.params.id);
+    const role = getRoleById(id);
+    if (!role) return res.status(404).json({ message: "Role not found" });
+    const { name, description, permissions } = req.body || {};
+    // System roles: lock name + description, allow permission edits.
+    if (role.is_system) {
+      if (name !== undefined && name !== role.name) {
+        return res.status(400).json({ message: "System role names cannot be changed." });
+      }
+    } else {
+      if (name !== undefined || description !== undefined) {
+        updateRole(id, { name, description });
+      }
+    }
+    if (Array.isArray(permissions)) {
+      setRolePermissions(id, permissions);
+    }
+    const updated = getRoleById(id)!;
+    res.json({ ...updated, permissions: listPermissionsForRole(id).map((p) => p.key) });
+  });
+
+  app.delete("/api/settings/roles/:id", authMiddleware, requirePermission("users.manage"), (req, res) => {
+    const id = Number(req.params.id);
+    const role = getRoleById(id);
+    if (!role) return res.status(404).json({ message: "Role not found" });
+    if (role.is_system) return res.status(400).json({ message: "System roles cannot be deleted." });
+    deleteRole(id);
+    res.json({ ok: true });
+  });
+
+  // List all user→role assignments (for the per-user role-assignment UI).
+  app.get("/api/settings/user-roles", authMiddleware, requirePermission("users.view"), (_req, res) => {
+    res.json(listAllUserRoles());
+  });
+
+  // Replace a single user's role assignments. Body: { assignments: [{ role_id, entity_id_scope }] }
+  // entity_id_scope: null = all entities.
+  app.put("/api/settings/users/:userId/roles", authMiddleware, requirePermission("users.manage"), (req, res) => {
+    const userId = Number(req.params.userId);
+    const user = getAppUserById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const { assignments } = req.body || {};
+    if (!Array.isArray(assignments)) {
+      return res.status(400).json({ message: "assignments must be an array" });
+    }
+    // Validate each assignment shape.
+    for (const a of assignments) {
+      if (!a || typeof a !== "object") return res.status(400).json({ message: "Invalid assignment" });
+      if (!Number.isFinite(Number(a.role_id))) return res.status(400).json({ message: "role_id must be a number" });
+      if (a.entity_id_scope !== null && !Number.isFinite(Number(a.entity_id_scope))) {
+        return res.status(400).json({ message: "entity_id_scope must be a number or null" });
+      }
+      if (!getRoleById(Number(a.role_id))) return res.status(400).json({ message: `Unknown role_id ${a.role_id}` });
+    }
+    // Safety: don't let an Owner remove their OWN Owner-with-all-entities grant.
+    // Otherwise they could lock themselves out and nobody could fix it.
+    if (userId === req.userId) {
+      const ownerRole = getRoleByName("Owner");
+      if (ownerRole) {
+        const stillOwnerEverywhere = assignments.some(
+          (a: any) => Number(a.role_id) === ownerRole.id && a.entity_id_scope === null
+        );
+        const currentlyOwnerEverywhere = listUserRolesForUser(userId).some(
+          (r) => r.role_id === ownerRole.id && r.entity_id_scope === null
+        );
+        if (currentlyOwnerEverywhere && !stillOwnerEverywhere) {
+          return res.status(400).json({
+            message: "You cannot remove your own Owner role across all entities. Ask another Owner to do it.",
+          });
+        }
+      }
+    }
+    setUserRoles(userId, assignments.map((a: any) => ({
+      role_id: Number(a.role_id),
+      entity_id_scope: a.entity_id_scope === null ? null : Number(a.entity_id_scope),
+    })));
+    res.json({ ok: true, assignments: listUserRolesForUser(userId) });
   });
 
   // ---- Health ----
@@ -1738,10 +1899,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ok: true });
   });
 
-  // ---- Current user (validate token, used on cold-start) ----
-  app.get("/api/me", authMiddleware, (req, res) => {
-    res.json({ email: req.email });
-  });
+  // NOTE: Earlier minimal /api/me handler removed in PR #7 — superseded by the
+  // RBAC-aware /api/me defined near the top of registerRoutes() which returns
+  // { email, role, name, user_id, permissions, roles }.
 
   // ---- All invoices (full search/filter) ----
   app.get("/api/all-invoices", authMiddleware, (req, res) => {
