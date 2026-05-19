@@ -130,9 +130,9 @@ function EntityRow({
   return (
     <div className="flex items-center justify-between p-3 rounded-md border bg-card">
       <div className="min-w-0">
-        <div className="text-sm font-medium">{name}</div>
+        <div className="text-sm font-medium">{location}</div>
         <div className="text-xs text-muted-foreground">
-          {location} • {cadence}
+          {name} • {cadence}
         </div>
       </div>
       <div className="text-xs text-muted-foreground text-right shrink-0 ml-3">{features}</div>
