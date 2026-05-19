@@ -1,7 +1,27 @@
-import { ReactNode, useState } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
-import { Inbox, FileText, BookOpen, History, Settings as SettingsIcon, Sun, Moon, LogOut, Menu, X, PackageOpen, AlertTriangle, FolderOpen, FileX, DollarSign } from "lucide-react";
+import {
+  Inbox,
+  FileText,
+  BookOpen,
+  History,
+  Settings as SettingsIcon,
+  Sun,
+  Moon,
+  LogOut,
+  Menu,
+  X,
+  PackageOpen,
+  AlertTriangle,
+  FolderOpen,
+  FileX,
+  DollarSign,
+  ChevronDown,
+  ChevronRight,
+  Receipt,
+  Wrench,
+} from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
@@ -18,15 +38,19 @@ type NavItem = {
 
 type NavSection = {
   label: string;
+  icon: any;
   items: NavItem[];
+  // Optional: tone for the rolled-up badge shown on the master row when collapsed.
+  // Falls back to amber if any amber-tone child has a positive count; red if any red-tone child does.
+  href?: string; // if set and items is empty, master row navigates directly
 };
 
-// Sidebar is grouped into modules so the app can grow beyond AP (Payroll next, then Sales
-// Reporting, Inventory, etc.). Existing AP items keep their original href + order under the
-// "Accounts Payable" section so nothing breaks for current users.
+// Sidebar is grouped into modules. Each section is a collapsible master menu with
+// its own children. Future modules (Sales Reporting, Inventory) plug in here.
 const NAV_SECTIONS: NavSection[] = [
   {
     label: "Accounts Payable",
+    icon: Receipt,
     items: [
       { href: "/", label: "Inbox", icon: Inbox, countKey: "inbox_count", toneIfPositive: "amber" },
       { href: "/receiving", label: "In Receiving", icon: PackageOpen, countKey: "receiving_count" },
@@ -40,17 +64,30 @@ const NAV_SECTIONS: NavSection[] = [
   },
   {
     label: "Payroll",
-    items: [
-      { href: "/payroll", label: "Overview", icon: DollarSign },
-    ],
+    icon: DollarSign,
+    items: [{ href: "/payroll", label: "Overview", icon: Wrench }],
   },
   {
     label: "System",
-    items: [
-      { href: "/settings", label: "Settings", icon: SettingsIcon },
-    ],
+    icon: SettingsIcon,
+    items: [{ href: "/settings", label: "Settings", icon: SettingsIcon }],
   },
 ];
+
+const SIDEBAR_STORAGE_KEY = "sidebar-expanded-sections-v1";
+
+// Determine which section a given URL belongs to. Used to auto-expand the
+// section the user is currently inside.
+function sectionForPath(path: string): string | null {
+  for (const section of NAV_SECTIONS) {
+    for (const item of section.items) {
+      if (path === item.href || (item.href !== "/" && path.startsWith(item.href))) {
+        return section.label;
+      }
+    }
+  }
+  return null;
+}
 
 export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
@@ -62,7 +99,70 @@ export function Layout({ children }: { children: ReactNode }) {
   const digestQ = useQuery<any>({ queryKey: ["/api/digest"] });
   const digest = digestQ.data || {};
 
-  function handleNav() { setMobileNavOpen(false); }
+  // Track which sections are expanded. On first load:
+  //   - active section is expanded
+  //   - all others are collapsed
+  // After that, user toggles are remembered in localStorage so manually-opened
+  // sections stay open across page navigations and reloads.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const stored = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
+      if (stored) return JSON.parse(stored);
+    } catch {}
+    const activeSection = sectionForPath(location);
+    const init: Record<string, boolean> = {};
+    for (const s of NAV_SECTIONS) init[s.label] = s.label === activeSection;
+    return init;
+  });
+
+  // Whenever the user navigates, make sure the active section is expanded.
+  // We don't collapse anything they had open — only auto-open the active one.
+  useEffect(() => {
+    const activeSection = sectionForPath(location);
+    if (!activeSection) return;
+    setExpanded((prev) => (prev[activeSection] ? prev : { ...prev, [activeSection]: true }));
+  }, [location]);
+
+  // Persist expanded state across reloads.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, JSON.stringify(expanded));
+    } catch {}
+  }, [expanded]);
+
+  function toggleSection(label: string) {
+    setExpanded((prev) => ({ ...prev, [label]: !prev[label] }));
+  }
+
+  function handleNav() {
+    setMobileNavOpen(false);
+  }
+
+  // Compute the rolled-up badge for a section (shown on the master row).
+  // If the section has any child with a positive count, show the highest-priority
+  // tone (red > amber > muted) and the sum across children.
+  function sectionBadge(section: NavSection): { count: number; tone: "red" | "amber" | "muted" } | null {
+    let total = 0;
+    let tone: "red" | "amber" | "muted" = "muted";
+    for (const item of section.items) {
+      if (!item.countKey) continue;
+      const n = digest[item.countKey];
+      if (typeof n !== "number" || n <= 0) continue;
+      total += n;
+      if (item.toneIfPositive === "red") tone = "red";
+      else if (item.toneIfPositive === "amber" && tone !== "red") tone = "amber";
+    }
+    return total > 0 ? { count: total, tone } : null;
+  }
+
+  const badgeToneClass = (tone: "red" | "amber" | "muted") =>
+    tone === "red"
+      ? "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30"
+      : tone === "amber"
+        ? "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+        : "bg-muted text-foreground/80 border-border";
 
   return (
     <div className="min-h-screen bg-background flex">
@@ -89,51 +189,125 @@ export function Layout({ children }: { children: ReactNode }) {
         <div className="px-5 pt-5 pb-6 hidden lg:block">
           <Wordmark />
         </div>
-        <nav className="px-3 pt-3 flex-1 space-y-4 overflow-y-auto">
-          {NAV_SECTIONS.map((section) => (
-            <div key={section.label} className="space-y-0.5">
-              <div
-                className="px-3 pt-1 pb-1 text-[10px] font-semibold uppercase tracking-wider text-sidebar-foreground/50"
-                data-testid={`section-label-${section.label.toLowerCase().replace(/ /g, "-")}`}
-              >
-                {section.label}
-              </div>
-              {section.items.map((item) => {
-                const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
-                const Icon = item.icon;
-                const count = item.countKey ? digest[item.countKey] : undefined;
-                const showBadge = typeof count === "number" && count > 0;
-                const badgeTone = item.toneIfPositive === "red" ? "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30"
-                  : item.toneIfPositive === "amber" ? "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
-                  : "bg-muted text-foreground/80 border-border";
-                return (
+        <nav className="px-2 pt-2 flex-1 space-y-1 overflow-y-auto">
+          {NAV_SECTIONS.map((section) => {
+            const SectionIcon = section.icon;
+            const isExpanded = !!expanded[section.label];
+            const isSingleItem = section.items.length === 1;
+            const activeChild = section.items.find(
+              (item) => location === item.href || (item.href !== "/" && location.startsWith(item.href)),
+            );
+            const isActiveSection = !!activeChild;
+            const badge = sectionBadge(section);
+
+            // Single-item sections: the master row is itself a Link to the child's href
+            // (no expand/collapse, no chevron). Saves a click on Settings/Overview/etc.
+            if (isSingleItem) {
+              const onlyItem = section.items[0];
+              const ItemIcon = section.icon; // use the section icon, not the child icon, for visual consistency
+              return (
+                <div key={section.label}>
                   <Link
-                    key={item.href}
-                    href={item.href}
+                    href={onlyItem.href}
                     onClick={handleNav}
-                    data-testid={`link-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
+                    data-testid={`link-nav-${section.label.toLowerCase().replace(/ /g, "-")}`}
                     className={cn(
                       "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium transition-colors hover-elevate",
-                      active
+                      isActiveSection
                         ? "bg-sidebar-accent text-sidebar-accent-foreground"
                         : "text-sidebar-foreground/80 hover:text-sidebar-foreground",
                     )}
                   >
-                    <Icon className="size-4 shrink-0" />
-                    <span className="flex-1">{item.label}</span>
-                    {showBadge && (
-                      <span
-                        className={cn("ml-auto text-[10px] font-medium tabular-nums px-1.5 py-0.5 rounded-md border", badgeTone)}
-                        data-testid={`badge-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
-                      >
-                        {count}
-                      </span>
-                    )}
+                    <ItemIcon className="size-4 shrink-0" />
+                    <span className="flex-1">{section.label}</span>
                   </Link>
-                );
-              })}
-            </div>
-          ))}
+                </div>
+              );
+            }
+
+            return (
+              <div key={section.label}>
+                {/* Master row: clickable, toggles expand/collapse */}
+                <button
+                  type="button"
+                  onClick={() => toggleSection(section.label)}
+                  data-testid={`section-toggle-${section.label.toLowerCase().replace(/ /g, "-")}`}
+                  className={cn(
+                    "w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium transition-colors hover-elevate text-left",
+                    isActiveSection
+                      ? "text-sidebar-foreground"
+                      : "text-sidebar-foreground/80 hover:text-sidebar-foreground",
+                  )}
+                  aria-expanded={isExpanded}
+                >
+                  <SectionIcon className="size-4 shrink-0" />
+                  <span className="flex-1">{section.label}</span>
+                  {/* Rolled-up badge only when collapsed, so it's visible at a glance */}
+                  {!isExpanded && badge && (
+                    <span
+                      className={cn(
+                        "text-[10px] font-medium tabular-nums px-1.5 py-0.5 rounded-md border",
+                        badgeToneClass(badge.tone),
+                      )}
+                      data-testid={`badge-section-${section.label.toLowerCase().replace(/ /g, "-")}`}
+                    >
+                      {badge.count}
+                    </span>
+                  )}
+                  {isExpanded ? (
+                    <ChevronDown className="size-3.5 shrink-0 text-sidebar-foreground/50" />
+                  ) : (
+                    <ChevronRight className="size-3.5 shrink-0 text-sidebar-foreground/50" />
+                  )}
+                </button>
+
+                {/* Children: indented and only rendered when expanded */}
+                {isExpanded && (
+                  <div className="mt-0.5 ml-2 pl-3 border-l border-sidebar-border/60 space-y-0.5">
+                    {section.items.map((item) => {
+                      const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
+                      const Icon = item.icon;
+                      const count = item.countKey ? digest[item.countKey] : undefined;
+                      const showBadge = typeof count === "number" && count > 0;
+                      const badgeTone = item.toneIfPositive === "red"
+                        ? "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30"
+                        : item.toneIfPositive === "amber"
+                          ? "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+                          : "bg-muted text-foreground/80 border-border";
+                      return (
+                        <Link
+                          key={item.href}
+                          href={item.href}
+                          onClick={handleNav}
+                          data-testid={`link-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
+                          className={cn(
+                            "flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-sm transition-colors hover-elevate",
+                            active
+                              ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
+                              : "text-sidebar-foreground/75 hover:text-sidebar-foreground",
+                          )}
+                        >
+                          <Icon className="size-3.5 shrink-0" />
+                          <span className="flex-1">{item.label}</span>
+                          {showBadge && (
+                            <span
+                              className={cn(
+                                "ml-auto text-[10px] font-medium tabular-nums px-1.5 py-0.5 rounded-md border",
+                                badgeTone,
+                              )}
+                              data-testid={`badge-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
+                            >
+                              {count}
+                            </span>
+                          )}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </nav>
         <div className="p-3 border-t border-sidebar-border space-y-2">
           <div className="px-2 py-1.5 text-xs">
