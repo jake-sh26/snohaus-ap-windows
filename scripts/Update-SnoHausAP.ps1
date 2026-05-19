@@ -56,10 +56,15 @@ if ($LASTEXITCODE -ne 0) { Pop-Location; Die "git pull failed" }
 $afterSha  = (git rev-parse HEAD).Trim()
 Pop-Location
 
+# Track whether the user explicitly opted into a re-install. If they did,
+# we must NOT short-circuit on the post-download hash check below — they
+# already told us they want the swap to happen.
+$forceReinstall = $false
 if ($beforeSha -eq $afterSha) {
     Write-Ok "Already at latest commit ($($afterSha.Substring(0,7))). Re-installing anyway? (Y/N)"
     $ans = Read-Host
     if ($ans -notmatch '^[Yy]') { Write-Host "Aborted." -ForegroundColor Yellow; exit 0 }
+    $forceReinstall = $true
 } else {
     Write-Ok "Updated $($beforeSha.Substring(0,7))..$($afterSha.Substring(0,7))"
 }
@@ -135,13 +140,33 @@ $newPublic = Join-Path $extracted "public"
 if (-not (Test-Path $newCjs) -or -not (Test-Path $newPublic)) {
     Die "Extracted artifact is missing index.cjs or public/"
 }
+# Hash the server bundle. Frontend-only changes (client/public/*) won't
+# change this, so the hash check below also compares the client bundle.
 $newHash = (Get-FileHash $newCjs -Algorithm SHA256).Hash
 Write-Ok "Downloaded + verified: $($newHash.Substring(0,16))..."
 
-if ($currentHash -eq $newHash) {
-    Write-Warn "New build is byte-identical to what's already running. Skipping swap."
+# Detect client-bundle changes by hashing the built index.html. Vite builds
+# fingerprint client asset filenames into index.html, so any client code
+# change (like a sidebar refactor) produces a different index.html hash.
+# This catches the frontend-only-update case where index.cjs is unchanged.
+$newClientHtml = Join-Path $newPublic "index.html"
+$newClientHash = if (Test-Path $newClientHtml) { (Get-FileHash $newClientHtml -Algorithm SHA256).Hash } else { $null }
+$curClientHtml = Join-Path $DistDir "public\index.html"
+$curClientHash = if (Test-Path $curClientHtml) { (Get-FileHash $curClientHtml -Algorithm SHA256).Hash } else { $null }
+
+$serverSame = ($currentHash -eq $newHash)
+$clientSame = ($newClientHash -ne $null) -and ($newClientHash -eq $curClientHash)
+
+if ($serverSame -and $clientSame -and -not $forceReinstall) {
+    Write-Warn "New build is byte-identical to what's already running (server + client). Skipping swap."
     Remove-Item $tmp -Recurse -Force
     exit 0
+}
+if ($serverSame -and -not $clientSame) {
+    Write-Ok "Server bundle unchanged; client bundle changed. Proceeding with swap."
+}
+if ($forceReinstall -and $serverSame -and $clientSame) {
+    Write-Ok "Build is byte-identical, but re-install was explicitly requested. Proceeding with swap."
 }
 
 # ---- 6. Stop services ----
