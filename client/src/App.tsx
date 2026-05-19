@@ -19,6 +19,8 @@ import Problem from "@/pages/Problem";
 import Skipped from "@/pages/Skipped";
 import Settings from "@/pages/Settings";
 import Payroll from "@/pages/Payroll";
+import PayrollEntities from "@/pages/PayrollEntities";
+import PayrollEmployees from "@/pages/PayrollEmployees";
 import NotFound from "@/pages/not-found";
 
 function ProtectedRoutes() {
@@ -55,6 +57,8 @@ function ProtectedRoutes() {
         <Route path="/aliases" component={Aliases} />
         <Route path="/settings" component={Settings} />
         <Route path="/payroll" component={Payroll} />
+        <Route path="/payroll/entities" component={PayrollEntities} />
+        <Route path="/payroll/employees" component={PayrollEmployees} />
         <Route component={NotFound} />
       </Switch>
     </Layout>
