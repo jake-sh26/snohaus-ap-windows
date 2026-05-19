@@ -1815,9 +1815,10 @@ type RbacPermission = {
 
 type RbacEntity = {
   id: number;
-  code: string;
+  // payroll_entities uses `location` (e.g. "Greenvale") and `legal_name`
+  // (e.g. "SD Ski and Patio Inc"); there is no `code` / `location_label`.
+  location: string;
   legal_name: string;
-  location_label: string | null;
 };
 
 type UserRoleAssignment = {
@@ -2276,7 +2277,7 @@ function UserRoleAssignmentRow({
     if (scopes.some((s) => s.entity_id_scope === null)) return `${roleName} — all entities`;
     const labels = scopes.map((s) => {
       const e = entities.find((x) => x.id === s.entity_id_scope);
-      return e?.location_label || e?.code || `#${s.entity_id_scope}`;
+      return e?.location || `#${s.entity_id_scope}`;
     });
     return `${roleName} — ${labels.join(", ")}`;
   })();
@@ -2343,7 +2344,7 @@ function UserRoleAssignmentRow({
                       data-testid={`checkbox-entity-${user.id}-${e.id}`}
                     />
                     <span className="text-sm">
-                      {e.location_label || e.code}
+                      {e.location}
                       <span className="text-[11px] text-muted-foreground ml-1.5">{e.legal_name}</span>
                     </span>
                   </label>

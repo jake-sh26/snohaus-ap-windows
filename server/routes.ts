@@ -65,6 +65,18 @@ import {
   listUserRolesForUser,
   setUserRoles,
   listPayrollEntities,
+  // Payroll admin (PR #9 + #10)
+  listAllPayrollEntities,
+  getPayrollEntityById,
+  updatePayrollEntity,
+  listProcessingFees,
+  getEffectiveProcessingFee,
+  addProcessingFee,
+  listEmployees,
+  getEmployeeById,
+  createEmployee,
+  updateEmployee,
+  deactivateEmployee,
 } from "./storage";
 import { getUserPermissions, requirePermission } from "./rbac";
 import {
@@ -699,6 +711,183 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       entity_id_scope: a.entity_id_scope === null ? null : Number(a.entity_id_scope),
     })));
     res.json({ ok: true, assignments: listUserRolesForUser(userId) });
+  });
+
+  // ============================================================================
+  // PAYROLL ADMIN — Entities (PR #9)
+  // ----------------------------------------------------------------------------
+  // Read endpoints use payroll.view; write endpoints use payroll.edit_employees
+  // (the same permission that gates the master employees list, since both are
+  // "who is being paid where" configuration).
+  // ============================================================================
+
+  app.get("/api/payroll/entities", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    // Include inactive entities so the admin UI can show them; the UI greys
+    // them out. For other consumers, use /api/settings/entities which is
+    // active-only.
+    const rows = listAllPayrollEntities();
+    // Attach the currently-effective tip CC fee, if any, for convenience.
+    const today = new Date().toISOString().slice(0, 10);
+    const enriched = rows.map((e) => {
+      const fee = getEffectiveProcessingFee(e.id, "tip_cc_fee", today);
+      return {
+        ...e,
+        current_tip_cc_fee_pct: fee ? fee.fee_pct : null,
+        current_tip_cc_fee_id: fee ? fee.id : null,
+      };
+    });
+    res.json(enriched);
+  });
+
+  app.patch("/api/payroll/entities/:id", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
+    const id = Number(req.params.id);
+    const existing = getPayrollEntityById(id);
+    if (!existing) return res.status(404).json({ message: "Entity not found" });
+    const { location, legal_name, cadence, adp_company_code,
+            commissions_enabled, pms_enabled, tips_enabled,
+            easyrent_enabled, spif_enabled, active } = req.body || {};
+    // Light validation: cadence must be weekly/biweekly when provided.
+    if (cadence !== undefined && cadence !== "weekly" && cadence !== "biweekly") {
+      return res.status(400).json({ message: "cadence must be 'weekly' or 'biweekly'" });
+    }
+    // Refuse to deactivate the only remaining active entity — the payroll
+    // module would have nothing to run against.
+    if (active === 0 && existing.active === 1) {
+      const remaining = listAllPayrollEntities().filter((e) => e.id !== id && e.active === 1).length;
+      if (remaining === 0) {
+        return res.status(400).json({
+          message: "Cannot deactivate the only active entity. Activate another first.",
+        });
+      }
+    }
+    const patch: any = {};
+    if (location !== undefined) patch.location = String(location);
+    if (legal_name !== undefined) patch.legal_name = String(legal_name);
+    if (cadence !== undefined) patch.cadence = cadence;
+    if (adp_company_code !== undefined) patch.adp_company_code = adp_company_code || null;
+    if (commissions_enabled !== undefined) patch.commissions_enabled = commissions_enabled ? 1 : 0;
+    if (pms_enabled !== undefined) patch.pms_enabled = pms_enabled ? 1 : 0;
+    if (tips_enabled !== undefined) patch.tips_enabled = tips_enabled ? 1 : 0;
+    if (easyrent_enabled !== undefined) patch.easyrent_enabled = easyrent_enabled ? 1 : 0;
+    if (spif_enabled !== undefined) patch.spif_enabled = spif_enabled ? 1 : 0;
+    if (active !== undefined) patch.active = active ? 1 : 0;
+    const updated = updatePayrollEntity(id, patch);
+    res.json(updated);
+  });
+
+  // Processing-fee history for one entity (e.g. the 3.8% Shift4 CC fee on tips).
+  app.get("/api/payroll/entities/:id/fees", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const id = Number(req.params.id);
+    if (!getPayrollEntityById(id)) return res.status(404).json({ message: "Entity not found" });
+    res.json(listProcessingFees(id));
+  });
+
+  app.post("/api/payroll/entities/:id/fees", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
+    const id = Number(req.params.id);
+    if (!getPayrollEntityById(id)) return res.status(404).json({ message: "Entity not found" });
+    const { fee_kind, fee_pct, effective_from, note } = req.body || {};
+    const kind = (fee_kind || "tip_cc_fee").toString();
+    const pct = Number(fee_pct);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 1) {
+      return res.status(400).json({
+        message: "fee_pct must be a number between 0 and 1 (e.g. 0.038 for 3.8%)",
+      });
+    }
+    const from = (effective_from || new Date().toISOString().slice(0, 10)).toString();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      return res.status(400).json({ message: "effective_from must be YYYY-MM-DD" });
+    }
+    const row = addProcessingFee(id, kind, pct, from, note ?? null);
+    res.json(row);
+  });
+
+  // ============================================================================
+  // PAYROLL ADMIN — Employees (PR #10)
+  // ============================================================================
+
+  app.get("/api/payroll/employees", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const entityIdRaw = req.query.entity_id;
+    const includeInactive = req.query.include_inactive === "1" || req.query.include_inactive === "true";
+    const opts: { entityId?: number; includeInactive?: boolean } = { includeInactive };
+    if (entityIdRaw !== undefined && entityIdRaw !== "" && entityIdRaw !== "all") {
+      const n = Number(entityIdRaw);
+      if (Number.isFinite(n)) opts.entityId = n;
+    }
+    res.json(listEmployees(opts));
+  });
+
+  app.post("/api/payroll/employees", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
+    const { entity_id, full_name, email, shopify_staff_member_id,
+            easyrent_clerk_guid, ltm_clerk_id, adp_employee_id,
+            commission_rate_pct, active, hired_at, notes } = req.body || {};
+    if (!Number.isFinite(Number(entity_id))) {
+      return res.status(400).json({ message: "entity_id is required" });
+    }
+    if (!getPayrollEntityById(Number(entity_id))) {
+      return res.status(400).json({ message: "Unknown entity_id" });
+    }
+    if (!full_name || typeof full_name !== "string" || !full_name.trim()) {
+      return res.status(400).json({ message: "full_name is required" });
+    }
+    const row = createEmployee({
+      entity_id: Number(entity_id),
+      full_name: full_name.trim(),
+      email: email ?? null,
+      shopify_staff_member_id: shopify_staff_member_id ?? null,
+      easyrent_clerk_guid: easyrent_clerk_guid ?? null,
+      ltm_clerk_id: ltm_clerk_id ?? null,
+      adp_employee_id: adp_employee_id ?? null,
+      commission_rate_pct: commission_rate_pct === "" || commission_rate_pct === undefined || commission_rate_pct === null
+        ? null
+        : Number(commission_rate_pct),
+      active: active === 0 ? 0 : 1,
+      hired_at: hired_at ?? null,
+      notes: notes ?? null,
+    });
+    res.json(row);
+  });
+
+  app.patch("/api/payroll/employees/:id", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
+    const id = Number(req.params.id);
+    const existing = getEmployeeById(id);
+    if (!existing) return res.status(404).json({ message: "Employee not found" });
+    const patch: any = {};
+    const body = req.body || {};
+    if (body.entity_id !== undefined) {
+      const n = Number(body.entity_id);
+      if (!Number.isFinite(n) || !getPayrollEntityById(n)) {
+        return res.status(400).json({ message: "Unknown entity_id" });
+      }
+      patch.entity_id = n;
+    }
+    if (body.full_name !== undefined) {
+      if (!String(body.full_name).trim()) return res.status(400).json({ message: "full_name cannot be empty" });
+      patch.full_name = String(body.full_name).trim();
+    }
+    for (const k of ["email", "shopify_staff_member_id", "easyrent_clerk_guid",
+                     "ltm_clerk_id", "adp_employee_id", "hired_at",
+                     "terminated_at", "notes"]) {
+      if (body[k] !== undefined) {
+        const v = body[k];
+        patch[k] = (v === "" || v === null) ? null : String(v);
+      }
+    }
+    if (body.commission_rate_pct !== undefined) {
+      const v = body.commission_rate_pct;
+      patch.commission_rate_pct = (v === "" || v === null) ? null : Number(v);
+    }
+    if (body.active !== undefined) patch.active = body.active ? 1 : 0;
+    const updated = updateEmployee(id, patch);
+    res.json(updated);
+  });
+
+  // Soft-delete: marks the employee inactive instead of deleting. Hard-delete
+  // is intentionally not exposed (would orphan payroll history).
+  app.delete("/api/payroll/employees/:id", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
+    const id = Number(req.params.id);
+    if (!getEmployeeById(id)) return res.status(404).json({ message: "Employee not found" });
+    const updated = deactivateEmployee(id);
+    res.json(updated);
   });
 
   // ---- Health ----

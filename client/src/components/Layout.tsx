@@ -21,6 +21,8 @@ import {
   ChevronRight,
   Receipt,
   Wrench,
+  Building2,
+  Users,
 } from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
@@ -70,7 +72,11 @@ const NAV_SECTIONS: NavSection[] = [
   {
     label: "Payroll",
     icon: DollarSign,
-    items: [{ href: "/payroll", label: "Overview", icon: Wrench }],
+    items: [
+      { href: "/payroll", label: "Overview", icon: Wrench },
+      { href: "/payroll/entities", label: "Entities", icon: Building2 },
+      { href: "/payroll/employees", label: "Employees", icon: Users },
+    ],
   },
   {
     label: "System",
@@ -84,10 +90,21 @@ const SIDEBAR_STORAGE_KEY = "sidebar-expanded-sections-v1";
 
 // Determine which section a given URL belongs to. Used to auto-expand the
 // section the user is currently inside.
+//
+// Matching is segment-aware so `/payroll` does NOT count as active when the
+// user is on `/payroll/entities` (the Entities child wins instead).
+function matchesNav(path: string, href: string): boolean {
+  if (path === href) return true;
+  if (href === "/") return false;
+  // Only count as a prefix match if the next char is a `/` (i.e. a sub-route),
+  // never a partial-string match like `/payroll` vs `/payroll-foo`.
+  return path.startsWith(href + "/");
+}
+
 function sectionForPath(path: string): string | null {
   for (const section of NAV_SECTIONS) {
     for (const item of section.items) {
-      if (path === item.href || (item.href !== "/" && path.startsWith(item.href))) {
+      if (matchesNav(path, item.href)) {
         return section.label;
       }
     }
@@ -207,9 +224,11 @@ export function Layout({ children }: { children: ReactNode }) {
             const SectionIcon = section.icon;
             const isExpanded = !!expanded[section.label];
             const isSingleItem = section.items.length === 1;
-            const activeChild = section.items.find(
-              (item) => location === item.href || (item.href !== "/" && location.startsWith(item.href)),
-            );
+            // Pick the most specific match — longest href that matches —
+            // so `/payroll/entities` activates the Entities child, not Overview.
+            const activeChild = section.items
+              .filter((item) => matchesNav(location, item.href))
+              .sort((a, b) => b.href.length - a.href.length)[0];
             const isActiveSection = !!activeChild;
             const badge = sectionBadge(section);
 
@@ -277,8 +296,13 @@ export function Layout({ children }: { children: ReactNode }) {
                 {/* Children: indented and only rendered when expanded */}
                 {isExpanded && (
                   <div className="mt-0.5 ml-2 pl-3 border-l border-sidebar-border/60 space-y-0.5">
-                    {section.items.map((item) => {
-                      const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
+                  {(() => {
+                    // Apply the same most-specific-wins rule for child highlighting.
+                    const mostSpecificHref = section.items
+                      .filter((item) => matchesNav(location, item.href))
+                      .sort((a, b) => b.href.length - a.href.length)[0]?.href;
+                    return section.items.map((item) => {
+                      const active = item.href === mostSpecificHref;
                       const Icon = item.icon;
                       const count = item.countKey ? digest[item.countKey] : undefined;
                       const showBadge = typeof count === "number" && count > 0;
@@ -315,7 +339,8 @@ export function Layout({ children }: { children: ReactNode }) {
                           )}
                         </Link>
                       );
-                    })}
+                    });
+                  })()}
                   </div>
                 )}
               </div>

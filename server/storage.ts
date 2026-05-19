@@ -2311,3 +2311,289 @@ export function setUserRoles(
   });
   txn(assignments);
 }
+
+// ============================================================================
+// PR #9 — Entities & processing-fee helpers
+// ----------------------------------------------------------------------------
+// listPayrollEntities() (defined above) returns ACTIVE entities only. The admin
+// UI needs to see inactive ones too — use listAllPayrollEntities() for that.
+// ============================================================================
+
+export function listAllPayrollEntities(): PayrollEntityRow[] {
+  return sqlite
+    .prepare(`SELECT * FROM payroll_entities ORDER BY active DESC, location ASC`)
+    .all() as PayrollEntityRow[];
+}
+
+export function getPayrollEntityById(id: number): PayrollEntityRow | null {
+  return (
+    (sqlite
+      .prepare(`SELECT * FROM payroll_entities WHERE id = ? LIMIT 1`)
+      .get(id) as PayrollEntityRow) || null
+  );
+}
+
+/**
+ * Partial update of a payroll entity. Only whitelisted fields are accepted to
+ * avoid surprise overwrites of bookkeeping columns (id, created_at, etc).
+ * Returns the fresh row.
+ */
+export function updatePayrollEntity(
+  id: number,
+  patch: Partial<{
+    location: string;
+    legal_name: string;
+    cadence: string;
+    adp_company_code: string | null;
+    commissions_enabled: number;
+    pms_enabled: number;
+    tips_enabled: number;
+    easyrent_enabled: number;
+    spif_enabled: number;
+    active: number;
+  }>,
+): PayrollEntityRow | null {
+  const allowed: Array<keyof typeof patch> = [
+    "location", "legal_name", "cadence", "adp_company_code",
+    "commissions_enabled", "pms_enabled", "tips_enabled",
+    "easyrent_enabled", "spif_enabled", "active",
+  ];
+  const sets: string[] = [];
+  const vals: any[] = [];
+  for (const k of allowed) {
+    if (patch[k] !== undefined) {
+      sets.push(`${k} = ?`);
+      vals.push(patch[k] as any);
+    }
+  }
+  if (sets.length === 0) return getPayrollEntityById(id);
+  sets.push(`updated_at = ?`);
+  vals.push(new Date().toISOString());
+  vals.push(id);
+  sqlite.prepare(`UPDATE payroll_entities SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+  return getPayrollEntityById(id);
+}
+
+// ----- Processing fees (CC fee on tips, etc.) -----
+
+export type ProcessingFeeRow = {
+  id: number;
+  entity_id: number;
+  fee_kind: string;
+  fee_pct: number;
+  effective_from: string;
+  effective_to: string | null;
+  note: string | null;
+  created_at: string | null;
+};
+
+/**
+ * List all processing-fee history rows for an entity (newest effective_from
+ * first). The UI shows the most recent as "current" but keeps history
+ * visible so the owner can see when the rate changed.
+ */
+export function listProcessingFees(entityId: number): ProcessingFeeRow[] {
+  return sqlite
+    .prepare(
+      `SELECT * FROM payroll_entity_processing_fees
+       WHERE entity_id = ?
+       ORDER BY effective_from DESC, id DESC`,
+    )
+    .all(entityId) as ProcessingFeeRow[];
+}
+
+/**
+ * Resolve the fee % in effect for a given date (defaults to today).
+ * Returns null when no fee row applies (e.g. Huntington/Hempstead don't take
+ * tips, so they have no fee history).
+ */
+export function getEffectiveProcessingFee(
+  entityId: number,
+  feeKind: string,
+  onDate?: string,
+): ProcessingFeeRow | null {
+  const d = onDate || new Date().toISOString().slice(0, 10);
+  return (
+    (sqlite
+      .prepare(
+        `SELECT * FROM payroll_entity_processing_fees
+         WHERE entity_id = ? AND fee_kind = ?
+           AND effective_from <= ?
+           AND (effective_to IS NULL OR effective_to >= ?)
+         ORDER BY effective_from DESC
+         LIMIT 1`,
+      )
+      .get(entityId, feeKind, d, d) as ProcessingFeeRow) || null
+  );
+}
+
+/**
+ * Add a new fee row, automatically closing out the previous row of the same
+ * kind by setting its effective_to to one day before the new effective_from.
+ * This keeps history intact (an old payroll run can still resolve the rate
+ * that was in effect at the time).
+ */
+export function addProcessingFee(
+  entityId: number,
+  feeKind: string,
+  feePct: number,
+  effectiveFrom: string,
+  note: string | null,
+): ProcessingFeeRow {
+  const now = new Date().toISOString();
+  const txn = sqlite.transaction(() => {
+    // Close out the current open fee row, if any.
+    const dayBefore = new Date(effectiveFrom + "T00:00:00Z");
+    dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
+    const closeDate = dayBefore.toISOString().slice(0, 10);
+    sqlite
+      .prepare(
+        `UPDATE payroll_entity_processing_fees
+         SET effective_to = ?
+         WHERE entity_id = ? AND fee_kind = ? AND effective_to IS NULL
+           AND effective_from < ?`,
+      )
+      .run(closeDate, entityId, feeKind, effectiveFrom);
+    sqlite
+      .prepare(
+        `INSERT INTO payroll_entity_processing_fees
+           (entity_id, fee_kind, fee_pct, effective_from, note, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(entityId, feeKind, feePct, effectiveFrom, note, now);
+  });
+  txn();
+  return (sqlite
+    .prepare(
+      `SELECT * FROM payroll_entity_processing_fees
+       WHERE entity_id = ? AND fee_kind = ?
+       ORDER BY effective_from DESC, id DESC LIMIT 1`,
+    )
+    .get(entityId, feeKind) as ProcessingFeeRow);
+}
+
+// ============================================================================
+// PR #10 — Employee helpers
+// ============================================================================
+
+export type EmployeeRow = {
+  id: number;
+  entity_id: number;
+  full_name: string;
+  email: string | null;
+  shopify_staff_member_id: string | null;
+  easyrent_clerk_guid: string | null;
+  ltm_clerk_id: string | null;
+  adp_employee_id: string | null;
+  commission_rate_pct: number | null;
+  active: number;
+  hired_at: string | null;
+  terminated_at: string | null;
+  notes: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export function listEmployees(opts?: { entityId?: number; includeInactive?: boolean }): EmployeeRow[] {
+  const wheres: string[] = [];
+  const args: any[] = [];
+  if (opts?.entityId !== undefined) {
+    wheres.push(`entity_id = ?`);
+    args.push(opts.entityId);
+  }
+  if (!opts?.includeInactive) {
+    wheres.push(`active = 1`);
+  }
+  const sql = `
+    SELECT * FROM payroll_employees
+    ${wheres.length ? "WHERE " + wheres.join(" AND ") : ""}
+    ORDER BY active DESC, full_name ASC
+  `;
+  return sqlite.prepare(sql).all(...args) as EmployeeRow[];
+}
+
+export function getEmployeeById(id: number): EmployeeRow | null {
+  return (
+    (sqlite
+      .prepare(`SELECT * FROM payroll_employees WHERE id = ? LIMIT 1`)
+      .get(id) as EmployeeRow) || null
+  );
+}
+
+export function createEmployee(emp: {
+  entity_id: number;
+  full_name: string;
+  email?: string | null;
+  shopify_staff_member_id?: string | null;
+  easyrent_clerk_guid?: string | null;
+  ltm_clerk_id?: string | null;
+  adp_employee_id?: string | null;
+  commission_rate_pct?: number | null;
+  active?: number;
+  hired_at?: string | null;
+  notes?: string | null;
+}): EmployeeRow {
+  const now = new Date().toISOString();
+  const info = sqlite
+    .prepare(
+      `INSERT INTO payroll_employees
+         (entity_id, full_name, email, shopify_staff_member_id, easyrent_clerk_guid,
+          ltm_clerk_id, adp_employee_id, commission_rate_pct, active,
+          hired_at, notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      emp.entity_id,
+      emp.full_name,
+      emp.email ?? null,
+      emp.shopify_staff_member_id ?? null,
+      emp.easyrent_clerk_guid ?? null,
+      emp.ltm_clerk_id ?? null,
+      emp.adp_employee_id ?? null,
+      emp.commission_rate_pct ?? null,
+      emp.active ?? 1,
+      emp.hired_at ?? null,
+      emp.notes ?? null,
+      now,
+      now,
+    );
+  return getEmployeeById(Number(info.lastInsertRowid))!;
+}
+
+export function updateEmployee(
+  id: number,
+  patch: Partial<Omit<EmployeeRow, "id" | "created_at" | "updated_at">>,
+): EmployeeRow | null {
+  const allowed: Array<keyof typeof patch> = [
+    "entity_id", "full_name", "email",
+    "shopify_staff_member_id", "easyrent_clerk_guid", "ltm_clerk_id",
+    "adp_employee_id", "commission_rate_pct", "active",
+    "hired_at", "terminated_at", "notes",
+  ];
+  const sets: string[] = [];
+  const vals: any[] = [];
+  for (const k of allowed) {
+    if (patch[k] !== undefined) {
+      sets.push(`${k} = ?`);
+      vals.push(patch[k] as any);
+    }
+  }
+  if (sets.length === 0) return getEmployeeById(id);
+  sets.push(`updated_at = ?`);
+  vals.push(new Date().toISOString());
+  vals.push(id);
+  sqlite
+    .prepare(`UPDATE payroll_employees SET ${sets.join(", ")} WHERE id = ?`)
+    .run(...vals);
+  return getEmployeeById(id);
+}
+
+/**
+ * Soft-delete by setting active=0 and terminated_at=today. Hard-delete is
+ * intentionally NOT exposed because employees are referenced from payroll
+ * history (commissions, tips, etc.) and removing them would orphan that data.
+ */
+export function deactivateEmployee(id: number): EmployeeRow | null {
+  const today = new Date().toISOString().slice(0, 10);
+  return updateEmployee(id, { active: 0, terminated_at: today });
+}
