@@ -1,7 +1,7 @@
 import { ReactNode, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
-import { Inbox, FileText, BookOpen, History, Settings as SettingsIcon, Sun, Moon, LogOut, Menu, X, PackageOpen, AlertTriangle, FolderOpen, FileX } from "lucide-react";
+import { Inbox, FileText, BookOpen, History, Settings as SettingsIcon, Sun, Moon, LogOut, Menu, X, PackageOpen, AlertTriangle, FolderOpen, FileX, DollarSign } from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
@@ -16,17 +16,40 @@ type NavItem = {
   toneIfPositive?: "amber" | "red";
 };
 
-// Order per user preference: Inbox / Receiving / Problem / All / History / Vendor Rules / Aliases / Settings.
-const NAV: NavItem[] = [
-  { href: "/", label: "Inbox", icon: Inbox, countKey: "inbox_count", toneIfPositive: "amber" },
-  { href: "/receiving", label: "In Receiving", icon: PackageOpen, countKey: "receiving_count" },
-  { href: "/problem", label: "Problem invoices", icon: AlertTriangle, countKey: "problem_count", toneIfPositive: "red" },
-  { href: "/skipped", label: "Skipped", icon: FileX, countKey: "skipped_count" },
-  { href: "/all-invoices", label: "All Invoices", icon: FolderOpen },
-  { href: "/posted", label: "History", icon: History },
-  { href: "/rules", label: "Vendor Rules", icon: BookOpen },
-  { href: "/aliases", label: "Aliases", icon: FileText },
-  { href: "/settings", label: "Settings", icon: SettingsIcon },
+type NavSection = {
+  label: string;
+  items: NavItem[];
+};
+
+// Sidebar is grouped into modules so the app can grow beyond AP (Payroll next, then Sales
+// Reporting, Inventory, etc.). Existing AP items keep their original href + order under the
+// "Accounts Payable" section so nothing breaks for current users.
+const NAV_SECTIONS: NavSection[] = [
+  {
+    label: "Accounts Payable",
+    items: [
+      { href: "/", label: "Inbox", icon: Inbox, countKey: "inbox_count", toneIfPositive: "amber" },
+      { href: "/receiving", label: "In Receiving", icon: PackageOpen, countKey: "receiving_count" },
+      { href: "/problem", label: "Problem invoices", icon: AlertTriangle, countKey: "problem_count", toneIfPositive: "red" },
+      { href: "/skipped", label: "Skipped", icon: FileX, countKey: "skipped_count" },
+      { href: "/all-invoices", label: "All Invoices", icon: FolderOpen },
+      { href: "/posted", label: "History", icon: History },
+      { href: "/rules", label: "Vendor Rules", icon: BookOpen },
+      { href: "/aliases", label: "Aliases", icon: FileText },
+    ],
+  },
+  {
+    label: "Payroll",
+    items: [
+      { href: "/payroll", label: "Overview", icon: DollarSign },
+    ],
+  },
+  {
+    label: "System",
+    items: [
+      { href: "/settings", label: "Settings", icon: SettingsIcon },
+    ],
+  },
 ];
 
 export function Layout({ children }: { children: ReactNode }) {
@@ -66,41 +89,51 @@ export function Layout({ children }: { children: ReactNode }) {
         <div className="px-5 pt-5 pb-6 hidden lg:block">
           <Wordmark />
         </div>
-        <nav className="px-3 pt-3 flex-1 space-y-0.5">
-          {NAV.map((item) => {
-            const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
-            const Icon = item.icon;
-            const count = item.countKey ? digest[item.countKey] : undefined;
-            const showBadge = typeof count === "number" && count > 0;
-            const badgeTone = item.toneIfPositive === "red" ? "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30"
-              : item.toneIfPositive === "amber" ? "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
-              : "bg-muted text-foreground/80 border-border";
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                onClick={handleNav}
-                data-testid={`link-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
-                className={cn(
-                  "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium transition-colors hover-elevate",
-                  active
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                    : "text-sidebar-foreground/80 hover:text-sidebar-foreground",
-                )}
+        <nav className="px-3 pt-3 flex-1 space-y-4 overflow-y-auto">
+          {NAV_SECTIONS.map((section) => (
+            <div key={section.label} className="space-y-0.5">
+              <div
+                className="px-3 pt-1 pb-1 text-[10px] font-semibold uppercase tracking-wider text-sidebar-foreground/50"
+                data-testid={`section-label-${section.label.toLowerCase().replace(/ /g, "-")}`}
               >
-                <Icon className="size-4 shrink-0" />
-                <span className="flex-1">{item.label}</span>
-                {showBadge && (
-                  <span
-                    className={cn("ml-auto text-[10px] font-medium tabular-nums px-1.5 py-0.5 rounded-md border", badgeTone)}
-                    data-testid={`badge-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
+                {section.label}
+              </div>
+              {section.items.map((item) => {
+                const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
+                const Icon = item.icon;
+                const count = item.countKey ? digest[item.countKey] : undefined;
+                const showBadge = typeof count === "number" && count > 0;
+                const badgeTone = item.toneIfPositive === "red" ? "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30"
+                  : item.toneIfPositive === "amber" ? "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+                  : "bg-muted text-foreground/80 border-border";
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    onClick={handleNav}
+                    data-testid={`link-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
+                    className={cn(
+                      "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium transition-colors hover-elevate",
+                      active
+                        ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                        : "text-sidebar-foreground/80 hover:text-sidebar-foreground",
+                    )}
                   >
-                    {count}
-                  </span>
-                )}
-              </Link>
-            );
-          })}
+                    <Icon className="size-4 shrink-0" />
+                    <span className="flex-1">{item.label}</span>
+                    {showBadge && (
+                      <span
+                        className={cn("ml-auto text-[10px] font-medium tabular-nums px-1.5 py-0.5 rounded-md border", badgeTone)}
+                        data-testid={`badge-nav-${item.label.toLowerCase().replace(/ /g, "-")}`}
+                      >
+                        {count}
+                      </span>
+                    )}
+                  </Link>
+                );
+              })}
+            </div>
+          ))}
         </nav>
         <div className="p-3 border-t border-sidebar-border space-y-2">
           <div className="px-2 py-1.5 text-xs">
