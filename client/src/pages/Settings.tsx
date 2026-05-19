@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from "@/components/ui/command";
+import { Checkbox } from "@/components/ui/checkbox";
 import { useAuth } from "@/lib/auth";
 import { apiRequest, getAuthToken } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -20,6 +21,7 @@ import {
   Ban, Trash2, Plus, Layers, ChevronDown, Copy, FileText,
   Users, Database, Archive, Download, Play, Link2, Link2Off,
   UserPlus, UserX, KeyRound, ToggleLeft, ToggleRight,
+  Lock, Save, X,
 } from "lucide-react";
 import { SkipSenderDialog } from "@/components/SkipSenderDialog";
 
@@ -715,6 +717,21 @@ export default function Settings() {
               Manage who can access Sno-Haus AP. Admin-only.
             </p>
             <UsersSection />
+          </Card>
+
+          {/* Access Control card (PR #7) — RBAC roles + per-user assignments */}
+          <Card className="border-card-border p-5 mt-4">
+            <div className="flex items-center gap-3 mb-2">
+              <Shield className="size-4 text-muted-foreground" />
+              <div className="text-sm font-medium">Access Control</div>
+            </div>
+            <p className="text-xs text-muted-foreground mb-3">
+              Define roles (groups of permissions) and assign them to users
+              per entity. Owner gets everything by default. Use ADP Exporter
+              for staff who should be able to export payroll CSVs without
+              seeing underlying invoice data.
+            </p>
+            <AccessControlSection />
           </Card>
 
           {/* Backups card */}
@@ -1767,4 +1784,612 @@ function ArchiveSection() {
       </div>
     </div>
   );
+}
+
+// ============================================================================
+// Access Control (PR #7)
+// ----------------------------------------------------------------------------
+// Two tabs:
+//   1. Roles      — list of roles + permission picker (grouped by module).
+//                   System roles (Owner, Manager, ADP Exporter, Read Only)
+//                   can't be renamed/deleted but their permissions are editable.
+//   2. Assignments — per-user role assignment. Pick one role for a user, then
+//                    check which entities it applies to (Option B from session).
+//                    "All entities" = entity_id_scope: null.
+// ============================================================================
+
+type RbacRole = {
+  id: number;
+  name: string;
+  description: string | null;
+  is_system: number;
+  permissions: string[];
+};
+
+type RbacPermission = {
+  id: number;
+  key: string;
+  module: string;
+  description: string | null;
+};
+
+type RbacEntity = {
+  id: number;
+  code: string;
+  legal_name: string;
+  location_label: string | null;
+};
+
+type UserRoleAssignment = {
+  user_id: number;
+  user_email: string;
+  user_name: string | null;
+  role_id: number;
+  role_name: string;
+  entity_id_scope: number | null;
+};
+
+function AccessControlSection() {
+  const [tab, setTab] = useState<"roles" | "assignments">("roles");
+
+  return (
+    <Tabs value={tab} onValueChange={(v) => setTab(v as any)}>
+      <TabsList className="grid grid-cols-2 w-full mb-4">
+        <TabsTrigger value="roles" data-testid="tab-rbac-roles">Roles &amp; Permissions</TabsTrigger>
+        <TabsTrigger value="assignments" data-testid="tab-rbac-assignments">User Assignments</TabsTrigger>
+      </TabsList>
+      <TabsContent value="roles">
+        <RbacRolesTab />
+      </TabsContent>
+      <TabsContent value="assignments">
+        <RbacAssignmentsTab />
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+function RbacRolesTab() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const [selectedRoleId, setSelectedRoleId] = useState<number | null>(null);
+  const [editingName, setEditingName] = useState("");
+  const [editingDescription, setEditingDescription] = useState("");
+  const [editingPerms, setEditingPerms] = useState<Set<string>>(new Set());
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const rolesQ = useQuery<RbacRole[]>({ queryKey: ["/api/settings/roles"] });
+  const permsQ = useQuery<{ permissions: RbacPermission[]; grouped: Record<string, RbacPermission[]> }>(
+    { queryKey: ["/api/settings/permissions"] },
+  );
+
+  const roles = rolesQ.data || [];
+  const grouped = permsQ.data?.grouped || {};
+  const selectedRole = roles.find((r) => r.id === selectedRoleId) || null;
+
+  // When user clicks a different role, load its fields into the local editor state.
+  function selectRole(r: RbacRole) {
+    setSelectedRoleId(r.id);
+    setEditingName(r.name);
+    setEditingDescription(r.description || "");
+    setEditingPerms(new Set(r.permissions));
+  }
+
+  // Auto-select the first role on initial load so the editor isn't empty.
+  // Effect (not inline) so we don't setState during render.
+  useEffect(() => {
+    if (roles.length > 0 && selectedRoleId === null) {
+      const first = roles[0];
+      setSelectedRoleId(first.id);
+      setEditingName(first.name);
+      setEditingDescription(first.description || "");
+      setEditingPerms(new Set(first.permissions));
+    }
+  }, [roles, selectedRoleId]);
+
+  const saveMut = useMutation({
+    mutationFn: async () => {
+      if (!selectedRole) throw new Error("No role selected");
+      const body: any = { permissions: Array.from(editingPerms) };
+      // System roles can't have name/description changed.
+      if (!selectedRole.is_system) {
+        body.name = editingName.trim();
+        body.description = editingDescription.trim() || null;
+      }
+      const res = await apiRequest("PATCH", `/api/settings/roles/${selectedRole.id}`, body);
+      return res.json();
+    },
+    onSuccess: () => {
+      toast({ title: "Role saved" });
+      qc.invalidateQueries({ queryKey: ["/api/settings/roles"] });
+      qc.invalidateQueries({ queryKey: ["/api/me"] }); // permissions may have changed for current user
+    },
+    onError: (e: any) => toast({ title: "Error saving role", description: e.message, variant: "destructive" }),
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: async (id: number) => apiRequest("DELETE", `/api/settings/roles/${id}`),
+    onSuccess: () => {
+      toast({ title: "Role deleted" });
+      setSelectedRoleId(null);
+      qc.invalidateQueries({ queryKey: ["/api/settings/roles"] });
+      qc.invalidateQueries({ queryKey: ["/api/settings/user-roles"] });
+    },
+    onError: (e: any) => toast({ title: "Cannot delete", description: e.message, variant: "destructive" }),
+  });
+
+  function togglePerm(key: string) {
+    setEditingPerms((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+
+  if (rolesQ.isLoading || permsQ.isLoading) {
+    return (
+      <div className="text-sm text-muted-foreground py-6 text-center">
+        <Loader2 className="size-4 animate-spin inline mr-2" />Loading…
+      </div>
+    );
+  }
+
+  const moduleLabels: Record<string, string> = {
+    ap: "Accounts Payable",
+    payroll: "Payroll",
+    users: "Users & Access",
+    system: "System",
+  };
+
+  // Detect unsaved changes so we can enable/disable the Save button.
+  const hasChanges = selectedRole && (
+    (!selectedRole.is_system && editingName !== selectedRole.name) ||
+    (!selectedRole.is_system && (editingDescription || "") !== (selectedRole.description || "")) ||
+    editingPerms.size !== selectedRole.permissions.length ||
+    Array.from(editingPerms).some((k) => !selectedRole.permissions.includes(k))
+  );
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-4">
+      {/* Left: role list */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Roles</div>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2"
+            onClick={() => setCreateOpen(true)}
+            data-testid="button-rbac-add-role"
+          >
+            <Plus className="size-3.5" />
+          </Button>
+        </div>
+        {roles.map((r) => (
+          <button
+            key={r.id}
+            onClick={() => selectRole(r)}
+            className={cnLocal(
+              "w-full text-left px-2.5 py-1.5 rounded-md text-sm transition-colors",
+              selectedRoleId === r.id ? "bg-accent text-accent-foreground" : "hover:bg-muted",
+            )}
+            data-testid={`button-rbac-role-${r.id}`}
+          >
+            <div className="flex items-center gap-1.5">
+              <span className="flex-1 truncate">{r.name}</span>
+              {r.is_system === 1 && (
+                <Lock className="size-3 text-muted-foreground" />
+              )}
+            </div>
+            <div className="text-[11px] text-muted-foreground">
+              {r.permissions.length} permission{r.permissions.length === 1 ? "" : "s"}
+            </div>
+          </button>
+        ))}
+        {roles.length === 0 && (
+          <div className="text-xs text-muted-foreground py-3 text-center">No roles</div>
+        )}
+      </div>
+
+      {/* Right: role editor */}
+      <div className="min-w-0">
+        {selectedRole ? (
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-xs">Role name</Label>
+              <Input
+                value={editingName}
+                onChange={(e) => setEditingName(e.target.value)}
+                disabled={selectedRole.is_system === 1}
+                data-testid="input-rbac-role-name"
+              />
+              {selectedRole.is_system === 1 && (
+                <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+                  <Lock className="size-3" /> System role name cannot be changed; permissions are editable.
+                </div>
+              )}
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Description</Label>
+              <Textarea
+                value={editingDescription}
+                onChange={(e) => setEditingDescription(e.target.value)}
+                rows={2}
+                disabled={selectedRole.is_system === 1}
+                placeholder="What does this role do?"
+                data-testid="input-rbac-role-description"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-xs">Permissions</Label>
+              <div className="space-y-3">
+                {Object.entries(grouped).map(([module, perms]) => (
+                  <div key={module} className="rounded-md border border-border p-3">
+                    <div className="text-xs font-medium mb-2">{moduleLabels[module] || module}</div>
+                    <div className="space-y-1.5">
+                      {perms.map((p) => (
+                        <label
+                          key={p.key}
+                          className="flex items-start gap-2 cursor-pointer"
+                          data-testid={`perm-row-${p.key}`}
+                        >
+                          <Checkbox
+                            checked={editingPerms.has(p.key)}
+                            onCheckedChange={() => togglePerm(p.key)}
+                            className="mt-0.5"
+                            data-testid={`checkbox-perm-${p.key}`}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-mono">{p.key}</div>
+                            {p.description && (
+                              <div className="text-[11px] text-muted-foreground">{p.description}</div>
+                            )}
+                          </div>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 pt-2">
+              <Button
+                size="sm"
+                onClick={() => saveMut.mutate()}
+                disabled={!hasChanges || saveMut.isPending}
+                data-testid="button-rbac-save-role"
+              >
+                {saveMut.isPending ? <Loader2 className="size-3.5 mr-1.5 animate-spin" /> : <Save className="size-3.5 mr-1.5" />}
+                Save
+              </Button>
+              {hasChanges && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => selectRole(selectedRole)}
+                  data-testid="button-rbac-discard"
+                >
+                  <X className="size-3.5 mr-1.5" /> Discard
+                </Button>
+              )}
+              {selectedRole.is_system === 0 && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="ml-auto text-destructive hover:text-destructive"
+                  onClick={() => {
+                    if (confirm(`Delete role "${selectedRole.name}"? This will remove it from all users.`)) {
+                      deleteMut.mutate(selectedRole.id);
+                    }
+                  }}
+                  disabled={deleteMut.isPending}
+                  data-testid="button-rbac-delete-role"
+                >
+                  <Trash2 className="size-3.5 mr-1.5" /> Delete role
+                </Button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="text-sm text-muted-foreground py-6 text-center">Select a role to edit</div>
+        )}
+      </div>
+
+      {createOpen && (
+        <CreateRoleDialog
+          onClose={() => setCreateOpen(false)}
+          onCreated={(id) => {
+            setCreateOpen(false);
+            qc.invalidateQueries({ queryKey: ["/api/settings/roles"] }).then(() => {
+              setSelectedRoleId(id);
+            });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function CreateRoleDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (id: number) => void }) {
+  const { toast } = useToast();
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const createMut = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/settings/roles", { name: name.trim(), description: description.trim() || null, permissions: [] });
+      return res.json();
+    },
+    onSuccess: (r: RbacRole) => {
+      toast({ title: "Role created" });
+      onCreated(r.id);
+    },
+    onError: (e: any) => toast({ title: "Cannot create role", description: e.message, variant: "destructive" }),
+  });
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>New role</DialogTitle>
+          <DialogDescription>Create a custom role, then pick its permissions on the next screen.</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Name</Label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Store Manager" data-testid="input-new-role-name" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Description (optional)</Label>
+            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} data-testid="input-new-role-description" />
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-2">
+            <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+            <Button
+              size="sm"
+              disabled={!name.trim() || createMut.isPending}
+              onClick={() => createMut.mutate()}
+              data-testid="button-create-role-submit"
+            >
+              {createMut.isPending && <Loader2 className="size-3.5 mr-1.5 animate-spin" />}
+              Create
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function RbacAssignmentsTab() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  const { user_id: meId } = useAuth();
+
+  const usersQ = useQuery<any[]>({ queryKey: ["/api/users"] });
+  const rolesQ = useQuery<RbacRole[]>({ queryKey: ["/api/settings/roles"] });
+  const entitiesQ = useQuery<RbacEntity[]>({ queryKey: ["/api/settings/entities"] });
+  const userRolesQ = useQuery<UserRoleAssignment[]>({ queryKey: ["/api/settings/user-roles"] });
+
+  if (usersQ.isLoading || rolesQ.isLoading || entitiesQ.isLoading || userRolesQ.isLoading) {
+    return (
+      <div className="text-sm text-muted-foreground py-6 text-center">
+        <Loader2 className="size-4 animate-spin inline mr-2" />Loading…
+      </div>
+    );
+  }
+
+  const users = usersQ.data || [];
+  const roles = rolesQ.data || [];
+  const entities = entitiesQ.data || [];
+  const allAssignments = userRolesQ.data || [];
+
+  // Group assignments by user_id.
+  const byUser = new Map<number, UserRoleAssignment[]>();
+  for (const a of allAssignments) {
+    if (!byUser.has(a.user_id)) byUser.set(a.user_id, []);
+    byUser.get(a.user_id)!.push(a);
+  }
+
+  return (
+    <div className="space-y-3">
+      {users.length === 0 && (
+        <div className="text-sm text-muted-foreground py-4 text-center">No users to assign roles to.</div>
+      )}
+      {users.map((u: any) => (
+        <UserRoleAssignmentRow
+          key={u.id}
+          user={u}
+          roles={roles}
+          entities={entities}
+          existing={byUser.get(u.id) || []}
+          isMe={u.id === meId}
+          onSaved={() => {
+            qc.invalidateQueries({ queryKey: ["/api/settings/user-roles"] });
+            qc.invalidateQueries({ queryKey: ["/api/me"] });
+            toast({ title: "Assignments saved" });
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function UserRoleAssignmentRow({
+  user, roles, entities, existing, isMe, onSaved,
+}: {
+  user: any;
+  roles: RbacRole[];
+  entities: RbacEntity[];
+  existing: UserRoleAssignment[];
+  isMe: boolean;
+  onSaved: () => void;
+}) {
+  const { toast } = useToast();
+  // Local state: which role and which entity scopes apply.
+  // Option B: ONE role per user; check which entities it applies to.
+  // entity_id_scope: null means "all entities" (the "All" checkbox).
+  const initialRoleId = existing[0]?.role_id ?? null;
+  const initialEntityIds: Array<number | null> = existing
+    .filter((a) => a.role_id === initialRoleId)
+    .map((a) => a.entity_id_scope);
+  const initialAllEntities = initialEntityIds.includes(null);
+
+  const [roleId, setRoleId] = useState<number | null>(initialRoleId);
+  const [allEntities, setAllEntities] = useState<boolean>(initialAllEntities);
+  const [entityIds, setEntityIds] = useState<Set<number>>(
+    new Set(initialEntityIds.filter((id): id is number => id !== null)),
+  );
+  const [open, setOpen] = useState(false);
+
+  function toggleEntity(id: number) {
+    setEntityIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  // Build the assignments payload that the API expects.
+  function buildAssignments() {
+    if (roleId === null) return [];
+    if (allEntities) return [{ role_id: roleId, entity_id_scope: null }];
+    return Array.from(entityIds).map((eid) => ({ role_id: roleId, entity_id_scope: eid }));
+  }
+
+  const saveMut = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("PUT", `/api/settings/users/${user.id}/roles`, { assignments: buildAssignments() });
+      return res.json();
+    },
+    onSuccess: () => {
+      setOpen(false);
+      onSaved();
+    },
+    onError: (e: any) => toast({ title: "Cannot save", description: e.message, variant: "destructive" }),
+  });
+
+  // Pretty summary line for the row (closed state).
+  const summary = (() => {
+    if (existing.length === 0) return "No role";
+    const roleName = existing[0].role_name;
+    const scopes = existing.filter((a) => a.role_id === existing[0].role_id);
+    if (scopes.some((s) => s.entity_id_scope === null)) return `${roleName} — all entities`;
+    const labels = scopes.map((s) => {
+      const e = entities.find((x) => x.id === s.entity_id_scope);
+      return e?.location_label || e?.code || `#${s.entity_id_scope}`;
+    });
+    return `${roleName} — ${labels.join(", ")}`;
+  })();
+
+  // Disable save if nothing selected (and existing isn't already empty).
+  const noSelection = roleId === null || (!allEntities && entityIds.size === 0);
+  const canSave = !noSelection || existing.length > 0; // allow clearing if currently has roles
+
+  return (
+    <div className="rounded-md border border-border bg-card" data-testid={`row-user-assign-${user.id}`}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center gap-2 px-3 py-2.5 text-left hover:bg-muted/40 transition-colors"
+      >
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-mono text-sm truncate">{user.email}</span>
+            {user.name && <span className="text-xs text-muted-foreground">({user.name})</span>}
+            {isMe && <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4">You</Badge>}
+          </div>
+          <div className="text-[11px] text-muted-foreground mt-0.5">{summary}</div>
+        </div>
+        <ChevronDown className={cnLocal("size-4 text-muted-foreground transition-transform", open && "rotate-180")} />
+      </button>
+
+      {open && (
+        <div className="px-3 pb-3 pt-1 border-t border-border space-y-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Role</Label>
+            <Select
+              value={roleId === null ? "" : String(roleId)}
+              onValueChange={(v) => setRoleId(v === "" ? null : Number(v))}
+            >
+              <SelectTrigger className="h-8 text-xs" data-testid={`select-role-assign-${user.id}`}>
+                <SelectValue placeholder="— No role —" />
+              </SelectTrigger>
+              <SelectContent>
+                {roles.map((r) => (
+                  <SelectItem key={r.id} value={String(r.id)}>{r.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {roleId !== null && (
+            <div className="space-y-1.5">
+              <Label className="text-xs">Applies to</Label>
+              <div className="space-y-1.5">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <Checkbox
+                    checked={allEntities}
+                    onCheckedChange={(v) => setAllEntities(!!v)}
+                    data-testid={`checkbox-all-entities-${user.id}`}
+                  />
+                  <span className="text-sm font-medium">All entities</span>
+                  <span className="text-[11px] text-muted-foreground">(includes future ones)</span>
+                </label>
+                {!allEntities && entities.map((e) => (
+                  <label key={e.id} className="flex items-center gap-2 cursor-pointer ml-5">
+                    <Checkbox
+                      checked={entityIds.has(e.id)}
+                      onCheckedChange={() => toggleEntity(e.id)}
+                      data-testid={`checkbox-entity-${user.id}-${e.id}`}
+                    />
+                    <span className="text-sm">
+                      {e.location_label || e.code}
+                      <span className="text-[11px] text-muted-foreground ml-1.5">{e.legal_name}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              onClick={() => saveMut.mutate()}
+              disabled={!canSave || saveMut.isPending}
+              data-testid={`button-save-assign-${user.id}`}
+            >
+              {saveMut.isPending ? <Loader2 className="size-3.5 mr-1.5 animate-spin" /> : <Save className="size-3.5 mr-1.5" />}
+              Save
+            </Button>
+            {existing.length > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setRoleId(null);
+                  setAllEntities(false);
+                  setEntityIds(new Set());
+                }}
+                data-testid={`button-clear-assign-${user.id}`}
+              >
+                <X className="size-3.5 mr-1.5" /> Clear
+              </Button>
+            )}
+            {isMe && (
+              <div className="ml-auto text-[11px] text-muted-foreground flex items-center gap-1">
+                <AlertTriangle className="size-3" />
+                You can’t remove your own Owner+all-entities access.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Small classnames helper to avoid pulling in cn from utils at the file top.
+function cnLocal(...parts: Array<string | false | null | undefined>): string {
+  return parts.filter(Boolean).join(" ");
 }

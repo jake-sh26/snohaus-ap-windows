@@ -43,6 +43,11 @@ type NavSection = {
   // Optional: tone for the rolled-up badge shown on the master row when collapsed.
   // Falls back to amber if any amber-tone child has a positive count; red if any red-tone child does.
   href?: string; // if set and items is empty, master row navigates directly
+  // Optional RBAC gate. If set, the whole section is hidden unless the
+  // current user has this permission key for at least one entity. Used to
+  // hide the System > Settings link from non-Owners while keeping the rest
+  // of the sidebar (AP, Payroll) visible to everyone.
+  permissionKey?: string;
 };
 
 // Sidebar is grouped into modules. Each section is a collapsible master menu with
@@ -71,6 +76,7 @@ const NAV_SECTIONS: NavSection[] = [
     label: "System",
     icon: SettingsIcon,
     items: [{ href: "/settings", label: "Settings", icon: SettingsIcon }],
+    permissionKey: "users.view",
   },
 ];
 
@@ -91,7 +97,14 @@ function sectionForPath(path: string): string | null {
 
 export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
-  const { email, logout } = useAuth();
+  const { email, logout, hasPermission } = useAuth();
+
+  // Filter sidebar sections by RBAC permission. A section with `permissionKey`
+  // is only rendered when the user has that permission for any entity. Owner
+  // gets all permissions (via seedRbacBaseline) so this is invisible for them.
+  const visibleSections = NAV_SECTIONS.filter(
+    (s) => !s.permissionKey || hasPermission(s.permissionKey),
+  );
   const { theme, toggle } = useTheme();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
@@ -190,7 +203,7 @@ export function Layout({ children }: { children: ReactNode }) {
           <Wordmark />
         </div>
         <nav className="px-2 pt-2 flex-1 space-y-1 overflow-y-auto">
-          {NAV_SECTIONS.map((section) => {
+          {visibleSections.map((section) => {
             const SectionIcon = section.icon;
             const isExpanded = !!expanded[section.label];
             const isSingleItem = section.items.length === 1;
