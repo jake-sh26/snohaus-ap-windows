@@ -18,6 +18,7 @@ import Receiving from "@/pages/Receiving";
 import Problem from "@/pages/Problem";
 import Skipped from "@/pages/Skipped";
 import Settings from "@/pages/Settings";
+import Payroll from "@/pages/Payroll";
 import NotFound from "@/pages/not-found";
 
 function ProtectedRoutes() {
@@ -53,6 +54,7 @@ function ProtectedRoutes() {
         <Route path="/rules" component={Rules} />
         <Route path="/aliases" component={Aliases} />
         <Route path="/settings" component={Settings} />
+        <Route path="/payroll" component={Payroll} />
         <Route component={NotFound} />
       </Switch>
     </Layout>
