@@ -108,7 +108,12 @@ $tmp = Join-Path $env:TEMP "snohaus-ap-update-$($run.id)"
 if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $artifactZip = Join-Path $tmp "artifact.zip"
-gh api "repos/$RepoOwner/$RepoName/actions/artifacts/$($artifact.id)/zip" > $artifactZip 2>$null
+# NOTE: We must use `gh api --output` (not PowerShell's `>` redirect) to write
+# binary data. PowerShell's stream redirection re-encodes bytes through its
+# text pipeline, which corrupts the zip and produces "End of Central Directory
+# record could not be found" when Expand-Archive tries to read it. The
+# `--output` flag tells gh to write raw bytes directly to the file.
+gh api "repos/$RepoOwner/$RepoName/actions/artifacts/$($artifact.id)/zip" --output $artifactZip 2>$null
 if (-not (Test-Path $artifactZip) -or (Get-Item $artifactZip).Length -lt 1000) {
     Die "Artifact download failed"
 }
