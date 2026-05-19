@@ -146,3 +146,482 @@ function getAllowedEmails(): string[] {
 }
 
 export const ALLOWED_EMAILS = getAllowedEmails();
+
+// ============================================================================
+// PAYROLL MODULE SCHEMA
+// ----------------------------------------------------------------------------
+// All payroll tables are prefixed `payroll_*` to keep them visually separated
+// from the AP module. They share the same SQLite database and live alongside
+// the AP tables.
+//
+// Cadence model (locked):
+//   - Commissions are computed WEEKLY (Mon – Sun) from Shopify + Easyrent.
+//   - Tips, PMs, and SPIFs are computed MONTHLY and paid in the FIRST
+//     weekly payroll of the following month.
+//   - Only Greenvale (SD Ski and Patio Inc) produces commission/PM/SPIF lines
+//     today. All three entities ingest Easyrent data; only Greenvale ingests
+//     LTM tips today, but the `payroll_ltm_merchants` table is extensible.
+// ============================================================================
+
+// --- Entities (3 legal entities, one per store) ---
+export const payrollEntities = sqliteTable("payroll_entities", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  // Display label used everywhere user-facing (e.g. "Greenvale").
+  location: text("location").notNull(),
+  // Legal entity name used on tax docs / ADP exports.
+  legal_name: text("legal_name").notNull(),
+  // 'weekly' | 'biweekly' — payroll-run cadence in ADP.
+  cadence: text("cadence").notNull(),
+  // ADP Run company code for this entity (used to label export CSVs).
+  adp_company_code: text("adp_company_code"),
+  // Module-level feature flags. Greenvale = all on. Huntington/Hempstead =
+  // easyrent only today (commissions/pms/tips off for now).
+  commissions_enabled: integer("commissions_enabled").notNull().default(0),
+  pms_enabled: integer("pms_enabled").notNull().default(0),
+  tips_enabled: integer("tips_enabled").notNull().default(0),
+  easyrent_enabled: integer("easyrent_enabled").notNull().default(0),
+  spif_enabled: integer("spif_enabled").notNull().default(0),
+  active: integer("active").notNull().default(1),
+  created_at: text("created_at"),
+  updated_at: text("updated_at"),
+});
+
+// --- Employees (entity-scoped roster) ---
+export const payrollEmployees = sqliteTable("payroll_employees", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  full_name: text("full_name").notNull(),
+  email: text("email"),
+  // External IDs used for sales/tip attribution.
+  shopify_staff_member_id: text("shopify_staff_member_id"),
+  easyrent_clerk_guid: text("easyrent_clerk_guid"),
+  ltm_clerk_id: text("ltm_clerk_id"),
+  // ADP Run employee ID (used for CSV export row identity).
+  adp_employee_id: text("adp_employee_id"),
+  // Per-employee flat commission rate (e.g. 0.04 for 4%). Overrides the
+  // entity default commission_rules when non-null.
+  commission_rate_pct: real("commission_rate_pct"),
+  active: integer("active").notNull().default(1),
+  hired_at: text("hired_at"),
+  terminated_at: text("terminated_at"),
+  notes: text("notes"),
+  created_at: text("created_at"),
+  updated_at: text("updated_at"),
+});
+
+// --- Pay periods (per-entity rolling window of payroll runs) ---
+export const payrollPayPeriods = sqliteTable("payroll_pay_periods", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  // 'weekly' | 'monthly' — drives which line types this period contains.
+  kind: text("kind").notNull(),
+  period_start: text("period_start").notNull(), // YYYY-MM-DD inclusive
+  period_end: text("period_end").notNull(),     // YYYY-MM-DD inclusive
+  // 'open' → still ingesting / editable.
+  // 'locked' → ready to export, no more edits.
+  // 'exported' → ADP CSV downloaded; immutable.
+  status: text("status").notNull().default("open"),
+  exported_at: text("exported_at"),
+  exported_by: text("exported_by"),
+  notes: text("notes"),
+  created_at: text("created_at"),
+  updated_at: text("updated_at"),
+});
+
+// --- POS locations (Shopify location_id → entity mapping) ---
+export const payrollPosLocations = sqliteTable("payroll_pos_locations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  shopify_location_id: text("shopify_location_id").notNull(),
+  label: text("label"), // human-readable for the UI
+  active: integer("active").notNull().default(1),
+});
+
+// --- LTM merchants (Shift4 merchant_id → entity mapping) ---
+// Greenvale-only today, but extensible: future stores can register their own
+// Shift4 Client GUID + merchant_id here and start ingesting tips automatically.
+export const payrollLtmMerchants = sqliteTable("payroll_ltm_merchants", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  merchant_id: text("merchant_id").notNull(),
+  client_guid: text("client_guid"), // Shift4 Client GUID (per-app credential)
+  label: text("label"),
+  active: integer("active").notNull().default(1),
+});
+
+// --- Entity processing fees (versioned tip-fee config) ---
+// Tips paid on credit cards have the CC processing fee deducted before they
+// hit ADP. Today: flat 3.8% for Greenvale. Versioned via effective_from/to
+// so we can change the rate without losing historical audit trail.
+export const payrollEntityProcessingFees = sqliteTable("payroll_entity_processing_fees", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  // 'tip_cc_fee' is the only kind today; left flexible for future fee types.
+  fee_kind: text("fee_kind").notNull().default("tip_cc_fee"),
+  fee_pct: real("fee_pct").notNull(), // e.g. 0.038 for 3.8%
+  effective_from: text("effective_from").notNull(), // YYYY-MM-DD inclusive
+  effective_to: text("effective_to"),               // YYYY-MM-DD inclusive, null = current
+  note: text("note"),
+  created_at: text("created_at"),
+});
+
+// --- Shopify weekly staff totals (one row per emp per pay period) ---
+export const payrollShopifyStaffWeeklyTotals = sqliteTable("payroll_shopify_staff_weekly_totals", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id"), // null = unmatched (see unmatched_attributions view)
+  shopify_staff_member_id: text("shopify_staff_member_id").notNull(),
+  raw_staff_name: text("raw_staff_name"),
+  net_sales: real("net_sales").notNull().default(0),
+  // We deliberately exclude gift cards from net sales — ShopifyQL
+  // pos_total_sales_by_staff_member already does this.
+  source: text("source").notNull().default("shopify_ql"),
+  ingested_at: text("ingested_at"),
+});
+
+// --- Easyrent weekly staff totals (per-employee rental sales) ---
+export const payrollEasyrentStaffWeeklyTotals = sqliteTable("payroll_easyrent_staff_weekly_totals", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id"),
+  easyrent_clerk_guid: text("easyrent_clerk_guid").notNull(),
+  raw_clerk_name: text("raw_clerk_name"),
+  net_sales: real("net_sales").notNull().default(0),
+  ingested_at: text("ingested_at"),
+});
+
+// --- Easyrent PMs (price modifier line attributions, monthly) ---
+export const payrollEasyrentPms = sqliteTable("payroll_easyrent_pms", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id"),
+  easyrent_clerk_guid: text("easyrent_clerk_guid"),
+  transaction_date: text("transaction_date"),
+  easyrent_transaction_id: text("easyrent_transaction_id"),
+  pm_code: text("pm_code"),
+  pm_label: text("pm_label"),
+  amount: real("amount").notNull().default(0),
+  ingested_at: text("ingested_at"),
+});
+
+// --- LTM tips (Shift4 tip transactions, monthly) ---
+// Stores gross/fee_pct/fee_amount/net for full audit trail. ADP receives `net`.
+export const payrollLtmTips = sqliteTable("payroll_ltm_tips", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id"),
+  ltm_clerk_id: text("ltm_clerk_id"),
+  raw_clerk_name: text("raw_clerk_name"),
+  transaction_date: text("transaction_date"),
+  shift4_invoice: text("shift4_invoice"), // Shift4 invoice/transaction identifier
+  gross_tip: real("gross_tip").notNull().default(0),
+  fee_pct: real("fee_pct").notNull().default(0),     // snapshotted at ingest from entity_processing_fees
+  fee_amount: real("fee_amount").notNull().default(0),
+  net_tip: real("net_tip").notNull().default(0),
+  ingested_at: text("ingested_at"),
+});
+
+// --- Shopify line items eligible for SPIFs (monthly) ---
+// Populated from the Shopify Orders API. The SPIF engine in PR #15 filters
+// these against `payroll_spif_rules` to produce payroll_lines of kind 'spif'.
+export const payrollShopifyLineItemsSpif = sqliteTable("payroll_shopify_line_items_spif", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id"),
+  shopify_staff_member_id: text("shopify_staff_member_id"),
+  shopify_order_id: text("shopify_order_id"),
+  shopify_line_item_id: text("shopify_line_item_id"),
+  order_date: text("order_date"),
+  sku: text("sku"),
+  product_title: text("product_title"),
+  quantity: real("quantity").notNull().default(0),
+  unit_price: real("unit_price"),
+  // Matched SPIF rule (denormalized so refunds-after-rule-change behave
+  // predictably). Null = no SPIF match.
+  matched_spif_rule_id: integer("matched_spif_rule_id"),
+  ingested_at: text("ingested_at"),
+});
+
+// --- SPIF rules (per-SKU bonus config) ---
+export const payrollSpifRules = sqliteTable("payroll_spif_rules", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  // Match by SKU exact, SKU prefix, or product title contains.
+  match_kind: text("match_kind").notNull(), // 'sku_exact' | 'sku_prefix' | 'title_contains'
+  match_value: text("match_value").notNull(),
+  label: text("label"), // e.g. "BootDoc fitting"
+  amount_per_unit: real("amount_per_unit").notNull(), // e.g. 3.00 for $3/each
+  effective_from: text("effective_from").notNull(),
+  effective_to: text("effective_to"),
+  active: integer("active").notNull().default(1),
+  created_at: text("created_at"),
+});
+
+// --- Commission rules (per-entity commission config) ---
+// Today: flat % of net POS sales. Schema supports future tiered/threshold
+// configs via `kind` + `config_json` so we don't need a migration to add.
+export const payrollCommissionRules = sqliteTable("payroll_commission_rules", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  kind: text("kind").notNull().default("flat_pct"), // 'flat_pct' | 'tiered' | future
+  default_rate_pct: real("default_rate_pct"),       // used when kind='flat_pct'
+  config_json: text("config_json"),                  // tier definitions etc.
+  effective_from: text("effective_from").notNull(),
+  effective_to: text("effective_to"),
+  active: integer("active").notNull().default(1),
+  created_at: text("created_at"),
+});
+
+// --- Payroll lines (final earnings rows; what gets exported to ADP) ---
+export const payrollLines = sqliteTable("payroll_lines", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id").notNull(),
+  // 'commission' | 'pm' | 'tip' | 'spif' | 'override'
+  kind: text("kind").notNull(),
+  amount: real("amount").notNull().default(0),
+  // Free-text description shown on the ADP CSV memo column.
+  description: text("description"),
+  // JSON breakdown for traceability (e.g. {"net_sales": 12500, "rate": 0.04}).
+  computation_json: text("computation_json"),
+  source_table: text("source_table"), // e.g. 'payroll_shopify_staff_weekly_totals'
+  source_row_id: integer("source_row_id"),
+  // ADP export tracking.
+  exported_at: text("exported_at"),
+  exported_run_id: text("exported_run_id"),
+  created_at: text("created_at"),
+});
+
+// --- Payroll overrides (manual corrections / one-off adjustments) ---
+export const payrollOverrides = sqliteTable("payroll_overrides", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  pay_period_id: integer("pay_period_id").notNull(),
+  employee_id: integer("employee_id").notNull(),
+  // Either: adjust an existing payroll_line (link via target_payroll_line_id)
+  // OR: add a new manual line (target_payroll_line_id null, amount stands alone).
+  target_payroll_line_id: integer("target_payroll_line_id"),
+  adjustment_amount: real("adjustment_amount").notNull(),
+  reason: text("reason").notNull(),
+  created_by: text("created_by").notNull(), // user email
+  created_at: text("created_at").notNull(),
+});
+
+// --- Sync log (external integration run history) ---
+export const payrollSyncLog = sqliteTable("payroll_sync_log", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  // 'shopify_staff_totals' | 'easyrent_staff_totals' | 'easyrent_pms'
+  //   | 'ltm_tips' | 'shopify_line_items_spif'
+  kind: text("kind").notNull(),
+  entity_id: integer("entity_id"),
+  pay_period_id: integer("pay_period_id"),
+  started_at: text("started_at").notNull(),
+  finished_at: text("finished_at"),
+  status: text("status").notNull(), // 'success' | 'partial' | 'error'
+  rows_ingested: integer("rows_ingested").default(0),
+  error_message: text("error_message"),
+  triggered_by: text("triggered_by"), // 'cron' | user email
+});
+
+// NOTE: `payroll_unmatched_attributions` is created as a VIEW (not a table) in
+// server/storage.ts bootstrap. It unions rows from the *_staff_weekly_totals,
+// *_pms, *_tips, and *_line_items_spif tables where employee_id IS NULL.
+// The view is intentionally read-only; surfacing unmatched attributions is a
+// reporting concern, not a write target.
+
+// ============================================================================
+// RBAC SCHEMA
+// ----------------------------------------------------------------------------
+// Layered on top of the existing `app_users` table. The pre-existing
+// `app_users.role` (admin/user) column stays for back-compat — PR #7
+// middleware will read both, treating 'admin' as having the system Owner role.
+//
+// Three-dimensional access model:
+//   1. Module access      (which features can the user see at all)
+//   2. Entity scope       (which entities can the user see/edit data for)
+//   3. Action scope       (read vs export vs edit vs admin)
+//
+// Permissions are dot-namespaced strings like `payroll.export_adp`.
+// ============================================================================
+
+export const roles = sqliteTable("roles", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  // System roles ('Owner', 'Manager', 'ADP Exporter') cannot be deleted/renamed
+  // via the UI. Custom user-created roles have is_system=0.
+  is_system: integer("is_system").notNull().default(0),
+  created_at: text("created_at"),
+});
+
+export const permissions = sqliteTable("permissions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  // Dot-namespaced key, e.g. 'payroll.view', 'payroll.export_adp'.
+  key: text("key").notNull().unique(),
+  // 'ap' | 'payroll' | 'users' | 'system' — used to group in the admin UI.
+  module: text("module").notNull(),
+  label: text("label").notNull(),
+  description: text("description"),
+});
+
+export const rolePermissions = sqliteTable("role_permissions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  role_id: integer("role_id").notNull(),
+  permission_id: integer("permission_id").notNull(),
+});
+
+export const userRoles = sqliteTable("user_roles", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  user_id: integer("user_id").notNull(),
+  role_id: integer("role_id").notNull(),
+  // null = role applies to ALL entities. Specific entity_id = scoped.
+  // e.g. a Manager role granted with entity_id=1 means "Manager of Greenvale".
+  entity_id_scope: integer("entity_id_scope"),
+  created_at: text("created_at"),
+});
+
+// Types for payroll + RBAC
+export type PayrollEntity = typeof payrollEntities.$inferSelect;
+export type PayrollEmployee = typeof payrollEmployees.$inferSelect;
+export type PayrollPayPeriod = typeof payrollPayPeriods.$inferSelect;
+export type PayrollPosLocation = typeof payrollPosLocations.$inferSelect;
+export type PayrollLtmMerchant = typeof payrollLtmMerchants.$inferSelect;
+export type PayrollEntityProcessingFee = typeof payrollEntityProcessingFees.$inferSelect;
+export type PayrollShopifyStaffWeeklyTotal = typeof payrollShopifyStaffWeeklyTotals.$inferSelect;
+export type PayrollEasyrentStaffWeeklyTotal = typeof payrollEasyrentStaffWeeklyTotals.$inferSelect;
+export type PayrollEasyrentPm = typeof payrollEasyrentPms.$inferSelect;
+export type PayrollLtmTip = typeof payrollLtmTips.$inferSelect;
+export type PayrollShopifyLineItemSpif = typeof payrollShopifyLineItemsSpif.$inferSelect;
+export type PayrollSpifRule = typeof payrollSpifRules.$inferSelect;
+export type PayrollCommissionRule = typeof payrollCommissionRules.$inferSelect;
+export type PayrollLine = typeof payrollLines.$inferSelect;
+export type PayrollOverride = typeof payrollOverrides.$inferSelect;
+export type PayrollSyncLogEntry = typeof payrollSyncLog.$inferSelect;
+export type Role = typeof roles.$inferSelect;
+export type Permission = typeof permissions.$inferSelect;
+export type RolePermission = typeof rolePermissions.$inferSelect;
+export type UserRole = typeof userRoles.$inferSelect;
+
+// Initial permission catalog — seeded into `permissions` on first boot.
+// Adding a new permission? Append it here AND in the migration in storage.ts.
+export const PERMISSION_CATALOG: Array<{
+  key: string;
+  module: "ap" | "payroll" | "users" | "system";
+  label: string;
+  description: string;
+}> = [
+  // ----- Accounts Payable -----
+  { key: "ap.view", module: "ap", label: "View AP", description: "See the AP inbox, invoices, and history." },
+  { key: "ap.approve", module: "ap", label: "Approve invoices", description: "Approve invoices and post to QuickBooks." },
+  { key: "ap.edit_rules", module: "ap", label: "Edit vendor rules", description: "Create or change vendor routing rules and aliases." },
+  { key: "ap.skip_senders", module: "ap", label: "Manage skip senders", description: "Add/remove email senders that AP should ignore." },
+
+  // ----- Payroll -----
+  { key: "payroll.view", module: "payroll", label: "View payroll", description: "See payroll lines, periods, and reports." },
+  { key: "payroll.edit_overrides", module: "payroll", label: "Edit overrides", description: "Create manual adjustments to payroll lines." },
+  { key: "payroll.lock_period", module: "payroll", label: "Lock pay periods", description: "Move a pay period from open to locked." },
+  { key: "payroll.export_adp", module: "payroll", label: "Export ADP CSV", description: "Download the per-entity ADP Run import file. Does not require payroll.view." },
+  { key: "payroll.edit_employees", module: "payroll", label: "Manage employees", description: "Add, edit, or deactivate employees within scoped entities." },
+  { key: "payroll.edit_rules", module: "payroll", label: "Edit commission/SPIF rules", description: "Change commission rates, SPIF rules, and processing fees." },
+  { key: "payroll.run_sync", module: "payroll", label: "Trigger sync", description: "Manually trigger Shopify / Easyrent / Shift4 ingestion runs." },
+
+  // ----- Users / RBAC -----
+  { key: "users.view", module: "users", label: "View users", description: "See the users list and their assigned roles." },
+  { key: "users.manage", module: "users", label: "Manage users & roles", description: "Create/edit/disable users and assign roles. Owner-equivalent." },
+
+  // ----- System -----
+  { key: "system.view_audit", module: "system", label: "View audit log", description: "Read the system audit log." },
+  { key: "system.view_sync_log", module: "system", label: "View sync log", description: "Read the integration sync log." },
+  { key: "system.manage_config", module: "system", label: "Manage system config", description: "Edit Google/QBO/Shift4/etc. integration credentials and global settings." },
+];
+
+// System role definitions — seeded into `roles` + `role_permissions` on first
+// boot. These are baseline starting points; the Owner can edit non-system
+// roles freely via the Settings UI (coming in PR #8).
+export const SYSTEM_ROLES: Array<{
+  name: string;
+  description: string;
+  permissions: string[] | "ALL";
+}> = [
+  {
+    name: "Owner",
+    description: "Full access to everything across all entities. Cannot be deleted.",
+    permissions: "ALL",
+  },
+  {
+    name: "Manager",
+    description: "Day-to-day management of AP and payroll within their scoped entity. Cannot manage users or system config.",
+    permissions: [
+      "ap.view",
+      "ap.approve",
+      "ap.edit_rules",
+      "payroll.view",
+      "payroll.edit_overrides",
+      "payroll.lock_period",
+      "payroll.edit_employees",
+      "payroll.run_sync",
+      "system.view_sync_log",
+    ],
+  },
+  {
+    name: "ADP Exporter",
+    description: "Limited role for whoever runs payroll in ADP — can download the export CSV but not see payroll detail.",
+    permissions: ["payroll.export_adp"],
+  },
+  {
+    name: "Read Only",
+    description: "View AP and payroll data without making changes. Useful for accountants and reviewers.",
+    permissions: ["ap.view", "payroll.view", "system.view_audit", "system.view_sync_log"],
+  },
+];
+
+// Initial entity seed — the 3 stores. Matches the StoreKey values up top so
+// AP-side store routing and payroll-side entity records stay in sync.
+export const INITIAL_ENTITIES: Array<{
+  location: string;
+  legal_name: string;
+  cadence: "weekly" | "biweekly";
+  commissions_enabled: 0 | 1;
+  pms_enabled: 0 | 1;
+  tips_enabled: 0 | 1;
+  easyrent_enabled: 0 | 1;
+  spif_enabled: 0 | 1;
+}> = [
+  {
+    location: "Greenvale",
+    legal_name: "SD Ski and Patio Inc",
+    cadence: "weekly",
+    commissions_enabled: 1,
+    pms_enabled: 1,
+    tips_enabled: 1,
+    easyrent_enabled: 1,
+    spif_enabled: 1,
+  },
+  {
+    location: "Huntington",
+    legal_name: "SH Huntington Inc",
+    cadence: "biweekly",
+    commissions_enabled: 0,
+    pms_enabled: 0,
+    tips_enabled: 0,
+    easyrent_enabled: 1,
+    spif_enabled: 0,
+  },
+  {
+    location: "Hempstead",
+    legal_name: "SH Hempstead Inc",
+    cadence: "biweekly",
+    commissions_enabled: 0,
+    pms_enabled: 0,
+    tips_enabled: 0,
+    easyrent_enabled: 1,
+    spif_enabled: 0,
+  },
+];
+
