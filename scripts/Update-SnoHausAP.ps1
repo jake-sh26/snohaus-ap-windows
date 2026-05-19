@@ -107,20 +107,27 @@ Write-Step "Downloading artifact"
 $tmp = Join-Path $env:TEMP "snohaus-ap-update-$($run.id)"
 if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
 New-Item -ItemType Directory -Path $tmp | Out-Null
-$artifactZip = Join-Path $tmp "artifact.zip"
-# NOTE: We must use `gh api --output` (not PowerShell's `>` redirect) to write
-# binary data. PowerShell's stream redirection re-encodes bytes through its
-# text pipeline, which corrupts the zip and produces "End of Central Directory
-# record could not be found" when Expand-Archive tries to read it. The
-# `--output` flag tells gh to write raw bytes directly to the file.
-gh api "repos/$RepoOwner/$RepoName/actions/artifacts/$($artifact.id)/zip" --output $artifactZip 2>$null
-if (-not (Test-Path $artifactZip) -or (Get-Item $artifactZip).Length -lt 1000) {
-    Die "Artifact download failed"
+# Use `gh run download` instead of `gh api ... --output`. The artifact zip
+# endpoint returns a 302 redirect to a pre-signed S3 URL, and `gh api`'s
+# redirect handling for binary downloads is unreliable across gh versions
+# (sometimes writes the redirect response body instead of following it).
+# `gh run download` is the purpose-built command: handles redirects, retries,
+# and verification, and writes directly to disk. It also auto-extracts the
+# outer GitHub Actions zip wrapper, so we land at the inner snohaus_ap_*.zip
+# in one step.
+$dlDir = Join-Path $tmp "download"
+New-Item -ItemType Directory -Path $dlDir | Out-Null
+$ghDownload = gh run download $run.id --repo "$RepoOwner/$RepoName" --name $artifact.name --dir $dlDir 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host $ghDownload -ForegroundColor Red
+    Die "Artifact download failed (gh run download exit $LASTEXITCODE)"
 }
-Expand-Archive $artifactZip -DestinationPath $tmp -Force
-Remove-Item $artifactZip
-$innerZip = Get-ChildItem $tmp -Filter "snohaus_ap_*.zip" | Select-Object -First 1
-if (-not $innerZip) { Die "Inner zip not found in artifact" }
+$innerZip = Get-ChildItem $dlDir -Filter "snohaus_ap_*.zip" -Recurse | Select-Object -First 1
+if (-not $innerZip) {
+    Write-Host "Files in download dir:" -ForegroundColor Yellow
+    Get-ChildItem $dlDir -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" -ForegroundColor Yellow }
+    Die "Inner zip not found in artifact"
+}
 $extracted = Join-Path $tmp "extracted"
 Expand-Archive $innerZip.FullName -DestinationPath $extracted -Force
 $newCjs = Join-Path $extracted "index.cjs"
