@@ -6,6 +6,9 @@ import {
   sessions,
   magicCodes,
   auditLog,
+  INITIAL_ENTITIES,
+  PERMISSION_CATALOG,
+  SYSTEM_ROLES,
   type Invoice,
   type InvoiceLineItem,
   type VendorRule,
@@ -291,8 +294,425 @@ function bootstrapSchema() {
     }
   }
 
+  // ============================================================================
+  // PAYROLL MODULE TABLES (PR #6)
+  // ----------------------------------------------------------------------------
+  // All idempotent (CREATE TABLE IF NOT EXISTS). Drizzle definitions live in
+  // shared/schema.ts — keep these two in sync.
+  // ============================================================================
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_entities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      location TEXT NOT NULL,
+      legal_name TEXT NOT NULL,
+      cadence TEXT NOT NULL,
+      adp_company_code TEXT,
+      commissions_enabled INTEGER NOT NULL DEFAULT 0,
+      pms_enabled INTEGER NOT NULL DEFAULT 0,
+      tips_enabled INTEGER NOT NULL DEFAULT 0,
+      easyrent_enabled INTEGER NOT NULL DEFAULT 0,
+      spif_enabled INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT,
+      updated_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_entities_location ON payroll_entities(location);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_employees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      full_name TEXT NOT NULL,
+      email TEXT,
+      shopify_staff_member_id TEXT,
+      easyrent_clerk_guid TEXT,
+      ltm_clerk_id TEXT,
+      adp_employee_id TEXT,
+      commission_rate_pct REAL,
+      active INTEGER NOT NULL DEFAULT 1,
+      hired_at TEXT,
+      terminated_at TEXT,
+      notes TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_employees_entity ON payroll_employees(entity_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_employees_shopify ON payroll_employees(shopify_staff_member_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_employees_easyrent ON payroll_employees(easyrent_clerk_guid);
+    CREATE INDEX IF NOT EXISTS idx_payroll_employees_ltm ON payroll_employees(ltm_clerk_id);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_pay_periods (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      kind TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      exported_at TEXT,
+      exported_by TEXT,
+      notes TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_pay_periods_entity ON payroll_pay_periods(entity_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_pay_periods_unique
+      ON payroll_pay_periods(entity_id, kind, period_start);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_pos_locations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      shopify_location_id TEXT NOT NULL,
+      label TEXT,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_pos_locations_shopify
+      ON payroll_pos_locations(shopify_location_id);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_ltm_merchants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      merchant_id TEXT NOT NULL,
+      client_guid TEXT,
+      label TEXT,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_ltm_merchants_merchant
+      ON payroll_ltm_merchants(merchant_id);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_entity_processing_fees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      fee_kind TEXT NOT NULL DEFAULT 'tip_cc_fee',
+      fee_pct REAL NOT NULL,
+      effective_from TEXT NOT NULL,
+      effective_to TEXT,
+      note TEXT,
+      created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_entity_processing_fees_entity
+      ON payroll_entity_processing_fees(entity_id, fee_kind, effective_from);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_shopify_staff_weekly_totals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER REFERENCES payroll_employees(id),
+      shopify_staff_member_id TEXT NOT NULL,
+      raw_staff_name TEXT,
+      net_sales REAL NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'shopify_ql',
+      ingested_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_shopify_staff_period
+      ON payroll_shopify_staff_weekly_totals(pay_period_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_shopify_staff_unique
+      ON payroll_shopify_staff_weekly_totals(pay_period_id, shopify_staff_member_id);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_easyrent_staff_weekly_totals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER REFERENCES payroll_employees(id),
+      easyrent_clerk_guid TEXT NOT NULL,
+      raw_clerk_name TEXT,
+      net_sales REAL NOT NULL DEFAULT 0,
+      ingested_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_easyrent_staff_period
+      ON payroll_easyrent_staff_weekly_totals(pay_period_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_easyrent_staff_unique
+      ON payroll_easyrent_staff_weekly_totals(pay_period_id, easyrent_clerk_guid);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_easyrent_pms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER REFERENCES payroll_employees(id),
+      easyrent_clerk_guid TEXT,
+      transaction_date TEXT,
+      easyrent_transaction_id TEXT,
+      pm_code TEXT,
+      pm_label TEXT,
+      amount REAL NOT NULL DEFAULT 0,
+      ingested_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_easyrent_pms_period
+      ON payroll_easyrent_pms(pay_period_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_easyrent_pms_txn
+      ON payroll_easyrent_pms(easyrent_transaction_id);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_ltm_tips (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER REFERENCES payroll_employees(id),
+      ltm_clerk_id TEXT,
+      raw_clerk_name TEXT,
+      transaction_date TEXT,
+      shift4_invoice TEXT,
+      gross_tip REAL NOT NULL DEFAULT 0,
+      fee_pct REAL NOT NULL DEFAULT 0,
+      fee_amount REAL NOT NULL DEFAULT 0,
+      net_tip REAL NOT NULL DEFAULT 0,
+      ingested_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_ltm_tips_period
+      ON payroll_ltm_tips(pay_period_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_ltm_tips_shift4_invoice
+      ON payroll_ltm_tips(shift4_invoice)
+      WHERE shift4_invoice IS NOT NULL;
+  `);
+
+  // NOTE: payroll_spif_rules is created BEFORE payroll_shopify_line_items_spif
+  // because the latter has a FK referencing it.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_spif_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      match_kind TEXT NOT NULL,
+      match_value TEXT NOT NULL,
+      label TEXT,
+      amount_per_unit REAL NOT NULL,
+      effective_from TEXT NOT NULL,
+      effective_to TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_spif_rules_entity
+      ON payroll_spif_rules(entity_id, active);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_shopify_line_items_spif (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER REFERENCES payroll_employees(id),
+      shopify_staff_member_id TEXT,
+      shopify_order_id TEXT,
+      shopify_line_item_id TEXT,
+      order_date TEXT,
+      sku TEXT,
+      product_title TEXT,
+      quantity REAL NOT NULL DEFAULT 0,
+      unit_price REAL,
+      matched_spif_rule_id INTEGER REFERENCES payroll_spif_rules(id) ON DELETE SET NULL,
+      ingested_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_shopify_spif_period
+      ON payroll_shopify_line_items_spif(pay_period_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_shopify_spif_unique
+      ON payroll_shopify_line_items_spif(shopify_line_item_id)
+      WHERE shopify_line_item_id IS NOT NULL;
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_commission_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      kind TEXT NOT NULL DEFAULT 'flat_pct',
+      default_rate_pct REAL,
+      config_json TEXT,
+      effective_from TEXT NOT NULL,
+      effective_to TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_commission_rules_entity
+      ON payroll_commission_rules(entity_id, active);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_lines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER NOT NULL REFERENCES payroll_employees(id),
+      kind TEXT NOT NULL,
+      amount REAL NOT NULL DEFAULT 0,
+      description TEXT,
+      computation_json TEXT,
+      source_table TEXT,
+      source_row_id INTEGER,
+      exported_at TEXT,
+      exported_run_id TEXT,
+      created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_lines_period ON payroll_lines(pay_period_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_lines_emp_period
+      ON payroll_lines(employee_id, pay_period_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_lines_kind ON payroll_lines(kind);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_overrides (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      employee_id INTEGER NOT NULL REFERENCES payroll_employees(id),
+      target_payroll_line_id INTEGER REFERENCES payroll_lines(id) ON DELETE SET NULL,
+      adjustment_amount REAL NOT NULL,
+      reason TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_overrides_period
+      ON payroll_overrides(pay_period_id);
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_sync_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL,
+      entity_id INTEGER,
+      pay_period_id INTEGER,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      rows_ingested INTEGER DEFAULT 0,
+      error_message TEXT,
+      triggered_by TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_sync_log_kind_started
+      ON payroll_sync_log(kind, started_at DESC);
+  `);
+
+  // ----- Unmatched attributions VIEW -----
+  // Surfaces every ingest row where employee_id IS NULL. The UI in PR #10
+  // shows this list so the user can map the raw clerk name/ID to an employee.
+  sqlite.exec(`
+    CREATE VIEW IF NOT EXISTS payroll_unmatched_attributions AS
+      SELECT
+        'shopify_staff_totals' AS source_kind,
+        id AS source_row_id,
+        entity_id,
+        pay_period_id,
+        shopify_staff_member_id AS external_id,
+        raw_staff_name AS raw_name,
+        net_sales AS amount,
+        ingested_at
+      FROM payroll_shopify_staff_weekly_totals
+      WHERE employee_id IS NULL
+      UNION ALL
+      SELECT
+        'easyrent_staff_totals',
+        id,
+        entity_id,
+        pay_period_id,
+        easyrent_clerk_guid,
+        raw_clerk_name,
+        net_sales,
+        ingested_at
+      FROM payroll_easyrent_staff_weekly_totals
+      WHERE employee_id IS NULL
+      UNION ALL
+      SELECT
+        'easyrent_pms',
+        id,
+        entity_id,
+        pay_period_id,
+        easyrent_clerk_guid,
+        NULL,
+        amount,
+        ingested_at
+      FROM payroll_easyrent_pms
+      WHERE employee_id IS NULL
+      UNION ALL
+      SELECT
+        'ltm_tips',
+        id,
+        entity_id,
+        pay_period_id,
+        ltm_clerk_id,
+        raw_clerk_name,
+        net_tip,
+        ingested_at
+      FROM payroll_ltm_tips
+      WHERE employee_id IS NULL
+      UNION ALL
+      SELECT
+        'shopify_line_items_spif',
+        id,
+        entity_id,
+        pay_period_id,
+        shopify_staff_member_id,
+        product_title,
+        COALESCE(quantity * unit_price, 0),
+        ingested_at
+      FROM payroll_shopify_line_items_spif
+      WHERE employee_id IS NULL;
+  `);
+
+  // ============================================================================
+  // RBAC TABLES (PR #6)
+  // ============================================================================
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS roles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      description TEXT,
+      is_system INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT
+    );
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS permissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT NOT NULL UNIQUE,
+      module TEXT NOT NULL,
+      label TEXT NOT NULL,
+      description TEXT
+    );
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS role_permissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+      permission_id INTEGER NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+      UNIQUE(role_id, permission_id)
+    );
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS user_roles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+      entity_id_scope INTEGER REFERENCES payroll_entities(id) ON DELETE CASCADE,
+      created_at TEXT,
+      UNIQUE(user_id, role_id, entity_id_scope)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id);
+  `);
+
   // Run user seed migration after schema is ready
   seedAppUsersFromEnv();
+
+  // Seed payroll + RBAC baseline data (entities, permissions, system roles).
+  // Idempotent — safe to run on every boot.
+  seedPayrollBaseline();
+  seedRbacBaseline();
 }
 
 // ===== app_users helpers =====
@@ -530,6 +950,146 @@ function seedAppUsersFromEnv(): void {
     console.log(`[storage] Seeded ${usersToSeed.length} users into app_users from env`);
   } catch (e: any) {
     console.error('[storage] seedAppUsersFromEnv failed:', e.message);
+  }
+}
+
+// ============================================================================
+// PAYROLL + RBAC BASELINE SEEDS (PR #6)
+// ----------------------------------------------------------------------------
+// Both functions are idempotent. They run on every boot via bootstrapSchema()
+// and are safe to re-run — they only insert rows that don't already exist.
+// ============================================================================
+
+function seedPayrollBaseline(): void {
+  try {
+    const now = new Date().toISOString();
+
+    // Seed the 3 entities if the table is empty. We deliberately don't try to
+    // "upsert" by location once the table is populated — the user may rename
+    // entities and we don't want to clobber their edits.
+    const entityCount = (sqlite.prepare(`SELECT COUNT(*) AS c FROM payroll_entities`).get() as { c: number }).c;
+    if (entityCount === 0) {
+      const insert = sqlite.prepare(`
+        INSERT INTO payroll_entities
+          (location, legal_name, cadence, commissions_enabled, pms_enabled,
+           tips_enabled, easyrent_enabled, spif_enabled, active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `);
+      for (const e of INITIAL_ENTITIES) {
+        insert.run(
+          e.location,
+          e.legal_name,
+          e.cadence,
+          e.commissions_enabled,
+          e.pms_enabled,
+          e.tips_enabled,
+          e.easyrent_enabled,
+          e.spif_enabled,
+          now,
+          now,
+        );
+      }
+      console.log(`[storage] Seeded ${INITIAL_ENTITIES.length} entities into payroll_entities`);
+    }
+
+    // Seed the 3.8% tip CC fee for Greenvale if no row exists.
+    const greenvale = sqlite.prepare(
+      `SELECT id FROM payroll_entities WHERE location = 'Greenvale' LIMIT 1`
+    ).get() as { id: number } | undefined;
+    if (greenvale) {
+      const feeExists = sqlite.prepare(
+        `SELECT 1 FROM payroll_entity_processing_fees WHERE entity_id = ? AND fee_kind = 'tip_cc_fee' LIMIT 1`
+      ).get(greenvale.id);
+      if (!feeExists) {
+        sqlite.prepare(`
+          INSERT INTO payroll_entity_processing_fees
+            (entity_id, fee_kind, fee_pct, effective_from, note, created_at)
+          VALUES (?, 'tip_cc_fee', 0.038, ?, 'Initial seed — 3.8% Shift4 CC processing fee deducted from tips before ADP import.', ?)
+        `).run(greenvale.id, '2020-01-01', now);
+        console.log(`[storage] Seeded Greenvale tip CC fee (3.8%)`);
+      }
+    }
+  } catch (e: any) {
+    console.error('[storage] seedPayrollBaseline failed:', e.message);
+  }
+}
+
+function seedRbacBaseline(): void {
+  try {
+    const now = new Date().toISOString();
+
+    // ----- Seed permission catalog -----
+    // Always run — lets us add new permissions in future PRs by simply
+    // appending to PERMISSION_CATALOG and they'll be inserted on next boot.
+    const upsertPerm = sqlite.prepare(`
+      INSERT INTO permissions (key, module, label, description)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        module = excluded.module,
+        label = excluded.label,
+        description = excluded.description
+    `);
+    for (const p of PERMISSION_CATALOG) {
+      upsertPerm.run(p.key, p.module, p.label, p.description);
+    }
+
+    // ----- Seed system roles -----
+    // Only insert if the role doesn't exist by name. If the Owner has edited
+    // a system role's permissions in the UI, we DON'T overwrite their changes
+    // on the next boot. New permissions added in future PRs need to be
+    // assigned to roles via the Settings UI (or a follow-up migration).
+    const getRoleByName = sqlite.prepare(`SELECT id FROM roles WHERE name = ? LIMIT 1`);
+    const insertRole = sqlite.prepare(`
+      INSERT INTO roles (name, description, is_system, created_at) VALUES (?, ?, 1, ?)
+    `);
+    const getAllPermIds = sqlite.prepare(`SELECT id, key FROM permissions`);
+    const getPermIdByKey = sqlite.prepare(`SELECT id FROM permissions WHERE key = ? LIMIT 1`);
+    const insertRolePerm = sqlite.prepare(`
+      INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)
+    `);
+
+    for (const r of SYSTEM_ROLES) {
+      let row = getRoleByName.get(r.name) as { id: number } | undefined;
+      if (!row) {
+        const info = insertRole.run(r.name, r.description, now);
+        row = { id: Number(info.lastInsertRowid) };
+
+        // Assign permissions only on initial creation.
+        if (r.permissions === "ALL") {
+          const allPerms = getAllPermIds.all() as Array<{ id: number; key: string }>;
+          for (const p of allPerms) {
+            insertRolePerm.run(row.id, p.id);
+          }
+        } else {
+          for (const key of r.permissions) {
+            const p = getPermIdByKey.get(key) as { id: number } | undefined;
+            if (p) insertRolePerm.run(row.id, p.id);
+          }
+        }
+        console.log(`[storage] Seeded system role "${r.name}" with ${
+          r.permissions === "ALL" ? "all" : r.permissions.length
+        } permissions`);
+      }
+    }
+
+    // ----- Auto-assign Owner role to legacy admin users -----
+    // Anyone in app_users with role='admin' should also have the Owner role
+    // in the new RBAC system, with no entity scope (= all entities).
+    const ownerRole = getRoleByName.get("Owner") as { id: number } | undefined;
+    if (ownerRole) {
+      const admins = sqlite.prepare(
+        `SELECT id FROM app_users WHERE role = 'admin' AND enabled = 1`
+      ).all() as Array<{ id: number }>;
+      const insertUserRole = sqlite.prepare(`
+        INSERT OR IGNORE INTO user_roles (user_id, role_id, entity_id_scope, created_at)
+        VALUES (?, ?, NULL, ?)
+      `);
+      for (const a of admins) {
+        insertUserRole.run(a.id, ownerRole.id, now);
+      }
+    }
+  } catch (e: any) {
+    console.error('[storage] seedRbacBaseline failed:', e.message);
   }
 }
 
