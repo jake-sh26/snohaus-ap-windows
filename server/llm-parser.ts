@@ -168,8 +168,8 @@ ADDITIONAL RULES:
 DUE_DATE EXTRACTION (critical — drives AP aging):
 - invoice_date = the document/issue date printed on the invoice ("Invoice Date", "Date", header date).
 - due_date = the date payment is owed by. NEVER copy invoice_date into due_date.
-- payment_terms = the verbatim terms string as printed ("Net 30", "Net 15", "Net 45", "Net 60", "Net 90", "2% 10 Net 30", "Due on Receipt", "COD", "Prepaid", etc). Look in a "Terms" column/row, near the totals block, or on the customer-info band.
-- ALWAYS populate payment_terms when any terms text is visible on the invoice, even if you also extract an explicit due_date.
+- payment_terms = the verbatim terms string as printed ("Net 30", "Net 15", "Net 45", "Net 60", "Net 90", "2% 10 Net 30", "Due on Receipt", "COD", "Prepaid", etc). Look in a "Terms" column/row, near the totals block, or on the customer-info band. Header bands often show "Terms: NET 30 DAYS" or "Terms NET 30 Days" between PO Number and Pack — these count.
+- ALWAYS populate payment_terms when any terms text is visible on the invoice, even if you also extract an explicit due_date. This is REQUIRED for scanned/image PDFs where we can't extract text any other way — if you can see the terms phrase on the page, you MUST put it in the payment_terms field, not just in notes.
 - Look for explicit due-date labels: "Due Date", "Payment Due", "Pay By", "Net Due Date", "Due".
 - If only payment terms are listed (no explicit due date), COMPUTE due_date deterministically:
     "Net N" / "Net-N" / "NETN" / "N days" / "Due in N days"  → due_date = invoice_date + N days
@@ -462,10 +462,50 @@ ${SCHEMA_HINT}`;
     }
   }
 
-  // v8.4.5 — Option A: when the LLM doesn't surface payment_terms (it often
-  // narrates the math into `notes` instead), scan the raw PDF text directly.
-  // We extract once with pdf-parse, then run both due_date AND discount detection
-  // against the full text. Cheap, deterministic, and doesn't trust the LLM.
+  // v8.4.6 — Scan every LLM-emitted string field for a recognizable terms
+  // pattern ("Net 30 Days", etc.). The LLM very often narrates terms into
+  // `notes`, `vendor_alias_applied`, or even `skip_reason` instead of putting
+  // them into the dedicated `payment_terms` field. We do this BEFORE the
+  // pdf-parse fallback because for image-only PDFs (printed-then-scanned
+  // invoices like Treasure Garden), pdf-parse returns empty text but the LLM
+  // saw the page visually and has the terms somewhere in its output.
+  if (!result.due_date && result.invoice_date) {
+    // Concatenate every text-bearing field on `result`. This is deliberately
+    // broad — we only act on it if computeDueDateFromTerms finds a Net N
+    // pattern, which is conservative.
+    const llmBlob = [
+      result.notes,
+      result.payment_terms,
+      result.payment_method,
+      result.vendor_alias_applied,
+      result.skip_reason,
+      result.vendor_raw_name,
+    ]
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .join(" | ");
+    if (llmBlob) {
+      const fromBlob = computeDueDateFromTerms(result.invoice_date, llmBlob);
+      if (fromBlob) {
+        result.due_date = fromBlob;
+        // Also promote the discovered terms into payment_terms if it was empty,
+        // so the UI shows "Net 30" instead of staying blank. We use the snippet
+        // helper because it returns ~60 chars around the match, which is exactly
+        // the terms phrase printed on the invoice.
+        const snippet = findTermsSnippet(llmBlob);
+        if (!result.payment_terms && snippet) {
+          result.payment_terms = snippet;
+        }
+        result.notes = (result.notes ? result.notes + " " : "") +
+          `[auto] due_date computed from LLM narrative ("${snippet || "matched"}")`;
+      }
+    }
+  }
+
+  // v8.4.5 — Option A: when the LLM doesn't surface payment_terms anywhere we
+  // can find, scan the raw PDF text directly. We extract once with pdf-parse,
+  // then run both due_date AND discount detection against the full text.
+  // Cheap and deterministic. NOTE: this returns empty for image-only PDFs —
+  // the v8.4.6 blob scan above is the safety net for those.
   let rawPdfText: string | null = null;
   if (!result.due_date && result.invoice_date) {
     rawPdfText = await safeExtractPdfText(pdfBuffer);
