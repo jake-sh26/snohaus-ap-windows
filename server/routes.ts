@@ -87,7 +87,28 @@ import {
   getZipMapping,
   upsertZipMapping,
   listPriorYearProRata,
+  // Reconciler (PR #R2)
+  listReconOrdersSample,
+  getReconOrderWithLines,
+  getReconOrdersWatermark,
 } from "./storage";
+import {
+  getShopifyReconStatus,
+  pingShopify,
+  listShopifyLocations,
+  getShopifyReconErrorLog,
+  clearShopifyReconErrorLog,
+} from "./shopify-recon";
+import {
+  syncOrdersIncremental,
+  transformShopifyOrder,
+} from "./shopify-recon-orders";
+import {
+  handleShopifyWebhook,
+  ensureShopifyWebhooks,
+  deleteAllOurWebhooks,
+  SHOPIFY_RECON_WEBHOOK_TOPICS,
+} from "./shopify-recon-webhooks";
 import { getUserPermissions, requirePermission } from "./rbac";
 import {
   isGoogleConfigured,
@@ -984,6 +1005,121 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(400).json({ message: "year must be a 4-digit integer" });
     }
     res.json(listPriorYearProRata(year));
+  });
+
+  // ==========================================================================
+  // SHOPIFY RECONCILER (PR #R2) — orders sync + webhooks
+  // --------------------------------------------------------------------------
+  // Read-only data + manual sync trigger + webhook receiver. NO QBO posting,
+  // NO allocation, NO bank match. All of that lands in PR #R3+.
+  // ==========================================================================
+
+  // Config + connectivity status. Safe to call without permission gating since
+  // it returns no PII / no secrets — only env presence flags.
+  app.get("/api/recon/shopify/status", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(getShopifyReconStatus());
+  });
+
+  // Live ping — hits Shopify /shop.json. Useful for the "Test connection"
+  // button in the Settings UI tile.
+  app.post("/api/recon/shopify/ping", authMiddleware, requirePermission("system.manage_config"), async (_req, res) => {
+    const r = await pingShopify();
+    res.status(r.ok ? 200 : 502).json(r);
+  });
+
+  // List Shopify locations — populates the Settings dropdown next to each
+  // entity ↔ POS mapping row (one-time setup when wiring 3 stores to 3 entities).
+  app.get("/api/recon/shopify/locations", authMiddleware, requirePermission("payroll.view"), async (_req, res) => {
+    try {
+      const locs = await listShopifyLocations();
+      res.json(locs);
+    } catch (e: any) {
+      res.status(502).json({ message: e?.message ?? "Failed to list locations" });
+    }
+  });
+
+  // Manual orders sync trigger — used during testing to force a pull. Returns
+  // counters synchronously. The daily cron in server/index.ts calls the same
+  // function automatically.
+  app.post("/api/recon/shopify/sync/orders", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const triggeredBy = `manual:${req.user?.email || "unknown"}`;
+    const result = await syncOrdersIncremental(triggeredBy);
+    res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // Current orders watermark (read-only) — shown in the Settings UI so the user
+  // knows where the incremental pull will resume from on next run.
+  app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json({ orders_watermark: getReconOrdersWatermark() });
+  });
+
+  // Sample of recently ingested orders — used by the Phase 1 testing UI so the
+  // user can spot-check transformations against Shopify Admin UI side-by-side.
+  app.get("/api/recon/orders", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
+    res.json(listReconOrdersSample(limit));
+  });
+
+  // Single order detail (order + line items) for spot-checking tax_channel_liable.
+  app.get("/api/recon/orders/:id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const detail = getReconOrderWithLines(String(req.params.id));
+    if (!detail) return res.status(404).json({ message: "Order not found" });
+    res.json(detail);
+  });
+
+  // Preview the transformation of a raw Shopify order payload WITHOUT writing
+  // to the DB. Pure debugging aid for when a transformed row looks wrong —
+  // POST the raw Shopify JSON, get back what we would have stored.
+  app.post("/api/recon/shopify/transform-preview", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    try {
+      const out = transformShopifyOrder(req.body);
+      res.json(out);
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message ?? "Transform failed" });
+    }
+  });
+
+  // Webhook registration — reconciles desired topics (orders/create, /updated,
+  // /cancelled) with what's currently subscribed at the configured public URL.
+  // Idempotent — safe to call on every boot or from the UI.
+  app.post("/api/recon/shopify/webhooks/register", authMiddleware, requirePermission("system.manage_config"), async (_req, res) => {
+    try {
+      const results = await ensureShopifyWebhooks();
+      res.json({ topics: SHOPIFY_RECON_WEBHOOK_TOPICS, results });
+    } catch (e: any) {
+      res.status(502).json({ message: e?.message ?? "Webhook registration failed" });
+    }
+  });
+
+  // Reset webhooks — deletes everything pointed at our public URL. Used after
+  // ngrok domain rotation when stale entries pile up, or to fully unwind.
+  app.delete("/api/recon/shopify/webhooks", authMiddleware, requirePermission("system.manage_config"), async (_req, res) => {
+    try {
+      const count = await deleteAllOurWebhooks();
+      res.json({ deleted: count });
+    } catch (e: any) {
+      res.status(502).json({ message: e?.message ?? "Webhook delete failed" });
+    }
+  });
+
+  // -------- Webhook receiver (PUBLIC — no auth, HMAC-verified) --------------
+  // Mounted under /api/recon/* so it lives next to the other recon routes but
+  // has NO authMiddleware/permission gate. HMAC verification inside the handler
+  // is the auth boundary. MUST run with req.rawBody available — captured by the
+  // global express.json({ verify }) hook in server/index.ts.
+  app.post("/api/recon/webhooks/shopify", (req, res) => {
+    void handleShopifyWebhook(req, res);
+  });
+
+  // Integration error log (most recent N entries) — surfaces transient API
+  // failures, HMAC mismatches, etc. for the Settings UI debug panel.
+  app.get("/api/recon/shopify/error-log", authMiddleware, requirePermission("system.view_sync_log"), (req, res) => {
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    res.json(getShopifyReconErrorLog(limit));
+  });
+  app.delete("/api/recon/shopify/error-log", authMiddleware, requirePermission("system.manage_config"), (_req, res) => {
+    clearShopifyReconErrorLog();
+    res.json({ ok: true });
   });
 
   // ---- Health ----
