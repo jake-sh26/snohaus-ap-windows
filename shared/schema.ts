@@ -486,6 +486,251 @@ export const userRoles = sqliteTable("user_roles", {
   created_at: text("created_at"),
 });
 
+// ============================================================================
+// SHOPIFY RECONCILER (PR #R1) — Drizzle definitions
+// ----------------------------------------------------------------------------
+// Column lists mirror the CREATE TABLE statements in server/storage.ts. If you
+// add a column there, add it here too. See PR #R1 description for the data
+// model rationale.
+// ============================================================================
+
+export const reconSettings = sqliteTable("recon_settings", {
+  id: integer("id").primaryKey(),
+  default_digital_gc_allocation_policy: text("default_digital_gc_allocation_policy")
+    .notNull()
+    .default("zip_then_pro_rata"),
+  prior_year_pro_rata_year: integer("prior_year_pro_rata_year"),
+  prior_year_pro_rata_frozen_at: text("prior_year_pro_rata_frozen_at"),
+  shopify_shop_domain: text("shopify_shop_domain"),
+  initial_sync_from: text("initial_sync_from").notNull().default("2025-01-01"),
+  payout_bank_plaid_account_id: text("payout_bank_plaid_account_id"),
+  updated_at: text("updated_at"),
+  updated_by: text("updated_by"),
+});
+
+export const reconEntityPosLocations = sqliteTable("recon_entity_pos_locations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  shopify_location_id: text("shopify_location_id"),
+  shopify_location_name: text("shopify_location_name"),
+  kind: text("kind").notNull().default("pos"),
+  active: integer("active").notNull().default(1),
+  created_at: text("created_at"),
+  updated_at: text("updated_at"),
+});
+
+export const reconZipToEntityLookup = sqliteTable("recon_zip_to_entity_lookup", {
+  zip: text("zip").primaryKey(),
+  entity_id: integer("entity_id"),
+  distance_miles: real("distance_miles"),
+  source: text("source").notNull().default("auto"),
+  updated_at: text("updated_at"),
+  updated_by: text("updated_by"),
+});
+
+export const reconPriorYearProRata = sqliteTable("recon_prior_year_pro_rata", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  applies_to_year: integer("applies_to_year").notNull(),
+  entity_id: integer("entity_id").notNull(),
+  share: real("share").notNull(),
+  source_redemptions_total: real("source_redemptions_total").notNull(),
+  frozen_at: text("frozen_at").notNull(),
+  frozen_by: text("frozen_by"),
+});
+
+export const reconOrders = sqliteTable("recon_orders", {
+  id: text("id").primaryKey(),
+  order_number: text("order_number"),
+  name: text("name"),
+  created_at: text("created_at").notNull(),
+  processed_at: text("processed_at"),
+  updated_at: text("updated_at"),
+  cancelled_at: text("cancelled_at"),
+  closed_at: text("closed_at"),
+  financial_status: text("financial_status"),
+  fulfillment_status: text("fulfillment_status"),
+  source_name: text("source_name"),
+  location_id: text("location_id"),
+  currency: text("currency"),
+  subtotal: real("subtotal"),
+  total_tax: real("total_tax"),
+  total_discounts: real("total_discounts"),
+  total_shipping: real("total_shipping"),
+  total_tips: real("total_tips"),
+  total_price: real("total_price"),
+  total_refunded: real("total_refunded").default(0),
+  customer_id: text("customer_id"),
+  customer_email: text("customer_email"),
+  billing_zip: text("billing_zip"),
+  shipping_zip: text("shipping_zip"),
+  has_gift_card: integer("has_gift_card").notNull().default(0),
+  tax_channel_liable: integer("tax_channel_liable").notNull().default(0),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
+  ingest_version: integer("ingest_version").notNull().default(1),
+});
+
+export const reconLineItems = sqliteTable("recon_line_items", {
+  id: text("id").primaryKey(),
+  order_id: text("order_id").notNull(),
+  product_id: text("product_id"),
+  variant_id: text("variant_id"),
+  sku: text("sku"),
+  title: text("title"),
+  variant_title: text("variant_title"),
+  quantity: real("quantity").notNull().default(0),
+  price: real("price"),
+  total_discount: real("total_discount").default(0),
+  line_subtotal: real("line_subtotal"),
+  line_tax_total: real("line_tax_total").default(0),
+  tax_channel_liable: integer("tax_channel_liable").notNull().default(0),
+  tax_lines_json: text("tax_lines_json"),
+  is_gift_card: integer("is_gift_card").notNull().default(0),
+  requires_shipping: integer("requires_shipping").notNull().default(0),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
+});
+
+export const reconPayouts = sqliteTable("recon_payouts", {
+  id: text("id").primaryKey(),
+  payout_date: text("payout_date").notNull(),
+  currency: text("currency"),
+  amount: real("amount").notNull(),
+  status: text("status"),
+  summary_json: text("summary_json"),
+  plaid_transaction_id: text("plaid_transaction_id"),
+  matched_at: text("matched_at"),
+  matched_by: text("matched_by"),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
+});
+
+export const reconBalanceTransactions = sqliteTable("recon_balance_transactions", {
+  id: text("id").primaryKey(),
+  payout_id: text("payout_id"),
+  type: text("type").notNull(),
+  processed_at: text("processed_at"),
+  amount: real("amount").notNull(),
+  fee: real("fee").default(0),
+  net: real("net"),
+  currency: text("currency"),
+  source_order_id: text("source_order_id"),
+  source_transaction_id: text("source_transaction_id"),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
+});
+
+export const reconAllocations = sqliteTable("recon_allocations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  order_id: text("order_id").notNull(),
+  line_item_id: text("line_item_id"),
+  entity_id: integer("entity_id").notNull(),
+  share: real("share").notNull(),
+  gross_amount: real("gross_amount").notNull().default(0),
+  tax_amount: real("tax_amount").notNull().default(0),
+  method: text("method").notNull(),
+  reason: text("reason"),
+  overridden_by: text("overridden_by"),
+  overridden_at: text("overridden_at"),
+  auto_method: text("auto_method"),
+  auto_entity_id: integer("auto_entity_id"),
+  created_at: text("created_at").notNull(),
+  updated_at: text("updated_at"),
+});
+
+export const reconGiftCards = sqliteTable("recon_gift_cards", {
+  id: text("id").primaryKey(),
+  last_characters: text("last_characters"),
+  initial_value: real("initial_value").notNull(),
+  balance: real("balance"),
+  currency: text("currency"),
+  kind: text("kind").notNull().default("digital"),
+  issuing_order_id: text("issuing_order_id"),
+  issuing_line_item_id: text("issuing_line_item_id"),
+  buyer_zip: text("buyer_zip"),
+  issuing_entity_id: integer("issuing_entity_id"),
+  issued_at: text("issued_at"),
+  disabled_at: text("disabled_at"),
+  expires_at: text("expires_at"),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
+});
+
+export const reconGiftCardRedemptions = sqliteTable("recon_gift_card_redemptions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  gift_card_id: text("gift_card_id"),
+  order_id: text("order_id").notNull(),
+  amount: real("amount").notNull(),
+  redeeming_entity_id: integer("redeeming_entity_id"),
+  issuing_entity_id: integer("issuing_entity_id"),
+  redeemed_at: text("redeemed_at").notNull(),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
+});
+
+export const reconSyncLog = sqliteTable("recon_sync_log", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  kind: text("kind").notNull(),
+  started_at: text("started_at").notNull(),
+  finished_at: text("finished_at"),
+  status: text("status").notNull(),
+  rows_ingested: integer("rows_ingested").default(0),
+  cursor: text("cursor"),
+  error_message: text("error_message"),
+  triggered_by: text("triggered_by"),
+});
+
+// Closed enums kept in code so the UI, allocator, and tests share one source.
+export const RECON_ALLOCATION_METHODS = [
+  "pos",                 // POS sale -> store of sale
+  "online_fulfillment",  // Online order -> fulfillment location
+  "gc_zip",              // Digital GC -> buyer's zip -> nearest entity
+  "gc_pro_rata",         // Digital GC fallback -> prior-year frozen pro-rata
+  "manual",              // User override
+] as const;
+export type ReconAllocationMethod = (typeof RECON_ALLOCATION_METHODS)[number];
+
+export const RECON_SOURCE_NAMES = [
+  "pos",
+  "online_store",
+  "shop",        // Shop channel — Shopify is marketplace facilitator (tax remitted by Shopify)
+  "web",
+  "facebook",
+  "google",
+  "draft_order",
+  "other",
+] as const;
+
+export const RECON_SYNC_KINDS = [
+  "orders",
+  "payouts",
+  "balance_transactions",
+  "gift_cards",
+  "allocator",
+  "pro_rata_freeze",
+] as const;
+export type ReconSyncKind = (typeof RECON_SYNC_KINDS)[number];
+
+export const RECON_GC_ALLOCATION_POLICIES = [
+  "zip_then_pro_rata", // v1 default
+  "pro_rata_only",     // future: skip zip lookup
+  "manual_only",       // future: require user to allocate every digital GC
+] as const;
+export type ReconGcAllocationPolicy = (typeof RECON_GC_ALLOCATION_POLICIES)[number];
+
+export type ReconSettings = typeof reconSettings.$inferSelect;
+export type ReconEntityPosLocation = typeof reconEntityPosLocations.$inferSelect;
+export type ReconZipToEntityLookup = typeof reconZipToEntityLookup.$inferSelect;
+export type ReconPriorYearProRata = typeof reconPriorYearProRata.$inferSelect;
+export type ReconOrder = typeof reconOrders.$inferSelect;
+export type ReconLineItem = typeof reconLineItems.$inferSelect;
+export type ReconPayout = typeof reconPayouts.$inferSelect;
+export type ReconBalanceTransaction = typeof reconBalanceTransactions.$inferSelect;
+export type ReconAllocation = typeof reconAllocations.$inferSelect;
+export type ReconGiftCard = typeof reconGiftCards.$inferSelect;
+export type ReconGiftCardRedemption = typeof reconGiftCardRedemptions.$inferSelect;
+export type ReconSyncLogEntry = typeof reconSyncLog.$inferSelect;
+
 // Types for payroll + RBAC
 export type PayrollEntity = typeof payrollEntities.$inferSelect;
 export type PayrollEmployee = typeof payrollEmployees.$inferSelect;
