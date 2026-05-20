@@ -193,6 +193,44 @@ app.use((req, res, next) => {
       // Schedule daily Acumatica pull at 2:00 AM ET (no-op if not configured).
       scheduleAcumaticaDailyPull();
 
+      // Shopify reconciler (PR #R2):
+      //  - On boot: ensure webhook subscriptions point at current public URL.
+      //  - Periodic: orders polling safety net (catches anything that missed
+      //    a webhook — webhook drops happen, especially during ngrok restarts).
+      const runShopifyBootstrap = async () => {
+        try {
+          const { getShopifyReconConfig } = await import("./shopify-recon");
+          if (!getShopifyReconConfig()) return; // unconfigured — silent no-op
+          const { ensureShopifyWebhooks } = await import("./shopify-recon-webhooks");
+          const results = await ensureShopifyWebhooks();
+          const summary = results.map(r => `${r.topic}=${r.state}`).join(", ");
+          log(`Shopify webhooks: ${summary}`);
+        } catch (e: any) {
+          console.error(`[shopify-recon] webhook bootstrap failed: ${e?.message ?? e}`);
+        }
+      };
+      const runShopifyOrdersSync = async () => {
+        try {
+          const { getShopifyReconConfig } = await import("./shopify-recon");
+          if (!getShopifyReconConfig()) return;
+          const { syncOrdersIncremental } = await import("./shopify-recon-orders");
+          const r = await syncOrdersIncremental("cron");
+          if (r.error) {
+            console.error(`[shopify-recon] orders sync error: ${r.error}`);
+          } else {
+            log(`Shopify orders sync: ${r.ordersIngested} rows (${r.inserted} new, ${r.updated} updated) across ${r.pages} pages`);
+          }
+        } catch (e: any) {
+          console.error(`[shopify-recon] orders sync failed: ${e?.message ?? e}`);
+        }
+      };
+      // Stagger — boot tasks already happen at +5/+7/+8s, run shopify at +9s
+      // so it doesn't compete with QBO/alias/line-item backfills.
+      setTimeout(runShopifyBootstrap, 9000);
+      setTimeout(runShopifyOrdersSync, 12000);
+      // Polling safety net every 6 hours (webhooks are the primary path).
+      setInterval(runShopifyOrdersSync, 6 * 60 * 60 * 1000);
+
       // Start backup scheduler (hourly local, daily Drive, weekly full)
       setTimeout(() => {
         try {

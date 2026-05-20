@@ -3340,3 +3340,225 @@ export function resolveEntityIdForLocation(
 }
 
 // (allocation method type is imported from @shared/schema by callers directly)
+
+// ============================================================================
+// RECON: Shopify orders + line items (PR #R2)
+// ----------------------------------------------------------------------------
+// Upserts are idempotent: webhook AND polling can both write the same row
+// without dupes. `ingest_version` bumps on every overwrite so we can tell
+// fresh vs stale at a glance during testing.
+// ============================================================================
+
+export type ReconOrderUpsert = {
+  id: string;
+  order_number: string | null;
+  name: string | null;
+  created_at: string;
+  processed_at: string | null;
+  updated_at: string | null;
+  cancelled_at: string | null;
+  closed_at: string | null;
+  financial_status: string | null;
+  fulfillment_status: string | null;
+  source_name: string | null;
+  location_id: string | null;
+  currency: string | null;
+  subtotal: number | null;
+  total_tax: number | null;
+  total_discounts: number | null;
+  total_shipping: number | null;
+  total_tips: number | null;
+  total_price: number | null;
+  total_refunded: number | null;
+  customer_id: string | null;
+  customer_email: string | null;
+  billing_zip: string | null;
+  shipping_zip: string | null;
+  has_gift_card: number;
+  tax_channel_liable: number;
+  raw_json: string;
+};
+
+export type ReconLineItemUpsert = {
+  id: string;
+  order_id: string;
+  product_id: string | null;
+  variant_id: string | null;
+  sku: string | null;
+  title: string | null;
+  variant_title: string | null;
+  quantity: number;
+  price: number | null;
+  total_discount: number;
+  line_subtotal: number | null;
+  line_tax_total: number;
+  tax_channel_liable: number;
+  tax_lines_json: string | null;
+  is_gift_card: number;
+  requires_shipping: number;
+  raw_json: string;
+};
+
+/**
+ * Idempotent upsert of one order. If the row exists, ingest_version is
+ * incremented and all mutable columns are replaced. Designed to be safe
+ * for repeated calls from both the webhook handler and the polling job.
+ *
+ * Returns "inserted" | "updated" so the caller (sync log) can report
+ * accurate counters.
+ */
+export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" {
+  const existing = sqlite
+    .prepare(`SELECT ingest_version FROM recon_orders WHERE id = ?`)
+    .get(row.id) as { ingest_version: number } | undefined;
+
+  const now = new Date().toISOString();
+
+  if (!existing) {
+    sqlite
+      .prepare(`
+        INSERT INTO recon_orders (
+          id, order_number, name, created_at, processed_at, updated_at,
+          cancelled_at, closed_at, financial_status, fulfillment_status,
+          source_name, location_id, currency, subtotal, total_tax,
+          total_discounts, total_shipping, total_tips, total_price,
+          total_refunded, customer_id, customer_email, billing_zip,
+          shipping_zip, has_gift_card, tax_channel_liable, raw_json,
+          ingested_at, ingest_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+      `)
+      .run(
+        row.id, row.order_number, row.name, row.created_at, row.processed_at, row.updated_at,
+        row.cancelled_at, row.closed_at, row.financial_status, row.fulfillment_status,
+        row.source_name, row.location_id, row.currency, row.subtotal, row.total_tax,
+        row.total_discounts, row.total_shipping, row.total_tips, row.total_price,
+        row.total_refunded ?? 0, row.customer_id, row.customer_email, row.billing_zip,
+        row.shipping_zip, row.has_gift_card, row.tax_channel_liable, row.raw_json,
+        now,
+      );
+    return "inserted";
+  }
+
+  sqlite
+    .prepare(`
+      UPDATE recon_orders SET
+        order_number = ?, name = ?, created_at = ?, processed_at = ?, updated_at = ?,
+        cancelled_at = ?, closed_at = ?, financial_status = ?, fulfillment_status = ?,
+        source_name = ?, location_id = ?, currency = ?, subtotal = ?, total_tax = ?,
+        total_discounts = ?, total_shipping = ?, total_tips = ?, total_price = ?,
+        total_refunded = ?, customer_id = ?, customer_email = ?, billing_zip = ?,
+        shipping_zip = ?, has_gift_card = ?, tax_channel_liable = ?, raw_json = ?,
+        ingested_at = ?, ingest_version = ingest_version + 1
+      WHERE id = ?
+    `)
+    .run(
+      row.order_number, row.name, row.created_at, row.processed_at, row.updated_at,
+      row.cancelled_at, row.closed_at, row.financial_status, row.fulfillment_status,
+      row.source_name, row.location_id, row.currency, row.subtotal, row.total_tax,
+      row.total_discounts, row.total_shipping, row.total_tips, row.total_price,
+      row.total_refunded ?? 0, row.customer_id, row.customer_email, row.billing_zip,
+      row.shipping_zip, row.has_gift_card, row.tax_channel_liable, row.raw_json,
+      now, row.id,
+    );
+  return "updated";
+}
+
+/**
+ * Replace ALL line items for a given order in a single transaction. We
+ * delete-then-insert instead of upserting because Shopify can reshape the
+ * line item array on edits (combined items, refunds split lines, etc.) and
+ * orphaned rows would corrupt downstream allocation math. Safe because the
+ * order_id FK has ON DELETE CASCADE and we always re-write the full set.
+ */
+export function replaceReconLineItems(
+  orderId: string,
+  lines: ReconLineItemUpsert[],
+): number {
+  const now = new Date().toISOString();
+  const tx = sqlite.transaction(() => {
+    sqlite.prepare(`DELETE FROM recon_line_items WHERE order_id = ?`).run(orderId);
+    const ins = sqlite.prepare(`
+      INSERT INTO recon_line_items (
+        id, order_id, product_id, variant_id, sku, title, variant_title,
+        quantity, price, total_discount, line_subtotal, line_tax_total,
+        tax_channel_liable, tax_lines_json, is_gift_card, requires_shipping,
+        raw_json, ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const li of lines) {
+      ins.run(
+        li.id, li.order_id, li.product_id, li.variant_id, li.sku, li.title, li.variant_title,
+        li.quantity, li.price, li.total_discount, li.line_subtotal, li.line_tax_total,
+        li.tax_channel_liable, li.tax_lines_json, li.is_gift_card, li.requires_shipping,
+        li.raw_json, now,
+      );
+    }
+  });
+  tx();
+  return lines.length;
+}
+
+/**
+ * Returns the most recent `updated_at` watermark we've successfully ingested
+ * via the `orders` sync log. Used to bound the polling job's `updated_at_min`
+ * query parameter. Null on first run -> caller uses `initial_sync_from`.
+ */
+export function getReconOrdersWatermark(): string | null {
+  const row = sqlite
+    .prepare(`
+      SELECT cursor FROM recon_sync_log
+      WHERE kind = 'orders' AND status = 'success' AND cursor IS NOT NULL
+      ORDER BY finished_at DESC
+      LIMIT 1
+    `)
+    .get() as { cursor: string } | undefined;
+  return row?.cursor ?? null;
+}
+
+/**
+ * Returns the most recent ingested orders (id, name, created_at, totals)
+ * so the testing UI / API can render a sample. Capped to keep payloads cheap.
+ */
+export function listReconOrdersSample(limit = 50): Array<{
+  id: string;
+  name: string | null;
+  created_at: string;
+  source_name: string | null;
+  location_id: string | null;
+  total_price: number | null;
+  total_tax: number | null;
+  financial_status: string | null;
+  has_gift_card: number;
+  tax_channel_liable: number;
+  ingest_version: number;
+  ingested_at: string;
+}> {
+  return sqlite
+    .prepare(`
+      SELECT id, name, created_at, source_name, location_id, total_price,
+             total_tax, financial_status, has_gift_card, tax_channel_liable,
+             ingest_version, ingested_at
+      FROM recon_orders
+      ORDER BY created_at DESC
+      LIMIT ?
+    `)
+    .all(Math.min(500, Math.max(1, limit))) as any;
+}
+
+/**
+ * Single order detail including its line items — used by the test UI to
+ * sanity-check the tax_channel_liable rollup against per-line tax_lines_json.
+ */
+export function getReconOrderWithLines(orderId: string): {
+  order: any;
+  lines: any[];
+} | null {
+  const order = sqlite
+    .prepare(`SELECT * FROM recon_orders WHERE id = ?`)
+    .get(orderId);
+  if (!order) return null;
+  const lines = sqlite
+    .prepare(`SELECT * FROM recon_line_items WHERE order_id = ? ORDER BY id ASC`)
+    .all(orderId);
+  return { order, lines };
+}
