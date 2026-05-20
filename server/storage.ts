@@ -14,6 +14,11 @@ import {
   type VendorRule,
   type VendorAlias,
   type Session,
+  // Reconciler (PR #R1)
+  type ReconSettings,
+  type ReconEntityPosLocation,
+  type ReconAllocationMethod,
+  type ReconGcAllocationPolicy,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
@@ -662,6 +667,415 @@ function bootstrapSchema() {
   `);
 
   // ============================================================================
+  // SHOPIFY RECONCILER TABLES (PR #R1)
+  // ----------------------------------------------------------------------------
+  // Phase 1 — READ ONLY ingest + allocation + monthly rollup. Test alongside
+  // Excel before any QBO writes. Phase 2 (PR #R6+) adds per-entity QBO posting.
+  //
+  // Naming: every table is prefixed `recon_` so it can never collide with the
+  // existing `payroll_` family even if Shopify concepts overlap (e.g. a single
+  // Shopify order is referenced from both modules independently).
+  //
+  // Foreign-key story: most tables reference `payroll_entities(id)` because the
+  // 3 legal entities (Greenvale / Huntington / Hempstead) are the same in both
+  // modules. We deliberately do NOT introduce a second "entity" table.
+  // ============================================================================
+
+  // Single-row settings table for reconciler-wide policy. Use a fixed PK so we
+  // can always upsert via INSERT OR REPLACE WHERE id=1.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      -- 'zip_then_pro_rata' is the v1 default: buyer zip -> nearest entity,
+      -- fall back to the frozen prior-year pro-rata snapshot.
+      default_digital_gc_allocation_policy TEXT NOT NULL DEFAULT 'zip_then_pro_rata',
+      -- Year the frozen pro-rata snapshot was computed from. Null until first
+      -- prior-year freeze runs. UI shows this so the user knows when to refresh.
+      prior_year_pro_rata_year INTEGER,
+      -- ISO timestamp of when the snapshot was frozen.
+      prior_year_pro_rata_frozen_at TEXT,
+      -- Shopify shop domain (e.g. 'snohaus.myshopify.com'). Cached for display.
+      shopify_shop_domain TEXT,
+      -- Initial sync depth boundary. Defaults to 2025-01-01 per locked design.
+      initial_sync_from TEXT NOT NULL DEFAULT '2025-01-01',
+      -- Bank account that receives Shopify payouts (for Plaid matching).
+      -- Stored as Plaid account_id; null until user picks one in settings UI.
+      payout_bank_plaid_account_id TEXT,
+      updated_at TEXT,
+      updated_by TEXT
+    );
+  `);
+
+  // Maps Shopify physical/POS locations to our legal entities. One row per
+  // Shopify location_id. Seeded with the 3 known stores; the user will edit
+  // location_id once it is read from Shopify.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_entity_pos_locations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id) ON DELETE CASCADE,
+      -- Shopify Admin API location id, e.g. '68042948819'. Nullable until the
+      -- user maps it after first sync.
+      shopify_location_id TEXT,
+      shopify_location_name TEXT,
+      -- 'pos' for in-store POS, 'fulfillment' for online order fulfillment.
+      -- Defaults to 'pos' because today every store is both — but we keep the
+      -- column so we can split later without a migration.
+      kind TEXT NOT NULL DEFAULT 'pos',
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT,
+      updated_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_entity_pos_locations_shopify
+      ON recon_entity_pos_locations(shopify_location_id)
+      WHERE shopify_location_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_recon_entity_pos_locations_entity
+      ON recon_entity_pos_locations(entity_id);
+  `);
+
+  // Zip-code lookup used to route digital gift cards to the nearest store.
+  // Populated lazily: when an unknown zip appears we resolve nearest entity
+  // and cache the result here. Seeded for NY's most common zips on first boot
+  // in a follow-up PR; for now this just stores manual entries from the UI.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_zip_to_entity_lookup (
+      zip TEXT PRIMARY KEY,
+      -- The entity this zip routes to. Null = explicitly "no nearest store"
+      -- (e.g. out-of-state) -> allocator falls back to pro-rata.
+      entity_id INTEGER REFERENCES payroll_entities(id),
+      -- Miles to nearest store, for transparency in the UI. Optional.
+      distance_miles REAL,
+      -- 'auto' (geocoded) | 'manual' (override entered by user)
+      source TEXT NOT NULL DEFAULT 'auto',
+      updated_at TEXT,
+      updated_by TEXT
+    );
+  `);
+
+  // Frozen prior-year pro-rata snapshot used as the FALLBACK for digital GC
+  // online sales whose buyer zip has no nearest store (e.g. out-of-state).
+  // One row per (year, entity) — sums to 1.0 across entities for a given year.
+  // Computed once per year from prior-year online GC REDEMPTIONS and never
+  // changes after that (frozen).
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_prior_year_pro_rata (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      -- Calendar year these ratios apply to (i.e. the year being allocated).
+      -- Computed from redemptions in (year - 1).
+      applies_to_year INTEGER NOT NULL,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      -- Share of prior-year redemptions for this entity. 0..1, sums to 1.0.
+      share REAL NOT NULL,
+      -- Raw dollar amount from the source year, for audit/UI display.
+      source_redemptions_total REAL NOT NULL,
+      frozen_at TEXT NOT NULL,
+      frozen_by TEXT,
+      UNIQUE(applies_to_year, entity_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_prior_year_pro_rata_year
+      ON recon_prior_year_pro_rata(applies_to_year);
+  `);
+
+  // ----- Shopify orders -----
+  // We mirror the fields we need for allocation + tax breakdown. Anything we
+  // don't need is left in `raw_json` for later forensics without a re-pull.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_orders (
+      -- Shopify order GID/id (we store the numeric id as text to avoid bigint).
+      id TEXT PRIMARY KEY,
+      order_number TEXT,
+      name TEXT,
+      -- ISO timestamp of order creation in Shopify (UTC). Used for monthly
+      -- rollup bucketing after converting to ET in the UI.
+      created_at TEXT NOT NULL,
+      processed_at TEXT,
+      updated_at TEXT,
+      cancelled_at TEXT,
+      closed_at TEXT,
+      financial_status TEXT,    -- paid|partially_refunded|refunded|...
+      fulfillment_status TEXT,  -- fulfilled|partial|null
+      -- Sales channel: 'pos' | 'online_store' | 'shop' | 'facebook' | ...
+      -- 'shop' is the marketplace-facilitator exception — tax is remitted by
+      -- Shopify, NOT by us. Allocator + tax UI MUST honor this.
+      source_name TEXT,
+      -- Shopify location_id for the order. For POS = store of sale. For
+      -- online = fulfillment location. Joined to recon_entity_pos_locations.
+      location_id TEXT,
+      currency TEXT,
+      -- Money fields (denormalized for fast monthly rollup).
+      subtotal REAL,
+      total_tax REAL,
+      total_discounts REAL,
+      total_shipping REAL,
+      total_tips REAL,
+      total_price REAL,
+      total_refunded REAL DEFAULT 0,
+      -- Customer fields used for digital-GC allocation (buyer's zip).
+      customer_id TEXT,
+      customer_email TEXT,
+      billing_zip TEXT,
+      shipping_zip TEXT,
+      -- True if any line item is a gift card. Cached for fast filtering.
+      has_gift_card INTEGER NOT NULL DEFAULT 0,
+      -- 'channel_liable' rollup across line items. If TRUE, taxes for this
+      -- order are remitted by Shopify (Shop channel marketplace facilitator).
+      tax_channel_liable INTEGER NOT NULL DEFAULT 0,
+      -- Raw GraphQL/REST payload for forensics. Stored as JSON text.
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL,
+      -- Bumped whenever an update webhook re-syncs the row. Cheap idempotency.
+      ingest_version INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_created_at
+      ON recon_orders(created_at);
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_processed_at
+      ON recon_orders(processed_at);
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_location
+      ON recon_orders(location_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_source
+      ON recon_orders(source_name);
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_financial_status
+      ON recon_orders(financial_status);
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_has_gift_card
+      ON recon_orders(has_gift_card) WHERE has_gift_card = 1;
+  `);
+
+  // ----- Shopify line items -----
+  // One row per line item per order. Tax detail is kept inline (tax_lines_json)
+  // because per-line tax breakdown matters for NY county-level filings. The
+  // CRITICAL field is `tax_channel_liable`: when TRUE the tax on this line is
+  // remitted by Shopify (Shop channel) and must be EXCLUDED from our owed-tax
+  // calculation.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_line_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      product_id TEXT,
+      variant_id TEXT,
+      sku TEXT,
+      title TEXT,
+      variant_title TEXT,
+      quantity REAL NOT NULL DEFAULT 0,
+      price REAL,
+      total_discount REAL DEFAULT 0,
+      -- Pre-tax line subtotal = price * quantity - total_discount.
+      line_subtotal REAL,
+      -- Sum of taxes on this line (regardless of channel_liable).
+      line_tax_total REAL DEFAULT 0,
+      -- TRUE if at least one tax_line on this item has channel_liable=true.
+      -- Mirrored from order-level for fast filtering of Shop-channel sales.
+      tax_channel_liable INTEGER NOT NULL DEFAULT 0,
+      -- Full per-jurisdiction tax breakdown for NY county filings:
+      --   [{ title, rate, price, channel_liable, jurisdiction }, ...]
+      tax_lines_json TEXT,
+      -- True if this line item IS a gift-card sale (not a redemption).
+      is_gift_card INTEGER NOT NULL DEFAULT 0,
+      -- True if this line is a physical product requiring fulfillment.
+      requires_shipping INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_line_items_order
+      ON recon_line_items(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_line_items_sku
+      ON recon_line_items(sku);
+    CREATE INDEX IF NOT EXISTS idx_recon_line_items_is_gift_card
+      ON recon_line_items(is_gift_card) WHERE is_gift_card = 1;
+    CREATE INDEX IF NOT EXISTS idx_recon_line_items_channel_liable
+      ON recon_line_items(tax_channel_liable);
+  `);
+
+  // ----- Shopify payouts -----
+  // A payout = one deposit from Shopify Payments to the bank account. The
+  // Plaid matcher in PR #R5 will join recon_payouts.amount + deposit date to
+  // bank transactions on the deposit account.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_payouts (
+      id TEXT PRIMARY KEY,
+      -- 'date' in Shopify payouts API = settlement/deposit date.
+      payout_date TEXT NOT NULL,
+      currency TEXT,
+      amount REAL NOT NULL,
+      status TEXT,             -- scheduled|in_transit|paid|failed|cancelled
+      summary_json TEXT,       -- charges/refunds/adjustments/fees totals
+      -- Plaid match — set by the matcher in PR #R5. Null until matched.
+      plaid_transaction_id TEXT,
+      matched_at TEXT,
+      matched_by TEXT,         -- 'auto' | user email
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_payouts_date
+      ON recon_payouts(payout_date);
+    CREATE INDEX IF NOT EXISTS idx_recon_payouts_status
+      ON recon_payouts(status);
+    CREATE INDEX IF NOT EXISTS idx_recon_payouts_plaid_match
+      ON recon_payouts(plaid_transaction_id)
+      WHERE plaid_transaction_id IS NOT NULL;
+  `);
+
+  // ----- Balance transactions -----
+  // One row per line on a payout (charge, refund, fee, adjustment). Used to
+  // explain a payout to a per-order level and to attribute Shopify fees back
+  // to entities in Phase 2.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_balance_transactions (
+      id TEXT PRIMARY KEY,
+      payout_id TEXT REFERENCES recon_payouts(id) ON DELETE SET NULL,
+      -- charge|refund|adjustment|fee|payout|...
+      type TEXT NOT NULL,
+      -- ISO timestamp the transaction was created in Shopify.
+      processed_at TEXT,
+      -- Net amount that hit the payout. Positive = inflow, negative = refund/fee.
+      amount REAL NOT NULL,
+      fee REAL DEFAULT 0,
+      net REAL,
+      currency TEXT,
+      -- Source order, if applicable. Joined to recon_orders for attribution.
+      source_order_id TEXT,
+      -- Original transaction id this row refunds/adjusts, if applicable.
+      source_transaction_id TEXT,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_balance_txn_payout
+      ON recon_balance_transactions(payout_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_balance_txn_order
+      ON recon_balance_transactions(source_order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_balance_txn_type
+      ON recon_balance_transactions(type);
+  `);
+
+  // ----- Allocations -----
+  // Derived: the allocator computes one row per order per receiving entity.
+  // For most orders that's a single row (100% to the store of sale). Digital
+  // gift cards can split across multiple entities; in that case multiple rows
+  // share the same order_id with shares summing to 1.0.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_allocations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      -- Specific line item, when the allocation differs per line (e.g. a cart
+      -- with both a physical product AND a digital gift card). Null = order-level.
+      line_item_id TEXT REFERENCES recon_line_items(id) ON DELETE CASCADE,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      -- Share of the order/line attributed to this entity. 0..1.
+      share REAL NOT NULL,
+      -- Dollar amount this entity gets (pre-tax). Denormalized for fast rollup.
+      gross_amount REAL NOT NULL DEFAULT 0,
+      tax_amount REAL NOT NULL DEFAULT 0,
+      -- 'pos' | 'online_fulfillment' | 'gc_zip' | 'gc_pro_rata' | 'manual'
+      method TEXT NOT NULL,
+      -- For audit: 'zip:11743' | 'location_id:680...' | 'override_by:user@x' etc.
+      reason TEXT,
+      -- Manual override audit trail. Null when allocator-set.
+      overridden_by TEXT,
+      overridden_at TEXT,
+      -- The auto-computed method/entity BEFORE the override (so we can
+      -- diff in the UI and revert).
+      auto_method TEXT,
+      auto_entity_id INTEGER REFERENCES payroll_entities(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_allocations_order
+      ON recon_allocations(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_allocations_entity
+      ON recon_allocations(entity_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_allocations_method
+      ON recon_allocations(method);
+    CREATE INDEX IF NOT EXISTS idx_recon_allocations_overridden
+      ON recon_allocations(overridden_at) WHERE overridden_at IS NOT NULL;
+  `);
+
+  // ----- Gift cards issued -----
+  // The Shopify GC ledger: one row per card created. Used to compute prior-year
+  // pro-rata when the card was DIGITAL and is later redeemed. We also store
+  // the issuing order so we can audit "who originally paid for this card."
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_gift_cards (
+      id TEXT PRIMARY KEY,
+      -- Last 4 of the GC code, for matching at redemption time.
+      last_characters TEXT,
+      initial_value REAL NOT NULL,
+      balance REAL,
+      currency TEXT,
+      -- 'digital' = emailed, no shipping. 'physical' = card SKU shipped.
+      kind TEXT NOT NULL DEFAULT 'digital',
+      -- Order that purchased this card, if applicable.
+      issuing_order_id TEXT REFERENCES recon_orders(id) ON DELETE SET NULL,
+      issuing_line_item_id TEXT REFERENCES recon_line_items(id) ON DELETE SET NULL,
+      -- For digital GCs purchased online: buyer's zip captured at purchase.
+      -- Used by the allocator to route to nearest store.
+      buyer_zip TEXT,
+      -- Entity assigned at purchase time (the seller of the card). Used by
+      -- Phase 2 deferred-revenue JE.
+      issuing_entity_id INTEGER REFERENCES payroll_entities(id),
+      issued_at TEXT,
+      disabled_at TEXT,
+      expires_at TEXT,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_gift_cards_issuing_order
+      ON recon_gift_cards(issuing_order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gift_cards_issued_at
+      ON recon_gift_cards(issued_at);
+    CREATE INDEX IF NOT EXISTS idx_recon_gift_cards_kind
+      ON recon_gift_cards(kind);
+  `);
+
+  // ----- Gift card redemptions -----
+  // Each time a GC is used to pay (full or partial) for an order, we record
+  // one row here. Powers (a) the prior-year pro-rata calculation, and (b) the
+  // intercompany due-to/from JEs in Phase 2 when the issuer != redeemer entity.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_gift_card_redemptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      gift_card_id TEXT REFERENCES recon_gift_cards(id) ON DELETE SET NULL,
+      -- Order where the card was applied as payment.
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      amount REAL NOT NULL,
+      -- Entity that REDEEMED the card (where the order shipped/sold).
+      redeeming_entity_id INTEGER REFERENCES payroll_entities(id),
+      -- Snapshotted at redemption time so later edits to recon_gift_cards
+      -- don't break the historical intercompany trail.
+      issuing_entity_id INTEGER REFERENCES payroll_entities(id),
+      redeemed_at TEXT NOT NULL,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_order
+      ON recon_gift_card_redemptions(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_gc
+      ON recon_gift_card_redemptions(gift_card_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_redeemed_at
+      ON recon_gift_card_redemptions(redeemed_at);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_redeeming_entity
+      ON recon_gift_card_redemptions(redeeming_entity_id);
+  `);
+
+  // ----- Reconciler sync log -----
+  // Mirrors payroll_sync_log shape so the existing /api/sync-log UI can show
+  // both modules in one timeline. `cursor` stores the per-stream incremental
+  // watermark (e.g. 'updated_at_min=2026-04-15T00:00:00Z').
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_sync_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      -- 'orders' | 'payouts' | 'balance_transactions' | 'gift_cards' | 'allocator' | 'pro_rata_freeze'
+      kind TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,      -- running|success|failure
+      rows_ingested INTEGER DEFAULT 0,
+      cursor TEXT,               -- watermark for resume
+      error_message TEXT,
+      triggered_by TEXT          -- 'cron' | 'manual:<email>'
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_sync_log_kind_started
+      ON recon_sync_log(kind, started_at DESC);
+  `);
+
+  // ============================================================================
   // RBAC TABLES (PR #6)
   // ============================================================================
 
@@ -713,6 +1127,9 @@ function bootstrapSchema() {
   // Idempotent — safe to run on every boot.
   seedPayrollBaseline();
   seedRbacBaseline();
+  // Reconciler baseline (PR #R1): one settings row + entity_pos_locations
+  // shells seeded from the 3 payroll_entities. Idempotent.
+  seedReconcilerBaseline();
 }
 
 // ===== app_users helpers =====
@@ -1011,6 +1428,60 @@ function seedPayrollBaseline(): void {
     }
   } catch (e: any) {
     console.error('[storage] seedPayrollBaseline failed:', e.message);
+  }
+}
+
+// ============================================================================
+// RECONCILER BASELINE SEED (PR #R1)
+// ----------------------------------------------------------------------------
+// Inserts the singleton recon_settings row and one shell recon_entity_pos_
+// locations row per active payroll entity so the UI in PR #R2 can immediately
+// render the mapping table (the user will fill in shopify_location_id after
+// the first Shopify sync). Fully idempotent.
+// ============================================================================
+
+function seedReconcilerBaseline(): void {
+  try {
+    const now = new Date().toISOString();
+
+    // 1) Singleton settings row.
+    const settingsExists = sqlite.prepare(
+      `SELECT 1 FROM recon_settings WHERE id = 1 LIMIT 1`
+    ).get();
+    if (!settingsExists) {
+      sqlite.prepare(`
+        INSERT INTO recon_settings
+          (id, default_digital_gc_allocation_policy, initial_sync_from, updated_at, updated_by)
+        VALUES (1, 'zip_then_pro_rata', '2025-01-01', ?, 'seed')
+      `).run(now);
+      console.log(`[storage] Seeded recon_settings (singleton row)`);
+    }
+
+    // 2) One pos-location shell per active payroll entity, if missing.
+    // We don't yet know the Shopify location_id; the user maps it in PR #R2.
+    const entities = sqlite.prepare(
+      `SELECT id, location FROM payroll_entities WHERE active = 1 ORDER BY id`
+    ).all() as Array<{ id: number; location: string }>;
+    const insertLoc = sqlite.prepare(`
+      INSERT INTO recon_entity_pos_locations
+        (entity_id, shopify_location_id, shopify_location_name, kind, active, created_at, updated_at)
+      VALUES (?, NULL, ?, 'pos', 1, ?, ?)
+    `);
+    let seededLocs = 0;
+    for (const e of entities) {
+      const exists = sqlite.prepare(
+        `SELECT 1 FROM recon_entity_pos_locations WHERE entity_id = ? LIMIT 1`
+      ).get(e.id);
+      if (!exists) {
+        insertLoc.run(e.id, `${e.location} (unmapped)`, now, now);
+        seededLocs++;
+      }
+    }
+    if (seededLocs > 0) {
+      console.log(`[storage] Seeded ${seededLocs} recon_entity_pos_locations shells`);
+    }
+  } catch (e: any) {
+    console.error('[storage] seedReconcilerBaseline failed:', e.message);
   }
 }
 
@@ -2597,3 +3068,275 @@ export function deactivateEmployee(id: number): EmployeeRow | null {
   const today = new Date().toISOString().slice(0, 10);
   return updateEmployee(id, { active: 0, terminated_at: today });
 }
+
+// ============================================================================
+// RECONCILER STORAGE HELPERS (PR #R1)
+// ----------------------------------------------------------------------------
+// Minimal read/write helpers used by the API stubs in PR #R1 and the
+// ingest/allocator code in PR #R2-R4. Kept tight on purpose — anything more
+// elaborate (joins, rollups, etc.) will arrive with the consumer PR that
+// actually needs it.
+// ============================================================================
+
+// ----- recon_settings -----
+
+export function getReconSettings(): ReconSettings | null {
+  return (sqlite
+    .prepare(`SELECT * FROM recon_settings WHERE id = 1 LIMIT 1`)
+    .get() as ReconSettings) || null;
+}
+
+export function updateReconSettings(
+  patch: Partial<{
+    default_digital_gc_allocation_policy: ReconGcAllocationPolicy;
+    shopify_shop_domain: string | null;
+    initial_sync_from: string;
+    payout_bank_plaid_account_id: string | null;
+  }>,
+  updatedBy: string
+): ReconSettings | null {
+  // Ensure the singleton row exists (paranoia — seed should have created it).
+  if (!getReconSettings()) {
+    sqlite.prepare(`
+      INSERT INTO recon_settings
+        (id, default_digital_gc_allocation_policy, initial_sync_from, updated_at, updated_by)
+      VALUES (1, 'zip_then_pro_rata', '2025-01-01', ?, ?)
+    `).run(new Date().toISOString(), updatedBy);
+  }
+  const allowed: Array<keyof typeof patch> = [
+    "default_digital_gc_allocation_policy",
+    "shopify_shop_domain",
+    "initial_sync_from",
+    "payout_bank_plaid_account_id",
+  ];
+  const sets: string[] = [];
+  const vals: any[] = [];
+  for (const k of allowed) {
+    if (patch[k] !== undefined) {
+      sets.push(`${k} = ?`);
+      vals.push(patch[k] as any);
+    }
+  }
+  if (sets.length === 0) return getReconSettings();
+  sets.push(`updated_at = ?`);
+  vals.push(new Date().toISOString());
+  sets.push(`updated_by = ?`);
+  vals.push(updatedBy);
+  sqlite
+    .prepare(`UPDATE recon_settings SET ${sets.join(", ")} WHERE id = 1`)
+    .run(...vals);
+  return getReconSettings();
+}
+
+// ----- recon_entity_pos_locations -----
+
+export function listReconEntityPosLocations(): Array<
+  ReconEntityPosLocation & { entity_location: string | null }
+> {
+  return sqlite
+    .prepare(`
+      SELECT l.*, e.location AS entity_location
+      FROM recon_entity_pos_locations l
+      LEFT JOIN payroll_entities e ON e.id = l.entity_id
+      ORDER BY l.entity_id ASC, l.id ASC
+    `)
+    .all() as any;
+}
+
+export function setReconShopifyLocationMapping(
+  id: number,
+  shopify_location_id: string | null,
+  shopify_location_name: string | null
+): ReconEntityPosLocation | null {
+  const now = new Date().toISOString();
+  sqlite
+    .prepare(`
+      UPDATE recon_entity_pos_locations
+      SET shopify_location_id = ?, shopify_location_name = ?, updated_at = ?
+      WHERE id = ?
+    `)
+    .run(shopify_location_id, shopify_location_name, now, id);
+  return (sqlite
+    .prepare(`SELECT * FROM recon_entity_pos_locations WHERE id = ? LIMIT 1`)
+    .get(id) as ReconEntityPosLocation) || null;
+}
+
+// ----- recon_sync_log -----
+
+export type ReconSyncLogRow = {
+  id: number;
+  kind: string;
+  started_at: string;
+  finished_at: string | null;
+  status: "running" | "success" | "failure";
+  rows_ingested: number | null;
+  cursor: string | null;
+  error_message: string | null;
+  triggered_by: string | null;
+};
+
+export function listReconSyncLog(limit = 50): ReconSyncLogRow[] {
+  return sqlite
+    .prepare(
+      `SELECT * FROM recon_sync_log ORDER BY started_at DESC LIMIT ?`
+    )
+    .all(limit) as ReconSyncLogRow[];
+}
+
+export function startReconSync(
+  kind: string,
+  triggeredBy: string,
+  cursor: string | null = null
+): number {
+  const res = sqlite
+    .prepare(`
+      INSERT INTO recon_sync_log (kind, started_at, status, cursor, triggered_by, rows_ingested)
+      VALUES (?, ?, 'running', ?, ?, 0)
+    `)
+    .run(kind, new Date().toISOString(), cursor, triggeredBy);
+  return Number(res.lastInsertRowid);
+}
+
+export function finishReconSync(
+  id: number,
+  patch: {
+    status: "success" | "failure";
+    rows_ingested?: number;
+    cursor?: string | null;
+    error_message?: string | null;
+  }
+): void {
+  sqlite
+    .prepare(`
+      UPDATE recon_sync_log
+      SET finished_at = ?, status = ?, rows_ingested = ?, cursor = COALESCE(?, cursor), error_message = ?
+      WHERE id = ?
+    `)
+    .run(
+      new Date().toISOString(),
+      patch.status,
+      patch.rows_ingested ?? 0,
+      patch.cursor ?? null,
+      patch.error_message ?? null,
+      id,
+    );
+}
+
+// ----- recon_orders / line_items / payouts -----
+// Read-only stat helpers used by the API stubs (PR #R1) and the rollup UI
+// (PR #R5). Heavy joins live in later PRs.
+
+export type ReconCounts = {
+  orders: number;
+  line_items: number;
+  payouts: number;
+  balance_transactions: number;
+  gift_cards: number;
+  gift_card_redemptions: number;
+  allocations: number;
+  oldest_order_at: string | null;
+  newest_order_at: string | null;
+  oldest_payout_at: string | null;
+  newest_payout_at: string | null;
+};
+
+export function getReconCounts(): ReconCounts {
+  const c = (sql: string) =>
+    (sqlite.prepare(sql).get() as { c: number }).c;
+  const minMax = (sql: string) =>
+    (sqlite.prepare(sql).get() as { min: string | null; max: string | null });
+  const o = minMax(
+    `SELECT MIN(created_at) AS min, MAX(created_at) AS max FROM recon_orders`
+  );
+  const p = minMax(
+    `SELECT MIN(payout_date) AS min, MAX(payout_date) AS max FROM recon_payouts`
+  );
+  return {
+    orders: c(`SELECT COUNT(*) AS c FROM recon_orders`),
+    line_items: c(`SELECT COUNT(*) AS c FROM recon_line_items`),
+    payouts: c(`SELECT COUNT(*) AS c FROM recon_payouts`),
+    balance_transactions: c(`SELECT COUNT(*) AS c FROM recon_balance_transactions`),
+    gift_cards: c(`SELECT COUNT(*) AS c FROM recon_gift_cards`),
+    gift_card_redemptions: c(`SELECT COUNT(*) AS c FROM recon_gift_card_redemptions`),
+    allocations: c(`SELECT COUNT(*) AS c FROM recon_allocations`),
+    oldest_order_at: o.min,
+    newest_order_at: o.max,
+    oldest_payout_at: p.min,
+    newest_payout_at: p.max,
+  };
+}
+
+// ----- zip lookup + prior-year pro-rata (read helpers for now) -----
+
+export function getZipMapping(zip: string): {
+  zip: string;
+  entity_id: number | null;
+  distance_miles: number | null;
+  source: string;
+} | null {
+  return (sqlite
+    .prepare(`SELECT zip, entity_id, distance_miles, source FROM recon_zip_to_entity_lookup WHERE zip = ? LIMIT 1`)
+    .get(zip) as any) || null;
+}
+
+export function upsertZipMapping(
+  zip: string,
+  entityId: number | null,
+  distanceMiles: number | null,
+  source: "auto" | "manual",
+  updatedBy: string
+): void {
+  const now = new Date().toISOString();
+  sqlite
+    .prepare(`
+      INSERT INTO recon_zip_to_entity_lookup
+        (zip, entity_id, distance_miles, source, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(zip) DO UPDATE SET
+        entity_id = excluded.entity_id,
+        distance_miles = excluded.distance_miles,
+        source = excluded.source,
+        updated_at = excluded.updated_at,
+        updated_by = excluded.updated_by
+    `)
+    .run(zip, entityId, distanceMiles, source, now, updatedBy);
+}
+
+export function listPriorYearProRata(year: number): Array<{
+  entity_id: number;
+  entity_location: string | null;
+  share: number;
+  source_redemptions_total: number;
+  frozen_at: string;
+  frozen_by: string | null;
+}> {
+  return sqlite
+    .prepare(`
+      SELECT p.entity_id, e.location AS entity_location,
+             p.share, p.source_redemptions_total, p.frozen_at, p.frozen_by
+      FROM recon_prior_year_pro_rata p
+      LEFT JOIN payroll_entities e ON e.id = p.entity_id
+      WHERE p.applies_to_year = ?
+      ORDER BY p.entity_id ASC
+    `)
+    .all(year) as any;
+}
+
+// Lightweight allocator hint used by the rollup UI in PR #R5: returns the
+// allocation method enum string for a given Shopify location_id, or null if
+// the location isn't mapped yet.
+export function resolveEntityIdForLocation(
+  shopifyLocationId: string | null
+): number | null {
+  if (!shopifyLocationId) return null;
+  const row = sqlite
+    .prepare(`
+      SELECT entity_id FROM recon_entity_pos_locations
+      WHERE shopify_location_id = ? AND active = 1
+      LIMIT 1
+    `)
+    .get(shopifyLocationId) as { entity_id: number } | undefined;
+  return row?.entity_id ?? null;
+}
+
+// (allocation method type is imported from @shared/schema by callers directly)

@@ -77,6 +77,16 @@ import {
   createEmployee,
   updateEmployee,
   deactivateEmployee,
+  // Reconciler (PR #R1)
+  getReconSettings,
+  updateReconSettings,
+  listReconEntityPosLocations,
+  setReconShopifyLocationMapping,
+  getReconCounts,
+  listReconSyncLog,
+  getZipMapping,
+  upsertZipMapping,
+  listPriorYearProRata,
 } from "./storage";
 import { getUserPermissions, requirePermission } from "./rbac";
 import {
@@ -888,6 +898,92 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!getEmployeeById(id)) return res.status(404).json({ message: "Employee not found" });
     const updated = deactivateEmployee(id);
     res.json(updated);
+  });
+
+  // ============================================================================
+  // SHOPIFY RECONCILER (PR #R1)
+  // ----------------------------------------------------------------------------
+  // Minimal read-only API stubs that let PR #R2's Settings UI render the
+  // entity ↔ Shopify location mapping table and the global policy controls.
+  // No write path to orders/payouts/allocations yet — that arrives in PR #R2+.
+  // ============================================================================
+
+  app.get("/api/recon/settings", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(getReconSettings());
+  });
+
+  app.patch("/api/recon/settings", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const updatedBy = req.user?.email || "unknown";
+    const { default_digital_gc_allocation_policy, shopify_shop_domain, initial_sync_from, payout_bank_plaid_account_id } = req.body || {};
+    if (default_digital_gc_allocation_policy !== undefined) {
+      const allowed: string[] = ["zip_then_pro_rata", "pro_rata_only", "manual_only"];
+      if (!allowed.includes(default_digital_gc_allocation_policy)) {
+        return res.status(400).json({ message: `default_digital_gc_allocation_policy must be one of ${allowed.join(", ")}` });
+      }
+    }
+    if (initial_sync_from !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(initial_sync_from))) {
+      return res.status(400).json({ message: "initial_sync_from must be YYYY-MM-DD" });
+    }
+    const updated = updateReconSettings(
+      { default_digital_gc_allocation_policy, shopify_shop_domain, initial_sync_from, payout_bank_plaid_account_id },
+      updatedBy,
+    );
+    res.json(updated);
+  });
+
+  app.get("/api/recon/pos-locations", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(listReconEntityPosLocations());
+  });
+
+  app.patch("/api/recon/pos-locations/:id", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    const id = Number(req.params.id);
+    const { shopify_location_id, shopify_location_name } = req.body || {};
+    const updated = setReconShopifyLocationMapping(
+      id,
+      shopify_location_id != null ? String(shopify_location_id) : null,
+      shopify_location_name != null ? String(shopify_location_name) : null,
+    );
+    if (!updated) return res.status(404).json({ message: "Mapping not found" });
+    res.json(updated);
+  });
+
+  // Bird's-eye-view counters used by the Reconciler landing page so the user
+  // can see at a glance how much data has been ingested. Cheap COUNT(*)s only.
+  app.get("/api/recon/counts", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(getReconCounts());
+  });
+
+  // Sync log — shared shape with /api/payroll-sync-log so a single UI tab can
+  // show both ingest histories side by side.
+  app.get("/api/recon/sync-log", authMiddleware, requirePermission("system.view_sync_log"), (req, res) => {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    res.json(listReconSyncLog(limit));
+  });
+
+  // Zip lookup admin (read + manual override). Auto-resolution lives in PR #R4.
+  app.get("/api/recon/zip-lookup/:zip", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    res.json(getZipMapping(String(req.params.zip)) || null);
+  });
+
+  app.put("/api/recon/zip-lookup/:zip", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const zip = String(req.params.zip);
+    if (!/^\d{5}$/.test(zip)) return res.status(400).json({ message: "zip must be a 5-digit US zip" });
+    const { entity_id, distance_miles } = req.body || {};
+    const entityId = entity_id == null ? null : Number(entity_id);
+    const dist = distance_miles == null ? null : Number(distance_miles);
+    upsertZipMapping(zip, entityId, dist, "manual", req.user?.email || "unknown");
+    res.json(getZipMapping(zip));
+  });
+
+  // Prior-year frozen pro-rata snapshot — read-only in PR #R1. The freeze
+  // computation arrives in PR #R4 (allocator) and is triggered manually from
+  // the Settings UI once per year.
+  app.get("/api/recon/prior-year-pro-rata/:year", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const year = Number(req.params.year);
+    if (!Number.isInteger(year) || year < 2000 || year > 3000) {
+      return res.status(400).json({ message: "year must be a 4-digit integer" });
+    }
+    res.json(listPriorYearProRata(year));
   });
 
   // ---- Health ----
