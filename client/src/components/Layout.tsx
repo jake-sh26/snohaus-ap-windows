@@ -23,6 +23,7 @@ import {
   Wrench,
   Building2,
   Users,
+  Scale,
 } from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
@@ -76,6 +77,13 @@ const NAV_SECTIONS: NavSection[] = [
       { href: "/payroll", label: "Overview", icon: Wrench },
       { href: "/payroll/entities", label: "Entities", icon: Building2 },
       { href: "/payroll/employees", label: "Employees", icon: Users },
+    ],
+  },
+  {
+    label: "Reconciler",
+    icon: Scale,
+    items: [
+      { href: "/reconciler/test", label: "Test Console", icon: Wrench },
     ],
   },
   {
