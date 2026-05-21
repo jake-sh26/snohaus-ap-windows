@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -58,6 +58,45 @@ type InstalledStatus = {
   lastUsedAt: string | null;
 };
 type InstallUrl = { url: string };
+type OrdersSummary = {
+  total_orders: number;
+  total_line_items: number;
+  earliest_order_at: string | null;
+  latest_order_at: string | null;
+  gross_total: number;
+  gross_tax: number;
+  gross_discounts: number;
+  gross_refunded: number;
+  by_month: Array<{ month: string; orders: number; total: number; tax: number; discounts: number }>;
+  by_channel: Array<{ source_name: string | null; orders: number; total: number }>;
+  by_location: Array<{ location_id: string | null; orders: number; total: number }>;
+  by_financial_status: Array<{ financial_status: string | null; orders: number }>;
+  gift_card_orders: number;
+  channel_liable_orders: number;
+};
+
+function money(n: number | null | undefined): string {
+  if (n == null) return "—";
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+}
+function num(n: number | null | undefined): string {
+  if (n == null) return "—";
+  return n.toLocaleString("en-US");
+}
+function shortDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  } catch {
+    return iso;
+  }
+}
+function monthLabel(yyyyMm: string): string {
+  // "2026-05" → "May 2026"
+  const [y, m] = yyyyMm.split("-").map(Number);
+  if (!y || !m) return yyyyMm;
+  return new Date(y, m - 1, 1).toLocaleDateString("en-US", { year: "numeric", month: "short" });
+}
 
 // ----- helpers -----
 async function jsonGet<T>(path: string): Promise<T> { const r = await apiRequest("GET", path); return r.json() as Promise<T>; }
@@ -171,6 +210,12 @@ export default function ReconcilerTest() {
       qc.invalidateQueries({ queryKey: ["/api/auth/shopify/installed-status"] });
       qc.invalidateQueries({ queryKey: ["/api/recon/shopify/status"] });
     },
+  });
+
+  // --- Orders summary (PR #R2f) ---
+  const summaryQ = useQuery<OrdersSummary>({
+    queryKey: ["/api/recon/shopify/orders-summary"],
+    refetchInterval: 30_000,
   });
 
   const cfg = statusQ.data;
@@ -397,6 +442,150 @@ export default function ReconcilerTest() {
                 </div>
               )}
             </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ===== 2b. Orders summary — PR #R2f ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><BarChart3 className="size-4" /> Orders summary</CardTitle>
+          <CardDescription>
+            What's in the database after the backfill. Sanity-check totals, date range, and per-month volume before moving to allocation.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {summaryQ.isLoading && <div className="text-sm text-muted-foreground">Loading…</div>}
+          {summaryQ.data && (
+            <>
+              {/* Top-line metrics */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground">Total orders</div>
+                  <div className="text-2xl font-semibold">{num(summaryQ.data.total_orders)}</div>
+                  <div className="text-xs text-muted-foreground mt-0.5">{num(summaryQ.data.total_line_items)} line items</div>
+                </div>
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground">Gross sales</div>
+                  <div className="text-2xl font-semibold">{money(summaryQ.data.gross_total)}</div>
+                  <div className="text-xs text-muted-foreground mt-0.5">Tax: {money(summaryQ.data.gross_tax)}</div>
+                </div>
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground">Discounts</div>
+                  <div className="text-2xl font-semibold">{money(summaryQ.data.gross_discounts)}</div>
+                  <div className="text-xs text-muted-foreground mt-0.5">Refunded: {money(summaryQ.data.gross_refunded)}</div>
+                </div>
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground flex items-center gap-1"><CalendarRange className="size-3" /> Date range</div>
+                  <div className="text-sm font-semibold mt-1">{shortDate(summaryQ.data.earliest_order_at)}</div>
+                  <div className="text-xs text-muted-foreground">to {shortDate(summaryQ.data.latest_order_at)}</div>
+                </div>
+              </div>
+
+              {/* Flags */}
+              <div className="flex flex-wrap gap-2 text-xs">
+                <Badge variant="outline">Gift card orders: {num(summaryQ.data.gift_card_orders)}</Badge>
+                <Badge variant="outline">Shop-channel (tax remitted by Shopify): {num(summaryQ.data.channel_liable_orders)}</Badge>
+              </div>
+
+              {/* Per-month */}
+              <div>
+                <div className="text-sm font-medium mb-1.5 flex items-center gap-1.5"><CalendarRange className="size-4" /> By month</div>
+                <div className="border rounded-md overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="bg-muted/50 text-xs text-muted-foreground">
+                      <tr>
+                        <th className="text-left px-3 py-1.5 font-medium">Month</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Orders</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Gross</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Tax</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Discounts</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {summaryQ.data.by_month.map((r) => (
+                        <tr key={r.month} className="border-t">
+                          <td className="px-3 py-1.5">{monthLabel(r.month)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{num(r.orders)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{money(r.total)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{money(r.tax)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{money(r.discounts)}</td>
+                        </tr>
+                      ))}
+                      {summaryQ.data.by_month.length === 0 && (
+                        <tr><td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">No orders yet</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Per-channel + per-location side-by-side */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <div className="text-sm font-medium mb-1.5 flex items-center gap-1.5"><Store className="size-4" /> By channel</div>
+                  <div className="border rounded-md overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50 text-xs text-muted-foreground">
+                        <tr>
+                          <th className="text-left px-3 py-1.5 font-medium">Source</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Orders</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Gross</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {summaryQ.data.by_channel.map((r, i) => (
+                          <tr key={`${r.source_name ?? "null"}-${i}`} className="border-t">
+                            <td className="px-3 py-1.5 font-mono text-xs">{r.source_name ?? "(unknown)"}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{num(r.orders)}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{money(r.total)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-sm font-medium mb-1.5 flex items-center gap-1.5"><Store className="size-4" /> By location</div>
+                  <div className="border rounded-md overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50 text-xs text-muted-foreground">
+                        <tr>
+                          <th className="text-left px-3 py-1.5 font-medium">Location ID</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Orders</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Gross</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {summaryQ.data.by_location.map((r, i) => (
+                          <tr key={`${r.location_id ?? "null"}-${i}`} className="border-t">
+                            <td className="px-3 py-1.5 font-mono text-xs">{r.location_id ?? "(unassigned)"}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{num(r.orders)}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{money(r.total)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              {/* Financial status */}
+              <div>
+                <div className="text-sm font-medium mb-1.5">By financial status</div>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {summaryQ.data.by_financial_status.map((r, i) => (
+                    <Badge key={`${r.financial_status ?? "null"}-${i}`} variant="secondary">
+                      {r.financial_status ?? "(unknown)"}: {num(r.orders)}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+
+              <Button size="sm" variant="outline" onClick={() => summaryQ.refetch()}>
+                <RefreshCw className="size-4 mr-1.5" /> Refresh summary
+              </Button>
+            </>
           )}
         </CardContent>
       </Card>

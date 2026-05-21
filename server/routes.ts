@@ -91,6 +91,7 @@ import {
   listReconOrdersSample,
   getReconOrderWithLines,
   getReconOrdersWatermark,
+  getReconOrdersSummary,
 } from "./storage";
 import {
   getShopifyReconConfig,
@@ -1092,6 +1093,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/recon/orders", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
     res.json(listReconOrdersSample(limit));
+  });
+
+  // Aggregated summary of all ingested orders — powers the "Orders summary"
+  // card in the Test Console. Totals, date range, per-month/channel/location
+  // breakdowns. Read-only (PR #R2f).
+  app.get("/api/recon/shopify/orders-summary", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(getReconOrdersSummary());
   });
 
   // Single order detail (order + line items) for spot-checking tax_channel_liable.
