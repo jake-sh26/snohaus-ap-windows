@@ -16,16 +16,20 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2 } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
+type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
 type Status = {
   configured: boolean;
   shopDomain: string | null;
   apiVersion: string | null;
   publicBaseUrl: string | null;
+  authMode: "client_credentials" | "static_token" | "none";
+  tokenStatus: TokenStatus;
   missing: string[];
 };
+type TokenRefreshResult = { ok: boolean; tokenPrefix?: string; tokenLength?: number; tokenStatus?: TokenStatus; authMode?: string; error?: string };
 type Ping = { ok: boolean; shopName: string | null; myshopifyDomain: string | null; primaryLocationId: string | null; error?: string };
 type Watermark = { orders_watermark: string | null };
 type SyncResult = { pages: number; ordersIngested: number; inserted: number; updated: number; watermark: string | null; syncLogId: number; error?: string };
@@ -120,6 +124,13 @@ export default function ReconcilerTest() {
     mutationFn: () => jsonDelete("/api/recon/shopify/webhooks"),
     onSuccess: (r) => setLastAction(`Deleted ${r.deleted} webhook(s)`),
   });
+  const refreshTokenMut = useMutation<TokenRefreshResult>({
+    mutationFn: () => jsonPost("/api/recon/shopify/token/refresh"),
+    onSuccess: (r) => {
+      setLastAction(r.ok ? `Token minted: ${r.tokenPrefix}… (${r.tokenLength} chars)` : `Token mint failed: ${r.error}`);
+      qc.invalidateQueries({ queryKey: ["/api/recon/shopify/status"] });
+    },
+  });
   const clearErrorsMut = useMutation<{ ok: boolean }>({
     mutationFn: () => jsonDelete("/api/recon/shopify/error-log"),
     onSuccess: () => {
@@ -167,6 +178,19 @@ export default function ReconcilerTest() {
               <div className="font-mono text-xs">{cfg.apiVersion ?? "—"}</div>
               <div className="font-medium">Public base URL</div>
               <div className="font-mono text-xs break-all">{cfg.publicBaseUrl ?? "—"}</div>
+              <div className="font-medium">Auth mode</div>
+              <div className="font-mono text-xs">
+                {cfg.authMode === "client_credentials" ? "client_credentials (auto-mint)"
+                  : cfg.authMode === "static_token" ? "static_token (override)"
+                  : "—"}
+              </div>
+              <div className="font-medium">Access token</div>
+              <div className="font-mono text-xs">
+                {cfg.tokenStatus?.hasToken
+                  ? <span className="text-green-700">cached — expires in {Math.floor((cfg.tokenStatus.expiresInSec ?? 0) / 60)} min</span>
+                  : cfg.authMode === "static_token" ? <span className="text-muted-foreground">using static token from .env</span>
+                  : <span className="text-amber-700">not minted yet</span>}
+              </div>
               {cfg.missing.length > 0 && (
                 <>
                   <div className="font-medium text-red-700">Missing env</div>
@@ -181,10 +205,33 @@ export default function ReconcilerTest() {
               {pingMut.isPending ? <RefreshCw className="size-4 mr-1.5 animate-spin" /> : <Plug className="size-4 mr-1.5" />}
               Ping Shopify
             </Button>
+            <Button size="sm" variant="outline" onClick={() => refreshTokenMut.mutate()} disabled={!configured || cfg?.authMode !== "client_credentials" || refreshTokenMut.isPending}>
+              {refreshTokenMut.isPending ? <RefreshCw className="size-4 mr-1.5 animate-spin" /> : <KeyRound className="size-4 mr-1.5" />}
+              Mint fresh token
+            </Button>
             <Button size="sm" variant="outline" onClick={() => statusQ.refetch()}>
               <RefreshCw className="size-4 mr-1.5" /> Refresh status
             </Button>
           </div>
+
+          {refreshTokenMut.data && (
+            <div className={`text-sm rounded-md border p-3 ${refreshTokenMut.data.ok ? "border-green-200 bg-green-50" : "border-red-200 bg-red-50"}`}>
+              {refreshTokenMut.data.ok ? (
+                <>
+                  <div className="font-medium text-green-800">Token minted</div>
+                  <div className="text-xs text-green-700 mt-1 font-mono">{refreshTokenMut.data.tokenPrefix}… ({refreshTokenMut.data.tokenLength} chars)</div>
+                  {refreshTokenMut.data.tokenStatus?.expiresInSec != null && (
+                    <div className="text-xs text-green-700">Expires in {Math.floor(refreshTokenMut.data.tokenStatus.expiresInSec / 60)} min</div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="font-medium text-red-800">Token mint failed</div>
+                  <div className="text-xs text-red-700 mt-1">{refreshTokenMut.data.error ?? "Unknown error"}</div>
+                </>
+              )}
+            </div>
+          )}
 
           {pingMut.data && (
             <div className={`text-sm rounded-md border p-3 ${pingMut.data.ok ? "border-green-200 bg-green-50" : "border-red-200 bg-red-50"}`}>
