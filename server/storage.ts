@@ -775,6 +775,26 @@ function bootstrapSchema() {
       ON recon_prior_year_pro_rata(applies_to_year);
   `);
 
+  // ----- Shopify OAuth tokens (PR #R2e) -----
+  // Storage for Admin API access tokens minted via the OAuth authorization code
+  // grant. One row per shop_domain (we only have one shop in practice, but the
+  // schema doesn't lock us in). When present, this token is preferred over the
+  // static SHOPIFY_ADMIN_TOKEN env var — it's how the install flow gives us a
+  // real shpat_ Admin API token.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_shopify_oauth_tokens (
+      shop_domain TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      scope TEXT,
+      -- 'offline' (permanent) or 'online' (expires). We use offline.
+      token_type TEXT NOT NULL DEFAULT 'offline',
+      installed_at TEXT NOT NULL,
+      installed_by TEXT,
+      -- Most recent successful API call — helps debug stale-token errors.
+      last_used_at TEXT
+    );
+  `);
+
   // ----- Shopify orders -----
   // We mirror the fields we need for allocation + tax breakdown. Anything we
   // don't need is left in `raw_json` for later forensics without a re-pull.
@@ -3126,6 +3146,62 @@ export function updateReconSettings(
     .prepare(`UPDATE recon_settings SET ${sets.join(", ")} WHERE id = 1`)
     .run(...vals);
   return getReconSettings();
+}
+
+// ----- recon_shopify_oauth_tokens (PR #R2e) -----
+
+export type ShopifyOAuthToken = {
+  shop_domain: string;
+  access_token: string;
+  scope: string | null;
+  token_type: string;
+  installed_at: string;
+  installed_by: string | null;
+  last_used_at: string | null;
+};
+
+/** Get the stored OAuth token for a shop, or null if not installed yet. */
+export function getShopifyOAuthToken(shopDomain: string): ShopifyOAuthToken | null {
+  return (sqlite
+    .prepare(`SELECT * FROM recon_shopify_oauth_tokens WHERE shop_domain = ? LIMIT 1`)
+    .get(shopDomain) as ShopifyOAuthToken) || null;
+}
+
+/** Upsert the token after a successful OAuth code exchange. */
+export function upsertShopifyOAuthToken(
+  shopDomain: string,
+  accessToken: string,
+  scope: string | null,
+  installedBy: string,
+): void {
+  const now = new Date().toISOString();
+  sqlite.prepare(`
+    INSERT INTO recon_shopify_oauth_tokens (shop_domain, access_token, scope, token_type, installed_at, installed_by)
+    VALUES (?, ?, ?, 'offline', ?, ?)
+    ON CONFLICT(shop_domain) DO UPDATE SET
+      access_token = excluded.access_token,
+      scope = excluded.scope,
+      installed_at = excluded.installed_at,
+      installed_by = excluded.installed_by
+  `).run(shopDomain, accessToken, scope, now, installedBy);
+}
+
+/** Touch last_used_at so the UI can show "last successful call”. Fire-and-forget. */
+export function touchShopifyOAuthTokenUsed(shopDomain: string): void {
+  try {
+    sqlite
+      .prepare(`UPDATE recon_shopify_oauth_tokens SET last_used_at = ? WHERE shop_domain = ?`)
+      .run(new Date().toISOString(), shopDomain);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+/** Wipe the token — used when the user uninstalls the app or wants to re-auth. */
+export function deleteShopifyOAuthToken(shopDomain: string): void {
+  sqlite
+    .prepare(`DELETE FROM recon_shopify_oauth_tokens WHERE shop_domain = ?`)
+    .run(shopDomain);
 }
 
 // ----- recon_entity_pos_locations -----

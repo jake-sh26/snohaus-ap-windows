@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -50,6 +50,14 @@ type WebhookRegResult = {
   topics: string[];
   results: Array<{ topic: string; state: string; address: string; webhookId: string | null; error?: string }>;
 };
+type InstalledStatus = {
+  installed: boolean;
+  shopDomain: string | null;
+  scopes: string[] | null;
+  installedAt: string | null;
+  lastUsedAt: string | null;
+};
+type InstallUrl = { url: string };
 
 // ----- helpers -----
 async function jsonGet<T>(path: string): Promise<T> { const r = await apiRequest("GET", path); return r.json() as Promise<T>; }
@@ -136,6 +144,32 @@ export default function ReconcilerTest() {
     onSuccess: () => {
       setLastAction("Error log cleared");
       qc.invalidateQueries({ queryKey: ["/api/recon/shopify/error-log"] });
+    },
+  });
+
+  // --- OAuth install status (PR #R2e) ---
+  const installedQ = useQuery<InstalledStatus>({
+    queryKey: ["/api/auth/shopify/installed-status"],
+    refetchInterval: 10_000,
+  });
+  const installMut = useMutation<InstallUrl>({
+    mutationFn: () => jsonGet<InstallUrl>("/api/auth/shopify/install-url"),
+    onSuccess: (r) => {
+      if (r?.url) {
+        setLastAction("Opening Shopify install page in a new tab…");
+        window.open(r.url, "_blank", "noopener,noreferrer");
+      } else {
+        setLastAction("Could not build install URL");
+      }
+    },
+    onError: (e: any) => setLastAction(`Install URL error: ${e?.message ?? "unknown"}`),
+  });
+  const deleteTokenMut = useMutation<{ ok: boolean; deleted: boolean }>({
+    mutationFn: () => jsonDelete("/api/auth/shopify/token"),
+    onSuccess: (r) => {
+      setLastAction(r.deleted ? "Stored Shopify token removed" : "No stored token to remove");
+      qc.invalidateQueries({ queryKey: ["/api/auth/shopify/installed-status"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/shopify/status"] });
     },
   });
 
@@ -247,6 +281,88 @@ export default function ReconcilerTest() {
                   <div className="text-xs text-red-700 mt-1">{pingMut.data.error ?? "Unknown error"}</div>
                 </>
               )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ===== 1b. App install (OAuth) — PR #R2e ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><ShieldCheck className="size-4" /> App install (Admin API token)</CardTitle>
+          <CardDescription>
+            Installs the custom Shopify app on your store and stores the Admin API token. Required before Ping or sync will work.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {installedQ.isLoading && <div className="text-sm text-muted-foreground">Checking install status…</div>}
+          {installedQ.data && (
+            <div className="flex items-center gap-2 text-sm">
+              {installedQ.data.installed ? (
+                <>
+                  <CheckCircle2 className="size-4 text-green-600" />
+                  <span className="font-medium text-green-800">Installed</span>
+                  <span className="text-muted-foreground">on {installedQ.data.shopDomain ?? "—"}</span>
+                </>
+              ) : (
+                <>
+                  <XCircle className="size-4 text-red-600" />
+                  <span className="font-medium text-red-800">Not installed</span>
+                  <span className="text-muted-foreground">— click below to install</span>
+                </>
+              )}
+            </div>
+          )}
+
+          {installedQ.data?.installed && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-muted-foreground">
+              <div>Installed: <span className="font-mono">{shortTime(installedQ.data.installedAt)}</span></div>
+              <div>Last used: <span className="font-mono">{shortTime(installedQ.data.lastUsedAt)}</span></div>
+              {installedQ.data.scopes && installedQ.data.scopes.length > 0 && (
+                <div className="md:col-span-2">
+                  Scopes: <span className="font-mono">{installedQ.data.scopes.join(", ")}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-2 pt-1">
+            <Button
+              size="sm"
+              onClick={() => installMut.mutate()}
+              disabled={!configured || installMut.isPending}
+            >
+              {installMut.isPending ? <RefreshCw className="size-4 mr-1.5 animate-spin" /> : <ExternalLink className="size-4 mr-1.5" />}
+              {installedQ.data?.installed ? "Reinstall via OAuth" : "Install via OAuth"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => installedQ.refetch()}
+            >
+              <RefreshCw className="size-4 mr-1.5" /> Refresh
+            </Button>
+            {installedQ.data?.installed && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  if (confirm("Remove the stored Shopify token? You'll need to reinstall to use Admin API calls again.")) {
+                    deleteTokenMut.mutate();
+                  }
+                }}
+                disabled={deleteTokenMut.isPending}
+                className="text-red-700 hover:text-red-800"
+              >
+                <Trash2 className="size-4 mr-1.5" /> Remove stored token
+              </Button>
+            )}
+          </div>
+
+          {!configured && (
+            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md p-2">
+              Set <span className="font-mono">SHOPIFY_SHOP_DOMAIN</span>, <span className="font-mono">SHOPIFY_CLIENT_ID</span>,
+              <span className="font-mono"> SHOPIFY_API_SECRET</span>, and <span className="font-mono">SHOPIFY_PUBLIC_BASE_URL</span> in .env before installing.
             </div>
           )}
         </CardContent>
