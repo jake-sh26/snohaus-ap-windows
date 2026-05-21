@@ -3622,6 +3622,111 @@ export function listReconOrdersSample(limit = 50): Array<{
 }
 
 /**
+ * Aggregated orders summary for the Test Console "Orders summary" card.
+ * Returns total count, date range, per-month, per-channel, and per-location
+ * breakdowns. Used to sanity-check the backfill and to spot thin months
+ * before PR #R5 builds the real rollup UI.
+ */
+export type ReconOrdersSummary = {
+  total_orders: number;
+  total_line_items: number;
+  earliest_order_at: string | null;
+  latest_order_at: string | null;
+  gross_total: number;
+  gross_tax: number;
+  gross_discounts: number;
+  gross_refunded: number;
+  by_month: Array<{ month: string; orders: number; total: number; tax: number; discounts: number }>;
+  by_channel: Array<{ source_name: string | null; orders: number; total: number }>;
+  by_location: Array<{ location_id: string | null; orders: number; total: number }>;
+  by_financial_status: Array<{ financial_status: string | null; orders: number }>;
+  gift_card_orders: number;
+  channel_liable_orders: number;
+};
+
+export function getReconOrdersSummary(): ReconOrdersSummary {
+  const totals = sqlite
+    .prepare(`
+      SELECT
+        COUNT(*)                            AS total_orders,
+        MIN(created_at)                     AS earliest_order_at,
+        MAX(created_at)                     AS latest_order_at,
+        COALESCE(SUM(total_price), 0)       AS gross_total,
+        COALESCE(SUM(total_tax), 0)         AS gross_tax,
+        COALESCE(SUM(total_discounts), 0)   AS gross_discounts,
+        COALESCE(SUM(total_refunded), 0)    AS gross_refunded,
+        SUM(has_gift_card)                  AS gift_card_orders,
+        SUM(tax_channel_liable)             AS channel_liable_orders
+      FROM recon_orders
+    `)
+    .get() as any;
+
+  const total_line_items =
+    (sqlite.prepare(`SELECT COUNT(*) AS c FROM recon_line_items`).get() as { c: number }).c;
+
+  // Per-month buckets keyed by YYYY-MM in UTC (UI converts to ET for display).
+  const by_month = sqlite
+    .prepare(`
+      SELECT
+        substr(created_at, 1, 7)            AS month,
+        COUNT(*)                            AS orders,
+        COALESCE(SUM(total_price), 0)       AS total,
+        COALESCE(SUM(total_tax), 0)         AS tax,
+        COALESCE(SUM(total_discounts), 0)   AS discounts
+      FROM recon_orders
+      GROUP BY substr(created_at, 1, 7)
+      ORDER BY month DESC
+      LIMIT 36
+    `)
+    .all() as Array<{ month: string; orders: number; total: number; tax: number; discounts: number }>;
+
+  const by_channel = sqlite
+    .prepare(`
+      SELECT source_name, COUNT(*) AS orders, COALESCE(SUM(total_price), 0) AS total
+      FROM recon_orders
+      GROUP BY source_name
+      ORDER BY orders DESC
+    `)
+    .all() as Array<{ source_name: string | null; orders: number; total: number }>;
+
+  const by_location = sqlite
+    .prepare(`
+      SELECT location_id, COUNT(*) AS orders, COALESCE(SUM(total_price), 0) AS total
+      FROM recon_orders
+      GROUP BY location_id
+      ORDER BY orders DESC
+      LIMIT 20
+    `)
+    .all() as Array<{ location_id: string | null; orders: number; total: number }>;
+
+  const by_financial_status = sqlite
+    .prepare(`
+      SELECT financial_status, COUNT(*) AS orders
+      FROM recon_orders
+      GROUP BY financial_status
+      ORDER BY orders DESC
+    `)
+    .all() as Array<{ financial_status: string | null; orders: number }>;
+
+  return {
+    total_orders: totals.total_orders ?? 0,
+    total_line_items,
+    earliest_order_at: totals.earliest_order_at ?? null,
+    latest_order_at: totals.latest_order_at ?? null,
+    gross_total: Number(totals.gross_total ?? 0),
+    gross_tax: Number(totals.gross_tax ?? 0),
+    gross_discounts: Number(totals.gross_discounts ?? 0),
+    gross_refunded: Number(totals.gross_refunded ?? 0),
+    by_month,
+    by_channel,
+    by_location,
+    by_financial_status,
+    gift_card_orders: Number(totals.gift_card_orders ?? 0),
+    channel_liable_orders: Number(totals.channel_liable_orders ?? 0),
+  };
+}
+
+/**
  * Single order detail including its line items — used by the test UI to
  * sanity-check the tax_channel_liable rollup against per-line tax_lines_json.
  */
