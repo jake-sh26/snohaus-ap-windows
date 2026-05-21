@@ -93,11 +93,14 @@ import {
   getReconOrdersWatermark,
 } from "./storage";
 import {
+  getShopifyReconConfig,
   getShopifyReconStatus,
   pingShopify,
   listShopifyLocations,
   getShopifyReconErrorLog,
   clearShopifyReconErrorLog,
+  getShopifyAccessToken,
+  clearShopifyTokenCache,
 } from "./shopify-recon";
 import {
   syncOrdersIncremental,
@@ -1025,6 +1028,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/recon/shopify/ping", authMiddleware, requirePermission("system.manage_config"), async (_req, res) => {
     const r = await pingShopify();
     res.status(r.ok ? 200 : 502).json(r);
+  });
+
+  // Force-mint a fresh Admin API token via the client_credentials grant.
+  // Clears the in-memory cache first so the user can verify credentials
+  // without restarting the server. Returns a redacted preview + expiry only.
+  app.post("/api/recon/shopify/token/refresh", authMiddleware, requirePermission("system.manage_config"), async (_req, res) => {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ ok: false, error: "Shopify reconciler not configured" });
+    try {
+      clearShopifyTokenCache();
+      const token = await getShopifyAccessToken(cfg, { forceRefresh: true });
+      // Don't leak the full token to the client — only show prefix + length.
+      const prefix = token.slice(0, 8);
+      const status = getShopifyReconStatus();
+      res.json({
+        ok: true,
+        tokenPrefix: prefix,
+        tokenLength: token.length,
+        tokenStatus: status.tokenStatus,
+        authMode: status.authMode,
+      });
+    } catch (e: any) {
+      res.status(502).json({ ok: false, error: e?.message ?? String(e) });
+    }
   });
 
   // List Shopify locations — populates the Settings dropdown next to each

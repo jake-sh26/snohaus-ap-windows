@@ -10,17 +10,23 @@
  * Auth: Shopify "app automation token" (modern replacement for legacy
  * custom-app `shpat_*` tokens — those were deprecated Jan 1, 2026).
  *
- * Env vars (no-op when any are missing):
+ * Env vars (no-op when any required ones are missing):
  *   SHOPIFY_SHOP_DOMAIN       e.g. sundown-ski-patio-greenvale.myshopify.com
- *   SHOPIFY_ADMIN_TOKEN       access token. Both formats supported:
- *                             - atkn_<64chars> (newer "app access token", post-Jan-2026):
- *                               sent as `Authorization: Bearer <token>`
- *                             - shpat_<...> / shpca_<...> (legacy custom app + client_credentials):
- *                               sent as `X-Shopify-Access-Token: <token>`
- *                             We detect by prefix and set the right header automatically.
- *   SHOPIFY_API_SECRET        client secret — used for webhook HMAC verification
+ *   SHOPIFY_CLIENT_ID         App Client ID — used to mint Admin API tokens via
+ *                             the OAuth 2.0 client_credentials grant. This is
+ *                             the recommended path for server-to-server work
+ *                             post-Jan-2026 (shpat_ tokens minted this way
+ *                             expire after 24h, so we cache + auto-refresh).
+ *   SHOPIFY_API_SECRET        Client Secret — used both for client_credentials
+ *                             token minting AND for webhook HMAC verification.
  *   SHOPIFY_API_VERSION       e.g. 2026-04
  *   SHOPIFY_PUBLIC_BASE_URL   public ngrok/edge URL used for webhook callbacks
+ *
+ *   SHOPIFY_ADMIN_TOKEN       (optional override) skip client_credentials and
+ *                             use a static token. Auto-detected by prefix:
+ *                             - atkn_*  → `Authorization: Bearer <token>`
+ *                             - other   → `X-Shopify-Access-Token: <token>`
+ *                             Mostly useful for testing with a hand-minted token.
  */
 
 import { recordIntegrationError, recordIntegrationWarn, getIntegrationErrorLog, clearIntegrationErrorLog } from "./error-log";
@@ -32,25 +38,34 @@ export function clearShopifyReconErrorLog() { clearIntegrationErrorLog("shopify-
 
 export type ShopifyReconConfig = {
   shopDomain: string;
-  adminToken: string;
+  // EITHER clientId is set (preferred — we'll mint shpat_ tokens via OAuth)
+  // OR adminToken is set (manual override path).
+  clientId: string | null;
+  adminToken: string | null;
   apiSecret: string;
   apiVersion: string;
   publicBaseUrl: string;
 };
 
 /**
- * Returns the env config or null when ANY required var is missing. Callers
- * MUST gracefully no-op on null — the module must not throw at boot in
+ * Returns the env config or null when REQUIRED vars are missing. Required:
+ *   - SHOPIFY_SHOP_DOMAIN, SHOPIFY_API_SECRET, SHOPIFY_API_VERSION,
+ *     SHOPIFY_PUBLIC_BASE_URL
+ *   - AT LEAST ONE of (SHOPIFY_CLIENT_ID, SHOPIFY_ADMIN_TOKEN)
+ *
+ * Callers MUST gracefully no-op on null — the module must not throw at boot in
  * unconfigured environments (mirrors the acumatica.ts / gmail.ts pattern).
  */
 export function getShopifyReconConfig(): ShopifyReconConfig | null {
   const shopDomain = (process.env.SHOPIFY_SHOP_DOMAIN || "").trim();
-  const adminToken = (process.env.SHOPIFY_ADMIN_TOKEN || "").trim();
+  const clientId = (process.env.SHOPIFY_CLIENT_ID || "").trim() || null;
+  const adminToken = (process.env.SHOPIFY_ADMIN_TOKEN || "").trim() || null;
   const apiSecret = (process.env.SHOPIFY_API_SECRET || "").trim();
   const apiVersion = (process.env.SHOPIFY_API_VERSION || "").trim();
   const publicBaseUrl = (process.env.SHOPIFY_PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
-  if (!shopDomain || !adminToken || !apiSecret || !apiVersion || !publicBaseUrl) return null;
-  return { shopDomain, adminToken, apiSecret, apiVersion, publicBaseUrl };
+  if (!shopDomain || !apiSecret || !apiVersion || !publicBaseUrl) return null;
+  if (!clientId && !adminToken) return null;
+  return { shopDomain, clientId, adminToken, apiSecret, apiVersion, publicBaseUrl };
 }
 
 export function isShopifyReconConfigured(): boolean {
@@ -66,22 +81,134 @@ export function getShopifyReconStatus(): {
   shopDomain: string | null;
   apiVersion: string | null;
   publicBaseUrl: string | null;
+  authMode: "client_credentials" | "static_token" | "none";
+  tokenStatus: { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
   missing: string[];
 } {
   const missing: string[] = [];
   if (!process.env.SHOPIFY_SHOP_DOMAIN) missing.push("SHOPIFY_SHOP_DOMAIN");
-  if (!process.env.SHOPIFY_ADMIN_TOKEN) missing.push("SHOPIFY_ADMIN_TOKEN");
+  // Either CLIENT_ID or ADMIN_TOKEN must be present.
+  if (!process.env.SHOPIFY_CLIENT_ID && !process.env.SHOPIFY_ADMIN_TOKEN) {
+    missing.push("SHOPIFY_CLIENT_ID (or SHOPIFY_ADMIN_TOKEN)");
+  }
   if (!process.env.SHOPIFY_API_SECRET) missing.push("SHOPIFY_API_SECRET");
   if (!process.env.SHOPIFY_API_VERSION) missing.push("SHOPIFY_API_VERSION");
   if (!process.env.SHOPIFY_PUBLIC_BASE_URL) missing.push("SHOPIFY_PUBLIC_BASE_URL");
+  const hasClientId = !!(process.env.SHOPIFY_CLIENT_ID || "").trim();
+  const hasAdminToken = !!(process.env.SHOPIFY_ADMIN_TOKEN || "").trim();
+  const authMode: "client_credentials" | "static_token" | "none" =
+    hasClientId ? "client_credentials" : hasAdminToken ? "static_token" : "none";
+  const now = Date.now();
+  const tokenStatus = tokenCache && tokenCache.expiresAt > now
+    ? {
+        hasToken: true,
+        expiresAt: new Date(tokenCache.expiresAt).toISOString(),
+        expiresInSec: Math.max(0, Math.floor((tokenCache.expiresAt - now) / 1000)),
+      }
+    : { hasToken: false, expiresAt: null, expiresInSec: null };
   return {
     configured: missing.length === 0,
     shopDomain: process.env.SHOPIFY_SHOP_DOMAIN || null,
     apiVersion: process.env.SHOPIFY_API_VERSION || null,
     publicBaseUrl: process.env.SHOPIFY_PUBLIC_BASE_URL || null,
+    authMode,
+    tokenStatus,
     missing,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Token manager — client_credentials flow.
+//
+// When SHOPIFY_CLIENT_ID is set, we mint a short-lived Admin API access token
+// by POSTing to /admin/oauth/access_token with grant_type=client_credentials.
+// Shopify returns { access_token: "shpat_...", scope, expires_in }. We cache
+// the token in-memory and refresh ~60s before expiry. Refresh is lazy — the
+// next REST call after expiry mints a new one, so no background timer needed.
+//
+// When SHOPIFY_ADMIN_TOKEN is set instead (no client_id), we just use that
+// token verbatim — useful for testing with a hand-minted token. atkn_*
+// prefixed tokens use Bearer auth, everything else uses X-Shopify-Access-Token.
+// ---------------------------------------------------------------------------
+
+type TokenCache = { token: string; expiresAt: number; scope: string };
+let tokenCache: TokenCache | null = null;
+
+/**
+ * Returns a valid shpat_ access token, minting one via client_credentials if
+ * needed. Cached in-process and reused until ~60s before expiry. Throws on
+ * config or HTTP failure (caller surfaces via the error log).
+ *
+ * Exported for the test console — clears + re-mints to verify creds.
+ */
+export async function getShopifyAccessToken(cfg: ShopifyReconConfig, opts: { forceRefresh?: boolean } = {}): Promise<string> {
+  // Static token override path — no minting, just return what was configured.
+  if (!cfg.clientId && cfg.adminToken) return cfg.adminToken;
+  if (!cfg.clientId) throw new Error("Shopify client_credentials not configured (missing SHOPIFY_CLIENT_ID)");
+
+  const now = Date.now();
+  if (!opts.forceRefresh && tokenCache && tokenCache.expiresAt > now + 5_000) {
+    return tokenCache.token;
+  }
+
+  const url = `https://${cfg.shopDomain}/admin/oauth/access_token`;
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: cfg.clientId,
+    client_secret: cfg.apiSecret,
+  }).toString();
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+      },
+      body,
+    });
+  } catch (e: any) {
+    shopifyError("oauth", `client_credentials network failure: ${e?.message ?? e}`);
+    throw e;
+  }
+
+  const text = await res.text();
+  if (!res.ok) {
+    const snippet = text.slice(0, 400);
+    shopifyError("oauth", `client_credentials -> ${res.status}: ${snippet}`);
+    throw new Error(`Shopify client_credentials failed: ${res.status} ${snippet}`);
+  }
+
+  let parsed: any;
+  try { parsed = JSON.parse(text); } catch {
+    shopifyError("oauth", `client_credentials: malformed JSON response: ${text.slice(0, 200)}`);
+    throw new Error("Shopify client_credentials: malformed JSON response");
+  }
+
+  const accessToken: string = parsed?.access_token;
+  const expiresIn: number = Number(parsed?.expires_in) || 0;
+  const scope: string = String(parsed?.scope || "");
+  if (!accessToken || !expiresIn) {
+    shopifyError("oauth", `client_credentials: missing access_token or expires_in in response`);
+    throw new Error("Shopify client_credentials: missing access_token or expires_in");
+  }
+
+  // Refresh 60s before actual expiry so an in-flight call never gets a 401
+  // from a token that expired mid-request.
+  tokenCache = {
+    token: accessToken,
+    expiresAt: now + Math.max(60_000, (expiresIn - 60) * 1000),
+    scope,
+  };
+  return accessToken;
+}
+
+/**
+ * Clears the in-memory token cache. Exposed for the test console so the user
+ * can force a fresh mint without restarting the server.
+ */
+export function clearShopifyTokenCache(): void { tokenCache = null; }
 
 // ---------------------------------------------------------------------------
 // REST helpers (orders + payouts use the REST Admin API — its pagination via
@@ -132,13 +259,17 @@ export async function shopifyRestCall(
     attempt++;
     let res: Response;
     try {
-      // Token-format detection: atkn_* tokens (newer access token format that
-      // replaced shpat_ on Jan 1 2026) are passed as Bearer auth, NOT in the
-      // legacy X-Shopify-Access-Token header. Get it wrong and Shopify returns
-      // 401 "Invalid API key or access token" with no further detail.
-      const authHeaders: Record<string, string> = cfg.adminToken.startsWith("atkn_")
-        ? { "Authorization": `Bearer ${cfg.adminToken}` }
-        : { "X-Shopify-Access-Token": cfg.adminToken };
+      // Get a valid token. When SHOPIFY_CLIENT_ID is configured this mints
+      // (or returns a cached) shpat_ token via client_credentials. When
+      // SHOPIFY_ADMIN_TOKEN is configured instead it just returns that.
+      const accessToken = await getShopifyAccessToken(cfg);
+      // atkn_* tokens (the new "access token" format) require Bearer auth.
+      // shpat_* tokens (what client_credentials returns) use the legacy
+      // X-Shopify-Access-Token header. Anything else we default to the
+      // header form for backward-compat.
+      const authHeaders: Record<string, string> = accessToken.startsWith("atkn_")
+        ? { "Authorization": `Bearer ${accessToken}` }
+        : { "X-Shopify-Access-Token": accessToken };
       res = await fetch(url, {
         method,
         headers: {
