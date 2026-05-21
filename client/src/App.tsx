@@ -21,6 +21,7 @@ import Settings from "@/pages/Settings";
 import Payroll from "@/pages/Payroll";
 import PayrollEntities from "@/pages/PayrollEntities";
 import PayrollEmployees from "@/pages/PayrollEmployees";
+import ReconcilerTest from "@/pages/ReconcilerTest";
 import NotFound from "@/pages/not-found";
 
 function ProtectedRoutes() {
@@ -59,6 +60,7 @@ function ProtectedRoutes() {
         <Route path="/payroll" component={Payroll} />
         <Route path="/payroll/entities" component={PayrollEntities} />
         <Route path="/payroll/employees" component={PayrollEmployees} />
+        <Route path="/reconciler/test" component={ReconcilerTest} />
         <Route component={NotFound} />
       </Switch>
     </Layout>
