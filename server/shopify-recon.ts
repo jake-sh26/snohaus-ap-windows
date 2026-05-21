@@ -30,6 +30,7 @@
  */
 
 import { recordIntegrationError, recordIntegrationWarn, getIntegrationErrorLog, clearIntegrationErrorLog } from "./error-log";
+import { getShopifyOAuthToken, touchShopifyOAuthTokenUsed } from "./storage";
 
 function shopifyError(scope: string, msg: string) { recordIntegrationError("shopify-recon", scope, msg, "error"); }
 function shopifyWarn(scope: string, msg: string) { recordIntegrationWarn("shopify-recon", scope, msg); }
@@ -142,9 +143,20 @@ let tokenCache: TokenCache | null = null;
  * Exported for the test console — clears + re-mints to verify creds.
  */
 export async function getShopifyAccessToken(cfg: ShopifyReconConfig, opts: { forceRefresh?: boolean } = {}): Promise<string> {
+  // Highest-priority path (PR #R2e): an OAuth token minted via the install
+  // flow and stored in the DB. This is what gets populated when the user
+  // installs the app on their store via Dev Dashboard. Always preferred when
+  // present — it's a real shpat_ Admin API token with the scopes we asked for.
+  const dbToken = getShopifyOAuthToken(cfg.shopDomain);
+  if (dbToken && dbToken.access_token) {
+    // Fire-and-forget last_used_at touch — useful for the UI's "Connected since" display.
+    touchShopifyOAuthTokenUsed(cfg.shopDomain);
+    return dbToken.access_token;
+  }
+
   // Static token override path — no minting, just return what was configured.
   if (!cfg.clientId && cfg.adminToken) return cfg.adminToken;
-  if (!cfg.clientId) throw new Error("Shopify client_credentials not configured (missing SHOPIFY_CLIENT_ID)");
+  if (!cfg.clientId) throw new Error("Shopify access token not available. Install the app via the OAuth callback at /api/auth/shopify/install, or set SHOPIFY_ADMIN_TOKEN.");
 
   const now = Date.now();
   if (!opts.forceRefresh && tokenCache && tokenCache.expiresAt > now + 5_000) {

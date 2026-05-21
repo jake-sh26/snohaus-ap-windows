@@ -112,6 +112,13 @@ import {
   deleteAllOurWebhooks,
   SHOPIFY_RECON_WEBHOOK_TOPICS,
 } from "./shopify-recon-webhooks";
+import {
+  shopifyInstallHandler,
+  shopifyCallbackHandler,
+  shopifyInstallUrlHandler,
+  shopifyInstalledStatusHandler,
+  shopifyDeleteTokenHandler,
+} from "./shopify-oauth";
 import { getUserPermissions, requirePermission } from "./rbac";
 import {
   isGoogleConfigured,
@@ -1148,6 +1155,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     clearShopifyReconErrorLog();
     res.json({ ok: true });
   });
+
+  // ---- Shopify OAuth (Authorization Code Grant) ----
+  // PR #R2e — Captures Admin API access token via standard OAuth install flow.
+  // Install + callback are PUBLIC (no authMiddleware) because Shopify itself
+  // hits them with no user session. The callback verifies HMAC + state to
+  // ensure the request really came from Shopify before storing the token.
+  app.get("/api/auth/shopify/install", shopifyInstallHandler);
+  app.get("/api/auth/shopify/callback", shopifyCallbackHandler);
+
+  // These are app-internal helpers used by the Test Console UI, so they are
+  // gated behind auth + the same permission used by other recon settings.
+  app.get("/api/auth/shopify/install-url", authMiddleware, requirePermission("system.manage_config"), shopifyInstallUrlHandler);
+  app.get("/api/auth/shopify/installed-status", authMiddleware, requirePermission("payroll.view"), shopifyInstalledStatusHandler);
+  app.delete("/api/auth/shopify/token", authMiddleware, requirePermission("system.manage_config"), shopifyDeleteTokenHandler);
 
   // ---- Health ----
   app.get("/api/health", (_req, res) => {
