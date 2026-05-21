@@ -12,7 +12,12 @@
  *
  * Env vars (no-op when any are missing):
  *   SHOPIFY_SHOP_DOMAIN       e.g. sundown-ski-patio-greenvale.myshopify.com
- *   SHOPIFY_ADMIN_TOKEN       app automation token (header X-Shopify-Access-Token)
+ *   SHOPIFY_ADMIN_TOKEN       access token. Both formats supported:
+ *                             - atkn_<64chars> (newer "app access token", post-Jan-2026):
+ *                               sent as `Authorization: Bearer <token>`
+ *                             - shpat_<...> / shpca_<...> (legacy custom app + client_credentials):
+ *                               sent as `X-Shopify-Access-Token: <token>`
+ *                             We detect by prefix and set the right header automatically.
  *   SHOPIFY_API_SECRET        client secret — used for webhook HMAC verification
  *   SHOPIFY_API_VERSION       e.g. 2026-04
  *   SHOPIFY_PUBLIC_BASE_URL   public ngrok/edge URL used for webhook callbacks
@@ -127,10 +132,17 @@ export async function shopifyRestCall(
     attempt++;
     let res: Response;
     try {
+      // Token-format detection: atkn_* tokens (newer access token format that
+      // replaced shpat_ on Jan 1 2026) are passed as Bearer auth, NOT in the
+      // legacy X-Shopify-Access-Token header. Get it wrong and Shopify returns
+      // 401 "Invalid API key or access token" with no further detail.
+      const authHeaders: Record<string, string> = cfg.adminToken.startsWith("atkn_")
+        ? { "Authorization": `Bearer ${cfg.adminToken}` }
+        : { "X-Shopify-Access-Token": cfg.adminToken };
       res = await fetch(url, {
         method,
         headers: {
-          "X-Shopify-Access-Token": cfg.adminToken,
+          ...authHeaders,
           "Content-Type": "application/json",
           "Accept": "application/json",
         },
