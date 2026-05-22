@@ -99,6 +99,13 @@ import {
   getReconPayoutWithTransactions,
   getReconPayoutsWatermark,
   getReconPayoutsSummary,
+  // Reconciler (PR #R4a-prep) — COA mapping
+  importReconEntityCoa,
+  listReconEntityCoa,
+  getReconCoaImportStatus,
+  buildReconCoaMappingMatrix,
+  bulkSaveReconCoaMapping,
+  RECON_COA_LOGICAL_ROLES,
 } from "./storage";
 import {
   getShopifyReconConfig,
@@ -1251,6 +1258,67 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.delete("/api/recon/shopify/error-log", authMiddleware, requirePermission("system.manage_config"), (_req, res) => {
     clearShopifyReconErrorLog();
     res.json({ ok: true });
+  });
+
+  // ---- Reconciler COA Mapping (PR #R4a-prep) ----
+  // Lets the user upload a per-entity QBO Chart of Accounts CSV and then
+  // confirm a mapping of each "logical role" the engine emits (sales_income,
+  // cogs, shopify_pit, etc.) to a specific QBO account name on that entity's
+  // books. The matrix is the foundation for PR #R4 (allocation engine) and
+  // later PRs that emit JEs.
+
+  // List logical roles + metadata (read-only).
+  app.get("/api/recon/coa/roles", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json({ roles: RECON_COA_LOGICAL_ROLES });
+  });
+
+  // Per-entity import status (last import timestamp + count + active count).
+  app.get("/api/recon/coa/import-status", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(getReconCoaImportStatus());
+  });
+
+  // List a single entity's imported accounts (used by the UI dropdowns).
+  app.get("/api/recon/coa/entity/:entityId/accounts", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const entityId = Number(req.params.entityId);
+    if (!Number.isFinite(entityId)) return res.status(400).json({ error: "invalid entity_id" });
+    const includeInactive = String(req.query.include_inactive || "") === "1";
+    res.json(listReconEntityCoa(entityId, includeInactive));
+  });
+
+  // Import a CSV for one entity. We accept a JSON body of pre-parsed rows so
+  // the heavy CSV parsing stays in the browser (PapaParse) where it already
+  // lives — the server just upserts.
+  // Body: { rows: [{ account_number?, account_name, account_type?, detail_type? }] }
+  app.post("/api/recon/coa/import/:entityId", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const entityId = Number(req.params.entityId);
+    if (!Number.isFinite(entityId)) return res.status(400).json({ error: "invalid entity_id" });
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!rows) return res.status(400).json({ error: "rows array required" });
+    try {
+      const result = importReconEntityCoa(entityId, rows);
+      res.json({ ok: true, ...result });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    }
+  });
+
+  // Build the full mapping matrix (entities × logical roles × each entity's
+  // accounts) including pre-fill suggestions and quality flags.
+  app.get("/api/recon/coa/mapping-matrix", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(buildReconCoaMappingMatrix());
+  });
+
+  // Bulk-save user-confirmed mapping rows.
+  // Body: { rows: [{ entity_id, logical_role, qbo_account_name, notes? }] }
+  app.post("/api/recon/coa/mapping/bulk-save", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!rows) return res.status(400).json({ error: "rows array required" });
+    try {
+      const result = bulkSaveReconCoaMapping(rows);
+      res.json({ ok: true, ...result });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    }
   });
 
   // ---- Shopify OAuth (Authorization Code Grant) ----

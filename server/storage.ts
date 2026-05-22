@@ -732,6 +732,47 @@ function bootstrapSchema() {
       ON recon_entity_pos_locations(entity_id);
   `);
 
+  // PR #R4a-prep: per-entity QBO chart of accounts (imported from CSV).
+  // Once the 3-QBO connector lands in Phase 2 we'll replace the CSV import
+  // with live API pulls, but the table shape stays the same.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_entity_coa (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id) ON DELETE CASCADE,
+      account_number TEXT,
+      account_name TEXT NOT NULL,
+      account_type TEXT,
+      detail_type TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      imported_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_entity_coa_entity
+      ON recon_entity_coa(entity_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_entity_coa_unique
+      ON recon_entity_coa(entity_id, account_name);
+  `);
+
+  // PR #R4a-prep: per-entity COA role mapping. One row per (entity, role)
+  // such that the allocator can look up "which account does this entity book
+  // sales_income to?" without hardcoding entity-specific names.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_coa_mapping (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id) ON DELETE CASCADE,
+      logical_role TEXT NOT NULL,
+      qbo_account_name TEXT,
+      qbo_account_id TEXT,
+      notes TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT,
+      updated_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_coa_mapping_role
+      ON recon_coa_mapping(entity_id, logical_role);
+    CREATE INDEX IF NOT EXISTS idx_recon_coa_mapping_entity
+      ON recon_coa_mapping(entity_id);
+  `);
+
   // Zip-code lookup used to route digital gift cards to the nearest store.
   // Populated lazily: when an unknown zip appears we resolve nearest entity
   // and cache the result here. Seeded for NY's most common zips on first boot
@@ -4263,5 +4304,612 @@ export function bulkSaveReconEntityPosLocations(
   });
 
   txn(rows);
+  return result;
+}
+
+// ============================================================================
+// PR #R4a-prep — Per-entity COA import + role mapping
+// ----------------------------------------------------------------------------
+// Three storage surfaces:
+//   1. CSV-driven import of an entity's QBO chart of accounts (so the COA
+//      Mapping UI can show real account names in its dropdowns without the
+//      QBO API being wired yet).
+//   2. The COA role mapping table itself (logical_role → qbo account name).
+//   3. A "suggested mapping" builder that pre-fills the mapping from the
+//      best fuzzy match against the imported COA — same UX pattern as the
+//      entity-mapping card in R3b.
+//
+// Logical roles are the stable contract the allocator + JE generator use.
+// Adding a new role requires touching the allocator code; renaming a QBO
+// account in any entity only requires re-importing the CSV.
+// ============================================================================
+
+export const RECON_COA_LOGICAL_ROLES = [
+  // Income
+  "sales_income",
+  "shipping_income",
+  "discounts_contra",
+  "refunds_contra",
+  "rental_sales",
+  "workshop_income",
+  // The catch-all bucket we are decomposing to $0.
+  "other_discounts_refunds_catchall",
+  // COGS
+  "cogs",
+  "cogs_gc_swap",
+  // Expenses
+  "cc_processing_fees",
+  "chargeback_losses",
+  "cs_goodwill",
+  // Assets
+  "shopify_pit",        // Shopify Payments in Transit (SD only; vestigial on Hunt/Hemp)
+  "shopify_bank",       // Final cash deposit account (SD only — Hunt/Hemp deposits route via Due-from-SD)
+  "inventory_asset",
+  "accounts_receivable",
+  // Liabilities
+  "sales_tax_payable",
+  "gift_cards_outstanding",
+  // Inter-company
+  "due_from_sd",        // Hunt/Hemp books only — their right to recover cash from SD
+  "due_to_sh_hempstead", // SD books only — SD's obligation to Hempstead
+  "due_to_sh_huntington",// SD books only — SD's obligation to Huntington
+] as const;
+
+export type ReconCoaLogicalRole = (typeof RECON_COA_LOGICAL_ROLES)[number];
+
+// Human-readable metadata for the UI. Used to label the mapping table rows
+// and give the user enough context to pick the right account.
+export const RECON_COA_ROLE_METADATA: Record<
+  ReconCoaLogicalRole,
+  { label: string; section: string; description: string; applies_to: "all" | "sd_only" | "hemp_hunt_only" }
+> = {
+  sales_income: {
+    label: "Sales income",
+    section: "Income",
+    description: "Primary revenue recognition for Shopify orders (e.g., '40000 Shopify Sales').",
+    applies_to: "all",
+  },
+  shipping_income: {
+    label: "Shipping income",
+    section: "Income",
+    description: "Shipping fees collected from customers (separate from product revenue).",
+    applies_to: "all",
+  },
+  discounts_contra: {
+    label: "Discounts (contra-revenue)",
+    section: "Income",
+    description: "Order-level + line-level discounts (e.g., '40001 Shopify Discounts/Refunds Given').",
+    applies_to: "all",
+  },
+  refunds_contra: {
+    label: "Refunds (contra-revenue)",
+    section: "Income",
+    description: "Returns and refunds processed (e.g., '40002 Shopify Returns').",
+    applies_to: "all",
+  },
+  rental_sales: {
+    label: "Rental sales (optional)",
+    section: "Income",
+    description: "Only used if a rental SKU appears in a Shopify order. Most rentals go through Shift4 + EasyRent.",
+    applies_to: "all",
+  },
+  workshop_income: {
+    label: "Workshop income (optional)",
+    section: "Income",
+    description: "Only used if a workshop SKU appears in a Shopify order.",
+    applies_to: "all",
+  },
+  other_discounts_refunds_catchall: {
+    label: "Catch-all (goal: $0)",
+    section: "Income",
+    description: "The 'Other Discounts/Refunds Given' bucket we are actively decomposing to $0 each month.",
+    applies_to: "all",
+  },
+  cogs: {
+    label: "Cost of Goods Sold",
+    section: "COGS",
+    description: "DR variant.cost × qty per line, CR Inventory Asset.",
+    applies_to: "all",
+  },
+  cogs_gc_swap: {
+    label: "COGS - Gift Cards (Swap)",
+    section: "COGS",
+    description: "Ski swap consignment: 80% of sale price issued to consignor as a gift card.",
+    applies_to: "all",
+  },
+  cc_processing_fees: {
+    label: "Credit card processing fees",
+    section: "Expense",
+    description: "Per-sale fee from Shopify Payments balance_transactions.fee, booked to sale period.",
+    applies_to: "all",
+  },
+  chargeback_losses: {
+    label: "Chargeback losses",
+    section: "Expense",
+    description: "Customer disputes / chargebacks detected from balance_transactions.",
+    applies_to: "all",
+  },
+  cs_goodwill: {
+    label: "Customer Service Goodwill",
+    section: "Expense",
+    description: "Manually-issued gift cards for service recovery (CS goodwill, not consignment, not sold).",
+    applies_to: "all",
+  },
+  shopify_pit: {
+    label: "Shopify Payments in Transit",
+    section: "Asset",
+    description: "SD only — Shopify Payments deposits clearing account. Hunt/Hemp's account is vestigial.",
+    applies_to: "sd_only",
+  },
+  shopify_bank: {
+    label: "Shopify deposit bank account",
+    section: "Asset",
+    description: "SD only — final Chase checking that receives Shopify Payments payouts.",
+    applies_to: "sd_only",
+  },
+  inventory_asset: {
+    label: "Inventory Asset",
+    section: "Asset",
+    description: "CR side of every COGS entry.",
+    applies_to: "all",
+  },
+  accounts_receivable: {
+    label: "Accounts Receivable (A/R)",
+    section: "Asset",
+    description: "Patio installment unpaid balances. DR at sale for amount owed, CR as installments are collected.",
+    applies_to: "all",
+  },
+  sales_tax_payable: {
+    label: "Sales tax payable (NY)",
+    section: "Liability",
+    description: "Single umbrella account; per-county detail lives on the recon side. Confirm canonical account for Huntington.",
+    applies_to: "all",
+  },
+  gift_cards_outstanding: {
+    label: "Gift Cards Outstanding",
+    section: "Liability",
+    description: "CR on GC sale, DR on GC redemption. Includes swap + CS + sold cards.",
+    applies_to: "all",
+  },
+  due_from_sd: {
+    label: "Due from SD Ski",
+    section: "Inter-company",
+    description: "Hunt/Hemp books only — their right to recover cash from SD (since all Shopify deposits land in SD's bank).",
+    applies_to: "hemp_hunt_only",
+  },
+  due_to_sh_hempstead: {
+    label: "Due to SH Hempstead",
+    section: "Inter-company",
+    description: "SD books only — SD's obligation to remit Hempstead's share of Shopify deposits.",
+    applies_to: "sd_only",
+  },
+  due_to_sh_huntington: {
+    label: "Due to SH Huntington",
+    section: "Inter-company",
+    description: "SD books only — SD's obligation to remit Huntington's share of Shopify deposits.",
+    applies_to: "sd_only",
+  },
+};
+
+// ----- COA import (per entity) --------------------------------------------
+
+export type ReconEntityCoaRow = {
+  id: number;
+  entity_id: number;
+  account_number: string | null;
+  account_name: string;
+  account_type: string | null;
+  detail_type: string | null;
+  active: number;
+  imported_at: string;
+};
+
+/**
+ * Replaces the imported COA for one entity in a single transaction. The CSV
+ * uploader is the only writer. We treat the upload as authoritative: any
+ * previously-imported rows for this entity that are not in the new set are
+ * marked inactive (so historical mappings still resolve their account name).
+ */
+export type CoaImportRow = {
+  account_number?: string | null;
+  account_name: string;
+  account_type?: string | null;
+  detail_type?: string | null;
+};
+
+export type CoaImportResult = {
+  entity_id: number;
+  inserted: number;
+  updated: number;
+  deactivated: number;
+};
+
+export function importReconEntityCoa(
+  entity_id: number,
+  rows: CoaImportRow[],
+): CoaImportResult {
+  const now = new Date().toISOString();
+  const incoming = new Map<string, CoaImportRow>();
+  for (const r of rows) {
+    const name = (r.account_name || "").trim();
+    if (!name) continue;
+    incoming.set(name, r);
+  }
+
+  let inserted = 0;
+  let updated = 0;
+  let deactivated = 0;
+
+  const txn = sqlite.transaction(() => {
+    const existing = sqlite.prepare(
+      `SELECT id, account_name, active FROM recon_entity_coa WHERE entity_id = ?`,
+    ).all(entity_id) as Array<{ id: number; account_name: string; active: number }>;
+    const existingByName = new Map(existing.map(r => [r.account_name, r]));
+
+    // Upsert each incoming row.
+    incoming.forEach((r, name) => {
+      const prev = existingByName.get(name);
+      if (prev) {
+        sqlite.prepare(`
+          UPDATE recon_entity_coa
+          SET account_number = ?, account_type = ?, detail_type = ?, active = 1, imported_at = ?
+          WHERE id = ?
+        `).run(r.account_number ?? null, r.account_type ?? null, r.detail_type ?? null, now, prev.id);
+        updated++;
+      } else {
+        sqlite.prepare(`
+          INSERT INTO recon_entity_coa
+            (entity_id, account_number, account_name, account_type, detail_type, active, imported_at)
+          VALUES (?, ?, ?, ?, ?, 1, ?)
+        `).run(
+          entity_id,
+          r.account_number ?? null,
+          name,
+          r.account_type ?? null,
+          r.detail_type ?? null,
+          now,
+        );
+        inserted++;
+      }
+    });
+
+    // Deactivate rows no longer present in the upload.
+    for (const e of existing) {
+      if (!incoming.has(e.account_name) && e.active === 1) {
+        sqlite.prepare(`UPDATE recon_entity_coa SET active = 0, imported_at = ? WHERE id = ?`)
+          .run(now, e.id);
+        deactivated++;
+      }
+    }
+  });
+
+  txn();
+  return { entity_id, inserted, updated, deactivated };
+}
+
+export function listReconEntityCoa(entity_id: number, includeInactive = false): ReconEntityCoaRow[] {
+  return sqlite.prepare(
+    includeInactive
+      ? `SELECT * FROM recon_entity_coa WHERE entity_id = ? ORDER BY account_name ASC`
+      : `SELECT * FROM recon_entity_coa WHERE entity_id = ? AND active = 1 ORDER BY account_name ASC`,
+  ).all(entity_id) as ReconEntityCoaRow[];
+}
+
+export function getReconCoaImportStatus(): Array<{
+  entity_id: number;
+  entity_location: string;
+  account_count: number;
+  last_imported_at: string | null;
+}> {
+  return sqlite.prepare(`
+    SELECT
+      e.id AS entity_id,
+      e.location AS entity_location,
+      COALESCE(SUM(CASE WHEN c.active = 1 THEN 1 ELSE 0 END), 0) AS account_count,
+      MAX(c.imported_at) AS last_imported_at
+    FROM payroll_entities e
+    LEFT JOIN recon_entity_coa c ON c.entity_id = e.id
+    WHERE e.active = 1
+    GROUP BY e.id, e.location
+    ORDER BY e.location ASC
+  `).all() as any;
+}
+
+// ----- COA role mapping ----------------------------------------------------
+
+export type ReconCoaMappingRow = {
+  id: number;
+  entity_id: number;
+  logical_role: string;
+  qbo_account_name: string | null;
+  qbo_account_id: string | null;
+  notes: string | null;
+  active: number;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export function listReconCoaMapping(): ReconCoaMappingRow[] {
+  return sqlite.prepare(
+    `SELECT * FROM recon_coa_mapping WHERE active = 1 ORDER BY entity_id ASC, logical_role ASC`,
+  ).all() as ReconCoaMappingRow[];
+}
+
+/**
+ * Builds a suggested mapping matrix: one row per logical_role × entity. For
+ * each cell we fuzzy-match against the entity's imported COA using simple
+ * keyword heuristics. Returns the suggested account name + the currently
+ * saved mapping (if any), in the same shape the entity-mapping card uses.
+ */
+export type CoaMappingCell = {
+  entity_id: number;
+  entity_location: string;
+  logical_role: ReconCoaLogicalRole;
+  // Suggested by fuzzy match against the imported COA.
+  suggested_account_name: string | null;
+  suggested_match_quality: "exact" | "strong" | "weak" | "none";
+  // Currently saved mapping (if any).
+  current_account_name: string | null;
+  current_account_id: string | null;
+  notes: string | null;
+  // True if role doesn't apply to this entity (e.g., shopify_pit on Hunt/Hemp).
+  not_applicable: boolean;
+  // All active accounts for the entity, so the UI dropdown can render them.
+  // (Returned at the matrix level, not per cell, to keep the payload small.)
+};
+
+export type CoaMappingMatrix = {
+  entities: Array<{
+    id: number;
+    location: string;
+    legal_name: string;
+    coa_imported: boolean;
+    account_count: number;
+    accounts: Array<{
+      account_number: string | null;
+      account_name: string;
+      account_type: string | null;
+      detail_type: string | null;
+    }>;
+  }>;
+  // Flat list of cells, one per (entity, role). Cells where not_applicable
+  // is true are skipped by the saver.
+  cells: CoaMappingCell[];
+  // Role metadata so the UI can render labels + descriptions without
+  // duplicating the constants table.
+  role_metadata: typeof RECON_COA_ROLE_METADATA;
+  // Convenience flag: are all required cells filled?
+  ready_for_phase_2: boolean;
+  missing_count: number;
+};
+
+/**
+ * Heuristic match: returns the best candidate from the entity's imported COA
+ * for the given logical role. We score by:
+ *   - exact normalized name match against curated patterns → 'exact'
+ *   - any pattern substring match → 'strong'
+ *   - generic keyword present (e.g., "shopify") → 'weak'
+ *   - nothing → 'none'
+ *
+ * Patterns are intentionally hardcoded for the 21 roles. If the user renames
+ * an account in QBO, we'll either fall back to 'weak' or the user just picks
+ * the right one in the dropdown — no schema change needed.
+ */
+function suggestCoaAccountForRole(
+  role: ReconCoaLogicalRole,
+  accounts: Array<{ account_name: string; account_type: string | null }>,
+): { name: string | null; quality: CoaMappingCell["suggested_match_quality"] } {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const namesByNorm = accounts.map(a => ({ raw: a.account_name, norm: norm(a.account_name), type: a.account_type ?? "" }));
+
+  // Exact + strong patterns per role. The first pattern in each array that
+  // matches uniquely wins.
+  const exactPatterns: Record<ReconCoaLogicalRole, string[]> = {
+    sales_income: ["40000 shopify sales", "shopify sales"],
+    shipping_income: ["shipping income", "shipping charges", "shipping freight delivery charges collected"],
+    discounts_contra: ["40001 shopify discounts refunds given", "shopify discounts refunds given"],
+    refunds_contra: ["40002 shopify returns", "shopify returns"],
+    rental_sales: ["40003 rental sales", "rental sales"],
+    workshop_income: ["40005 workshop income", "workshop income"],
+    other_discounts_refunds_catchall: ["other discounts refunds given customer order deposit adjustments"],
+    cogs: ["cost of goods sold"],
+    cogs_gc_swap: ["cost of goods sold gift cards swap"],
+    cc_processing_fees: ["credit card processing fees"],
+    chargeback_losses: ["chargeback losses", "chargebacks"],
+    cs_goodwill: ["customer service goodwill", "cs goodwill"],
+    shopify_pit: ["shopify payments in transit"],
+    shopify_bank: ["shopify chase checking 3796"],
+    inventory_asset: ["inventory asset"],
+    accounts_receivable: ["accounts receivable a r", "accounts receivable"],
+    sales_tax_payable: ["new york department of taxation and finance payable"],
+    gift_cards_outstanding: ["gift cards outstanding"],
+    due_from_sd: ["due from sd ski"],
+    due_to_sh_hempstead: ["due to sh hempstead"],
+    due_to_sh_huntington: ["due to sh huntington"],
+  };
+  const weakKeywords: Record<ReconCoaLogicalRole, string[]> = {
+    sales_income: ["shopify", "sales"],
+    shipping_income: ["shipping", "freight"],
+    discounts_contra: ["discount"],
+    refunds_contra: ["return", "refund"],
+    rental_sales: ["rental"],
+    workshop_income: ["workshop"],
+    other_discounts_refunds_catchall: ["other discount", "catch"],
+    cogs: ["cost of goods"],
+    cogs_gc_swap: ["gift card", "swap"],
+    cc_processing_fees: ["credit card", "processing"],
+    chargeback_losses: ["chargeback"],
+    cs_goodwill: ["goodwill", "customer service"],
+    shopify_pit: ["payments in transit"],
+    shopify_bank: ["chase", "checking"],
+    inventory_asset: ["inventory"],
+    accounts_receivable: ["receivable", "a r"],
+    sales_tax_payable: ["taxation", "sales tax"],
+    gift_cards_outstanding: ["gift card"],
+    due_from_sd: ["due from sd"],
+    due_to_sh_hempstead: ["due to sh hempstead", "due to hempstead"],
+    due_to_sh_huntington: ["due to sh huntington", "due to huntington"],
+  };
+
+  const patterns = exactPatterns[role] || [];
+  for (const p of patterns) {
+    const pn = norm(p);
+    // Exact normalized match
+    const exact = namesByNorm.find(a => a.norm === pn);
+    if (exact) return { name: exact.raw, quality: "exact" };
+  }
+  for (const p of patterns) {
+    const pn = norm(p);
+    const strong = namesByNorm.find(a => a.norm.includes(pn));
+    if (strong) return { name: strong.raw, quality: "strong" };
+  }
+  for (const k of weakKeywords[role] || []) {
+    const kn = norm(k);
+    const weak = namesByNorm.find(a => a.norm.includes(kn));
+    if (weak) return { name: weak.raw, quality: "weak" };
+  }
+  return { name: null, quality: "none" };
+}
+
+export function buildReconCoaMappingMatrix(): CoaMappingMatrix {
+  const entities = listPayrollEntities();
+  const allMappings = listReconCoaMapping();
+  const mappingByKey = new Map<string, ReconCoaMappingRow>();
+  for (const m of allMappings) mappingByKey.set(`${m.entity_id}::${m.logical_role}`, m);
+
+  // entityShape per entity. SD = "Greenvale". Determined by location keyword.
+  function shape(loc: string): "sd" | "hemp" | "hunt" {
+    const l = loc.toLowerCase();
+    if (l.includes("greenvale")) return "sd";
+    if (l.includes("hempstead")) return "hemp";
+    return "hunt";
+  }
+
+  const entityPayload = entities.map(e => {
+    const accounts = listReconEntityCoa(e.id).map(a => ({
+      account_number: a.account_number,
+      account_name: a.account_name,
+      account_type: a.account_type,
+      detail_type: a.detail_type,
+    }));
+    return {
+      id: e.id,
+      location: e.location,
+      legal_name: e.legal_name,
+      coa_imported: accounts.length > 0,
+      account_count: accounts.length,
+      accounts,
+    };
+  });
+
+  const cells: CoaMappingCell[] = [];
+  let missingCount = 0;
+  for (const e of entityPayload) {
+    const s = shape(e.location);
+    for (const role of RECON_COA_LOGICAL_ROLES) {
+      const meta = RECON_COA_ROLE_METADATA[role];
+      let notApplicable = false;
+      if (meta.applies_to === "sd_only" && s !== "sd") notApplicable = true;
+      if (meta.applies_to === "hemp_hunt_only" && s === "sd") notApplicable = true;
+      // SD specifically also doesn't need its own due_to_self lines.
+      if (role === "due_to_sh_hempstead" && s !== "sd") notApplicable = true;
+      if (role === "due_to_sh_huntington" && s !== "sd") notApplicable = true;
+
+      const cur = mappingByKey.get(`${e.id}::${role}`);
+      const sug = notApplicable
+        ? { name: null, quality: "none" as const }
+        : suggestCoaAccountForRole(role, e.accounts);
+
+      const cell: CoaMappingCell = {
+        entity_id: e.id,
+        entity_location: e.location,
+        logical_role: role,
+        suggested_account_name: sug.name,
+        suggested_match_quality: sug.quality,
+        current_account_name: cur?.qbo_account_name ?? null,
+        current_account_id: cur?.qbo_account_id ?? null,
+        notes: cur?.notes ?? null,
+        not_applicable: notApplicable,
+      };
+      cells.push(cell);
+      if (!notApplicable && !cur?.qbo_account_name) missingCount++;
+    }
+  }
+
+  return {
+    entities: entityPayload,
+    cells,
+    role_metadata: RECON_COA_ROLE_METADATA,
+    ready_for_phase_2: missingCount === 0 && entityPayload.every(e => e.coa_imported),
+    missing_count: missingCount,
+  };
+}
+
+export type CoaMappingBulkSaveInput = Array<{
+  entity_id: number;
+  logical_role: string;
+  qbo_account_name: string | null;
+  notes?: string | null;
+}>;
+
+export type CoaMappingBulkSaveResult = {
+  inserted: number;
+  updated: number;
+  cleared: number;
+  errors: Array<{ entity_id: number; logical_role: string; message: string }>;
+};
+
+export function bulkSaveReconCoaMapping(rows: CoaMappingBulkSaveInput): CoaMappingBulkSaveResult {
+  const now = new Date().toISOString();
+  const result: CoaMappingBulkSaveResult = { inserted: 0, updated: 0, cleared: 0, errors: [] };
+
+  const txn = sqlite.transaction(() => {
+    for (const r of rows) {
+      try {
+        const role = String(r.logical_role || "");
+        if (!RECON_COA_LOGICAL_ROLES.includes(role as ReconCoaLogicalRole)) {
+          result.errors.push({ entity_id: r.entity_id, logical_role: role, message: "unknown logical_role" });
+          continue;
+        }
+        const existing = sqlite.prepare(
+          `SELECT id FROM recon_coa_mapping WHERE entity_id = ? AND logical_role = ? LIMIT 1`,
+        ).get(r.entity_id, role) as { id: number } | undefined;
+
+        if (r.qbo_account_name == null || r.qbo_account_name.trim() === "") {
+          // Clear existing mapping (don't delete — set qbo_account_name NULL).
+          if (existing) {
+            sqlite.prepare(`UPDATE recon_coa_mapping SET qbo_account_name = NULL, updated_at = ? WHERE id = ?`)
+              .run(now, existing.id);
+            result.cleared++;
+          }
+          continue;
+        }
+
+        if (existing) {
+          sqlite.prepare(`
+            UPDATE recon_coa_mapping
+            SET qbo_account_name = ?, notes = ?, active = 1, updated_at = ?
+            WHERE id = ?
+          `).run(r.qbo_account_name, r.notes ?? null, now, existing.id);
+          result.updated++;
+        } else {
+          sqlite.prepare(`
+            INSERT INTO recon_coa_mapping
+              (entity_id, logical_role, qbo_account_name, notes, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+          `).run(r.entity_id, role, r.qbo_account_name, r.notes ?? null, now, now);
+          result.inserted++;
+        }
+      } catch (e: any) {
+        result.errors.push({
+          entity_id: r.entity_id,
+          logical_role: r.logical_role,
+          message: e?.message ?? String(e),
+        });
+      }
+    }
+  });
+
+  txn();
   return result;
 }

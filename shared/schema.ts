@@ -519,6 +519,37 @@ export const reconEntityPosLocations = sqliteTable("recon_entity_pos_locations",
   updated_at: text("updated_at"),
 });
 
+// PR #R4a-prep — chart-of-accounts mapping per entity.
+// One row per (entity, logical_role). The logical_role is the role the
+// reconciler needs to book to (e.g. 'sales_income', 'cc_fees') and
+// qbo_account_name is the entity's actual QBO account that role maps to.
+// qbo_account_id stays NULL until the 3-QBO connector is wired in Phase 2.
+export const reconCoaMapping = sqliteTable("recon_coa_mapping", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  logical_role: text("logical_role").notNull(),
+  qbo_account_name: text("qbo_account_name"),
+  qbo_account_id: text("qbo_account_id"),
+  notes: text("notes"),
+  active: integer("active").notNull().default(1),
+  created_at: text("created_at"),
+  updated_at: text("updated_at"),
+});
+
+// Per-entity QBO chart of accounts (imported from CSV export until the
+// 3-QBO connector is wired). Used to populate the dropdown options in the
+// COA Mapping UI card.
+export const reconEntityCoa = sqliteTable("recon_entity_coa", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  entity_id: integer("entity_id").notNull(),
+  account_number: text("account_number"),
+  account_name: text("account_name").notNull(),
+  account_type: text("account_type"),
+  detail_type: text("detail_type"),
+  active: integer("active").notNull().default(1),
+  imported_at: text("imported_at").notNull(),
+});
+
 export const reconZipToEntityLookup = sqliteTable("recon_zip_to_entity_lookup", {
   zip: text("zip").primaryKey(),
   entity_id: integer("entity_id"),
@@ -727,6 +758,8 @@ export type ReconGcAllocationPolicy = (typeof RECON_GC_ALLOCATION_POLICIES)[numb
 
 export type ReconSettings = typeof reconSettings.$inferSelect;
 export type ReconEntityPosLocation = typeof reconEntityPosLocations.$inferSelect;
+export type ReconCoaMapping = typeof reconCoaMapping.$inferSelect;
+export type ReconEntityCoa = typeof reconEntityCoa.$inferSelect;
 export type ReconZipToEntityLookup = typeof reconZipToEntityLookup.$inferSelect;
 export type ReconPriorYearProRata = typeof reconPriorYearProRata.$inferSelect;
 export type ReconOrder = typeof reconOrders.$inferSelect;
