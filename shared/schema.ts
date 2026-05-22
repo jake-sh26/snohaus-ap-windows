@@ -616,6 +616,13 @@ export const reconBalanceTransactions = sqliteTable("recon_balance_transactions"
   currency: text("currency"),
   source_order_id: text("source_order_id"),
   source_transaction_id: text("source_transaction_id"),
+  // PR #R3: explicit chargeback flag. TRUE when Shopify's balance_transaction
+  // is a customer dispute outflow (`type=adjustment` with chargeback-related
+  // adjustment_reason, or any `type` matching dispute_*). Critical for the
+  // catch-all decomposition — chargebacks are one of the silent sources of
+  // the "Other Discounts/Refunds Given" plug in the old process.
+  chargeback: integer("chargeback").notNull().default(0),
+  adjustment_reason: text("adjustment_reason"),
   raw_json: text("raw_json"),
   ingested_at: text("ingested_at").notNull(),
 });
