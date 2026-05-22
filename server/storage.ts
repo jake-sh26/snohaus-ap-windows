@@ -1067,6 +1067,79 @@ function bootstrapSchema() {
       ON recon_gift_card_issuance(gc_id) WHERE gc_id IS NOT NULL;
   `);
 
+  // ----- PR #R4i — Defensive schema-drift migration -----
+  // Production DBs that survived an earlier partial R4e deploy attempt have
+  // a recon_gift_card_redemptions table created from a draft schema that's
+  // missing several columns (in particular is_cross_entity). The CREATE
+  // TABLE IF NOT EXISTS statements below are no-ops on those DBs, but the
+  // CREATE INDEX ... WHERE is_cross_entity = 1 clause that follows crashes
+  // with "no such column: is_cross_entity" because the existing table never
+  // had it.
+  //
+  // ensureColumns inspects PRAGMA table_info() and ALTER TABLE ADD COLUMN
+  // for any expected R4e columns that are missing. Runs BEFORE the CREATE
+  // TABLE / CREATE INDEX block so:
+  //   - brand-new DBs: ensureColumns is a no-op (table doesn't exist yet),
+  //     then CREATE TABLE creates the full schema, then CREATE INDEX works.
+  //   - drifted DBs:   ensureColumns patches in the missing columns, then
+  //     CREATE TABLE IF NOT EXISTS no-ops, then CREATE INDEX works.
+  //
+  // SQLite ADD COLUMN requires a constant default — `datetime('now')` is
+  // NOT constant, so the patched-in `created_at` is nullable text. Rows
+  // INSERTED after the patch get a value via the application code path;
+  // rows that pre-existed the patch get NULL, which is acceptable for the
+  // legacy stub (those rows didn't carry the column at all).
+  function ensureColumns(
+    tableName: string,
+    expected: Array<{ name: string; defn: string }>,
+  ) {
+    const exists = sqlite
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`)
+      .get(tableName);
+    if (!exists) return; // table doesn't exist — CREATE TABLE below will handle it
+    const cols = sqlite
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all() as Array<{ name: string }>;
+    const have = new Set(cols.map((c) => c.name));
+    for (const col of expected) {
+      if (have.has(col.name)) continue;
+      try {
+        sqlite.exec(`ALTER TABLE ${tableName} ADD COLUMN ${col.name} ${col.defn}`);
+        console.log(`[schema-migration] Added column ${tableName}.${col.name}`);
+      } catch (e) {
+        console.error(`[schema-migration] FAILED to add ${tableName}.${col.name}:`, e);
+        throw e;
+      }
+    }
+  }
+
+  ensureColumns("recon_gift_card_redemptions", [
+    // ADD COLUMN can't enforce NOT NULL without a default. The legacy stub
+    // was created via a partial migration; surviving rows (if any) are
+    // backfilled by the application's idempotent INSERT-OR-IGNORE writes.
+    { name: "gc_id", defn: "TEXT" },
+    { name: "order_id", defn: "TEXT" },
+    { name: "transaction_id", defn: "TEXT" },
+    { name: "amount", defn: "REAL" },
+    { name: "issuer_entity_id", defn: "INTEGER" },
+    { name: "redeemer_entity_id", defn: "INTEGER" },
+    { name: "is_cross_entity", defn: "INTEGER NOT NULL DEFAULT 0" },
+    { name: "redeemed_at", defn: "TEXT" },
+    { name: "created_at", defn: "TEXT" }, // datetime('now') is non-constant — leave nullable
+  ]);
+  ensureColumns("recon_inter_company_journal_entries", [
+    { name: "source_kind", defn: "TEXT" },
+    { name: "source_id", defn: "INTEGER" },
+    { name: "entity_id", defn: "INTEGER" },
+    { name: "counterparty_entity_id", defn: "INTEGER" },
+    { name: "account_role", defn: "TEXT" },
+    { name: "side", defn: "TEXT" },
+    { name: "amount", defn: "REAL" },
+    { name: "order_id", defn: "TEXT" },
+    { name: "gc_id", defn: "TEXT" },
+    { name: "created_at", defn: "TEXT" },
+  ]);
+
   // ----- Gift card redemptions (PR #R4e) -----
   // The mirror of recon_gift_card_issuance — captures every time a GC is used
   // at checkout. Inferred from order.transactions[] where gateway='gift_card'.
