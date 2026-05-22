@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -1133,20 +1133,35 @@ export default function ReconcilerTest() {
               <RefreshCw className={`size-4 mr-1.5 ${mappingSuggestedMut.isPending ? "animate-spin" : ""}`} />
               {mappingDraft ? "Reload suggestions" : "Load suggestions"}
             </Button>
-            {mappingDraft && mappingDraft.length > 0 && (
-              <Button
-                size="sm"
-                variant="default"
-                onClick={() => mappingDraft && mappingSaveMut.mutate(mappingDraft)}
-                disabled={mappingSaveMut.isPending}
-              >
-                <Save className="size-4 mr-1.5" /> Confirm & save all
-              </Button>
-            )}
+            {mappingDraft && mappingDraft.length > 0 && (() => {
+              const allSynced = mappingDraft.every(r => r.current_entity_id != null && r.current_entity_id === r.suggested_entity_id && (r.current_kind ?? "pos") === r.suggested_kind);
+              const pendingCount = mappingDraft.filter(r => r.current_entity_id == null || r.current_entity_id !== r.suggested_entity_id || (r.current_kind ?? "pos") !== r.suggested_kind).length;
+              return (
+                <Button
+                  size="sm"
+                  variant={allSynced ? "outline" : "default"}
+                  onClick={() => mappingDraft && mappingSaveMut.mutate(mappingDraft)}
+                  disabled={mappingSaveMut.isPending || allSynced}
+                >
+                  {allSynced ? (
+                    <><Check className="size-4 mr-1.5 text-emerald-700" /> All saved</>
+                  ) : (
+                    <><Save className="size-4 mr-1.5" /> Confirm & save ({pendingCount} pending)</>
+                  )}
+                </Button>
+              );
+            })()}
             {!configured && (
               <span className="text-xs text-muted-foreground">Connect Shopify first.</span>
             )}
           </div>
+
+          {mappingSaveMut.isSuccess && mappingDraft && mappingDraft.length > 0 && mappingDraft.every(r => r.current_entity_id != null && r.current_entity_id === r.suggested_entity_id && (r.current_kind ?? "pos") === r.suggested_kind) && (
+            <div className="flex items-center gap-2 text-emerald-700 text-sm bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 rounded-md px-3 py-2">
+              <CheckCircle2 className="size-4" />
+              All {mappingDraft.length} locations saved. Last save: {mappingSaveMut.data ? `${mappingSaveMut.data.inserted} inserted, ${mappingSaveMut.data.updated} updated, ${mappingSaveMut.data.skipped} skipped` : ""}
+            </div>
+          )}
 
           {mappingDraft && mappingDraft.length > 0 && (
             <div className="border rounded-md overflow-x-auto">
@@ -1213,13 +1228,19 @@ export default function ReconcilerTest() {
                             <option value="inactive">Inactive / ignore</option>
                           </select>
                         </td>
-                        <td className="px-2 py-1.5 text-muted-foreground">
+                        <td className="px-2 py-1.5">
                           {row.current_entity_id == null ? (
-                            <span className="text-amber-700">new</span>
+                            <span className="inline-flex items-center gap-1 text-amber-700 text-[11px]">
+                              <AlertTriangle className="size-3" /> not saved yet
+                            </span>
                           ) : changed ? (
-                            <span className="text-blue-700">{row.current_entity_location} / {row.current_kind} → will update</span>
+                            <span className="inline-flex items-center gap-1 text-blue-700 text-[11px]">
+                              {row.current_entity_location} / {row.current_kind} → will update
+                            </span>
                           ) : (
-                            <span>{row.current_entity_location} / {row.current_kind}</span>
+                            <span className="inline-flex items-center gap-1 text-emerald-700 text-[11px]">
+                              <Check className="size-3" /> saved
+                            </span>
                           )}
                         </td>
                       </tr>
