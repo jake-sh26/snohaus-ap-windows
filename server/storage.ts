@@ -945,6 +945,42 @@ function bootstrapSchema() {
       ON recon_line_items(tax_channel_liable);
   `);
 
+  // ----- Shopify order fulfillments (PR #R4b) -----
+  // One row per fulfillment record on an order. Critical for online sales:
+  // the order-level `location_id` is null for online orders, but each
+  // fulfillment carries the actual store/warehouse it shipped from. We use
+  // this to allocate online physical sales to the right entity.
+  //
+  // We store ALL fulfillments (including cancelled ones) but the allocator
+  // only trusts ones with status='success'. line_item_ids_json holds the
+  // subset of the order's line_items that were shipped on this fulfillment
+  // — needed for split-fulfillment orders (rare but possible) where one
+  // order ships from two stores.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_order_fulfillments (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      location_id TEXT,
+      status TEXT,                     -- success|cancelled|error|pending|open
+      shipment_status TEXT,            -- delivered|in_transit|...
+      created_at TEXT,
+      updated_at TEXT,
+      tracking_company TEXT,
+      tracking_number TEXT,
+      -- JSON array of line_item ids that were fulfilled on THIS fulfillment.
+      -- Used by allocator for split-fulfillment per-line routing.
+      line_item_ids_json TEXT,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_fulfillments_order
+      ON recon_order_fulfillments(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_fulfillments_location
+      ON recon_order_fulfillments(location_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_fulfillments_status
+      ON recon_order_fulfillments(status);
+  `);
+
   // ----- Shopify payouts -----
   // A payout = one deposit from Shopify Payments to the bank account. The
   // Plaid matcher in PR #R5 will join recon_payouts.amount + deposit date to
@@ -3626,6 +3662,52 @@ export function replaceReconLineItems(
   });
   tx();
   return lines.length;
+}
+
+/**
+ * PR #R4b — fulfillment upsert. One row per (order_id, fulfillment_id).
+ * Like line items, we delete-then-insert all fulfillments for an order in a
+ * single transaction — Shopify can reshape the array on edits/refunds.
+ */
+export type ReconFulfillmentUpsert = {
+  id: string;
+  order_id: string;
+  location_id: string | null;
+  status: string | null;
+  shipment_status: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  tracking_company: string | null;
+  tracking_number: string | null;
+  line_item_ids_json: string | null;
+  raw_json: string | null;
+};
+
+export function replaceReconFulfillments(
+  orderId: string,
+  fulfillments: ReconFulfillmentUpsert[],
+): number {
+  const now = new Date().toISOString();
+  const tx = sqlite.transaction(() => {
+    sqlite.prepare(`DELETE FROM recon_order_fulfillments WHERE order_id = ?`).run(orderId);
+    if (fulfillments.length === 0) return;
+    const ins = sqlite.prepare(`
+      INSERT INTO recon_order_fulfillments (
+        id, order_id, location_id, status, shipment_status,
+        created_at, updated_at, tracking_company, tracking_number,
+        line_item_ids_json, raw_json, ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const f of fulfillments) {
+      ins.run(
+        f.id, f.order_id, f.location_id, f.status, f.shipment_status,
+        f.created_at, f.updated_at, f.tracking_company, f.tracking_number,
+        f.line_item_ids_json, f.raw_json, now,
+      );
+    }
+  });
+  tx();
+  return fulfillments.length;
 }
 
 /**

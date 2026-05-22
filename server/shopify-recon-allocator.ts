@@ -134,6 +134,60 @@ function getProRataShares(year: number): Array<{ entity_id: number; share: numbe
     .all(year) as Array<{ entity_id: number; share: number }>;
 }
 
+// PR #R4b — fulfillment lookup. Returns ALL successful fulfillments for an
+// order, with the line item ids each fulfillment shipped. Used by allocator
+// to route online-physical sales to the right entity (the order's top-level
+// location_id is null for online sales).
+type FulfillmentRow = {
+  id: string;
+  location_id: string | null;
+  status: string | null;
+  line_item_ids: string[];
+};
+
+function listSuccessfulFulfillments(orderId: string): FulfillmentRow[] {
+  const rows = sqlite
+    .prepare(
+      `SELECT id, location_id, status, line_item_ids_json
+       FROM recon_order_fulfillments
+       WHERE order_id = ? AND status = 'success'
+       ORDER BY (created_at IS NULL), created_at ASC, id ASC`
+    )
+    .all(orderId) as Array<{
+      id: string;
+      location_id: string | null;
+      status: string | null;
+      line_item_ids_json: string | null;
+    }>;
+  return rows.map(r => ({
+    id: r.id,
+    location_id: r.location_id,
+    status: r.status,
+    line_item_ids: (() => {
+      if (!r.line_item_ids_json) return [];
+      try {
+        const parsed = JSON.parse(r.line_item_ids_json);
+        return Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch { return []; }
+    })(),
+  }));
+}
+
+// Returns the *successful* fulfillment that shipped a given line item, if
+// exactly one exists. If a line item appears on multiple fulfillments (rare
+// — e.g. partial cancellation + reship), prefer the most recent. Returns
+// null if none.
+function findFulfillmentForLine(
+  fulfillments: FulfillmentRow[],
+  lineItemId: string,
+): FulfillmentRow | null {
+  const matches = fulfillments.filter(f => f.line_item_ids.includes(lineItemId));
+  if (matches.length === 0) return null;
+  // Last in chronological order (we sorted ASC) wins — represents the most
+  // recent successful ship of this line.
+  return matches[matches.length - 1];
+}
+
 // Allocate a single line item. Returns one or more AllocationRow slices.
 function allocateLineItem(
   order: OrderRow,
@@ -141,6 +195,7 @@ function allocateLineItem(
   ctx: {
     locationMap: Map<string, { entity_id: number; kind: string }>;
     sdEntityId: number | null;
+    fulfillments: FulfillmentRow[];
   },
 ): AllocationRow[] {
   const gross =
@@ -235,7 +290,18 @@ function allocateLineItem(
     }];
   }
 
-  // Online physical order: route by fulfillment location_id.
+  // ------------------------------------------------------------------
+  // Online physical order. Three cases, in priority order:
+  //   (a) Order has a top-level location_id (rare on web orders, but
+  //       Shopify sets it on some Shop Pay / draft order flows). Use it.
+  //   (b) Line item is on a successful fulfillment — use that fulfillment's
+  //       ship-from location_id. This is the common path. Handles split
+  //       fulfillments correctly (each line ships from its own location).
+  //   (c) Order is unfulfilled (or this line is on no successful
+  //       fulfillment yet) — flag needs_review so we don't guess.
+  // ------------------------------------------------------------------
+
+  // (a) Direct order-level location_id.
   if (order.location_id) {
     const hit = ctx.locationMap.get(order.location_id);
     if (hit) {
@@ -248,15 +314,65 @@ function allocateLineItem(
         gross_amount: gross,
         tax_amount: tax,
         method,
-        reason: `Online @ fulfillment location ${order.location_id} → ${hit.kind}`,
+        reason: `Online @ order location ${order.location_id} → ${hit.kind}`,
         auto_method: method,
         auto_entity_id: hit.entity_id,
       }];
     }
+    // Order has a location but it's unmapped — flag.
+    return [{
+      order_id: order.id,
+      line_item_id: line.id,
+      entity_id: ctx.sdEntityId ?? 0,
+      share: 1,
+      gross_amount: gross,
+      tax_amount: tax,
+      method: "needs_review",
+      reason: `Online @ unmapped order location ${order.location_id}`,
+      auto_method: "needs_review",
+      auto_entity_id: null,
+    }];
   }
 
-  // No location_id (rare for non-GC online orders) — default to SD with
-  // needs_review so the user can confirm.
+  // (b) Look up the fulfillment that shipped this line.
+  const fulfillment = findFulfillmentForLine(ctx.fulfillments, line.id);
+  if (fulfillment && fulfillment.location_id) {
+    const hit = ctx.locationMap.get(fulfillment.location_id);
+    if (hit) {
+      const method: AllocationMethod = hit.kind === "warehouse" ? "warehouse_rollup" : "fulfillment_location";
+      return [{
+        order_id: order.id,
+        line_item_id: line.id,
+        entity_id: hit.entity_id,
+        share: 1,
+        gross_amount: gross,
+        tax_amount: tax,
+        method,
+        reason: `Online → fulfillment ${fulfillment.id} @ location ${fulfillment.location_id} (${hit.kind})`,
+        auto_method: method,
+        auto_entity_id: hit.entity_id,
+      }];
+    }
+    // Shipped from an unmapped location — flag for review.
+    return [{
+      order_id: order.id,
+      line_item_id: line.id,
+      entity_id: ctx.sdEntityId ?? 0,
+      share: 1,
+      gross_amount: gross,
+      tax_amount: tax,
+      method: "needs_review",
+      reason: `Online → fulfillment @ unmapped location ${fulfillment.location_id}`,
+      auto_method: "needs_review",
+      auto_entity_id: null,
+    }];
+  }
+
+  // (c) No order-level location, no successful fulfillment for this line.
+  // Per user spec: leave as needs_review until fulfilled.
+  const reason = ctx.fulfillments.length === 0
+    ? `Online order not yet fulfilled — review after ship`
+    : `Online order has fulfillments, but none ship line ${line.id} yet`;
   return [{
     order_id: order.id,
     line_item_id: line.id,
@@ -265,7 +381,7 @@ function allocateLineItem(
     gross_amount: gross,
     tax_amount: tax,
     method: "needs_review",
-    reason: `Online order with no fulfillment location_id`,
+    reason,
     auto_method: "needs_review",
     auto_entity_id: null,
   }];
@@ -373,11 +489,17 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
         .all(o.id) as Array<{ line_item_id: string | null }>;
       const overriddenLineIds = new Set(overrides.map(r => r.line_item_id));
 
+      // PR #R4b — pre-load successful fulfillments for this order so the
+      // online-physical branch can route each line by its actual ship-from
+      // location instead of the (often null) order-level location_id.
+      const fulfillments = listSuccessfulFulfillments(o.id);
+      const lineCtx = { ...ctx, fulfillments };
+
       let orderHasReview = false;
       for (const line of lines) {
         summary.line_items_processed++;
         if (overriddenLineIds.has(line.id)) continue; // keep manual override
-        const slices = allocateLineItem(o, line, ctx);
+        const slices = allocateLineItem(o, line, lineCtx);
         for (const a of slices) {
           insertStmt.run(
             a.order_id,
