@@ -24,8 +24,10 @@
 import {
   startReconSync, finishReconSync,
   upsertReconOrder, replaceReconLineItems, replaceReconFulfillments,
+  replaceReconFulfillmentOrders,
   getReconOrdersWatermark, getReconSettings,
   type ReconOrderUpsert, type ReconLineItemUpsert, type ReconFulfillmentUpsert,
+  type ReconFulfillmentOrderUpsert,
 } from "./storage";
 import {
   getShopifyReconConfig, shopifyRestCall, parseNextPageUrl,
@@ -45,6 +47,7 @@ export function transformShopifyOrder(o: any): {
   order: ReconOrderUpsert;
   lines: ReconLineItemUpsert[];
   fulfillments: ReconFulfillmentUpsert[];
+  fulfillment_orders: ReconFulfillmentOrderUpsert[];
 } {
   // ---- Defensive number coercion. Shopify sends money as strings ("123.45"). ----
   const num = (v: any): number | null => {
@@ -179,25 +182,90 @@ export function transformShopifyOrder(o: any): {
     };
   });
 
-  return { order, lines, fulfillments };
+  // ---- Fulfillment orders (PR #R4d) ----
+  // The FO graph is more reliable than fulfillments[] for two cases:
+  //   1. Online orders that haven't shipped yet still get an FO at order time,
+  //      with assigned_location_id set to the routed store. Pre-#R4d these
+  //      fell to needs_review until the merchant shipped.
+  //   2. Locally orders, which arrive with a non-null order-level location_id
+  //      that points at Locally's pseudo-location (e.g. 123711225857), have
+  //      a FO assigned to the *actual* fulfilling store. Without this we mis-
+  //      routed every Locally order to needs_review or to Locally's fake loc.
+  //
+  // fulfillment_orders is NOT part of the default /orders.json response —
+  // see fetchFulfillmentOrdersForOrder() below for how we hydrate it during
+  // sync. If the field happens to be present on the payload (webhook hot path
+  // or `fields=...,fulfillment_orders` query) we transform it here too.
+  const rawFulfillmentOrders = Array.isArray(o.fulfillment_orders) ? o.fulfillment_orders : [];
+  const fulfillment_orders: ReconFulfillmentOrderUpsert[] = rawFulfillmentOrders.map((fo: any) => {
+    const lineItemIds = Array.isArray(fo.line_items)
+      ? fo.line_items.map((li: any) => (li?.line_item_id != null ? String(li.line_item_id) : null)).filter(Boolean)
+      : [];
+    return {
+      id: String(fo.id),
+      order_id: String(o.id),
+      assigned_location_id: fo.assigned_location_id != null ? String(fo.assigned_location_id) : null,
+      status: fo.status ?? null,
+      request_status: fo.request_status ?? null,
+      supported_actions_json: fo.supported_actions ? JSON.stringify(fo.supported_actions) : null,
+      line_item_ids_json: JSON.stringify(lineItemIds),
+      raw_json: JSON.stringify(fo),
+    };
+  });
+
+  return { order, lines, fulfillments, fulfillment_orders };
 }
 
 /**
- * Upsert a single order + its line items + its fulfillments. Used by both
- * webhook handlers and the polling loop. Idempotent — safe to call multiple
- * times for the same order.
+ * Fetch fulfillment_orders for a given order id via the dedicated endpoint.
+ * The list /orders.json endpoint does not include this collection even with
+ * `fields=...,fulfillment_orders` — confirmed empirically against the 2024-10
+ * REST admin API. So during sync we make one extra call per order.
+ *
+ * For high-volume backfills this WOULD be a problem, but: (a) we only call
+ * this on orders we actually want to (re)route, and (b) the regular sync
+ * loop already throttles via shopifyRestCall's leaky-bucket helper.
  */
-export function upsertOrderFromShopify(rawOrder: any): {
+export async function fetchFulfillmentOrdersForOrder(
+  cfg: ReturnType<typeof getShopifyReconConfig>,
+  orderId: string,
+): Promise<any[]> {
+  if (!cfg) return [];
+  const res = await shopifyRestCall(cfg, `/orders/${orderId}/fulfillment_orders.json`);
+  return Array.isArray(res.json?.fulfillment_orders) ? res.json.fulfillment_orders : [];
+}
+
+/**
+ * Upsert a single order + its line items + its fulfillments + its
+ * fulfillment_orders. Used by both webhook handlers and the polling loop.
+ * Idempotent — safe to call multiple times for the same order.
+ *
+ * If the order payload doesn't include `fulfillment_orders` (the common case
+ * from the list endpoint), pass `rawFulfillmentOrders` separately — the
+ * caller is responsible for fetching them via fetchFulfillmentOrdersForOrder().
+ */
+export function upsertOrderFromShopify(
+  rawOrder: any,
+  rawFulfillmentOrders?: any[] | null,
+): {
   orderId: string;
   outcome: "inserted" | "updated";
   lineCount: number;
   fulfillmentCount: number;
+  fulfillmentOrderCount: number;
 } {
-  const { order, lines, fulfillments } = transformShopifyOrder(rawOrder);
+  // If the caller supplied FOs separately, splice them into the raw order so
+  // the transform sees them uniformly. (Webhooks: never separate. Sync: usually
+  // separate.)
+  if (Array.isArray(rawFulfillmentOrders) && rawFulfillmentOrders.length > 0) {
+    rawOrder = { ...rawOrder, fulfillment_orders: rawFulfillmentOrders };
+  }
+  const { order, lines, fulfillments, fulfillment_orders } = transformShopifyOrder(rawOrder);
   const outcome = upsertReconOrder(order);
   const lineCount = replaceReconLineItems(order.id, lines);
   const fulfillmentCount = replaceReconFulfillments(order.id, fulfillments);
-  return { orderId: order.id, outcome, lineCount, fulfillmentCount };
+  const fulfillmentOrderCount = replaceReconFulfillmentOrders(order.id, fulfillment_orders);
+  return { orderId: order.id, outcome, lineCount, fulfillmentCount, fulfillmentOrderCount };
 }
 
 /**
@@ -257,7 +325,17 @@ export async function syncOrdersIncremental(
       const orders = (res.json?.orders || []) as any[];
       for (const o of orders) {
         try {
-          const { outcome } = upsertOrderFromShopify(o);
+          // PR #R4d — hydrate fulfillment_orders via the dedicated endpoint.
+          // The list /orders.json response doesn't include them. We swallow
+          // errors here (best-effort) — the order itself still ingests so the
+          // sync watermark advances; the FO backfill route can fill gaps later.
+          let foPayload: any[] | null = null;
+          try {
+            foPayload = await fetchFulfillmentOrdersForOrder(cfg, String(o.id));
+          } catch (e: any) {
+            srWarn("orders-ingest", `order ${o?.id} FO fetch failed: ${e?.message ?? e}`);
+          }
+          const { outcome } = upsertOrderFromShopify(o, foPayload);
           if (outcome === "inserted") inserted++; else updated++;
           if (o.updated_at && (!maxUpdatedAt || o.updated_at > maxUpdatedAt)) {
             maxUpdatedAt = o.updated_at;
@@ -474,6 +552,33 @@ export async function backfillFulfillments(
           const written = replaceReconFulfillments(oid, fulfillments);
           totalFulfillments += written;
           if (written > 0) updated++;
+
+          // PR #R4d — also hydrate fulfillment_orders for this order so the
+          // allocator can route Locally / unshipped online orders correctly.
+          // One extra REST call per order; cheap relative to the per-order
+          // pulls #R4c eliminated for shipments themselves.
+          try {
+            const foPayload = await fetchFulfillmentOrdersForOrder(cfg, oid);
+            const fos: ReconFulfillmentOrderUpsert[] = (foPayload || []).map((fo: any) => {
+              const lineItemIds = Array.isArray(fo.line_items)
+                ? fo.line_items.map((li: any) => (li?.line_item_id != null ? String(li.line_item_id) : null)).filter(Boolean)
+                : [];
+              return {
+                id: String(fo.id),
+                order_id: oid,
+                assigned_location_id: fo.assigned_location_id != null ? String(fo.assigned_location_id) : null,
+                status: fo.status ?? null,
+                request_status: fo.request_status ?? null,
+                supported_actions_json: fo.supported_actions ? JSON.stringify(fo.supported_actions) : null,
+                line_item_ids_json: JSON.stringify(lineItemIds),
+                raw_json: JSON.stringify(fo),
+              };
+            });
+            replaceReconFulfillmentOrders(oid, fos);
+          } catch (e: any) {
+            srWarn("fulfillments-backfill", `order ${oid} FO fetch failed: ${e?.message ?? e}`);
+            // Not counted as a fatal error — FO hydration is best-effort.
+          }
         } catch (e: any) {
           errors++;
           srWarn("fulfillments-backfill", `order ${oid}: ${e?.message ?? e}`);
@@ -484,8 +589,11 @@ export async function backfillFulfillments(
         pages, orders_scanned: scanned, orders_updated: updated,
         fulfillments_written: totalFulfillments, errors,
       });
-      if (pages > 50) {
-        srWarn("fulfillments-backfill", `stopping at ${pages} pages — narrow the date range`);
+      // PR #R4d — cap raised 50 → 200 to enable "Backfill all history" runs.
+      // Each page is 250 orders, so 200 pages = 50k orders; at our volume
+      // that's well over a year of history. A full reset still terminates.
+      if (pages > 200) {
+        srWarn("fulfillments-backfill", `stopping at ${pages} pages — narrow the date range or split the run`);
         break;
       }
     } while (nextUrl);
