@@ -9,7 +9,7 @@
  * to register/reset webhook subscriptions on the Shopify side and the manual
  * sync trigger (which is also automated on boot + every 6h).
  */
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -360,41 +360,88 @@ export default function ReconcilerTest() {
   };
   const [backfillSince, setBackfillSince] = useState<string>("");
   const [backfillUntil, setBackfillUntil] = useState<string>("");
-  const [backfillProgress, setBackfillProgress] = useState<BackfillProgress | null>(null);
   // PR #R4d — pull initial_sync_from from reconciler settings so the
   // "Backfill all history" button knows where the configured history floor is.
   const settingsQ = useQuery<{ initial_sync_from?: string | null }>({
     queryKey: ["/api/recon/settings"],
     queryFn: () => fetch("/api/recon/settings", { credentials: "include" }).then((r) => r.json()),
   });
+  // PR #R4f — always-on backfill progress poller. Decoupled from the
+  // mutation's isPending so a freshly-loaded client (after a refresh, or
+  // simply someone else's session) sees the running job's state within
+  // ~1.5s. The server returns the currently-running backfill (or the most
+  // recent finished one) when called without a syncLogId.
+  const backfillProgressQ = useQuery<{ progress: BackfillProgress | null; recent?: BackfillProgress[] }>({
+    queryKey: ["/api/recon/shopify/sync/fulfillments-backfill/progress"],
+    queryFn: () =>
+      fetch("/api/recon/shopify/sync/fulfillments-backfill/progress", { credentials: "include" })
+        .then((r) => (r.ok ? r.json() : { progress: null })),
+    refetchInterval: 1500,
+    // Always refetch in the background even when the tab is hidden, so a
+    // user returning to the tab sees fresh state immediately.
+    refetchIntervalInBackground: true,
+  });
+  const backfillProgress = backfillProgressQ.data?.progress ?? null;
+  const backfillIsRunning = backfillProgress?.state === "running";
+  // Surface the final tally exactly once when the run flips out of running.
+  const prevRunningRef = useRef(false);
+  useEffect(() => {
+    const wasRunning = prevRunningRef.current;
+    if (wasRunning && !backfillIsRunning && backfillProgress) {
+      if (backfillProgress.state === "failure") {
+        setLastAction(
+          `Backfill ended: ${backfillProgress.message ?? backfillProgress.error ?? "failure"} — ` +
+          `${backfillProgress.orders_scanned} scanned, ${backfillProgress.orders_updated} updated, ${backfillProgress.fulfillments_written} fulfillments`,
+        );
+      } else {
+        setLastAction(
+          `Backfill done: ${backfillProgress.orders_scanned} scanned, ${backfillProgress.orders_updated} updated, ${backfillProgress.fulfillments_written} fulfillment rows, ${backfillProgress.errors} errors (${backfillProgress.pages} page(s))`,
+        );
+      }
+      qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
+    }
+    prevRunningRef.current = backfillIsRunning;
+  }, [backfillIsRunning, backfillProgress, qc]);
+
   const fulfillmentBackfillMut = useMutation<FulfillmentBackfillResult, Error, { since: string; until?: string }>({
     mutationFn: (args) => jsonPost<FulfillmentBackfillResult>("/api/recon/shopify/sync/fulfillments-backfill", args),
     onSuccess: (r) => {
-      setLastAction(
-        r.error
-          ? `Fulfillment backfill error: ${r.error}`
-          : `Backfill: ${r.orders_scanned} scanned, ${r.orders_updated} updated, ${r.fulfillments_written} fulfillment rows written, ${r.errors} errors (${r.pages} page(s))`,
-      );
+      // The always-on poller surfaces progress + final tally; we don't need
+      // to duplicate the success line. We still record an error if the run
+      // itself reported one in its response body (vs. the 409 path which
+      // throws and lands in onError below).
+      if (r.error) setLastAction(`Fulfillment backfill error: ${r.error}`);
       qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
     },
-    onError: (e: any) => setLastAction(`Fulfillment backfill failed: ${e?.message ?? e}`),
+    onError: (e: any) => {
+      const msg: string = e?.message ?? String(e);
+      // apiRequest throws as `${status}: ${body}` — pick the 409 we send
+      // when a run is already in flight and surface it in plain English.
+      if (msg.startsWith("409:")) {
+        setLastAction("A backfill is already running — wait or stop it first");
+      } else {
+        setLastAction(`Fulfillment backfill failed: ${msg}`);
+      }
+    },
   });
-  // Poll progress every 1.5s while a backfill is running.
-  useEffect(() => {
-    if (!fulfillmentBackfillMut.isPending) return;
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const res = await fetch("/api/recon/shopify/sync/fulfillments-backfill/progress", { credentials: "include" });
-        if (!res.ok) return;
-        const j = await res.json();
-        if (!cancelled && j.progress) setBackfillProgress(j.progress as BackfillProgress);
-      } catch { /* ignore poll errors */ }
-    };
-    void tick();
-    const id = window.setInterval(tick, 1500);
-    return () => { cancelled = true; window.clearInterval(id); };
-  }, [fulfillmentBackfillMut.isPending]);
+
+  // PR #R4f — stop the currently-running backfill (server cancels ALL when
+  // no syncLogId is provided in the body). The actual halt is cooperative —
+  // the loop checks the flag between pages/orders — so it may take a few
+  // seconds to take effect, which we tell the user.
+  const cancelBackfillMut = useMutation<{ cancelled: number[] }, Error>({
+    mutationFn: () => jsonPost("/api/recon/shopify/sync/fulfillments-backfill/cancel", {}),
+    onSuccess: (r) => {
+      if (r.cancelled && r.cancelled.length > 0) {
+        setLastAction(
+          `Backfill stop requested (id ${r.cancelled.join(", ")}). It may take a few seconds to halt.`,
+        );
+      } else {
+        setLastAction("No running backfill to stop");
+      }
+    },
+    onError: (e: any) => setLastAction(`Stop request failed: ${e?.message ?? e}`),
+  });
   const registerMut = useMutation<WebhookRegResult>({
     mutationFn: () => jsonPost("/api/recon/shopify/webhooks/register"),
     onSuccess: (r) => setLastAction(`Webhooks: ${r.results.map(x => `${x.topic}=${x.state}`).join(", ")}`),
@@ -993,38 +1040,55 @@ export default function ReconcilerTest() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!configured || !backfillSince || fulfillmentBackfillMut.isPending}
+                disabled={!configured || !backfillSince || fulfillmentBackfillMut.isPending || backfillIsRunning}
                 onClick={() => {
-                  setBackfillProgress(null);
                   fulfillmentBackfillMut.mutate({
                     since: backfillSince,
                     until: backfillUntil || undefined,
                   });
                 }}
               >
-                <RefreshCw className={`size-4 mr-1.5 ${fulfillmentBackfillMut.isPending ? "animate-spin" : ""}`} />
-                {fulfillmentBackfillMut.isPending ? "Backfilling…" : "Backfill fulfillments"}
+                <RefreshCw className={`size-4 mr-1.5 ${(fulfillmentBackfillMut.isPending || backfillIsRunning) ? "animate-spin" : ""}`} />
+                {(fulfillmentBackfillMut.isPending || backfillIsRunning) ? "Backfilling…" : "Backfill fulfillments"}
               </Button>
               {/* PR #R4d — single-button shortcut for the full history sweep. */}
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!configured || fulfillmentBackfillMut.isPending}
+                disabled={!configured || fulfillmentBackfillMut.isPending || backfillIsRunning}
                 onClick={() => {
                   const floor = settingsQ.data?.initial_sync_from || "2025-01-01";
                   const ok = window.confirm(
                     `Backfill fulfillments + fulfillment_orders for ALL orders since ${floor}? This may take several minutes for a full history sweep.`,
                   );
                   if (!ok) return;
-                  setBackfillProgress(null);
                   fulfillmentBackfillMut.mutate({ since: floor });
                 }}
               >
-                <RefreshCw className={`size-4 mr-1.5 ${fulfillmentBackfillMut.isPending ? "animate-spin" : ""}`} />
+                <RefreshCw className={`size-4 mr-1.5 ${(fulfillmentBackfillMut.isPending || backfillIsRunning) ? "animate-spin" : ""}`} />
                 Backfill all history
               </Button>
+              {/* PR #R4f — cooperative cancel. Disabled unless a run is
+                  actually in flight (server state, not client mutation). */}
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={!backfillIsRunning || cancelBackfillMut.isPending}
+                onClick={() => {
+                  const ok = window.confirm(
+                    "Stop the running backfill? Progress will be lost.",
+                  );
+                  if (!ok) return;
+                  cancelBackfillMut.mutate();
+                }}
+              >
+                Stop backfill
+              </Button>
             </div>
-            {fulfillmentBackfillMut.isPending && backfillProgress && (
+            {/* PR #R4f — show the progress card whenever a run is actually
+                in flight on the server, regardless of whether THIS client
+                started it. Resumes correctly after a page refresh. */}
+            {backfillIsRunning && backfillProgress && (
               <div className="text-xs rounded-md border border-blue-200 bg-blue-50 p-2.5 text-blue-900">
                 <div className="flex items-center gap-2">
                   <RefreshCw className="size-3.5 animate-spin" />
@@ -1038,6 +1102,9 @@ export default function ReconcilerTest() {
                   {" "}{backfillProgress.orders_updated} updated,
                   {" "}{backfillProgress.fulfillments_written} fulfillments
                   {backfillProgress.errors > 0 ? `, ${backfillProgress.errors} errors` : ""}
+                </div>
+                <div className="mt-1 text-[10px] text-blue-700/80">
+                  syncLogId {backfillProgress.syncLogId} · started {shortTime(backfillProgress.startedAt)}
                 </div>
               </div>
             )}
@@ -2233,28 +2300,50 @@ export default function ReconcilerTest() {
       </Card>
 
       {/* ===== 9. Error log ===== */}
-      {errorLogQ.data && errorLogQ.data.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-amber-700"><AlertTriangle className="size-4" /> Integration errors</CardTitle>
-            <CardDescription>Transient API failures or HMAC mismatches. Safe to clear once reviewed.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="space-y-1.5">
-              {errorLogQ.data.map((e, i) => (
-                <div key={i} className="text-xs font-mono border-l-2 border-amber-300 pl-2">
-                  <span className="text-muted-foreground">{shortTime(e.ts)}</span>{" "}
-                  <span className="text-amber-700">[{e.scope}]</span>{" "}
-                  <span>{e.message}</span>
+      {(() => {
+        if (!errorLogQ.data || errorLogQ.data.length === 0) return null;
+        // PR #R4f — suppress 429 backoff lines from the Integration Errors
+        // panel. The shopifyRestCall helper logs every "429 from <url> sleeping
+        // <ms>ms" event so the operator can see throttling pressure, but it's
+        // not an *error* — it's the rate limiter doing its job. Hide them by
+        // default and just show a count, so a real error doesn't get lost in
+        // hundreds of backoff lines during a long backfill.
+        const isRateLimitNoise = (msg: string) =>
+          /^429 from .* sleeping/i.test(msg);
+        const filtered = errorLogQ.data.filter((e) => !isRateLimitNoise(e.message));
+        const suppressed = errorLogQ.data.length - filtered.length;
+        if (filtered.length === 0 && suppressed === 0) return null;
+        return (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-amber-700"><AlertTriangle className="size-4" /> Integration errors</CardTitle>
+              <CardDescription>Transient API failures or HMAC mismatches. Safe to clear once reviewed.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="space-y-1.5">
+                {filtered.map((e, i) => (
+                  <div key={i} className="text-xs font-mono border-l-2 border-amber-300 pl-2">
+                    <span className="text-muted-foreground">{shortTime(e.ts)}</span>{" "}
+                    <span className="text-amber-700">[{e.scope}]</span>{" "}
+                    <span>{e.message}</span>
+                  </div>
+                ))}
+                {filtered.length === 0 && (
+                  <div className="text-xs text-muted-foreground italic">No real errors right now.</div>
+                )}
+              </div>
+              {suppressed > 0 && (
+                <div className="text-[10px] text-muted-foreground">
+                  {suppressed} 429 backoff line{suppressed === 1 ? "" : "s"} suppressed (normal rate-limit pressure).
                 </div>
-              ))}
-            </div>
-            <Button size="sm" variant="outline" onClick={() => clearErrorsMut.mutate()}>
-              <Trash2 className="size-4 mr-1.5" /> Clear error log
-            </Button>
-          </CardContent>
-        </Card>
-      )}
+              )}
+              <Button size="sm" variant="outline" onClick={() => clearErrorsMut.mutate()}>
+                <Trash2 className="size-4 mr-1.5" /> Clear error log
+              </Button>
+            </CardContent>
+          </Card>
+        );
+      })()}
 
       {/* Tiny status line at the bottom */}
       {lastAction && (
