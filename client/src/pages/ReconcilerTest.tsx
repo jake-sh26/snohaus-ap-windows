@@ -331,6 +331,32 @@ export default function ReconcilerTest() {
       qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
     },
   });
+  // PR #R4b — Fulfillment backfill. For orders ingested before R4b shipped,
+  // re-pulls each order's fulfillments[] only and rewrites recon_order_fulfillments.
+  // Order/line item rows are NOT touched. Used to make past months' allocations
+  // pick up the correct online-store ship-from location.
+  type FulfillmentBackfillResult = {
+    orders_scanned: number;
+    orders_updated: number;
+    fulfillments_written: number;
+    errors: number;
+    syncLogId: number;
+    error?: string;
+  };
+  const [backfillSince, setBackfillSince] = useState<string>("");
+  const [backfillUntil, setBackfillUntil] = useState<string>("");
+  const fulfillmentBackfillMut = useMutation<FulfillmentBackfillResult, Error, { since: string; until?: string }>({
+    mutationFn: (args) => jsonPost<FulfillmentBackfillResult>("/api/recon/shopify/sync/fulfillments-backfill", args),
+    onSuccess: (r) => {
+      setLastAction(
+        r.error
+          ? `Fulfillment backfill error: ${r.error}`
+          : `Backfill: ${r.orders_scanned} scanned, ${r.orders_updated} updated, ${r.fulfillments_written} fulfillment rows written, ${r.errors} errors`,
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
+    },
+    onError: (e: any) => setLastAction(`Fulfillment backfill failed: ${e?.message ?? e}`),
+  });
   const registerMut = useMutation<WebhookRegResult>({
     mutationFn: () => jsonPost("/api/recon/shopify/webhooks/register"),
     onSuccess: (r) => setLastAction(`Webhooks: ${r.results.map(x => `${x.topic}=${x.state}`).join(", ")}`),
@@ -894,6 +920,78 @@ export default function ReconcilerTest() {
               )}
             </div>
           )}
+
+          {/* ===== PR #R4b: Fulfillment backfill ===== */}
+          <Separator className="my-2" />
+          <div className="space-y-2">
+            <div className="text-sm font-medium flex items-center gap-1.5">
+              <RefreshCw className="size-4" /> Fulfillment backfill (PR #R4b)
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Re-pulls fulfillments only for orders already in the database in this date range.
+              Use this for past months (e.g. Feb/Jan 2026, Nov 2025) so online-store orders
+              get their ship-from location set correctly. Safe to re-run — order/line item
+              rows are not touched.
+            </div>
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">Since</label>
+                <input
+                  type="date"
+                  value={backfillSince}
+                  onChange={(e) => setBackfillSince(e.target.value)}
+                  className="border rounded px-2 py-1.5 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">Until (optional)</label>
+                <input
+                  type="date"
+                  value={backfillUntil}
+                  onChange={(e) => setBackfillUntil(e.target.value)}
+                  className="border rounded px-2 py-1.5 text-sm font-mono"
+                />
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!configured || !backfillSince || fulfillmentBackfillMut.isPending}
+                onClick={() =>
+                  fulfillmentBackfillMut.mutate({
+                    since: backfillSince,
+                    until: backfillUntil || undefined,
+                  })
+                }
+              >
+                <RefreshCw className={`size-4 mr-1.5 ${fulfillmentBackfillMut.isPending ? "animate-spin" : ""}`} />
+                {fulfillmentBackfillMut.isPending ? "Backfilling…" : "Backfill fulfillments"}
+              </Button>
+            </div>
+            {fulfillmentBackfillMut.data && (
+              <div
+                className={`text-sm rounded-md border p-3 ${
+                  fulfillmentBackfillMut.data.error
+                    ? "border-red-200 bg-red-50"
+                    : "border-green-200 bg-green-50"
+                }`}
+              >
+                {fulfillmentBackfillMut.data.error ? (
+                  <div className="text-red-800">
+                    <AlertTriangle className="size-4 inline mr-1" />
+                    {fulfillmentBackfillMut.data.error}
+                  </div>
+                ) : (
+                  <div className="text-green-800">
+                    Scanned <b>{fulfillmentBackfillMut.data.orders_scanned}</b> orders, updated{" "}
+                    <b>{fulfillmentBackfillMut.data.orders_updated}</b>, wrote{" "}
+                    <b>{fulfillmentBackfillMut.data.fulfillments_written}</b> fulfillment row(s)
+                    {fulfillmentBackfillMut.data.errors > 0 ? `, ${fulfillmentBackfillMut.data.errors} error(s)` : ""}.
+                    {" "}Re-run allocation for the same month after this completes.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </CardContent>
       </Card>
 

@@ -120,6 +120,7 @@ import {
 import {
   syncOrdersIncremental,
   transformShopifyOrder,
+  backfillFulfillments,
 } from "./shopify-recon-orders";
 import {
   syncPayoutsIncremental,
@@ -1146,6 +1147,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/recon/shopify/sync/orders", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
     const triggeredBy = `manual:${req.user?.email || "unknown"}`;
     const result = await syncOrdersIncremental(triggeredBy);
+    res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // PR #R4b — Fulfillment backfill. For orders ingested before R4b (which
+  // didn't extract fulfillments[]), this re-pulls each order's fulfillments
+  // array only and rewrites recon_order_fulfillments. Order/line item rows
+  // are NOT touched, so it's safe to run repeatedly. Date range is required
+  // so we don't hammer Shopify with the entire order history.
+  app.post("/api/recon/shopify/sync/fulfillments-backfill", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const since = String(req.body?.since || "").trim();
+    const until = req.body?.until ? String(req.body.until).trim() : undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+      return res.status(400).json({ message: "`since` is required as YYYY-MM-DD" });
+    }
+    if (until && !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+      return res.status(400).json({ message: "`until` must be YYYY-MM-DD when provided" });
+    }
+    const triggeredBy = `manual:${req.user?.email || "unknown"}`;
+    // Convert YYYY-MM-DD to ISO at midnight UTC. The DB query uses created_at
+    // string compare, which is ISO-8601 lex-sortable, so this works.
+    const sinceIso = `${since}T00:00:00Z`;
+    const untilIso = until ? `${until}T00:00:00Z` : undefined;
+    const result = await backfillFulfillments(triggeredBy, { sinceIso, untilIso });
     res.status(result.error ? 502 : 200).json(result);
   });
 
