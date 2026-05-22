@@ -123,6 +123,9 @@ import {
   backfillFulfillments,
   getBackfillProgress,
   listRecentBackfillProgress,
+  getActiveBackfillProgress,
+  listRunningBackfillIds,
+  requestCancelBackfill,
 } from "./shopify-recon-orders";
 import {
   syncPayoutsIncremental,
@@ -1166,6 +1169,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (until && !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
       return res.status(400).json({ message: "`until` must be YYYY-MM-DD when provided" });
     }
+    // PR #R4f — reject if a backfill is already running. The original UX
+    // (one user clicked "Backfill all history" five times during debugging)
+    // had five concurrent runs fighting for the same Shopify rate-limit
+    // bucket. Plain 409 + an existing syncLogId lets the client point at
+    // the run-in-flight instead of starting another.
+    const running = listRunningBackfillIds();
+    if (running.length > 0) {
+      return res.status(409).json({
+        error: "Backfill already running",
+        syncLogId: running[0],
+        running,
+      });
+    }
     const triggeredBy = `manual:${req.user?.email || "unknown"}`;
     // Convert YYYY-MM-DD to ISO at midnight UTC. The DB query uses created_at
     // string compare, which is ISO-8601 lex-sortable, so this works.
@@ -1175,8 +1191,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.status(result.error ? 502 : 200).json(result);
   });
 
-  // PR #R4c — progress poll for the fulfillment backfill. Returns the most
-  // recent in-progress or completed run, or by syncLogId if specified.
+  // PR #R4c/R4f — progress poll for the fulfillment backfill.
+  // - If syncLogId is provided, returns that specific run's progress (legacy).
+  // - Otherwise: returns the currently-running run (state="running") if any,
+  //   falling back to the most recent finished run. This lets a freshly
+  //   loaded client resume the live spinner without knowing the id.
   app.get("/api/recon/shopify/sync/fulfillments-backfill/progress", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
     const idStr = String(req.query.syncLogId || "").trim();
     if (idStr) {
@@ -1184,8 +1203,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const p = Number.isFinite(id) ? getBackfillProgress(id) : null;
       return res.json({ progress: p });
     }
+    const active = getActiveBackfillProgress();
     const recent = listRecentBackfillProgress();
-    res.json({ progress: recent[0] ?? null, recent });
+    res.json({ progress: active ?? recent[0] ?? null, recent });
+  });
+
+  // PR #R4f — cancel one or all running backfills.
+  // Body: { syncLogId?: number }. If omitted, cancel every running entry.
+  // Returns the syncLogIds whose cancel flags were actually set (skips
+  // ids that aren't running anymore — idempotent).
+  app.post("/api/recon/shopify/sync/fulfillments-backfill/cancel", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const requested = req.body?.syncLogId;
+    const targets: number[] =
+      typeof requested === "number" && Number.isFinite(requested)
+        ? [requested]
+        : listRunningBackfillIds();
+    const cancelled: number[] = [];
+    for (const id of targets) {
+      if (requestCancelBackfill(id)) cancelled.push(id);
+    }
+    res.json({ cancelled });
   });
 
   // Current orders watermark (read-only) — shown in the Settings UI so the user

@@ -446,6 +446,59 @@ function setBackfillProgress(syncLogId: number, patch: Partial<FulfillmentBackfi
 }
 
 /**
+ * PR #R4f — Cancellation. The backfill is a long-running async loop that
+ * holds no DB lock, so we can stop it cleanly between pages/orders by
+ * checking an in-memory flag. The set is bounded (cleaned up on exit), so
+ * leaving stale entries on a server crash is harmless.
+ *
+ * The flag is set by the cancel route and read at the top of every backfill
+ * loop iteration. We don't try to abort an in-flight HTTP call — that's
+ * cooperative cancellation at the boundary of "between Shopify calls."
+ */
+const cancelledSyncLogIds = new Set<number>();
+
+export function requestCancelBackfill(syncLogId: number): boolean {
+  // Only meaningful if the run is actually still in our in-memory map and
+  // currently marked running — otherwise we'd be setting a flag for a
+  // syncLogId that will never check it.
+  const p = backfillProgress.get(syncLogId);
+  if (!p || p.state !== "running") return false;
+  cancelledSyncLogIds.add(syncLogId);
+  return true;
+}
+
+function isCancelled(syncLogId: number): boolean {
+  return cancelledSyncLogIds.has(syncLogId);
+}
+
+/**
+ * Returns the syncLogIds of every backfill currently in state="running".
+ * Used by (a) the cancel-all route, and (b) the POST handler's concurrency
+ * guard to reject a second click while a run is already underway.
+ */
+export function listRunningBackfillIds(): number[] {
+  const out: number[] = [];
+  backfillProgress.forEach((v, k) => {
+    if (v.state === "running") out.push(k);
+  });
+  return out;
+}
+
+/**
+ * Returns the currently-running backfill (if any). Used by the progress
+ * endpoint so the UI can resume polling after a page refresh without knowing
+ * the syncLogId of the run it didn't initiate.
+ */
+export function getActiveBackfillProgress(): FulfillmentBackfillProgress | null {
+  let best: FulfillmentBackfillProgress | null = null;
+  backfillProgress.forEach((v) => {
+    if (v.state !== "running") return;
+    if (!best || v.syncLogId > best.syncLogId) best = v;
+  });
+  return best;
+}
+
+/**
  * PR #R4b/R4c — backfill fulfillments for orders already in the DB.
  *
  * Existing orders ingested before R4b have no rows in recon_order_fulfillments
@@ -508,7 +561,10 @@ export async function backfillFulfillments(
     });
 
     let nextUrl: string | null = null;
+    let wasCancelled = false;
     do {
+      // PR #R4f — between-page cancel check.
+      if (isCancelled(syncLogId)) { wasCancelled = true; break; }
       pages++;
       const res = nextUrl
         ? await shopifyRestCall(cfg, nextUrl)
@@ -524,6 +580,10 @@ export async function backfillFulfillments(
           });
       const orders = (res.json?.orders || []) as any[];
       for (const order of orders) {
+        // PR #R4f — between-order cancel check (per-order FO fetch is the
+        // slowest part of the loop, so checking before each one keeps the
+        // halt latency under a second in typical conditions).
+        if (isCancelled(syncLogId)) { wasCancelled = true; break; }
         const oid = order?.id != null ? String(order.id) : null;
         if (!oid) continue;
         scanned++;
@@ -596,7 +656,33 @@ export async function backfillFulfillments(
         srWarn("fulfillments-backfill", `stopping at ${pages} pages — narrow the date range or split the run`);
         break;
       }
-    } while (nextUrl);
+    } while (nextUrl && !wasCancelled);
+
+    if (wasCancelled) {
+      // PR #R4f — user-requested halt. Mark failure with a plain-English
+      // reason so the UI surfaces it instead of treating partial counts as
+      // a successful (smaller) run. Clean up the flag so the next run on
+      // this syncLogId — impossible, but defensive — wouldn't inherit it.
+      cancelledSyncLogIds.delete(syncLogId);
+      finishReconSync(syncLogId, {
+        status: "failure",
+        rows_ingested: totalFulfillments,
+        error_message: "Cancelled by user",
+      });
+      setBackfillProgress(syncLogId, {
+        state: "failure",
+        pages, orders_scanned: scanned, orders_updated: updated,
+        fulfillments_written: totalFulfillments, errors,
+        finishedAt: new Date().toISOString(),
+        error: "Cancelled by user",
+        message: "Cancelled by user",
+      });
+      return {
+        orders_scanned: scanned, orders_updated: updated,
+        fulfillments_written: totalFulfillments, errors, pages, syncLogId,
+        error: "Cancelled by user",
+      };
+    }
 
     finishReconSync(syncLogId, {
       status: errors > scanned / 2 ? "failure" : "success",
@@ -623,5 +709,10 @@ export async function backfillFulfillments(
       status: "failure", rows_ingested: totalFulfillments, error_message: msg,
     });
     return { orders_scanned: scanned, orders_updated: updated, fulfillments_written: totalFulfillments, errors, pages, syncLogId, error: msg };
+  } finally {
+    // PR #R4f — always drop the cancel flag on exit, even on the happy path
+    // or thrown error path. Keeps the set from leaking entries for runs that
+    // weren't actually cancelled.
+    cancelledSyncLogIds.delete(syncLogId);
   }
 }
