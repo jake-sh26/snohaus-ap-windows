@@ -146,6 +146,8 @@ import {
   listNeedsReview,
   applyAllocationOverride,
   getAllocationRollup,
+  getAllocationRollupStoreTime,
+  getMonthBoundaryDiag,
   getAllocationReadiness,
 } from "./shopify-recon-allocator";
 import {
@@ -1474,6 +1476,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
     try {
       res.json({ rows: getAllocationRollup(month) });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  // PR #R4k-diag — Same rollup, but bound the month in store time
+  // (America/New_York) instead of UTC, so the result is directly comparable
+  // to Shopify Finance summary reports.
+  app.get("/api/recon/allocations/rollup-store-time", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = typeof req.query.month === "string" ? req.query.month : "";
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ error: "month must be YYYY-MM" });
+    }
+    try {
+      res.json({ rows: getAllocationRollupStoreTime(month) });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  // PR #R4k-diag — Surface the orders that fall on the timezone edge of the
+  // month (in UTC bucket but not store-time bucket, and vice versa).
+  app.get("/api/recon/allocations/month-boundary-diag", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = typeof req.query.month === "string" ? req.query.month : "";
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ error: "month must be YYYY-MM" });
+    }
+    try {
+      res.json(getMonthBoundaryDiag(month));
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? String(e) });
     }

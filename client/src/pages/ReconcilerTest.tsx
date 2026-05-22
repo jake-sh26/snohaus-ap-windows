@@ -665,6 +665,33 @@ export default function ReconcilerTest() {
     queryKey: ["/api/recon/allocations/rollup", allocMonth],
     queryFn: () => jsonGet(`/api/recon/allocations/rollup?month=${encodeURIComponent(allocMonth)}`),
   });
+  // PR #R4k-diag — store-time bucketed rollup, ties to Shopify Finance reports.
+  const allocRollupStoreQ = useQuery<{ rows: AllocRollupRow[] }>({
+    queryKey: ["/api/recon/allocations/rollup-store-time", allocMonth],
+    queryFn: () => jsonGet(`/api/recon/allocations/rollup-store-time?month=${encodeURIComponent(allocMonth)}`),
+  });
+  // PR #R4k-diag — timezone-edge orders that drive UTC vs store variance.
+  const allocBoundaryDiagQ = useQuery<{
+    month: string;
+    tz: string;
+    utc_bounds: { start: string; end: string };
+    store_bounds_as_utc: { start: string; end: string };
+    in_utc_not_store: {
+      order_count: number;
+      gross_sum: number;
+      tax_sum: number;
+      samples: Array<{ order_id: string; created_at: string; order_name: string | null; gross: number; tax: number }>;
+    };
+    in_store_not_utc: {
+      order_count: number;
+      gross_sum: number;
+      tax_sum: number;
+      samples: Array<{ order_id: string; created_at: string; order_name: string | null; gross: number; tax: number }>;
+    };
+  }>({
+    queryKey: ["/api/recon/allocations/month-boundary-diag", allocMonth],
+    queryFn: () => jsonGet(`/api/recon/allocations/month-boundary-diag?month=${encodeURIComponent(allocMonth)}`),
+  });
 
   const allocRunMut = useMutation<AllocRunSummary, Error, string>({
     mutationFn: (month) => jsonPost<AllocRunSummary>("/api/recon/allocations/run", { month }),
@@ -677,6 +704,8 @@ export default function ReconcilerTest() {
       );
       qc.invalidateQueries({ queryKey: ["/api/recon/allocations/needs-review"] });
       qc.invalidateQueries({ queryKey: ["/api/recon/allocations/rollup"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/rollup-store-time"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/month-boundary-diag"] });
     },
     onError: (e: any) => setLastAction(`Allocation run failed: ${e?.message ?? e}`),
   });
@@ -691,6 +720,8 @@ export default function ReconcilerTest() {
       setLastAction(`Override saved: order ${vars.order_id} → entity ${vars.entity_id} (${r.updated} rows)`);
       qc.invalidateQueries({ queryKey: ["/api/recon/allocations/needs-review"] });
       qc.invalidateQueries({ queryKey: ["/api/recon/allocations/rollup"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/rollup-store-time"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/month-boundary-diag"] });
     },
     onError: (e: any) => setLastAction(`Override failed: ${e?.message ?? e}`),
   });
@@ -2286,6 +2317,145 @@ export default function ReconcilerTest() {
                   </tbody>
                 </table>
               </div>
+            )}
+          </div>
+
+          {/* --- PR #R4k-diag — Shopify tie-out (timezone diagnostic) --- */}
+          <div className="space-y-3">
+            <div className="text-sm font-semibold flex items-center gap-2">
+              <span>Shopify tie-out — store-time rollup &amp; timezone diagnostic</span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              The rollup above buckets orders by their UTC <code>created_at</code>. Shopify Finance reports bucket by store time (America/New_York). Edge-of-month orders move between buckets. This panel shows the same allocations re-bucketed in store time, plus the exact orders driving the variance.
+            </p>
+
+            {allocRollupStoreQ.isLoading || allocBoundaryDiagQ.isLoading ? (
+              <div className="text-sm text-muted-foreground">Loading…</div>
+            ) : !allocRollupStoreQ.data || !allocBoundaryDiagQ.data ? (
+              <div className="text-sm text-muted-foreground italic">No data yet — run allocation first.</div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <div className="border rounded p-2">
+                    <div className="font-mono text-muted-foreground">UTC bucket</div>
+                    <div className="font-mono">{allocBoundaryDiagQ.data.utc_bounds.start} → {allocBoundaryDiagQ.data.utc_bounds.end}</div>
+                  </div>
+                  <div className="border rounded p-2">
+                    <div className="font-mono text-muted-foreground">Store-time bucket (as UTC)</div>
+                    <div className="font-mono">{allocBoundaryDiagQ.data.store_bounds_as_utc.start} → {allocBoundaryDiagQ.data.store_bounds_as_utc.end}</div>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto border rounded">
+                  <table className="w-full text-sm">
+                    <thead className="bg-muted/50 text-xs">
+                      <tr>
+                        <th className="text-left px-2 py-1.5">Entity (store-time bucket)</th>
+                        <th className="text-right px-2 py-1.5">Orders</th>
+                        <th className="text-right px-2 py-1.5" title="Merchandise revenue in store-time month — ties to Shopify Net sales + |Returns|">Gross (merch)</th>
+                        <th className="text-right px-2 py-1.5" title="Digital GC issuance in store-time month — ties to Shopify Net sales from gift cards">GC issued</th>
+                        <th className="text-right px-2 py-1.5" title="Merch + GC — ties to Shopify Gross sales − Discounts">Total activity</th>
+                        <th className="text-right px-2 py-1.5">Tax</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {allocRollupStoreQ.data.rows.map((row) => (
+                        <tr key={row.entity_id} className="border-t">
+                          <td className="px-2 py-1.5">{row.entity_location ?? `Entity #${row.entity_id}`}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{num(row.orders)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{money(row.gross_total)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono text-muted-foreground">{money(row.gc_issuance_total ?? 0)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{money((row.gross_total ?? 0) + (row.gc_issuance_total ?? 0))}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{money(row.tax_total)}</td>
+                        </tr>
+                      ))}
+                      {(() => {
+                        const t = allocRollupStoreQ.data.rows.reduce(
+                          (acc, r) => ({
+                            orders: acc.orders + r.orders,
+                            gross: acc.gross + (r.gross_total ?? 0),
+                            gc: acc.gc + (r.gc_issuance_total ?? 0),
+                            tax: acc.tax + (r.tax_total ?? 0),
+                          }),
+                          { orders: 0, gross: 0, gc: 0, tax: 0 }
+                        );
+                        return (
+                          <tr className="border-t bg-muted/30 font-medium">
+                            <td className="px-2 py-1.5">Total (store time)</td>
+                            <td className="px-2 py-1.5 text-right font-mono">{num(t.orders)}</td>
+                            <td className="px-2 py-1.5 text-right font-mono">{money(t.gross)}</td>
+                            <td className="px-2 py-1.5 text-right font-mono text-muted-foreground">{money(t.gc)}</td>
+                            <td className="px-2 py-1.5 text-right font-mono">{money(t.gross + t.gc)}</td>
+                            <td className="px-2 py-1.5 text-right font-mono">{money(t.tax)}</td>
+                          </tr>
+                        );
+                      })()}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <div className="border rounded p-2 space-y-1">
+                    <div className="font-semibold">In UTC bucket, NOT in store-time bucket</div>
+                    <div className="text-muted-foreground">Currently counted in your rollup but Shopify drops them in another month.</div>
+                    <div className="font-mono">
+                      {num(allocBoundaryDiagQ.data.in_utc_not_store.order_count)} orders · gross {money(allocBoundaryDiagQ.data.in_utc_not_store.gross_sum)} · tax {money(allocBoundaryDiagQ.data.in_utc_not_store.tax_sum)}
+                    </div>
+                    {allocBoundaryDiagQ.data.in_utc_not_store.samples.length > 0 && (
+                      <div className="mt-1 max-h-48 overflow-y-auto border-t pt-1">
+                        <table className="w-full text-xs font-mono">
+                          <thead className="text-muted-foreground">
+                            <tr>
+                              <th className="text-left">Order</th>
+                              <th className="text-left">created_at (UTC)</th>
+                              <th className="text-right">Gross</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allocBoundaryDiagQ.data.in_utc_not_store.samples.map((s) => (
+                              <tr key={s.order_id}>
+                                <td>{s.order_name ?? s.order_id}</td>
+                                <td>{s.created_at}</td>
+                                <td className="text-right">{money(s.gross)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="border rounded p-2 space-y-1">
+                    <div className="font-semibold">In store-time bucket, NOT in UTC bucket</div>
+                    <div className="text-muted-foreground">Shopify counts these in this month but your UTC rollup misses them.</div>
+                    <div className="font-mono">
+                      {num(allocBoundaryDiagQ.data.in_store_not_utc.order_count)} orders · gross {money(allocBoundaryDiagQ.data.in_store_not_utc.gross_sum)} · tax {money(allocBoundaryDiagQ.data.in_store_not_utc.tax_sum)}
+                    </div>
+                    {allocBoundaryDiagQ.data.in_store_not_utc.samples.length > 0 && (
+                      <div className="mt-1 max-h-48 overflow-y-auto border-t pt-1">
+                        <table className="w-full text-xs font-mono">
+                          <thead className="text-muted-foreground">
+                            <tr>
+                              <th className="text-left">Order</th>
+                              <th className="text-left">created_at (UTC)</th>
+                              <th className="text-right">Gross</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allocBoundaryDiagQ.data.in_store_not_utc.samples.map((s) => (
+                              <tr key={s.order_id}>
+                                <td>{s.order_name ?? s.order_id}</td>
+                                <td>{s.created_at}</td>
+                                <td className="text-right">{money(s.gross)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
             )}
           </div>
 
