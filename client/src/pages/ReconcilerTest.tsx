@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check, BookOpen, Upload } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -137,6 +137,56 @@ type MappingBulkSaveResult = {
   skipped: number;
   errors: Array<{ shopify_location_id: string; message: string }>;
 };
+
+// PR #R4a-prep — per-entity COA import + mapping
+type CoaImportStatusRow = {
+  entity_id: number;
+  location: string;
+  legal_name: string;
+  account_count: number;
+  active_count: number;
+  last_imported_at: string | null;
+};
+type CoaAccountRow = {
+  account_number: string | null;
+  account_name: string;
+  account_type: string | null;
+  detail_type: string | null;
+};
+type CoaRoleMeta = {
+  label: string;
+  section: string;
+  description: string;
+  applies_to: "all" | "sd_only" | "hemp_hunt_only";
+};
+type CoaMatrixEntity = {
+  id: number;
+  location: string;
+  legal_name: string;
+  coa_imported: boolean;
+  account_count: number;
+  accounts: CoaAccountRow[];
+};
+type CoaMatrixCell = {
+  entity_id: number;
+  entity_location: string;
+  logical_role: string;
+  suggested_account_name: string | null;
+  suggested_match_quality: "exact" | "strong" | "weak" | "none";
+  current_account_name: string | null;
+  current_account_id: string | null;
+  notes: string | null;
+  not_applicable: boolean;
+};
+type CoaMatrix = {
+  entities: CoaMatrixEntity[];
+  cells: CoaMatrixCell[];
+  role_metadata: Record<string, CoaRoleMeta>;
+  ready_for_phase_2: boolean;
+  missing_count: number;
+};
+type CoaImportResult = { ok: boolean; entity_id: number; inserted: number; updated: number; deactivated: number; error?: string };
+type CoaBulkSaveResult = { ok: boolean; inserted: number; updated: number; cleared: number; errors: Array<{ entity_id: number; logical_role: string; message: string }>; error?: string };
 
 function money(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -351,6 +401,135 @@ export default function ReconcilerTest() {
       return next;
     });
   }
+
+  // --- PR #R4a-prep: COA mapping ---
+  // Two queries: per-entity import freshness (always shown) + the full mapping
+  // matrix (only built once at least one entity has been imported).
+  const coaStatusQ = useQuery<CoaImportStatusRow[]>({
+    queryKey: ["/api/recon/coa/import-status"],
+  });
+  const coaMatrixQ = useQuery<CoaMatrix>({
+    queryKey: ["/api/recon/coa/mapping-matrix"],
+    enabled: !!coaStatusQ.data && coaStatusQ.data.some(r => r.account_count > 0),
+  });
+  // Local draft of cell selections so the user can edit before saving.
+  const [coaDraft, setCoaDraft] = useState<Record<string, string | null>>({});
+  const [coaSavedFlash, setCoaSavedFlash] = useState(false);
+  // Track which cells have been edited locally (so we know what to save).
+  const cellKey = (entityId: number, role: string) => `${entityId}::${role}`;
+  const getCellValue = (entityId: number, role: string): string | null => {
+    const k = cellKey(entityId, role);
+    if (k in coaDraft) return coaDraft[k];
+    const cell = coaMatrixQ.data?.cells.find(c => c.entity_id === entityId && c.logical_role === role);
+    return cell?.current_account_name ?? cell?.suggested_account_name ?? null;
+  };
+  const coaImportMut = useMutation<CoaImportResult, Error, { entityId: number; rows: CoaAccountRow[] }>({
+    mutationFn: ({ entityId, rows }) => jsonPost<CoaImportResult>(`/api/recon/coa/import/${entityId}`, { rows }),
+    onSuccess: (r) => {
+      setLastAction(r.error ? `COA import error: ${r.error}` : `COA imported: ${r.inserted} new, ${r.updated} updated, ${r.deactivated} deactivated`);
+      qc.invalidateQueries({ queryKey: ["/api/recon/coa/import-status"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/coa/mapping-matrix"] });
+    },
+    onError: (e: any) => setLastAction(`COA import failed: ${e?.message ?? e}`),
+  });
+  const coaSaveMut = useMutation<CoaBulkSaveResult, Error, Array<{ entity_id: number; logical_role: string; qbo_account_name: string | null }>>({
+    mutationFn: (rows) => jsonPost<CoaBulkSaveResult>("/api/recon/coa/mapping/bulk-save", { rows }),
+    onSuccess: (r) => {
+      const errMsg = r.errors.length > 0 ? `, ${r.errors.length} errors` : "";
+      setLastAction(`COA mapping saved: ${r.inserted} inserted, ${r.updated} updated, ${r.cleared} cleared${errMsg}`);
+      setCoaDraft({});
+      setCoaSavedFlash(true);
+      setTimeout(() => setCoaSavedFlash(false), 2_500);
+      qc.invalidateQueries({ queryKey: ["/api/recon/coa/mapping-matrix"] });
+    },
+    onError: (e: any) => setLastAction(`COA save failed: ${e?.message ?? e}`),
+  });
+
+  // Parses a QBO COA CSV (Account Type, Detail Type, Name, Number variants).
+  // Returns rows ready for /api/recon/coa/import/:entityId.
+  function parseCoaCsv(text: string): CoaAccountRow[] {
+    // Minimal CSV parser — handles quoted fields with embedded commas/newlines.
+    const out: string[][] = [];
+    let row: string[] = [];
+    let field = "";
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else { inQuotes = false; }
+        } else { field += c; }
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ",") { row.push(field); field = ""; }
+        else if (c === "\n") { row.push(field); out.push(row); row = []; field = ""; }
+        else if (c === "\r") { /* skip */ }
+        else { field += c; }
+      }
+    }
+    if (field.length > 0 || row.length > 0) { row.push(field); out.push(row); }
+
+    // Find the header row. QBO exports often have 1-3 preamble rows.
+    let headerIdx = -1;
+    for (let i = 0; i < out.length && i < 10; i++) {
+      const r = out[i].map(s => s.toLowerCase().trim());
+      if (r.some(s => s === "account" || s === "name") && r.some(s => s === "type" || s === "account type")) {
+        headerIdx = i; break;
+      }
+    }
+    if (headerIdx === -1) return [];
+    const header = out[headerIdx].map(s => s.toLowerCase().trim());
+    const colName = header.findIndex(h => h === "account" || h === "name");
+    const colNumber = header.findIndex(h => h === "number" || h === "acct #" || h === "acct#" || h === "account number");
+    const colType = header.findIndex(h => h === "type" || h === "account type");
+    const colDetail = header.findIndex(h => h === "detail type" || h === "detail_type");
+
+    const rows: CoaAccountRow[] = [];
+    for (let i = headerIdx + 1; i < out.length; i++) {
+      const r = out[i];
+      const name = (colName >= 0 ? r[colName] : "")?.trim();
+      if (!name) continue;
+      rows.push({
+        account_name: name,
+        account_number: colNumber >= 0 ? (r[colNumber]?.trim() || null) : null,
+        account_type: colType >= 0 ? (r[colType]?.trim() || null) : null,
+        detail_type: colDetail >= 0 ? (r[colDetail]?.trim() || null) : null,
+      });
+    }
+    return rows;
+  }
+
+  function handleCoaCsvUpload(entityId: number, file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || "");
+      const rows = parseCoaCsv(text);
+      if (rows.length === 0) {
+        setLastAction(`COA parse error: no rows detected in ${file.name}`);
+        return;
+      }
+      coaImportMut.mutate({ entityId, rows });
+    };
+    reader.onerror = () => setLastAction(`COA read error: ${file.name}`);
+    reader.readAsText(file);
+  }
+
+  function saveCoaMapping() {
+    if (!coaMatrixQ.data) return;
+    // Build the full payload from current draft + existing cells so the server
+    // sees one authoritative state per (entity, role).
+    const rows = coaMatrixQ.data.cells
+      .filter(c => !c.not_applicable)
+      .map(c => ({
+        entity_id: c.entity_id,
+        logical_role: c.logical_role,
+        qbo_account_name: getCellValue(c.entity_id, c.logical_role),
+      }));
+    coaSaveMut.mutate(rows);
+  }
+
+  const coaDirty = Object.keys(coaDraft).length > 0;
 
   const cfg = statusQ.data;
   const configured = !!cfg?.configured;
@@ -1266,7 +1445,190 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
-      {/* ===== 7. Error log ===== */}
+      {/* ===== 7. COA mapping (PR #R4a-prep) ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><BookOpen className="size-4" /> Chart of Accounts mapping</CardTitle>
+          <CardDescription>
+            For each entity, upload its QuickBooks CoA CSV, then confirm which account fulfills each role the reconciler needs (sales income, COGS, Shopify PIT, etc.). This is the foundation Phase 2's journal entries will use.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Import status table */}
+          <div className="rounded-md border">
+            <div className="grid grid-cols-12 px-3 py-2 text-xs font-medium text-muted-foreground bg-muted/40">
+              <div className="col-span-4">Entity</div>
+              <div className="col-span-3">Imported accounts</div>
+              <div className="col-span-3">Last imported</div>
+              <div className="col-span-2 text-right">Action</div>
+            </div>
+            {coaStatusQ.isLoading && (
+              <div className="px-3 py-3 text-sm text-muted-foreground">Loading…</div>
+            )}
+            {coaStatusQ.data?.map(row => (
+              <div key={row.entity_id} className="grid grid-cols-12 px-3 py-2 text-sm border-t items-center">
+                <div className="col-span-4">
+                  <div className="font-medium flex items-center gap-1.5"><Building2 className="size-3.5 text-muted-foreground" /> {row.location}</div>
+                  <div className="text-xs text-muted-foreground">{row.legal_name}</div>
+                </div>
+                <div className="col-span-3">
+                  {row.account_count === 0 ? (
+                    <span className="text-muted-foreground italic">Not yet imported</span>
+                  ) : (
+                    <span>{row.active_count} active / {row.account_count} total</span>
+                  )}
+                </div>
+                <div className="col-span-3 text-xs text-muted-foreground">
+                  {row.last_imported_at ? shortTime(row.last_imported_at) : "—"}
+                </div>
+                <div className="col-span-2 text-right">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer px-2 py-1 rounded-md border text-xs hover:bg-muted/40">
+                    <Upload className="size-3.5" />
+                    {row.account_count === 0 ? "Upload CSV" : "Replace CSV"}
+                    <input
+                      type="file"
+                      accept=".csv,text/csv"
+                      className="hidden"
+                      onChange={e => {
+                        const f = e.target.files?.[0];
+                        if (f) handleCoaCsvUpload(row.entity_id, f);
+                        e.target.value = "";
+                      }}
+                    />
+                  </label>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Mapping matrix (only once at least one entity has imported) */}
+          {coaMatrixQ.data && coaMatrixQ.data.entities.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium">Role → account mapping</div>
+                  <div className="text-xs text-muted-foreground">
+                    {coaMatrixQ.data.ready_for_phase_2
+                      ? "All required cells filled. Ready for Phase 2."
+                      : `${coaMatrixQ.data.missing_count} required cell${coaMatrixQ.data.missing_count === 1 ? "" : "s"} still missing.`}
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  onClick={() => saveCoaMapping()}
+                  disabled={coaSaveMut.isPending}
+                  variant={coaSavedFlash && !coaDirty ? "secondary" : "default"}
+                >
+                  {coaSavedFlash && !coaDirty ? (
+                    <><Check className="size-4 mr-1.5 text-green-600" /> Saved</>
+                  ) : (
+                    <><Save className="size-4 mr-1.5" /> Confirm &amp; save all</>
+                  )}
+                </Button>
+              </div>
+
+              {/* Group cells by section (Income / COGS / Expense / Asset / Liability / Inter-company) */}
+              {["Income", "COGS", "Expense", "Asset", "Liability", "Inter-company"].map(section => {
+                const rolesInSection = Object.entries(coaMatrixQ.data!.role_metadata)
+                  .filter(([, meta]) => meta.section === section)
+                  .map(([role]) => role);
+                if (rolesInSection.length === 0) return null;
+                return (
+                  <div key={section} className="rounded-md border overflow-hidden">
+                    <div className="px-3 py-2 bg-muted/60 text-xs font-semibold uppercase tracking-wide">
+                      {section}
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-xs text-muted-foreground border-b">
+                            <th className="text-left px-3 py-2 w-[280px]">Role</th>
+                            {coaMatrixQ.data!.entities.map(e => (
+                              <th key={e.id} className="text-left px-3 py-2 min-w-[220px]">{e.location}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rolesInSection.map(role => {
+                            const meta = coaMatrixQ.data!.role_metadata[role];
+                            return (
+                              <tr key={role} className="border-b last:border-b-0">
+                                <td className="px-3 py-2 align-top">
+                                  <div className="font-medium">{meta.label}</div>
+                                  <div className="text-xs text-muted-foreground mt-0.5">{meta.description}</div>
+                                </td>
+                                {coaMatrixQ.data!.entities.map(e => {
+                                  const cell = coaMatrixQ.data!.cells.find(c => c.entity_id === e.id && c.logical_role === role);
+                                  if (!cell) return <td key={e.id} className="px-3 py-2 align-top text-xs text-muted-foreground italic">—</td>;
+                                  if (cell.not_applicable) {
+                                    return <td key={e.id} className="px-3 py-2 align-top text-xs text-muted-foreground italic">N/A</td>;
+                                  }
+                                  const value = getCellValue(e.id, role);
+                                  const isEdited = cellKey(e.id, role) in coaDraft;
+                                  const quality = cell.suggested_match_quality;
+                                  const showQualityBadge = !cell.current_account_name && cell.suggested_account_name && !isEdited;
+                                  return (
+                                    <td key={e.id} className="px-3 py-2 align-top">
+                                      <select
+                                        className={
+                                          "w-full text-xs border rounded-md px-2 py-1.5 bg-background " +
+                                          (isEdited ? "border-blue-400 ring-1 ring-blue-100" : "")
+                                        }
+                                        value={value ?? ""}
+                                        onChange={ev => {
+                                          const v = ev.target.value || null;
+                                          setCoaDraft(prev => ({ ...prev, [cellKey(e.id, role)]: v }));
+                                        }}
+                                      >
+                                        <option value="">— not mapped —</option>
+                                        {e.accounts.map(a => (
+                                          <option key={a.account_name} value={a.account_name}>
+                                            {a.account_number ? `${a.account_number} · ` : ""}{a.account_name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      {showQualityBadge && (
+                                        <div className="mt-1">
+                                          <Badge variant="outline" className={
+                                            "text-[10px] py-0 px-1.5 " +
+                                            (quality === "exact" ? "border-green-300 text-green-700" :
+                                             quality === "strong" ? "border-blue-300 text-blue-700" :
+                                             quality === "weak" ? "border-amber-300 text-amber-700" : "")
+                                          }>
+                                            {quality === "exact" ? "Exact match" : quality === "strong" ? "Likely match" : quality === "weak" ? "Possible match" : "No match"} — review
+                                          </Badge>
+                                        </div>
+                                      )}
+                                      {isEdited && (
+                                        <div className="mt-1 text-[10px] text-blue-700">Unsaved change</div>
+                                      )}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {coaSaveMut.data && coaSaveMut.data.errors.length > 0 && (
+                <div className="rounded-md border border-amber-200 bg-amber-50 p-2 text-xs space-y-1">
+                  <div className="font-medium text-amber-700">Save errors:</div>
+                  {coaSaveMut.data.errors.map((e, i) => (
+                    <div key={i} className="font-mono text-amber-700">• entity {e.entity_id} / {e.logical_role}: {e.message}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ===== 8. Error log ===== */}
       {errorLogQ.data && errorLogQ.data.length > 0 && (
         <Card>
           <CardHeader>
