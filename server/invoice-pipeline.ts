@@ -18,6 +18,7 @@ import { smartMatchVendor, resolveShipToStore, learnVendorAlias, checkSkipSender
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { getQboStatus, searchBills, searchPayments } from "./qbo";
 import { findDuplicateInvoice } from "./dup-detector";
+import { parsePaymentTermsFallback } from "./payment-terms-parser";
 
 const DB_PATH = path.resolve(process.cwd(), "data.db");
 
@@ -215,6 +216,52 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
       vendor_match_status: null,
       reason: `${llmResult.document_type}${llmResult.skip_reason ? ` — ${llmResult.skip_reason}` : ""}`,
     };
+  }
+
+  // PR #R4h — Deterministic terms-parsing fallback. The LLM is inconsistent
+  // about populating the discount_terms_pct/days/due_date/kind fields when it
+  // sees a "2% 10 Net 30" style string in the terms text — same PDF + same
+  // prompt sometimes produces structured fields, sometimes only the verbatim
+  // string. Regex-parse the verbatim text and fill any gaps the LLM left,
+  // preserving anything the LLM did populate correctly.
+  // Triggering case: EC Woods invoice QS 7193, terms "2% 10 - Net 30".
+  if (llmResult?.payment_terms) {
+    const fallback = parsePaymentTermsFallback(llmResult.payment_terms, llmResult.invoice_date);
+    if (fallback) {
+      const filled: string[] = [];
+      if (llmResult.discount_terms_pct == null && fallback.discount_terms_pct != null) {
+        llmResult.discount_terms_pct = fallback.discount_terms_pct;
+        filled.push("discount_terms_pct");
+      }
+      if (llmResult.discount_days == null && fallback.discount_days != null) {
+        llmResult.discount_days = fallback.discount_days;
+        filled.push("discount_days");
+      }
+      if (!llmResult.discount_due_date && fallback.discount_due_date) {
+        llmResult.discount_due_date = fallback.discount_due_date;
+        filled.push("discount_due_date");
+      }
+      if (!llmResult.discount_kind && fallback.discount_kind) {
+        llmResult.discount_kind = fallback.discount_kind;
+        filled.push("discount_kind");
+      }
+      // due_date: only fill if the LLM left it null AND the fallback produced
+      // one. The verbatim "Net 30" with no LLM due_date is exactly the gap
+      // this catches.
+      if (!llmResult.due_date && fallback.due_date) {
+        llmResult.due_date = fallback.due_date;
+        filled.push("due_date");
+      }
+      if (filled.length > 0) {
+        // invoiceId isn't assigned yet at this point in the pipeline (id is
+        // derived from filename later); the invoice_number / vendor are the
+        // most useful identifiers at this stage.
+        const tag = llmResult.invoice_number ?? llmResult.vendor_raw_name ?? "?";
+        console.log(
+          `[terms-fallback] ${tag}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
+        );
+      }
+    }
   }
 
   // Build parsed_data
