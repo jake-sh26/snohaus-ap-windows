@@ -139,6 +139,19 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
   });
   const inv = invQ.data;
 
+  // PR #R4h — Single source of truth for the displayed due date. When the
+  // user has the early-pay discount selected the Due Date input must show
+  // the discount-window date (e.g. 10 days out for "2% 10 Net 30"), not the
+  // full Net date. For "net_with_discount" terms the discount is automatic
+  // and discount_due_date IS the due date. The QBO payload builder in
+  // buildQboBillPayload computes the same value; we hoist it here so the
+  // input field, the discount card summary, and the payload all agree.
+  const discountActiveTop = !!(inv?.discount_applied && inv?.discount_terms_pct && inv?.discount_kind);
+  const effectiveDueDate: string | null =
+    discountActiveTop && inv?.discount_due_date
+      ? inv.discount_due_date
+      : (inv?.due_date ?? null);
+
   const [routingMode, setRoutingMode] = useState<"single_store" | "percent_split" | "line_item_split">("single_store");
   const [singleStore, setSingleStore] = useState<StoreKey>("greenvale");
   const [percentSplit, setPercentSplit] = useState<Record<StoreKey, number>>({ greenvale: 100, hempstead: 0, huntington: 0 });
@@ -195,7 +208,9 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
     setEditFreight(inv.freight != null ? String(inv.freight) : "");
     setEditInvoiceNumber(inv.invoice_number || "");
     setEditInvoiceDate(inv.invoice_date || "");
-    setEditDueDate(inv.due_date || "");
+    // PR #R4h — seed from effectiveDueDate so toggling the discount visibly
+    // updates the input. Falls back to inv.due_date when no discount applies.
+    setEditDueDate(effectiveDueDate || "");
     // Hydrate fuzzyMatch from the persisted hint on the invoice row, if any.
     try {
       if (inv.fuzzy_dup_hint) {
@@ -238,6 +253,16 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
         .catch(() => {});
     }
   }, [inv?.id]);
+
+  // PR #R4h — keep the Due Date input in sync with the discount toggle.
+  // The bigger useEffect above only re-fires on inv.id change; toggling the
+  // discount (which mutates inv.discount_applied) needs its own pass so the
+  // field flips between the discount-window date and the full-Net date as
+  // the user clicks "Take 2% discount" / "Pay full amount."
+  useEffect(() => {
+    if (!inv) return;
+    setEditDueDate(effectiveDueDate || "");
+  }, [effectiveDueDate, inv?.id]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -885,10 +910,20 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                         onChange={(e) => setEditDueDate(e.target.value)}
                         onBlur={() => {
                           const next = editDueDate ? editDueDate.slice(0, 10) : "";
-                          const prev = inv.due_date ? inv.due_date.slice(0, 10) : "";
-                          if (next !== prev) {
-                            saveInvoiceFieldsMutation.mutate({ due_date: next || null });
-                          }
+                          // PR #R4h — compare against the *effective* due date
+                          // (which is the value the input was actually showing),
+                          // not inv.due_date. Otherwise toggling the discount
+                          // back off would fire a redundant save against the
+                          // newly-revealed Net date.
+                          const prev = effectiveDueDate ? effectiveDueDate.slice(0, 10) : "";
+                          if (next === prev) return;
+                          // PR #R4h — if a discount was applied, a manual edit
+                          // to the Due Date is an override: clear the discount
+                          // flag so the user's typed date wins over the toggle.
+                          // Sent as a single patch to keep AP aging consistent.
+                          const patch: { due_date: string | null; discount_applied?: 0 } = { due_date: next || null };
+                          if (discountActiveTop) patch.discount_applied = 0;
+                          saveInvoiceFieldsMutation.mutate(patch as any);
                         }}
                         className={cn("h-9", !inv.due_date && "border-amber-300 dark:border-amber-700")}
                         data-testid="input-due-date"
@@ -1998,7 +2033,13 @@ function DiscountTermsCard({
             Discount automatically applied: −{fmtMoney(discountAmount)}
           </div>
           <div className="text-[11px] text-muted-foreground mt-1 pl-6">
-            Bill will post as {fmtMoney(effectiveTotal)} due {fmtDate(invoice.due_date)}.
+            {/* PR #R4h — for net_with_discount the discount IS automatic and
+                the actual due date is the (single) discount window. Was
+                showing invoice.due_date which on most "Net 90 10%" rows
+                matches discount_due_date anyway, but if the LLM populated
+                only discount_due_date the prior line displayed an empty
+                "due" tail. discount_due_date is the canonical field. */}
+            Bill will post as {fmtMoney(effectiveTotal)} due {fmtDate(invoice.discount_due_date || invoice.due_date)}.
           </div>
         </div>
       )}

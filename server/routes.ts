@@ -185,6 +185,7 @@ import {
 } from "./pdf-archive";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { processInvoicePdf, normalizeDueDate } from "./invoice-pipeline";
+import { parsePaymentTermsFallback } from "./payment-terms-parser";
 import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms } from "./llm-parser";
 import {
   listVendorGroups, getVendorGroup, createVendorGroup, updateVendorGroup, deleteVendorGroup,
@@ -1637,7 +1638,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const before = { ...inv };
     // v8: allow editing invoice_number / invoice_date / due_date so OCR fixes
     // don't require re-uploading the PDF.
-    const allowed = ["routing_mode", "routing_data", "total", "freight", "notes", "invoice_number", "invoice_date", "due_date"];
+    // PR #R4h: allow discount_applied so the drawer can clear it in the same
+    // patch when the user manually overrides Due Date while a discount was
+    // active. Server-side post path already accepts a sibling endpoint
+    // (POST /discount-applied) — including the field here keeps both writes
+    // atomic from the client's perspective.
+    const allowed = ["routing_mode", "routing_data", "total", "freight", "notes", "invoice_number", "invoice_date", "due_date", "discount_applied"];
     const patch: any = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     if (patch.routing_data && typeof patch.routing_data !== "string") patch.routing_data = JSON.stringify(patch.routing_data);
@@ -1926,6 +1932,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         : null;
       const finalDue = normalized || fromTerms;
       if (finalDue) patch.due_date = finalDue;
+    }
+
+    // PR #R4h — same deterministic terms-parsing fallback as the initial
+    // pipeline. If the LLM gave us a payment_terms string but left the
+    // discount_* fields null, regex-parse it and fill the gaps so a reparse
+    // doesn't keep producing the same "verbatim terms only" output.
+    if (llmResult.payment_terms) {
+      const effectiveInvoiceDate = patch.invoice_date || inv.invoice_date || llmResult.invoice_date || null;
+      const fallback = parsePaymentTermsFallback(llmResult.payment_terms, effectiveInvoiceDate);
+      if (fallback) {
+        const filled: string[] = [];
+        if (llmResult.discount_terms_pct == null && fallback.discount_terms_pct != null) {
+          llmResult.discount_terms_pct = fallback.discount_terms_pct;
+          filled.push("discount_terms_pct");
+        }
+        if (llmResult.discount_days == null && fallback.discount_days != null) {
+          llmResult.discount_days = fallback.discount_days;
+          filled.push("discount_days");
+        }
+        if (!llmResult.discount_due_date && fallback.discount_due_date) {
+          llmResult.discount_due_date = fallback.discount_due_date;
+          filled.push("discount_due_date");
+        }
+        if (!llmResult.discount_kind && fallback.discount_kind) {
+          llmResult.discount_kind = fallback.discount_kind;
+          filled.push("discount_kind");
+        }
+        if (filled.length > 0) {
+          console.log(
+            `[terms-fallback] reparse ${inv.id}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
+          );
+        }
+      }
     }
 
     // v8.4.5: discount fields. Only fill when the invoice has no discount_kind
