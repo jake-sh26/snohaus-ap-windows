@@ -1067,6 +1067,85 @@ function bootstrapSchema() {
       ON recon_gift_card_issuance(gc_id) WHERE gc_id IS NOT NULL;
   `);
 
+  // ----- Gift card redemptions (PR #R4e) -----
+  // The mirror of recon_gift_card_issuance — captures every time a GC is used
+  // at checkout. Inferred from order.transactions[] where gateway='gift_card'.
+  // We record the issuer (looked up from recon_gift_card_issuance.gc_id) and
+  // the redeemer (the entity the order was allocated to), and flag whether
+  // those differ. The cross-entity flag drives JE generation in the next
+  // table; if issuance hasn't been ingested for the gc_id we still record the
+  // redemption with issuer_entity_id=NULL so the audit trail isn't lost.
+  //
+  // Idempotency: UNIQUE(gc_id, order_id, transaction_id). Shopify reuses
+  // transaction ids on partial captures, but the (gc, order) pair is enough
+  // for the rare case where transaction_id is null on older orders.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_gift_card_redemptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      gc_id TEXT NOT NULL,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      transaction_id TEXT,
+      amount REAL NOT NULL,
+      issuer_entity_id INTEGER REFERENCES payroll_entities(id),
+      redeemer_entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      is_cross_entity INTEGER NOT NULL DEFAULT 0,
+      redeemed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(gc_id, order_id, transaction_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_order
+      ON recon_gift_card_redemptions(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_gc
+      ON recon_gift_card_redemptions(gc_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_redeemed_at
+      ON recon_gift_card_redemptions(redeemed_at);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_cross_entity
+      ON recon_gift_card_redemptions(is_cross_entity) WHERE is_cross_entity = 1;
+  `);
+
+  // ----- Inter-company journal entries (PR #R4e, READ-ONLY) -----
+  // Generated ledger of JE legs that WILL post to QBO once Phase 2 ships.
+  // Right now this table exists purely so Jake can inspect what would be
+  // posted, validate the direction is correct, and only flip to live posting
+  // once the math is trusted. Multiple legs share one source row via
+  // (source_kind, source_id); UNIQUE(source_kind, source_id, entity_id,
+  // account_role, side) is the idempotency key so a rebuild over the same
+  // period writes nothing new.
+  //
+  // For GC redemptions:
+  //   - same-entity: 1 leg total
+  //       entity=issuer, role=gift_cards_outstanding, side=DR
+  //   - cross-entity: 3 legs total
+  //       entity=issuer,   role=gift_cards_outstanding, side=DR
+  //       entity=issuer,   role=due_to_<redeemer>,       side=CR
+  //       entity=redeemer, role=due_from_<issuer>,       side=DR
+  //   The revenue/COGS/sales-tax CR side is already booked by the regular
+  //   allocation flow when the order was placed — we do NOT duplicate it.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_inter_company_journal_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_kind TEXT NOT NULL,
+      source_id INTEGER NOT NULL,
+      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      counterparty_entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      account_role TEXT NOT NULL,
+      side TEXT NOT NULL CHECK(side IN ('DR','CR')),
+      amount REAL NOT NULL,
+      order_id TEXT,
+      gc_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(source_kind, source_id, entity_id, account_role, side)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_interco_je_source
+      ON recon_inter_company_journal_entries(source_kind, source_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_interco_je_entity
+      ON recon_inter_company_journal_entries(entity_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_interco_je_order
+      ON recon_inter_company_journal_entries(order_id) WHERE order_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_recon_interco_je_created
+      ON recon_inter_company_journal_entries(created_at);
+  `);
+
   // ----- Shopify payouts -----
   // A payout = one deposit from Shopify Payments to the bank account. The
   // Plaid matcher in PR #R5 will join recon_payouts.amount + deposit date to
@@ -4007,6 +4086,264 @@ export function getReconOrderWithLines(orderId: string): {
 }
 
 // ============================================================================
+// PR #R4e — GC redemption + inter-company JE storage helpers.
+// ----------------------------------------------------------------------------
+// One redemption = one gateway='gift_card' transaction on a Shopify order.
+// The (gc_id, order_id, transaction_id) UNIQUE constraint makes upsert a
+// no-op on re-runs. JEs reference back via (source_kind='gc_redemption',
+// source_id=redemption.id).
+// ============================================================================
+
+export type GcRedemptionUpsert = {
+  gc_id: string;
+  order_id: string;
+  transaction_id: string | null;
+  amount: number;
+  issuer_entity_id: number | null;
+  redeemer_entity_id: number;
+  is_cross_entity: 0 | 1;
+  redeemed_at: string;
+};
+
+export type GcRedemptionRow = GcRedemptionUpsert & {
+  id: number;
+  created_at: string;
+};
+
+/**
+ * Insert-or-fetch. SQLite's INSERT OR IGNORE on the unique key is the cheapest
+ * idempotent path; we then read back the row by the same triplet to return
+ * the (possibly pre-existing) id so the caller can attach JE legs to it.
+ */
+export function upsertGiftCardRedemption(rec: GcRedemptionUpsert): GcRedemptionRow {
+  sqlite
+    .prepare(
+      `INSERT OR IGNORE INTO recon_gift_card_redemptions
+         (gc_id, order_id, transaction_id, amount, issuer_entity_id,
+          redeemer_entity_id, is_cross_entity, redeemed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      rec.gc_id, rec.order_id, rec.transaction_id, rec.amount,
+      rec.issuer_entity_id, rec.redeemer_entity_id, rec.is_cross_entity,
+      rec.redeemed_at,
+    );
+  // transaction_id may be NULL; SQLite treats NULL as distinct from NULL in
+  // UNIQUE, so the IS-NULL branch is needed for the lookup.
+  const row = (rec.transaction_id == null
+    ? sqlite
+        .prepare(
+          `SELECT * FROM recon_gift_card_redemptions
+           WHERE gc_id = ? AND order_id = ? AND transaction_id IS NULL`
+        )
+        .get(rec.gc_id, rec.order_id)
+    : sqlite
+        .prepare(
+          `SELECT * FROM recon_gift_card_redemptions
+           WHERE gc_id = ? AND order_id = ? AND transaction_id = ?`
+        )
+        .get(rec.gc_id, rec.order_id, rec.transaction_id)
+  ) as GcRedemptionRow;
+  return row;
+}
+
+export function getRedemptionsByOrder(orderId: string): GcRedemptionRow[] {
+  return sqlite
+    .prepare(
+      `SELECT * FROM recon_gift_card_redemptions
+       WHERE order_id = ?
+       ORDER BY id ASC`
+    )
+    .all(orderId) as GcRedemptionRow[];
+}
+
+export function listRedemptionsForRange(
+  sinceIso: string,
+  untilIso: string,
+): GcRedemptionRow[] {
+  return sqlite
+    .prepare(
+      `SELECT * FROM recon_gift_card_redemptions
+       WHERE redeemed_at >= ? AND redeemed_at < ?
+       ORDER BY redeemed_at ASC, id ASC`
+    )
+    .all(sinceIso, untilIso) as GcRedemptionRow[];
+}
+
+export type InterCoJeUpsert = {
+  source_kind: string;
+  source_id: number;
+  entity_id: number;
+  counterparty_entity_id: number;
+  account_role: string;
+  side: "DR" | "CR";
+  amount: number;
+  order_id: string | null;
+  gc_id: string | null;
+};
+
+export type InterCoJeRow = InterCoJeUpsert & {
+  id: number;
+  created_at: string;
+};
+
+/**
+ * Idempotent insert via INSERT OR IGNORE on the composite unique key. We
+ * never UPDATE an existing leg — once written it's audit history; if the
+ * amount changes (e.g. order refund partially reverses redemption) that's
+ * a separate source row, not a mutation.
+ */
+export function upsertInterCompanyJE(rec: InterCoJeUpsert): void {
+  sqlite
+    .prepare(
+      `INSERT OR IGNORE INTO recon_inter_company_journal_entries
+         (source_kind, source_id, entity_id, counterparty_entity_id,
+          account_role, side, amount, order_id, gc_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      rec.source_kind, rec.source_id, rec.entity_id, rec.counterparty_entity_id,
+      rec.account_role, rec.side, rec.amount, rec.order_id, rec.gc_id,
+    );
+}
+
+export function listInterCompanyJEsForRange(
+  sinceIso: string,
+  untilIso: string,
+): InterCoJeRow[] {
+  // Filter by created_at — these rows are generated when redemptions are
+  // processed, which can lag the redeemed_at by hours. The UI joins to the
+  // redemption row for traceability.
+  return sqlite
+    .prepare(
+      `SELECT j.*
+       FROM recon_inter_company_journal_entries j
+       LEFT JOIN recon_gift_card_redemptions r
+         ON j.source_kind = 'gc_redemption' AND j.source_id = r.id
+       WHERE COALESCE(r.redeemed_at, j.created_at) >= ?
+         AND COALESCE(r.redeemed_at, j.created_at) < ?
+       ORDER BY j.entity_id ASC, j.source_id ASC, j.id ASC`
+    )
+    .all(sinceIso, untilIso) as InterCoJeRow[];
+}
+
+export function getJEsForRedemption(redemptionId: number): InterCoJeRow[] {
+  return sqlite
+    .prepare(
+      `SELECT * FROM recon_inter_company_journal_entries
+       WHERE source_kind = 'gc_redemption' AND source_id = ?
+       ORDER BY id ASC`
+    )
+    .all(redemptionId) as InterCoJeRow[];
+}
+
+/**
+ * Aggregated rollup for the UI Redemption card. Distinct from
+ * listRedemptionsForRange because the UI wants per-pair totals and
+ * cross-entity sums in one round trip.
+ */
+export type RedemptionSummary = {
+  count: number;
+  total_amount: number;
+  cross_entity_count: number;
+  cross_entity_amount: number;
+  by_pair: Array<{
+    issuer_entity_id: number | null;
+    redeemer_entity_id: number;
+    count: number;
+    amount: number;
+  }>;
+};
+
+export function getRedemptionSummary(
+  sinceIso: string,
+  untilIso: string,
+): RedemptionSummary {
+  const totals = sqlite
+    .prepare(
+      `SELECT
+         COUNT(*)                                              AS count,
+         COALESCE(SUM(amount), 0)                              AS total_amount,
+         SUM(CASE WHEN is_cross_entity = 1 THEN 1 ELSE 0 END)  AS cross_entity_count,
+         COALESCE(SUM(CASE WHEN is_cross_entity = 1 THEN amount ELSE 0 END), 0)
+                                                               AS cross_entity_amount
+       FROM recon_gift_card_redemptions
+       WHERE redeemed_at >= ? AND redeemed_at < ?`
+    )
+    .get(sinceIso, untilIso) as any;
+  const by_pair = sqlite
+    .prepare(
+      `SELECT issuer_entity_id, redeemer_entity_id,
+              COUNT(*) AS count, COALESCE(SUM(amount), 0) AS amount
+       FROM recon_gift_card_redemptions
+       WHERE redeemed_at >= ? AND redeemed_at < ?
+       GROUP BY issuer_entity_id, redeemer_entity_id
+       ORDER BY amount DESC`
+    )
+    .all(sinceIso, untilIso) as any[];
+  return {
+    count: Number(totals.count ?? 0),
+    total_amount: Number(totals.total_amount ?? 0),
+    cross_entity_count: Number(totals.cross_entity_count ?? 0),
+    cross_entity_amount: Number(totals.cross_entity_amount ?? 0),
+    by_pair,
+  };
+}
+
+/**
+ * Per-entity GC issuance rollup for the UI Issuance card. The R4d module
+ * exposes a flat ledger; this gives the month-scoped aggregates the UI
+ * actually wants.
+ */
+export type IssuanceSummary = {
+  count: number;
+  total_face_value: number;
+  by_entity: Array<{ entity_id: number; count: number; face_value: number }>;
+  by_method: Array<{ method: string; count: number; face_value: number }>;
+};
+
+export function getIssuanceSummary(
+  sinceIso: string,
+  untilIso: string,
+): IssuanceSummary {
+  const totals = sqlite
+    .prepare(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(face_value), 0) AS total_face_value
+       FROM recon_gift_card_issuance
+       WHERE issued_at >= ? AND issued_at < ?`
+    )
+    .get(sinceIso, untilIso) as any;
+  const by_entity = sqlite
+    .prepare(
+      `SELECT assigned_entity_id AS entity_id,
+              COUNT(*) AS count,
+              COALESCE(SUM(face_value), 0) AS face_value
+       FROM recon_gift_card_issuance
+       WHERE issued_at >= ? AND issued_at < ?
+       GROUP BY assigned_entity_id
+       ORDER BY face_value DESC`
+    )
+    .all(sinceIso, untilIso) as any[];
+  const by_method = sqlite
+    .prepare(
+      `SELECT assignment_method AS method,
+              COUNT(*) AS count,
+              COALESCE(SUM(face_value), 0) AS face_value
+       FROM recon_gift_card_issuance
+       WHERE issued_at >= ? AND issued_at < ?
+       GROUP BY assignment_method
+       ORDER BY face_value DESC`
+    )
+    .all(sinceIso, untilIso) as any[];
+  return {
+    count: Number(totals.count ?? 0),
+    total_face_value: Number(totals.total_face_value ?? 0),
+    by_entity,
+    by_method,
+  };
+}
+
+// ============================================================================
 // PR #R3 — Shopify payouts + balance_transactions storage helpers.
 // ----------------------------------------------------------------------------
 // A payout = one settlement deposit from Shopify Payments. Each payout has
@@ -4557,10 +4894,17 @@ export const RECON_COA_LOGICAL_ROLES = [
   // Liabilities
   "sales_tax_payable",
   "gift_cards_outstanding",
-  // Inter-company
-  "due_from_sd",        // Hunt/Hemp books only — their right to recover cash from SD
-  "due_to_sh_hempstead", // SD books only — SD's obligation to Hempstead
-  "due_to_sh_huntington",// SD books only — SD's obligation to Huntington
+  // Inter-company. Jake confirmed all six accounts exist in QBO already; the
+  // original enum (PR #R4a-prep) only listed the "primary" direction needed
+  // for the Shopify-deposit reverse-flow. PR #R4e adds the reverse direction
+  // because a Hempstead/Huntington-issued GC redeemed at SD creates the
+  // opposite payable/receivable, and a clean ledger needs both sides.
+  "due_from_sd",          // Hunt/Hemp books — receivable from SD
+  "due_to_sd",            // Hunt/Hemp books — payable to SD (PR #R4e)
+  "due_to_sh_hempstead",  // SD books — payable to Hempstead
+  "due_from_sh_hempstead",// SD books — receivable from Hempstead (PR #R4e)
+  "due_to_sh_huntington", // SD books — payable to Huntington
+  "due_from_sh_huntington",// SD books — receivable from Huntington (PR #R4e)
 ] as const;
 
 export type ReconCoaLogicalRole = (typeof RECON_COA_LOGICAL_ROLES)[number];
@@ -4685,16 +5029,34 @@ export const RECON_COA_ROLE_METADATA: Record<
     description: "Hunt/Hemp books only — their right to recover cash from SD (since all Shopify deposits land in SD's bank).",
     applies_to: "hemp_hunt_only",
   },
+  due_to_sd: {
+    label: "Due to SD Ski",
+    section: "Inter-company",
+    description: "Hunt/Hemp books — what they owe SD (e.g. SD-issued GC sale, Hunt/Hemp redeems → Hunt/Hemp owes SD the cash that originally funded the card). Added in PR #R4e.",
+    applies_to: "hemp_hunt_only",
+  },
   due_to_sh_hempstead: {
     label: "Due to SH Hempstead",
     section: "Inter-company",
     description: "SD books only — SD's obligation to remit Hempstead's share of Shopify deposits.",
     applies_to: "sd_only",
   },
+  due_from_sh_hempstead: {
+    label: "Due from SH Hempstead",
+    section: "Inter-company",
+    description: "SD books only — what Hempstead owes SD (e.g. Hempstead-issued GC redeemed at SD). Added in PR #R4e.",
+    applies_to: "sd_only",
+  },
   due_to_sh_huntington: {
     label: "Due to SH Huntington",
     section: "Inter-company",
     description: "SD books only — SD's obligation to remit Huntington's share of Shopify deposits.",
+    applies_to: "sd_only",
+  },
+  due_from_sh_huntington: {
+    label: "Due from SH Huntington",
+    section: "Inter-company",
+    description: "SD books only — what Huntington owes SD (e.g. Huntington-issued GC redeemed at SD). Added in PR #R4e.",
     applies_to: "sd_only",
   },
 };
@@ -4932,8 +5294,11 @@ function suggestCoaAccountForRole(
     sales_tax_payable: ["new york department of taxation and finance payable"],
     gift_cards_outstanding: ["gift cards outstanding"],
     due_from_sd: ["due from sd ski"],
+    due_to_sd: ["due to sd ski"],
     due_to_sh_hempstead: ["due to sh hempstead"],
+    due_from_sh_hempstead: ["due from sh hempstead"],
     due_to_sh_huntington: ["due to sh huntington"],
+    due_from_sh_huntington: ["due from sh huntington"],
   };
   const weakKeywords: Record<ReconCoaLogicalRole, string[]> = {
     sales_income: ["shopify", "sales"],
@@ -4955,8 +5320,11 @@ function suggestCoaAccountForRole(
     sales_tax_payable: ["taxation", "sales tax"],
     gift_cards_outstanding: ["gift card"],
     due_from_sd: ["due from sd"],
+    due_to_sd: ["due to sd"],
     due_to_sh_hempstead: ["due to sh hempstead", "due to hempstead"],
+    due_from_sh_hempstead: ["due from sh hempstead", "due from hempstead"],
     due_to_sh_huntington: ["due to sh huntington", "due to huntington"],
+    due_from_sh_huntington: ["due from sh huntington", "due from huntington"],
   };
 
   const patterns = exactPatterns[role] || [];
@@ -5022,6 +5390,12 @@ export function buildReconCoaMappingMatrix(): CoaMappingMatrix {
       // SD specifically also doesn't need its own due_to_self lines.
       if (role === "due_to_sh_hempstead" && s !== "sd") notApplicable = true;
       if (role === "due_to_sh_huntington" && s !== "sd") notApplicable = true;
+      // PR #R4e — reverse-direction intercompany roles. SD-only because they
+      // sit on SD's books (SD's receivable from Hunt/Hemp). The `applies_to`
+      // metadata already says "sd_only" but we keep the explicit redundancy
+      // to match the pattern of the lines above.
+      if (role === "due_from_sh_hempstead" && s !== "sd") notApplicable = true;
+      if (role === "due_from_sh_huntington" && s !== "sd") notApplicable = true;
 
       const cur = mappingByKey.get(`${e.id}::${role}`);
       const sug = notApplicable

@@ -2367,6 +2367,9 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
+      {/* ===== 8b. Gift card activity (PR #R4e) ===== */}
+      <GiftCardActivityCard month={allocMonth} />
+
       {/* ===== 9. Error log ===== */}
       {(() => {
         if (!errorLogQ.data || errorLogQ.data.length === 0) return null;
@@ -2421,5 +2424,281 @@ export default function ReconcilerTest() {
         </>
       )}
     </div>
+  );
+}
+
+// =============================================================================
+// PR #R4e — Gift card activity (issuance + redemption + inter-company JE
+// preview). Self-contained component, sources its own data from the new
+// /api/recon/gc-redemptions and /api/recon/intercompany-jes endpoints. Driven
+// by the allocation month picker (parent passes the same month string).
+// =============================================================================
+
+type GcRedemptionRow = {
+  id: number;
+  gc_id: string;
+  order_id: string;
+  transaction_id: string | null;
+  amount: number;
+  issuer_entity_id: number | null;
+  redeemer_entity_id: number;
+  is_cross_entity: number;
+  redeemed_at: string;
+};
+type GcRedemptionSummary = {
+  count: number;
+  total_amount: number;
+  cross_entity_count: number;
+  cross_entity_amount: number;
+  by_pair: Array<{
+    issuer_entity_id: number | null;
+    redeemer_entity_id: number;
+    count: number;
+    amount: number;
+  }>;
+};
+type GcIssuanceSummary = {
+  count: number;
+  total_face_value: number;
+  by_entity: Array<{ entity_id: number; count: number; face_value: number }>;
+  by_method: Array<{ method: string; count: number; face_value: number }>;
+};
+type InterCoJeRow = {
+  id: number;
+  source_kind: string;
+  source_id: number;
+  entity_id: number;
+  counterparty_entity_id: number;
+  account_role: string;
+  side: "DR" | "CR";
+  amount: number;
+  order_id: string | null;
+  gc_id: string | null;
+  created_at: string;
+};
+type EntityRow = { id: number; location: string; legal_name: string };
+
+function GiftCardActivityCard({ month }: { month: string }) {
+  // Month → [sinceIso, untilIso). The server's parseRangeOrNull expects
+  // YYYY-MM-DD, so we convert month-start to month-end-exclusive here.
+  const { since, until } = (() => {
+    const [y, m] = month.split("-").map(Number);
+    const sinceDate = `${month}-01`;
+    const nextY = m === 12 ? y + 1 : y;
+    const nextM = m === 12 ? 1 : m + 1;
+    const untilDate = `${nextY}-${String(nextM).padStart(2, "0")}-01`;
+    return { since: sinceDate, until: untilDate };
+  })();
+
+  const qc = useQueryClient();
+  const [resyncMsg, setResyncMsg] = useState<string | null>(null);
+
+  const entitiesQ = useQuery<EntityRow[]>({ queryKey: ["/api/payroll/entities"] });
+  const entityLabel = (id: number | null): string => {
+    if (id == null) return "(unknown)";
+    const e = entitiesQ.data?.find((x) => x.id === id);
+    return e?.location ?? `entity ${id}`;
+  };
+
+  const redemptionsQ = useQuery<{ rows: GcRedemptionRow[]; summary: GcRedemptionSummary; issuance: GcIssuanceSummary }>({
+    queryKey: ["/api/recon/gc-redemptions", since, until],
+    queryFn: () =>
+      jsonGet(`/api/recon/gc-redemptions?since=${since}&until=${until}`),
+  });
+
+  const jesQ = useQuery<{ rows: InterCoJeRow[] }>({
+    queryKey: ["/api/recon/intercompany-jes", since, until],
+    queryFn: () => jsonGet(`/api/recon/intercompany-jes?since=${since}&until=${until}`),
+  });
+
+  const rebuildMut = useMutation<{ orders_scanned: number; redemptions_recorded: number; je_legs_emitted: number; orders_deferred: number; errors: number }, Error>({
+    mutationFn: () => jsonPost("/api/recon/gc-redemptions/rebuild", { since, until }),
+    onSuccess: (r) => {
+      setResyncMsg(
+        `Scanned ${r.orders_scanned} orders → ${r.redemptions_recorded} redemptions, ${r.je_legs_emitted} JE legs` +
+        (r.orders_deferred > 0 ? `, ${r.orders_deferred} deferred (no allocation)` : "") +
+        (r.errors > 0 ? `, ${r.errors} errors` : ""),
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/gc-redemptions", since, until] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/intercompany-jes", since, until] });
+    },
+    onError: (e) => setResyncMsg(`Rebuild failed: ${e.message}`),
+  });
+
+  const issuance = redemptionsQ.data?.issuance;
+  const redemptionSummary = redemptionsQ.data?.summary;
+
+  // Group JE legs by entity for the preview disclosure.
+  const jesByEntity = (() => {
+    const map = new Map<number, InterCoJeRow[]>();
+    for (const j of jesQ.data?.rows ?? []) {
+      const arr = map.get(j.entity_id) ?? [];
+      arr.push(j);
+      map.set(j.entity_id, arr);
+    }
+    return Array.from(map.entries()).sort((a, b) => a[0] - b[0]);
+  })();
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Banknote className="size-4" /> Gift card activity — {monthLabel(month)}
+        </CardTitle>
+        <CardDescription>
+          Issuance ledger + redemption ledger + inter-company JE preview for the
+          selected month. Read-only — these records will eventually feed the
+          QBO journal-entry posting in Phase 2.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Issuance + Redemption cards stacked */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Issuance */}
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="text-sm font-semibold flex items-center gap-1.5">
+              <Banknote className="size-4" /> Issuance
+            </div>
+            {issuance ? (
+              <>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
+                  <div className="text-muted-foreground">Cards issued</div>
+                  <div className="font-mono text-right">{issuance.count}</div>
+                  <div className="text-muted-foreground">Total face value</div>
+                  <div className="font-mono text-right">{money(issuance.total_face_value)}</div>
+                </div>
+                {issuance.by_entity.length > 0 && (
+                  <div className="text-xs">
+                    <div className="font-medium mb-0.5">By entity</div>
+                    <div className="space-y-0.5">
+                      {issuance.by_entity.map((r) => (
+                        <div key={r.entity_id} className="flex justify-between font-mono">
+                          <span>{entityLabel(r.entity_id)}</span>
+                          <span>{r.count} · {money(r.face_value)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {issuance.by_method.length > 0 && (
+                  <div className="text-xs">
+                    <div className="font-medium mb-0.5">By method</div>
+                    <div className="space-y-0.5">
+                      {issuance.by_method.map((r) => (
+                        <div key={r.method} className="flex justify-between font-mono">
+                          <span>{r.method}</span>
+                          <span>{r.count} · {money(r.face_value)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="text-xs text-muted-foreground italic">Loading…</div>
+            )}
+          </div>
+
+          {/* Redemption */}
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="text-sm font-semibold flex items-center gap-1.5">
+              <Banknote className="size-4" /> Redemption
+            </div>
+            {redemptionSummary ? (
+              <>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
+                  <div className="text-muted-foreground">Redemptions</div>
+                  <div className="font-mono text-right">{redemptionSummary.count}</div>
+                  <div className="text-muted-foreground">Total redeemed</div>
+                  <div className="font-mono text-right">{money(redemptionSummary.total_amount)}</div>
+                  <div className="text-muted-foreground">Cross-entity</div>
+                  <div className="font-mono text-right">{redemptionSummary.cross_entity_count}</div>
+                  <div className="text-muted-foreground">Cross-entity $</div>
+                  <div className="font-mono text-right">{money(redemptionSummary.cross_entity_amount)}</div>
+                </div>
+                {redemptionSummary.by_pair.length > 0 && (
+                  <div className="text-xs">
+                    <div className="font-medium mb-0.5">Issuer → Redeemer</div>
+                    <div className="space-y-0.5">
+                      {redemptionSummary.by_pair.map((p, i) => (
+                        <div key={i} className="flex justify-between font-mono">
+                          <span>
+                            {entityLabel(p.issuer_entity_id)} → {entityLabel(p.redeemer_entity_id)}
+                          </span>
+                          <span>{p.count} · {money(p.amount)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="text-xs text-muted-foreground italic">Loading…</div>
+            )}
+          </div>
+        </div>
+
+        {/* Resync button + status */}
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => rebuildMut.mutate()}
+            disabled={rebuildMut.isPending}
+            data-testid="button-gc-redemption-rebuild"
+          >
+            <RefreshCw className={`size-4 mr-1.5 ${rebuildMut.isPending ? "animate-spin" : ""}`} />
+            {rebuildMut.isPending ? "Resyncing…" : "Resync GC redemptions"}
+          </Button>
+          {resyncMsg && <span className="text-xs text-muted-foreground">{resyncMsg}</span>}
+        </div>
+
+        {/* Inter-company JE preview */}
+        <details className="rounded-md border px-3 py-2 bg-muted/30">
+          <summary className="cursor-pointer select-none text-sm font-medium">
+            Inter-company JE preview
+            <span className="ml-2 text-[10px] font-mono text-muted-foreground">
+              {jesQ.data?.rows.length ?? 0} legs across {jesByEntity.length} entit{jesByEntity.length === 1 ? "y" : "ies"}
+            </span>
+          </summary>
+          <div className="mt-2 space-y-3">
+            {jesByEntity.length === 0 && (
+              <div className="text-xs text-muted-foreground italic">No JE legs for this period yet.</div>
+            )}
+            {jesByEntity.map(([entityId, legs]) => (
+              <div key={entityId} className="rounded-md border bg-background">
+                <div className="px-2 py-1.5 text-xs font-semibold bg-muted/50 border-b">
+                  {entityLabel(entityId)} · {legs.length} leg{legs.length === 1 ? "" : "s"}
+                </div>
+                <table className="w-full text-xs">
+                  <thead className="text-muted-foreground">
+                    <tr>
+                      <th className="text-left px-2 py-1 font-medium">Order</th>
+                      <th className="text-left px-2 py-1 font-medium">GC</th>
+                      <th className="text-left px-2 py-1 font-medium">Account role</th>
+                      <th className="text-center px-2 py-1 font-medium">Side</th>
+                      <th className="text-right px-2 py-1 font-medium">Amount</th>
+                      <th className="text-left px-2 py-1 font-medium">Counterparty</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {legs.map((j) => (
+                      <tr key={j.id} className="border-t">
+                        <td className="px-2 py-1 font-mono">{j.order_id ?? "—"}</td>
+                        <td className="px-2 py-1 font-mono">{j.gc_id ?? "—"}</td>
+                        <td className="px-2 py-1 font-mono">{j.account_role}</td>
+                        <td className="px-2 py-1 text-center font-mono">{j.side}</td>
+                        <td className="px-2 py-1 text-right font-mono">{money(j.amount)}</td>
+                        <td className="px-2 py-1 font-mono">{entityLabel(j.counterparty_entity_id)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ))}
+          </div>
+        </details>
+      </CardContent>
+    </Card>
   );
 }

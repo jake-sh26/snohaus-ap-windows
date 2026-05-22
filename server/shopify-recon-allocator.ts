@@ -28,6 +28,7 @@
 
 import { sqlite, listPayrollEntities } from "./storage";
 import { assignGcIssuance } from "./shopify-recon-gc-issuance";
+import { processOrderForGCRedemption } from "./shopify-recon-gc-redemption";
 
 // ----- types -----
 
@@ -61,6 +62,11 @@ export type AllocationRunSummary = {
   by_method: Record<AllocationMethod, number>;
   needs_review_orders: number;
   failed_orders: number;
+  // PR #R4e — redemption / JE counters from the post-allocation pass.
+  // Populated after the main transaction commits; zero on cancelled-only
+  // months or when no orders carried gift_card transactions.
+  gc_redemptions_recorded: number;
+  gc_je_legs_emitted: number;
   warnings: string[];
   ran_at: string;
 };
@@ -514,6 +520,8 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
     },
     needs_review_orders: 0,
     failed_orders: 0,
+    gc_redemptions_recorded: 0,
+    gc_je_legs_emitted: 0,
     warnings: [],
     ran_at: new Date().toISOString(),
   };
@@ -634,6 +642,28 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
   } catch (e: any) {
     summary.failed_orders = summary.orders_processed - summary.needs_review_orders;
     summary.warnings.push(`Transaction failed: ${e?.message ?? String(e)}`);
+  }
+
+  // PR #R4e — Post-allocation: record GC redemptions + generate inter-company
+  // JE legs. Runs AFTER the allocation transaction commits so the redemption
+  // module can read the canonical redeemer entity from recon_allocations.
+  // Each call is independently idempotent (UNIQUE constraints on both
+  // tables), so partial reruns and re-trigger from the rebuild route both
+  // converge to the same state.
+  for (const o of orders) {
+    if (o.cancelled_at) continue;
+    const raw = sqlite
+      .prepare(`SELECT raw_json FROM recon_orders WHERE id = ?`)
+      .get(o.id) as { raw_json: string | null } | undefined;
+    if (!raw?.raw_json) continue;
+    try {
+      const parsed = JSON.parse(raw.raw_json);
+      const r = processOrderForGCRedemption(o.id, parsed);
+      summary.gc_redemptions_recorded += r.redemptions_recorded;
+      summary.gc_je_legs_emitted += r.je_legs_emitted;
+    } catch (e: any) {
+      summary.warnings.push(`GC redemption ${o.id}: ${e?.message ?? String(e)}`);
+    }
   }
 
   return summary;
