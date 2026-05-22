@@ -19,7 +19,14 @@ let initialized = false;
 
 export function getAppLogPath(): string {
   if (logPath) return logPath;
-  const dir = path.resolve(process.cwd(), "logs");
+  // PR #R4j — anchor the logs dir to the executable directory rather than
+  // process.cwd(). Under NSSM cwd can be C:\Windows\system32, which is why
+  // every previous "site went down" investigation found an empty
+  // logs/app.log: the file was being written next to system32, not the
+  // install root. __dirname in the bundled cjs build = `<install>/dist`, so
+  // `..` walks up to the install root.
+  const installRoot = path.resolve(__dirname, "..");
+  const dir = path.join(installRoot, "logs");
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
   logPath = path.join(dir, "app.log");
   return logPath;

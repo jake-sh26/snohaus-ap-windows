@@ -29,7 +29,8 @@ import { getQboStatus, searchBills, searchPayments } from "./qbo";
 // Types from imapflow / mailparser are loaded dynamically so they don't crash
 // if not installed (graceful degradation when env vars are missing).
 
-const DB_PATH = path.resolve(process.cwd(), "data.db");
+import { getDbPath } from "./db-path";
+const DB_PATH = getDbPath(); // PR #R4j: NSSM-safe path
 let _db: ReturnType<typeof Database> | null = null;
 
 function getDb() {

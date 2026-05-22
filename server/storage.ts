@@ -25,9 +25,20 @@ import Database from "better-sqlite3";
 import { eq, and, desc, gte, lte, like, or } from "drizzle-orm";
 import seedData from "./data/seed_data.json" with { type: "json" };
 import qboVendorsData from "./data/qbo_vendors.json" with { type: "json" };
+import { getDbPath } from "./db-path";
 
-export const sqlite = new Database("data.db");
+// PR #R4j — Open the SQLite file via the centralized path resolver. Under
+// NSSM/LocalSystem `process.cwd()` is unreliable; getDbPath() resolves the
+// data file relative to the executable directory so the service boots
+// regardless of how it was launched. See ./db-path.ts for details.
+export const sqlite = new Database(getDbPath());
+// PR #R4j — WAL + busy_timeout + NORMAL sync. Allows the recon job to read
+// allocations while another connection writes payouts, instead of locking
+// the whole DB for the duration of a recon run.
 sqlite.pragma("journal_mode = WAL");
+sqlite.pragma("busy_timeout = 5000");
+sqlite.pragma("synchronous = NORMAL");
+console.log(`[storage] SQLite opened at ${getDbPath()}`);
 
 export const db = drizzle(sqlite);
 
@@ -1372,35 +1383,31 @@ function bootstrapSchema() {
       ON recon_gift_cards(kind);
   `);
 
-  // ----- Gift card redemptions -----
-  // Each time a GC is used to pay (full or partial) for an order, we record
-  // one row here. Powers (a) the prior-year pro-rata calculation, and (b) the
-  // intercompany due-to/from JEs in Phase 2 when the issuer != redeemer entity.
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS recon_gift_card_redemptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      gift_card_id TEXT REFERENCES recon_gift_cards(id) ON DELETE SET NULL,
-      -- Order where the card was applied as payment.
-      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
-      amount REAL NOT NULL,
-      -- Entity that REDEEMED the card (where the order shipped/sold).
-      redeeming_entity_id INTEGER REFERENCES payroll_entities(id),
-      -- Snapshotted at redemption time so later edits to recon_gift_cards
-      -- don't break the historical intercompany trail.
-      issuing_entity_id INTEGER REFERENCES payroll_entities(id),
-      redeemed_at TEXT NOT NULL,
-      raw_json TEXT,
-      ingested_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_order
-      ON recon_gift_card_redemptions(order_id);
-    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_gc
-      ON recon_gift_card_redemptions(gift_card_id);
-    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_redeemed_at
-      ON recon_gift_card_redemptions(redeemed_at);
-    CREATE INDEX IF NOT EXISTS idx_recon_gc_redemptions_redeeming_entity
-      ON recon_gift_card_redemptions(redeeming_entity_id);
-  `);
+  // ----- Gift card redemptions (legacy block) -----
+  // PR #R4j — This block was superseded by the R4e schema defined earlier
+  // in bootstrapSchema (~line 1100) which uses gc_id / redeemer_entity_id /
+  // issuer_entity_id / is_cross_entity. On a FRESH database the R4e block
+  // ran first and created the table with the new column names; then this
+  // legacy block's CREATE INDEX ... ON recon_gift_card_redemptions
+  // (redeeming_entity_id) ran and threw SQLITE_ERROR because the column
+  // doesn't exist in the R4e schema. That synchronous throw at module
+  // load is what was killing the NSSM service in <1500ms with no log
+  // breadcrumb — the crash happened inside `require("./storage")` before
+  // app-logger could tee any output.
+  //
+  // The legacy CREATE TABLE IF NOT EXISTS is harmless (no-op when the
+  // table already exists), but the legacy indexes referenced columns that
+  // R4e renamed. Removing the entire legacy block is safe because the R4e
+  // block above already creates the table and its indexes; the R4i
+  // ensureColumns migration above has already patched any legacy DBs into
+  // the new column shape.
+  //
+  // Kept as a comment for archaeology in case any reader wonders where the
+  // historic `redeeming_entity_id` / `issuing_entity_id` / `raw_json`
+  // columns went — they're now `redeemer_entity_id`,
+  // `issuer_entity_id`, and inferred from raw_json on the orders table.
+  //
+  // (intentionally no sqlite.exec here)
 
   // ----- Reconciler sync log -----
   // Mirrors payroll_sync_log shape so the existing /api/sync-log UI can show

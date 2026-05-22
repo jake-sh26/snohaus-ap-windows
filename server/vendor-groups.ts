@@ -14,11 +14,13 @@
 // vendors; they just route disambiguation in the drawer.
 
 import Database from "better-sqlite3";
+import { getDbPath } from "./db-path";
 
 let _db: Database.Database | null = null;
 function getDb() {
   if (_db) return _db;
-  _db = new Database("data.db");
+  // PR #R4j: NSSM-safe DB path (see ./db-path.ts).
+  _db = new Database(getDbPath());
   _db.pragma("journal_mode = WAL");
   _db.exec(`
     CREATE TABLE IF NOT EXISTS vendor_groups (
