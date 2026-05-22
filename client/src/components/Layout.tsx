@@ -124,6 +124,31 @@ export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
   const { email, logout, hasPermission } = useAuth();
 
+  // PR #R4g — Session-expired banner. queryClient.ts dispatches a window
+  // "auth-expired" event on any 401 response; we surface a clear banner with
+  // a one-click "Sign in again" CTA so the operator isn't staring at a
+  // silently-401ing page. The state is auto-cleared as soon as the user
+  // either signs in (token returns) or dismisses; we also drop the banner
+  // on any successful navigation away from a 401 state.
+  const [sessionExpired, setSessionExpired] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onExpired = () => setSessionExpired(true);
+    window.addEventListener("auth-expired", onExpired);
+    return () => window.removeEventListener("auth-expired", onExpired);
+  }, []);
+  // If the token comes back (user re-logged in), clear the banner.
+  useEffect(() => {
+    if (!sessionExpired) return;
+    if (typeof localStorage === "undefined") return;
+    if (localStorage.getItem("snohaus_token")) setSessionExpired(false);
+  }, [sessionExpired, location]);
+  function signInAgain() {
+    try { localStorage.removeItem("snohaus_token"); } catch {}
+    setSessionExpired(false);
+    if (typeof window !== "undefined") window.location.hash = "#/login";
+  }
+
   // Filter sidebar sections by RBAC permission. A section with `permissionKey`
   // is only rendered when the user has that permission for any entity. Owner
   // gets all permissions (via seedRbacBaseline) so this is invisible for them.
@@ -374,6 +399,25 @@ export function Layout({ children }: { children: ReactNode }) {
 
       {/* Main */}
       <main className="flex-1 min-w-0 overflow-x-hidden pt-14 lg:pt-0">
+        {sessionExpired && (
+          <div
+            className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-500/15 px-4 py-2 text-sm text-amber-900 dark:text-amber-200"
+            data-testid="banner-session-expired"
+          >
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="size-4 shrink-0" />
+              <span>Your session has expired. Sign in again to keep working.</span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={signInAgain}
+              data-testid="button-session-expired-relogin"
+            >
+              Sign in again
+            </Button>
+          </div>
+        )}
         {children}
       </main>
     </div>

@@ -362,20 +362,33 @@ export default function ReconcilerTest() {
   const [backfillUntil, setBackfillUntil] = useState<string>("");
   // PR #R4d — pull initial_sync_from from reconciler settings so the
   // "Backfill all history" button knows where the configured history floor is.
+  // PR #R4g — was a raw fetch() with `credentials: "include"`; the API uses
+  // Bearer auth (cookies not honoured by requirePermission), so a session
+  // refresh would silently 401 these. Route through apiRequest so the
+  // Authorization header is read fresh from localStorage every poll.
   const settingsQ = useQuery<{ initial_sync_from?: string | null }>({
     queryKey: ["/api/recon/settings"],
-    queryFn: () => fetch("/api/recon/settings", { credentials: "include" }).then((r) => r.json()),
+    queryFn: () => jsonGet("/api/recon/settings"),
   });
   // PR #R4f — always-on backfill progress poller. Decoupled from the
   // mutation's isPending so a freshly-loaded client (after a refresh, or
   // simply someone else's session) sees the running job's state within
   // ~1.5s. The server returns the currently-running backfill (or the most
   // recent finished one) when called without a syncLogId.
+  // PR #R4g — same fix as above; uses apiRequest so a relogin's fresh token
+  // is picked up on the very next poll instead of 401ing forever.
   const backfillProgressQ = useQuery<{ progress: BackfillProgress | null; recent?: BackfillProgress[] }>({
     queryKey: ["/api/recon/shopify/sync/fulfillments-backfill/progress"],
-    queryFn: () =>
-      fetch("/api/recon/shopify/sync/fulfillments-backfill/progress", { credentials: "include" })
-        .then((r) => (r.ok ? r.json() : { progress: null })),
+    queryFn: async () => {
+      try {
+        const r = await apiRequest("GET", "/api/recon/shopify/sync/fulfillments-backfill/progress");
+        return r.json();
+      } catch {
+        // Don't break the poller on a single transient failure — return the
+        // safe empty shape so the Diagnostics block can show "no progress."
+        return { progress: null, recent: [] };
+      }
+    },
     refetchInterval: 1500,
     // Always refetch in the background even when the tab is hidden, so a
     // user returning to the tab sees fresh state immediately.
@@ -1108,6 +1121,61 @@ export default function ReconcilerTest() {
                 </div>
               </div>
             )}
+            {/* PR #R4g — Defensive observability. The Diagnostics disclosure
+                is always rendered (collapsed by default) so if the progress
+                card ever fails to appear despite a running backfill on the
+                server, the operator can expand this and see exactly what
+                the client knows about the poll. Surfaces query lifecycle
+                state, last-good timestamp, and the raw response body. */}
+            <details className="text-xs rounded-md border border-muted-foreground/20 bg-muted/30 px-2.5 py-1.5">
+              <summary className="cursor-pointer select-none font-medium text-muted-foreground">
+                Diagnostics
+                <span className="ml-2 font-mono text-[10px] text-muted-foreground/70">
+                  status={backfillProgressQ.status}
+                  {backfillProgressQ.isFetching ? " · fetching" : ""}
+                  {backfillProgressQ.isError ? " · ERROR" : ""}
+                </span>
+              </summary>
+              <div className="mt-2 space-y-1.5 font-mono text-[11px] text-foreground/80">
+                <div>
+                  <span className="text-muted-foreground">Query status:</span>{" "}
+                  {backfillProgressQ.status}
+                  {backfillProgressQ.isFetching ? " (refetching)" : ""}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Last successful response:</span>{" "}
+                  {backfillProgressQ.dataUpdatedAt
+                    ? new Date(backfillProgressQ.dataUpdatedAt).toLocaleTimeString()
+                    : "—"}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Last error:</span>{" "}
+                  {backfillProgressQ.error
+                    ? String((backfillProgressQ.error as Error).message ?? backfillProgressQ.error)
+                    : "—"}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Stored auth token present:</span>{" "}
+                  {typeof localStorage !== "undefined" && localStorage.getItem("snohaus_token") ? "yes" : "no"}
+                </div>
+                <div className="mt-1.5">
+                  <div className="text-muted-foreground mb-0.5">data.progress:</div>
+                  <pre className="whitespace-pre-wrap break-all text-[10px] bg-background/60 rounded px-1.5 py-1 border">
+                    {backfillProgressQ.data?.progress
+                      ? JSON.stringify(backfillProgressQ.data.progress, null, 2)
+                      : "null"}
+                  </pre>
+                </div>
+                <div>
+                  <div className="text-muted-foreground mb-0.5">data.recent (last 3):</div>
+                  <pre className="whitespace-pre-wrap break-all text-[10px] bg-background/60 rounded px-1.5 py-1 border">
+                    {backfillProgressQ.data?.recent && backfillProgressQ.data.recent.length > 0
+                      ? JSON.stringify(backfillProgressQ.data.recent.slice(0, 3), null, 2)
+                      : "[]"}
+                  </pre>
+                </div>
+              </div>
+            </details>
             {fulfillmentBackfillMut.data && (
               <div
                 className={`text-sm rounded-md border p-3 ${
