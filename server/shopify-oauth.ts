@@ -42,15 +42,18 @@ function oauthWarn(scope: string, msg: string) {
  */
 const REQUIRED_SCOPES = [
   "read_all_orders",
+  "read_assigned_fulfillment_orders",
   "read_customers",
   "read_fulfillments",
   "read_gift_cards",
   "read_inventory",
   "read_locations",
+  "read_merchant_managed_fulfillment_orders",
   "read_orders",
   "read_products",
   "read_shopify_payments_disputes",
   "read_shopify_payments_payouts",
+  "read_third_party_fulfillment_orders",
 ].join(",");
 
 /**
