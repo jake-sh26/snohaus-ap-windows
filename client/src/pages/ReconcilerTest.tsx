@@ -239,7 +239,13 @@ type AllocRollupRow = {
   entity_location: string | null;
   orders: number;
   line_items: number;
+  // PR #R4k — merchandise gross only (excludes digital GC issuance).
+  // Matches Shopify Net sales + |Returns|.
   gross_total: number;
+  // PR #R4k — digital GC issuance face value, allocated to issuer entity.
+  // Matches Shopify "Net sales from gift cards" report. Always present from
+  // the server; older deployments default to 0.
+  gc_issuance_total: number;
   tax_total: number;
 };
 
@@ -2236,7 +2242,9 @@ export default function ReconcilerTest() {
                       <th className="text-left px-2 py-1.5">Entity</th>
                       <th className="text-right px-2 py-1.5">Orders</th>
                       <th className="text-right px-2 py-1.5">Line items</th>
-                      <th className="text-right px-2 py-1.5">Gross</th>
+                      <th className="text-right px-2 py-1.5" title="Merchandise revenue — ties to Shopify Net sales (Gross sales − Discounts) + |Returns|">Gross (merch)</th>
+                      <th className="text-right px-2 py-1.5" title="Digital gift card face value sold — ties to Shopify Net sales from gift cards (a liability, not revenue until redeemed)">GC issued</th>
+                      <th className="text-right px-2 py-1.5" title="Total Shopify activity: merchandise + GC issuance — ties to Shopify Gross sales − Discounts">Total activity</th>
                       <th className="text-right px-2 py-1.5">Tax</th>
                     </tr>
                   </thead>
@@ -2247,6 +2255,8 @@ export default function ReconcilerTest() {
                         <td className="px-2 py-1.5 text-right font-mono">{num(row.orders)}</td>
                         <td className="px-2 py-1.5 text-right font-mono">{num(row.line_items)}</td>
                         <td className="px-2 py-1.5 text-right font-mono">{money(row.gross_total)}</td>
+                        <td className="px-2 py-1.5 text-right font-mono text-muted-foreground">{money(row.gc_issuance_total ?? 0)}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">{money((row.gross_total ?? 0) + (row.gc_issuance_total ?? 0))}</td>
                         <td className="px-2 py-1.5 text-right font-mono">{money(row.tax_total)}</td>
                       </tr>
                     ))}
@@ -2256,9 +2266,10 @@ export default function ReconcilerTest() {
                           orders: acc.orders + r.orders,
                           line_items: acc.line_items + r.line_items,
                           gross: acc.gross + (r.gross_total ?? 0),
+                          gc: acc.gc + (r.gc_issuance_total ?? 0),
                           tax: acc.tax + (r.tax_total ?? 0),
                         }),
-                        { orders: 0, line_items: 0, gross: 0, tax: 0 }
+                        { orders: 0, line_items: 0, gross: 0, gc: 0, tax: 0 }
                       );
                       return (
                         <tr className="border-t bg-muted/30 font-medium">
@@ -2266,6 +2277,8 @@ export default function ReconcilerTest() {
                           <td className="px-2 py-1.5 text-right font-mono">{num(t.orders)}</td>
                           <td className="px-2 py-1.5 text-right font-mono">{num(t.line_items)}</td>
                           <td className="px-2 py-1.5 text-right font-mono">{money(t.gross)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono text-muted-foreground">{money(t.gc)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{money(t.gross + t.gc)}</td>
                           <td className="px-2 py-1.5 text-right font-mono">{money(t.tax)}</td>
                         </tr>
                       );
