@@ -106,6 +106,11 @@ import {
   buildReconCoaMappingMatrix,
   bulkSaveReconCoaMapping,
   RECON_COA_LOGICAL_ROLES,
+  // Reconciler (PR #R4e) — GC redemption ledger + inter-company JE preview
+  listRedemptionsForRange,
+  getRedemptionSummary,
+  listInterCompanyJEsForRange,
+  getIssuanceSummary,
 } from "./storage";
 import {
   getShopifyReconConfig,
@@ -143,6 +148,9 @@ import {
   getAllocationRollup,
   getAllocationReadiness,
 } from "./shopify-recon-allocator";
+import {
+  rebuildRedemptionsForRange,
+} from "./shopify-recon-gc-redemption";
 import {
   shopifyInstallHandler,
   shopifyCallbackHandler,
@@ -1465,6 +1473,63 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
     try {
       res.json({ rows: getAllocationRollup(month) });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  // ---- PR #R4e — GC redemption + inter-company JE preview ----
+  // Three endpoints; all behind system.manage_config like the other writer-
+  // adjacent reconciler routes (the rebuild one actually writes records, the
+  // two GETs are read-only but kept on the same permission for simplicity).
+  // YYYY-MM-DD inputs convert to midnight UTC for the storage queries.
+  function parseRangeOrNull(
+    q: any,
+  ): { sinceIso: string; untilIso: string } | { error: string } {
+    const since = typeof q.since === "string" ? q.since : "";
+    const until = typeof q.until === "string" ? q.until : "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+      return { error: "since must be YYYY-MM-DD" };
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+      return { error: "until must be YYYY-MM-DD" };
+    }
+    return { sinceIso: `${since}T00:00:00Z`, untilIso: `${until}T00:00:00Z` };
+  }
+
+  app.get("/api/recon/gc-redemptions", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    const parsed = parseRangeOrNull(req.query);
+    if ("error" in parsed) return res.status(400).json(parsed);
+    try {
+      const rows = listRedemptionsForRange(parsed.sinceIso, parsed.untilIso);
+      const summary = getRedemptionSummary(parsed.sinceIso, parsed.untilIso);
+      const issuance = getIssuanceSummary(parsed.sinceIso, parsed.untilIso);
+      res.json({ rows, summary, issuance });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  app.get("/api/recon/intercompany-jes", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    const parsed = parseRangeOrNull(req.query);
+    if ("error" in parsed) return res.status(400).json(parsed);
+    try {
+      const rows = listInterCompanyJEsForRange(parsed.sinceIso, parsed.untilIso);
+      res.json({ rows });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  app.post("/api/recon/gc-redemptions/rebuild", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    // Body OR query — easier to copy/paste from the existing fulfillment
+    // backfill flow either way.
+    const src = Object.keys(req.body || {}).length > 0 ? req.body : req.query;
+    const parsed = parseRangeOrNull(src);
+    if ("error" in parsed) return res.status(400).json(parsed);
+    try {
+      const result = rebuildRedemptionsForRange(parsed.sinceIso, parsed.untilIso);
+      res.json(result);
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? String(e) });
     }
