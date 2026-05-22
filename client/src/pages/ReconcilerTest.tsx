@@ -361,6 +361,12 @@ export default function ReconcilerTest() {
   const [backfillSince, setBackfillSince] = useState<string>("");
   const [backfillUntil, setBackfillUntil] = useState<string>("");
   const [backfillProgress, setBackfillProgress] = useState<BackfillProgress | null>(null);
+  // PR #R4d — pull initial_sync_from from reconciler settings so the
+  // "Backfill all history" button knows where the configured history floor is.
+  const settingsQ = useQuery<{ initial_sync_from?: string | null }>({
+    queryKey: ["/api/recon/settings"],
+    queryFn: () => fetch("/api/recon/settings", { credentials: "include" }).then((r) => r.json()),
+  });
   const fulfillmentBackfillMut = useMutation<FulfillmentBackfillResult, Error, { since: string; until?: string }>({
     mutationFn: (args) => jsonPost<FulfillmentBackfillResult>("/api/recon/shopify/sync/fulfillments-backfill", args),
     onSuccess: (r) => {
@@ -999,6 +1005,24 @@ export default function ReconcilerTest() {
                 <RefreshCw className={`size-4 mr-1.5 ${fulfillmentBackfillMut.isPending ? "animate-spin" : ""}`} />
                 {fulfillmentBackfillMut.isPending ? "Backfilling…" : "Backfill fulfillments"}
               </Button>
+              {/* PR #R4d — single-button shortcut for the full history sweep. */}
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!configured || fulfillmentBackfillMut.isPending}
+                onClick={() => {
+                  const floor = settingsQ.data?.initial_sync_from || "2025-01-01";
+                  const ok = window.confirm(
+                    `Backfill fulfillments + fulfillment_orders for ALL orders since ${floor}? This may take several minutes for a full history sweep.`,
+                  );
+                  if (!ok) return;
+                  setBackfillProgress(null);
+                  fulfillmentBackfillMut.mutate({ since: floor });
+                }}
+              >
+                <RefreshCw className={`size-4 mr-1.5 ${fulfillmentBackfillMut.isPending ? "animate-spin" : ""}`} />
+                Backfill all history
+              </Button>
             </div>
             {fulfillmentBackfillMut.isPending && backfillProgress && (
               <div className="text-xs rounded-md border border-blue-200 bg-blue-50 p-2.5 text-blue-900">
@@ -1123,6 +1147,38 @@ export default function ReconcilerTest() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <div className="text-sm font-medium mb-1.5 flex items-center gap-1.5"><Store className="size-4" /> By channel</div>
+                  {/* PR #R4d — five-bucket roll-up over the raw source_name rows.
+                      Surfaces Locally / draft / shop-pay / other so we can spot
+                      Locally volume at a glance without scrolling the raw table. */}
+                  {(() => {
+                    const buckets: Record<string, { orders: number; total: number }> = {
+                      pos: { orders: 0, total: 0 },
+                      web: { orders: 0, total: 0 },
+                      shopify_draft_order: { orders: 0, total: 0 },
+                      locally: { orders: 0, total: 0 },
+                      other: { orders: 0, total: 0 },
+                    };
+                    for (const r of summaryQ.data.by_channel) {
+                      const sn = (r.source_name || "").toLowerCase();
+                      let key = "other";
+                      if (sn === "pos") key = "pos";
+                      else if (sn === "web" || sn === "shopify_payments" || sn === "shop") key = "web";
+                      else if (sn === "shopify_draft_order" || sn.includes("draft")) key = "shopify_draft_order";
+                      else if (sn.includes("locally")) key = "locally";
+                      buckets[key].orders += r.orders;
+                      buckets[key].total += r.total;
+                    }
+                    const order: Array<keyof typeof buckets> = ["pos", "web", "shopify_draft_order", "locally", "other"];
+                    return (
+                      <div className="flex flex-wrap gap-1.5 mb-2">
+                        {order.map((k) => (
+                          <Badge key={k} variant="outline" className="text-xs font-mono">
+                            {k}: {num(buckets[k].orders)} · {money(buckets[k].total)}
+                          </Badge>
+                        ))}
+                      </div>
+                    );
+                  })()}
                   <div className="border rounded-md overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 text-xs text-muted-foreground">
@@ -1979,7 +2035,7 @@ export default function ReconcilerTest() {
                 type="month"
                 value={allocMonth}
                 onChange={(e) => setAllocMonth(e.target.value)}
-                className="border rounded px-2 py-1.5 text-sm font-mono"
+                className="border rounded px-2 py-1.5 text-sm font-mono bg-background text-foreground [color-scheme:light_dark]"
               />
             </div>
             <Button

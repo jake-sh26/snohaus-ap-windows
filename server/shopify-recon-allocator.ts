@@ -27,6 +27,7 @@
  */
 
 import { sqlite, listPayrollEntities } from "./storage";
+import { assignGcIssuance } from "./shopify-recon-gc-issuance";
 
 // ----- types -----
 
@@ -69,6 +70,7 @@ type OrderRow = {
   created_at: string;
   source_name: string | null;
   location_id: string | null;
+  customer_id: string | null;
   shipping_zip: string | null;
   billing_zip: string | null;
   has_gift_card: number;
@@ -116,23 +118,12 @@ function getSdEntityId(): number | null {
   return sd?.id ?? null;
 }
 
-function lookupZip(zip: string | null): number | null {
-  if (!zip) return null;
-  const z5 = zip.trim().slice(0, 5);
-  if (z5.length < 5) return null;
-  const row = sqlite
-    .prepare(`SELECT entity_id FROM recon_zip_to_entity_lookup WHERE zip = ?`)
-    .get(z5) as { entity_id: number | null } | undefined;
-  return row?.entity_id ?? null;
-}
-
-function getProRataShares(year: number): Array<{ entity_id: number; share: number }> {
-  return sqlite
-    .prepare(
-      `SELECT entity_id, share FROM recon_prior_year_pro_rata WHERE applies_to_year = ?`
-    )
-    .all(year) as Array<{ entity_id: number; share: number }>;
-}
+// PR #R4d — `lookupZip` (recon_zip_to_entity_lookup) and `getProRataShares`
+// (recon_prior_year_pro_rata) used to back the digital-GC cascade. They were
+// superseded by shopify-recon-gc-issuance.ts (customer_affinity → zip_radius
+// → fallback_sd). The underlying tables are intentionally left in place —
+// they still feed the readiness check and can be re-attached in PR #R5 if
+// the issuance cascade ever needs a hybrid mode.
 
 // PR #R4b — fulfillment lookup. Returns ALL successful fulfillments for an
 // order, with the line item ids each fulfillment shipped. Used by allocator
@@ -188,6 +179,63 @@ function findFulfillmentForLine(
   return matches[matches.length - 1];
 }
 
+// PR #R4d — fulfillment_order lookup. Distinct from fulfillments[]: a FO is
+// the routed *intent* (created at order time), whereas fulfillments[] only
+// appears once the merchant ships. For Locally orders and unshipped online
+// orders, the FO's assigned_location_id is the only routing signal we have.
+type FulfillmentOrderRow = {
+  id: string;
+  assigned_location_id: string | null;
+  status: string | null;
+  line_item_ids: string[];
+};
+
+function listFulfillmentOrders(orderId: string): FulfillmentOrderRow[] {
+  // We accept open|in_progress|scheduled FOs as routing signals. Cancelled
+  // / incomplete / closed-without-ship leave the assigned_location_id behind
+  // but it no longer represents intent, so we skip them.
+  const rows = sqlite
+    .prepare(
+      `SELECT id, assigned_location_id, status, line_item_ids_json
+       FROM recon_fulfillment_orders
+       WHERE order_id = ?
+         AND status IN ('open', 'in_progress', 'scheduled', 'closed')
+       ORDER BY (status = 'closed'), id ASC`
+    )
+    .all(orderId) as Array<{
+      id: string;
+      assigned_location_id: string | null;
+      status: string | null;
+      line_item_ids_json: string | null;
+    }>;
+  return rows.map(r => ({
+    id: r.id,
+    assigned_location_id: r.assigned_location_id,
+    status: r.status,
+    line_item_ids: (() => {
+      if (!r.line_item_ids_json) return [];
+      try {
+        const parsed = JSON.parse(r.line_item_ids_json);
+        return Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch { return []; }
+    })(),
+  }));
+}
+
+// Find the fulfillment_order assigned to ship a given line item. The FO graph
+// guarantees each line belongs to exactly one open FO at a time, so the first
+// match wins. If we ever see split FOs the ORDER BY in listFulfillmentOrders
+// puts open/in_progress before closed.
+function findFulfillmentOrderForLine(
+  fulfillmentOrders: FulfillmentOrderRow[],
+  lineItemId: string,
+): FulfillmentOrderRow | null {
+  for (const fo of fulfillmentOrders) {
+    if (fo.line_item_ids.includes(lineItemId)) return fo;
+  }
+  return null;
+}
+
 // Allocate a single line item. Returns one or more AllocationRow slices.
 function allocateLineItem(
   order: OrderRow,
@@ -196,6 +244,7 @@ function allocateLineItem(
     locationMap: Map<string, { entity_id: number; kind: string }>;
     sdEntityId: number | null;
     fulfillments: FulfillmentRow[];
+    fulfillmentOrders: FulfillmentOrderRow[];
   },
 ): AllocationRow[] {
   const gross =
@@ -204,7 +253,15 @@ function allocateLineItem(
       : (line.price ?? 0) * (line.quantity ?? 0) - (line.total_discount ?? 0);
   const tax = line.line_tax_total ?? 0;
 
-  // POS order — every POS order has a location_id we can map.
+  // PR #R4d — pos_location requires BOTH source_name === 'pos' AND a mapped
+  // POS location. Pre-#R4d we treated any non-null order.location_id as POS
+  // if the location mapped to a POS entity. That broke for Locally orders,
+  // which inject their own pseudo-location id (e.g. 123711225857) onto the
+  // order but are NOT actually POS sales. Without the source filter the
+  // allocator would either map the fake id to needs_review (best case) or
+  // pick the wrong entity (worst case). Now Locally orders fall through
+  // into the fulfillment_orders / fulfillments cascade below, which uses
+  // the *real* routed store.
   if ((order.source_name || "").toLowerCase() === "pos" && order.location_id) {
     const hit = ctx.locationMap.get(order.location_id);
     if (hit) {
@@ -236,76 +293,90 @@ function allocateLineItem(
     }];
   }
 
-  // Digital gift cards (no fulfillment, requires_shipping=0, is_gift_card=1)
+  // PR #R4d — Digital gift cards: replace the old zip_lookup/pro_rata cascade
+  // with the issuance cascade (customer_affinity → zip_radius → fallback_sd).
+  // The issuance ledger persists the assignment so it can't flip on re-runs;
+  // the allocator just mirrors the chosen entity into recon_allocations so
+  // the same per-entity rollups continue to work downstream.
   if (line.is_gift_card === 1 && line.requires_shipping === 0) {
-    const z = order.shipping_zip || order.billing_zip;
-    const zipEntity = lookupZip(z);
-    if (zipEntity) {
+    const issuance = assignGcIssuance({
+      order_id: order.id,
+      line_item_id: line.id,
+      face_value: gross,
+      customer_id: order.customer_id,
+      billing_zip: order.billing_zip,
+      shipping_zip: order.shipping_zip,
+      order_created_at: order.created_at,
+    });
+    // Translate the issuance method into an AllocationMethod. Keep the
+    // existing "zip_lookup" / "prior_year_pro_rata" enum surface alive for
+    // back-compat — newer methods reuse them with the issuance method
+    // captured in `reason` for debuggability.
+    let method: AllocationMethod;
+    if (issuance.assignment_method === "customer_affinity") {
+      // Customer affinity behaves like a fulfillment_location pick (we know
+      // exactly which entity, with high confidence). No existing enum is a
+      // perfect fit — reuse zip_lookup since it's the legacy GC-routed bucket.
+      method = "zip_lookup";
+    } else if (issuance.assignment_method === "zip_radius") {
+      method = "zip_lookup";
+    } else {
+      // fallback_sd reuses the prior_year_pro_rata bucket so existing
+      // dashboards distinguish "explicitly routed" from "catch-all."
+      method = "prior_year_pro_rata";
+    }
+    if (issuance.assigned_entity_id === 0) {
+      // Cascade couldn't resolve an entity (no SD configured) — flag.
       return [{
         order_id: order.id,
         line_item_id: line.id,
-        entity_id: zipEntity,
+        entity_id: ctx.sdEntityId ?? 0,
         share: 1,
         gross_amount: gross,
         tax_amount: tax,
-        method: "zip_lookup",
-        reason: `Digital GC zip=${z} → entity ${zipEntity}`,
-        auto_method: "zip_lookup",
-        auto_entity_id: zipEntity,
+        method: "needs_review",
+        reason: `GC issuance failed: ${issuance.reason}`,
+        auto_method: "needs_review",
+        auto_entity_id: null,
       }];
     }
-    // Fallback: prior-year pro-rata for the *order's* year.
-    const orderYear = new Date(order.created_at).getUTCFullYear();
-    const shares = getProRataShares(orderYear);
-    if (shares.length > 0) {
-      const out: AllocationRow[] = [];
-      for (const s of shares) {
-        out.push({
-          order_id: order.id,
-          line_item_id: line.id,
-          entity_id: s.entity_id,
-          share: s.share,
-          gross_amount: gross * s.share,
-          tax_amount: tax * s.share,
-          method: "prior_year_pro_rata",
-          reason: `Digital GC no-zip fallback (year ${orderYear})`,
-          auto_method: "prior_year_pro_rata",
-          auto_entity_id: s.entity_id,
-        });
-      }
-      return out;
-    }
-    // No zip + no pro-rata data → flag for review.
     return [{
       order_id: order.id,
       line_item_id: line.id,
-      entity_id: ctx.sdEntityId ?? 0,
+      entity_id: issuance.assigned_entity_id,
       share: 1,
       gross_amount: gross,
       tax_amount: tax,
-      method: "needs_review",
-      reason: `Digital GC with no zip and no prior-year pro-rata for ${orderYear}`,
-      auto_method: "needs_review",
-      auto_entity_id: null,
+      method,
+      reason: issuance.reason,
+      auto_method: method,
+      auto_entity_id: issuance.assigned_entity_id,
     }];
   }
 
   // ------------------------------------------------------------------
-  // Online physical order. Three cases, in priority order:
-  //   (a) Order has a top-level location_id (rare on web orders, but
-  //       Shopify sets it on some Shop Pay / draft order flows). Use it.
+  // Online physical order. PR #R4d priority cascade:
+  //   (a) Order-level location_id is non-null AND maps to a POS entity.
+  //       Tight constraint: a non-POS order with a non-null location_id is
+  //       usually a third-party app artefact (e.g. Locally) and the field
+  //       should NOT win here. Only "real" POS-kind locations bypass the
+  //       fulfillment cascade.
   //   (b) Line item is on a successful fulfillment — use that fulfillment's
-  //       ship-from location_id. This is the common path. Handles split
-  //       fulfillments correctly (each line ships from its own location).
-  //   (c) Order is unfulfilled (or this line is on no successful
-  //       fulfillment yet) — flag needs_review so we don't guess.
+  //       ship-from location_id. Most reliable signal once the order ships.
+  //   (c) [PR #R4d] Line item is on an open/in_progress fulfillment_order —
+  //       use its assigned_location_id. This is the routing intent at order
+  //       time; it exists BEFORE the first ship event and is the only signal
+  //       we have for unshipped online orders and for Locally orders.
+  //   (d) Nothing matches → needs_review.
   // ------------------------------------------------------------------
 
-  // (a) Direct order-level location_id.
+  // (a) Direct order-level location_id, only if it maps to a POS entity.
   if (order.location_id) {
     const hit = ctx.locationMap.get(order.location_id);
-    if (hit) {
-      const method: AllocationMethod = hit.kind === "warehouse" ? "warehouse_rollup" : "fulfillment_location";
+    if (hit && hit.kind === "pos") {
+      // POS-mapped location on a non-POS order is unusual but legitimate
+      // (e.g. Shop Pay express checkout from inside a store). Treat as
+      // fulfillment_location since source_name !== 'pos'.
       return [{
         order_id: order.id,
         line_item_id: line.id,
@@ -313,25 +384,15 @@ function allocateLineItem(
         share: 1,
         gross_amount: gross,
         tax_amount: tax,
-        method,
-        reason: `Online @ order location ${order.location_id} → ${hit.kind}`,
-        auto_method: method,
+        method: "fulfillment_location",
+        reason: `Online @ order location ${order.location_id} → pos entity (direct route)`,
+        auto_method: "fulfillment_location",
         auto_entity_id: hit.entity_id,
       }];
     }
-    // Order has a location but it's unmapped — flag.
-    return [{
-      order_id: order.id,
-      line_item_id: line.id,
-      entity_id: ctx.sdEntityId ?? 0,
-      share: 1,
-      gross_amount: gross,
-      tax_amount: tax,
-      method: "needs_review",
-      reason: `Online @ unmapped order location ${order.location_id}`,
-      auto_method: "needs_review",
-      auto_entity_id: null,
-    }];
+    // If the location_id is set but kind != 'pos' (warehouse, fulfillment,
+    // inactive, unmapped — e.g. Locally's 123711225857), DON'T trust it.
+    // Fall through to fulfillment[] / fulfillment_orders[] below.
   }
 
   // (b) Look up the fulfillment that shipped this line.
@@ -368,11 +429,53 @@ function allocateLineItem(
     }];
   }
 
-  // (c) No order-level location, no successful fulfillment for this line.
-  // Per user spec: leave as needs_review until fulfilled.
-  const reason = ctx.fulfillments.length === 0
-    ? `Online order not yet fulfilled — review after ship`
-    : `Online order has fulfillments, but none ship line ${line.id} yet`;
+  // (c) PR #R4d — Fulfillment_order routing. The FO is created at order
+  // placement, before any ship event, with assigned_location_id pointing at
+  // the routed store. This is what catches Locally orders and unshipped
+  // online orders that would otherwise fall to needs_review.
+  const fo = findFulfillmentOrderForLine(ctx.fulfillmentOrders, line.id);
+  if (fo && fo.assigned_location_id) {
+    const hit = ctx.locationMap.get(fo.assigned_location_id);
+    if (hit) {
+      const method: AllocationMethod = hit.kind === "warehouse" ? "warehouse_rollup" : "fulfillment_location";
+      return [{
+        order_id: order.id,
+        line_item_id: line.id,
+        entity_id: hit.entity_id,
+        share: 1,
+        gross_amount: gross,
+        tax_amount: tax,
+        method,
+        reason: `Online → fulfillment_order ${fo.id} @ assigned_location_id ${fo.assigned_location_id} (${hit.kind}) [status=${fo.status ?? "?"}] via fulfillment_order assigned_location_id`,
+        auto_method: method,
+        auto_entity_id: hit.entity_id,
+      }];
+    }
+    // FO points at an unmapped location — flag.
+    return [{
+      order_id: order.id,
+      line_item_id: line.id,
+      entity_id: ctx.sdEntityId ?? 0,
+      share: 1,
+      gross_amount: gross,
+      tax_amount: tax,
+      method: "needs_review",
+      reason: `Online → fulfillment_order @ unmapped assigned_location_id ${fo.assigned_location_id}`,
+      auto_method: "needs_review",
+      auto_entity_id: null,
+    }];
+  }
+
+  // (d) No order-level POS location, no successful fulfillment, no FO with
+  // an assigned location. Per spec: leave as needs_review until something
+  // fires. Examples: pending online order with no FO yet (rare), or a draft
+  // order that was never routed.
+  const reason =
+    ctx.fulfillments.length === 0 && ctx.fulfillmentOrders.length === 0
+      ? `Online order not yet routed (no fulfillment + no fulfillment_order) — review after order processed`
+      : ctx.fulfillments.length === 0
+        ? `Online order has fulfillment_orders, but none route line ${line.id}`
+        : `Online order has fulfillments, but none ship line ${line.id} yet`;
   return [{
     order_id: order.id,
     line_item_id: line.id,
@@ -421,9 +524,9 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
 
   const orders = sqlite
     .prepare(
-      `SELECT id, created_at, source_name, location_id, shipping_zip, billing_zip,
-              has_gift_card, cancelled_at, subtotal, total_tax, total_shipping,
-              total_discounts, total_price
+      `SELECT id, created_at, source_name, location_id, customer_id,
+              shipping_zip, billing_zip, has_gift_card, cancelled_at, subtotal,
+              total_tax, total_shipping, total_discounts, total_price
        FROM recon_orders
        WHERE created_at >= ? AND created_at < ?
        ORDER BY created_at ASC`
@@ -493,7 +596,10 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
       // online-physical branch can route each line by its actual ship-from
       // location instead of the (often null) order-level location_id.
       const fulfillments = listSuccessfulFulfillments(o.id);
-      const lineCtx = { ...ctx, fulfillments };
+      // PR #R4d — pre-load fulfillment_orders too, for unshipped + Locally
+      // orders that have no fulfillments yet but DO have FO routing intent.
+      const fulfillmentOrders = listFulfillmentOrders(o.id);
+      const lineCtx = { ...ctx, fulfillments, fulfillmentOrders };
 
       let orderHasReview = false;
       for (const line of lines) {

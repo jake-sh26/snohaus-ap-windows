@@ -981,6 +981,92 @@ function bootstrapSchema() {
       ON recon_order_fulfillments(status);
   `);
 
+  // ----- Shopify fulfillment_orders (PR #R4d) -----
+  // Distinct from recon_order_fulfillments: a Fulfillment Order is the routed
+  // *intent* (this order, these lines, ship/pickup from THIS location), created
+  // when the order is placed. The recon_order_fulfillments row only appears
+  // once the merchant actually ships. For Locally orders, third-party app
+  // injections, and unshipped online orders, the fulfillment_order's
+  // assigned_location_id is the authoritative ship-from BEFORE any shipment
+  // exists — so the allocator can route them without waiting for a ship event.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_fulfillment_orders (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      -- The store/warehouse Shopify routed this FO to. Equivalent to
+      -- fulfillments[].location_id but exists earlier in the lifecycle.
+      assigned_location_id TEXT,
+      -- open | in_progress | cancelled | incomplete | closed | scheduled | on_hold
+      status TEXT,
+      -- request_status from the FO payload: unsubmitted | submitted | accepted |
+      -- rejected | cancellation_requested | cancellation_accepted | closed
+      request_status TEXT,
+      -- JSON array of supported_actions Shopify lists for this FO (debug-only).
+      supported_actions_json TEXT,
+      -- JSON array of line_item ids belonging to this FO (mirrors the
+      -- recon_order_fulfillments shape — used by the allocator for per-line
+      -- assigned-location lookup on split FOs).
+      line_item_ids_json TEXT,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_fo_order
+      ON recon_fulfillment_orders(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_fo_assigned_location
+      ON recon_fulfillment_orders(assigned_location_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_fo_status
+      ON recon_fulfillment_orders(status);
+  `);
+
+  // ----- Gift card issuance (PR #R4d) -----
+  // Per-line gift card issuance ledger. Distinct from recon_gift_cards (which
+  // is the Shopify GC object — id, balance, etc.) — this table captures the
+  // *allocation decision* at issuance time: which entity gets credited for the
+  // sale of the card, by which method, and with what supporting evidence.
+  //
+  // Why split from recon_gift_cards: the Shopify GC ledger row may not exist
+  // yet at the moment of order ingest (Shopify creates the gift_card lazily),
+  // but the issuance allocation must be decided when we see the order. We
+  // store gc_id when known and join on it later. The cascade is:
+  //   customer_affinity (prior orders for this customer)
+  //     → zip_radius (closest store by haversine to billing ZIP)
+  //       → fallback_sd (Greenvale catch-all).
+  // Once assigned, the assignment is COMMITTED — re-running allocation must
+  // not flip the entity (otherwise revenue moves between books retroactively).
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_gift_card_issuance (
+      -- Shopify gift_card.id when known; null if we issued the row before
+      -- Shopify materialized the GC object (we'll backfill on the next pass).
+      gc_id TEXT,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      line_item_id TEXT REFERENCES recon_line_items(id) ON DELETE CASCADE,
+      face_value REAL NOT NULL,
+      assigned_entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
+      -- 'customer_affinity' | 'zip_radius' | 'fallback_sd'
+      assignment_method TEXT NOT NULL,
+      -- Only populated when assignment_method = 'zip_radius'.
+      assignment_distance_mi REAL,
+      customer_id TEXT,
+      customer_zip TEXT,
+      -- Remaining redeemable balance. Initialised to face_value; PR #R5
+      -- redemption tracking will decrement this as the card is used.
+      remaining REAL NOT NULL,
+      issued_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      -- (order_id, line_item_id) is the natural key — one issuance row per
+      -- gift-card line on an order. gc_id is nullable so we can't use it.
+      PRIMARY KEY (order_id, line_item_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_issuance_order
+      ON recon_gift_card_issuance(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_issuance_entity
+      ON recon_gift_card_issuance(assigned_entity_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_issuance_customer
+      ON recon_gift_card_issuance(customer_id) WHERE customer_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_recon_gc_issuance_gc
+      ON recon_gift_card_issuance(gc_id) WHERE gc_id IS NOT NULL;
+  `);
+
   // ----- Shopify payouts -----
   // A payout = one deposit from Shopify Payments to the bank account. The
   // Plaid matcher in PR #R5 will join recon_payouts.amount + deposit date to
@@ -3708,6 +3794,46 @@ export function replaceReconFulfillments(
   });
   tx();
   return fulfillments.length;
+}
+
+// ----- Fulfillment orders (PR #R4d) -----
+// Same delete-then-insert pattern as fulfillments — Shopify reshapes FOs when
+// the merchant marks the order routed/scheduled/etc. so wholesale replace
+// keeps us in sync without merge logic.
+export type ReconFulfillmentOrderUpsert = {
+  id: string;
+  order_id: string;
+  assigned_location_id: string | null;
+  status: string | null;
+  request_status: string | null;
+  supported_actions_json: string | null;
+  line_item_ids_json: string | null;
+  raw_json: string | null;
+};
+
+export function replaceReconFulfillmentOrders(
+  orderId: string,
+  fulfillmentOrders: ReconFulfillmentOrderUpsert[],
+): number {
+  const now = new Date().toISOString();
+  const tx = sqlite.transaction(() => {
+    sqlite.prepare(`DELETE FROM recon_fulfillment_orders WHERE order_id = ?`).run(orderId);
+    if (fulfillmentOrders.length === 0) return;
+    const ins = sqlite.prepare(`
+      INSERT INTO recon_fulfillment_orders (
+        id, order_id, assigned_location_id, status, request_status,
+        supported_actions_json, line_item_ids_json, raw_json, ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const fo of fulfillmentOrders) {
+      ins.run(
+        fo.id, fo.order_id, fo.assigned_location_id, fo.status, fo.request_status,
+        fo.supported_actions_json, fo.line_item_ids_json, fo.raw_json, now,
+      );
+    }
+  });
+  tx();
+  return fulfillmentOrders.length;
 }
 
 /**
