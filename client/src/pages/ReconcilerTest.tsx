@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -110,6 +110,32 @@ type PayoutsSummary = {
   by_month: Array<{ month: string; payouts: number; amount: number; chargebacks: number }>;
   by_status: Array<{ status: string | null; payouts: number; amount: number }>;
   by_txn_type: Array<{ type: string; count: number; amount: number; fees: number }>;
+};
+
+// PR #R3b — Suggested entity ↔ Shopify location mapping
+type MappingEntity = { id: number; location: string; legal_name: string };
+type MappingKind = "pos" | "fulfillment" | "warehouse" | "inactive";
+type MappingSuggestion = {
+  shopify_location_id: string;
+  shopify_location_name: string;
+  active: boolean;
+  legacy: boolean;
+  order_count_365d: number;
+  total_sales_365d: number;
+  suggested_entity_id: number | null;
+  suggested_entity_location: string | null;
+  suggested_kind: MappingKind;
+  current_mapping_id: number | null;
+  current_entity_id: number | null;
+  current_entity_location: string | null;
+  current_kind: string | null;
+};
+type MappingSuggestedResponse = { entities: MappingEntity[]; suggestions: MappingSuggestion[] };
+type MappingBulkSaveResult = {
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errors: Array<{ shopify_location_id: string; message: string }>;
 };
 
 function money(n: number | null | undefined): string {
@@ -281,6 +307,50 @@ export default function ReconcilerTest() {
       qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
     },
   });
+
+  // --- PR #R3b: Suggested entity ↔ location mapping ---
+  // Lazy: only fetched when the user clicks "Load suggestions". Editable
+  // table state lives in `mappingDraft` so we can preview before saving.
+  const [mappingDraft, setMappingDraft] = useState<MappingSuggestion[] | null>(null);
+  const [mappingEntities, setMappingEntities] = useState<MappingEntity[]>([]);
+  const mappingSuggestedMut = useMutation<MappingSuggestedResponse>({
+    mutationFn: () => jsonGet("/api/recon/entity-mapping/suggested"),
+    onSuccess: (r) => {
+      // Pre-fill any unmapped rows with suggested values; preserve current
+      // saved mappings so the user can see what's already there.
+      setMappingDraft(r.suggestions);
+      setMappingEntities(r.entities);
+      setLastAction(`Loaded ${r.suggestions.length} Shopify locations`);
+    },
+    onError: (e: any) => setLastAction(`Failed to load mapping: ${e?.message ?? e}`),
+  });
+  const mappingSaveMut = useMutation<MappingBulkSaveResult, Error, MappingSuggestion[]>({
+    mutationFn: (rows) =>
+      jsonPost<MappingBulkSaveResult>("/api/recon/entity-mapping/bulk-save", {
+        rows: rows.map(r => ({
+          shopify_location_id: r.shopify_location_id,
+          shopify_location_name: r.shopify_location_name,
+          entity_id: r.suggested_entity_id,
+          kind: r.suggested_kind,
+        })),
+      }),
+    onSuccess: (r) => {
+      const errMsg = r.errors.length > 0 ? `, ${r.errors.length} errors` : "";
+      setLastAction(`Mapping saved: ${r.inserted} inserted, ${r.updated} updated, ${r.skipped} skipped${errMsg}`);
+      qc.invalidateQueries({ queryKey: ["/api/recon/pos-locations"] });
+      mappingSuggestedMut.mutate();
+    },
+    onError: (e: any) => setLastAction(`Save failed: ${e?.message ?? e}`),
+  });
+
+  function updateDraftRow(idx: number, patch: Partial<MappingSuggestion>) {
+    setMappingDraft(prev => {
+      if (!prev) return prev;
+      const next = prev.slice();
+      next[idx] = { ...next[idx], ...patch };
+      return next;
+    });
+  }
 
   const cfg = statusQ.data;
   const configured = !!cfg?.configured;
@@ -1039,6 +1109,137 @@ export default function ReconcilerTest() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ===== 6.5. Suggested entity ↔ Shopify location mapping (PR #R3b) ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><MapPin className="size-4" /> Suggested entity ↔ location mapping</CardTitle>
+          <CardDescription>
+            One row per Shopify location with a suggested legal entity + kind based on name match.
+            Edit any row before saving. Re-runnable as new stores are added.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              onClick={() => mappingSuggestedMut.mutate()}
+              disabled={mappingSuggestedMut.isPending || !configured}
+            >
+              <RefreshCw className={`size-4 mr-1.5 ${mappingSuggestedMut.isPending ? "animate-spin" : ""}`} />
+              {mappingDraft ? "Reload suggestions" : "Load suggestions"}
+            </Button>
+            {mappingDraft && mappingDraft.length > 0 && (
+              <Button
+                size="sm"
+                variant="default"
+                onClick={() => mappingDraft && mappingSaveMut.mutate(mappingDraft)}
+                disabled={mappingSaveMut.isPending}
+              >
+                <Save className="size-4 mr-1.5" /> Confirm & save all
+              </Button>
+            )}
+            {!configured && (
+              <span className="text-xs text-muted-foreground">Connect Shopify first.</span>
+            )}
+          </div>
+
+          {mappingDraft && mappingDraft.length > 0 && (
+            <div className="border rounded-md overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-muted/50">
+                  <tr className="text-left">
+                    <th className="px-2 py-2 font-medium">Shopify location</th>
+                    <th className="px-2 py-2 font-medium">Status</th>
+                    <th className="px-2 py-2 font-medium text-right">Orders 365d</th>
+                    <th className="px-2 py-2 font-medium text-right">Sales 365d</th>
+                    <th className="px-2 py-2 font-medium">Entity</th>
+                    <th className="px-2 py-2 font-medium">Kind</th>
+                    <th className="px-2 py-2 font-medium">Current</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mappingDraft.map((row, idx) => {
+                    const changed =
+                      row.current_entity_id !== row.suggested_entity_id ||
+                      (row.current_kind ?? "pos") !== row.suggested_kind;
+                    return (
+                      <tr key={row.shopify_location_id} className="border-t">
+                        <td className="px-2 py-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <Building2 className="size-3 text-muted-foreground" />
+                            <span className="font-medium">{row.shopify_location_name}</span>
+                          </div>
+                          <div className="text-muted-foreground font-mono text-[10px]">id: {row.shopify_location_id}</div>
+                        </td>
+                        <td className="px-2 py-1.5">
+                          {row.active ? (
+                            <Badge variant="outline" className="text-[10px]">active</Badge>
+                          ) : (
+                            <Badge variant="secondary" className="text-[10px]">inactive</Badge>
+                          )}
+                          {row.legacy && <Badge variant="secondary" className="text-[10px] ml-1">legacy</Badge>}
+                        </td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{num(row.order_count_365d)}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{money(row.total_sales_365d)}</td>
+                        <td className="px-2 py-1.5">
+                          <select
+                            className="w-full text-xs border rounded px-1 py-1 bg-background"
+                            value={row.suggested_entity_id ?? ""}
+                            onChange={e => updateDraftRow(idx, {
+                              suggested_entity_id: e.target.value === "" ? null : Number(e.target.value),
+                              suggested_entity_location: mappingEntities.find(ent => ent.id === Number(e.target.value))?.location ?? null,
+                            })}
+                          >
+                            <option value="">— unassigned —</option>
+                            {mappingEntities.map(ent => (
+                              <option key={ent.id} value={ent.id}>{ent.location} ({ent.legal_name})</option>
+                            ))}
+                          </select>
+                        </td>
+                        <td className="px-2 py-1.5">
+                          <select
+                            className="w-full text-xs border rounded px-1 py-1 bg-background"
+                            value={row.suggested_kind}
+                            onChange={e => updateDraftRow(idx, { suggested_kind: e.target.value as MappingKind })}
+                          >
+                            <option value="pos">POS (in-store)</option>
+                            <option value="fulfillment">Online fulfillment</option>
+                            <option value="warehouse">Warehouse (no sales)</option>
+                            <option value="inactive">Inactive / ignore</option>
+                          </select>
+                        </td>
+                        <td className="px-2 py-1.5 text-muted-foreground">
+                          {row.current_entity_id == null ? (
+                            <span className="text-amber-700">new</span>
+                          ) : changed ? (
+                            <span className="text-blue-700">{row.current_entity_location} / {row.current_kind} → will update</span>
+                          ) : (
+                            <span>{row.current_entity_location} / {row.current_kind}</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {mappingDraft && mappingDraft.length === 0 && (
+            <div className="text-sm text-muted-foreground">Shopify returned no locations. Check the connection.</div>
+          )}
+
+          {mappingSaveMut.data && mappingSaveMut.data.errors.length > 0 && (
+            <div className="text-xs space-y-1">
+              <div className="font-medium text-amber-700">Save errors:</div>
+              {mappingSaveMut.data.errors.map((e, i) => (
+                <div key={i} className="font-mono text-amber-700">• {e.shopify_location_id}: {e.message}</div>
+              ))}
             </div>
           )}
         </CardContent>

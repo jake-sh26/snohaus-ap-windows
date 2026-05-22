@@ -4021,3 +4021,247 @@ export function getReconPayoutsSummary(): ReconPayoutsSummary {
     by_txn_type,
   };
 }
+
+// ============================================================================
+// PR #R3b — Entity ↔ POS location suggested mapping
+// ----------------------------------------------------------------------------
+// Joins three sources together so the user can confirm the entity↔location
+// map in one screen:
+//   1. payroll_entities — the legal entities we file under
+//   2. Shopify /locations.json (passed in by caller — async fetch lives in
+//      shopify-recon.ts so we keep storage.ts pure-SQL)
+//   3. recon_entity_pos_locations — existing saved mappings (may be the
+//      seeded shells with shopify_location_id = NULL)
+//   4. recon_orders.by_location — order volume per Shopify location_id over
+//      the last 365 days so the user can sanity-check before saving
+//
+// Returns one row per Shopify location with a suggested entity + kind based
+// on simple substring matching against the entity.location field, plus the
+// existing mapping (if any) so the UI can pre-select.
+// ============================================================================
+
+export type EntityMappingSuggestion = {
+  shopify_location_id: string;
+  shopify_location_name: string;
+  active: boolean;
+  legacy: boolean;
+  order_count_365d: number;
+  total_sales_365d: number;
+  suggested_entity_id: number | null;
+  suggested_entity_location: string | null;
+  suggested_kind: "pos" | "fulfillment" | "warehouse" | "inactive";
+  // The existing recon_entity_pos_locations row, if any. May be the seeded
+  // shell (with shopify_location_id = NULL) matched by name guess, or an
+  // exact match by id from a prior save.
+  current_mapping_id: number | null;
+  current_entity_id: number | null;
+  current_entity_location: string | null;
+  current_kind: string | null;
+};
+
+/**
+ * Pulls per-location order volume from the last 365 days. Cheap GROUP BY.
+ */
+export function getReconOrderCountsByLocation(): Map<string, { orders: number; total: number }> {
+  const rows = sqlite
+    .prepare(`
+      SELECT location_id, COUNT(*) AS orders, COALESCE(SUM(total_price), 0) AS total
+      FROM recon_orders
+      WHERE created_at >= datetime('now', '-365 days')
+        AND location_id IS NOT NULL
+      GROUP BY location_id
+    `)
+    .all() as Array<{ location_id: string; orders: number; total: number }>;
+  const map = new Map<string, { orders: number; total: number }>();
+  for (const r of rows) {
+    map.set(String(r.location_id), { orders: Number(r.orders), total: Number(r.total) });
+  }
+  return map;
+}
+
+/**
+ * Given the live Shopify locations list, builds suggestions by:
+ *   - exact match by shopify_location_id (preferred — already saved)
+ *   - then by name substring against payroll_entities.location
+ *   - warehouse hint by name keyword (amityville|syosset|warehouse|whse)
+ *
+ * Per the user's confirmed rules:
+ *   - Greenvale → SD Ski and Patio Inc
+ *   - Huntington → SH Huntington Inc
+ *   - Hempstead → SH Hempstead Inc
+ *   - Amityville / Syosset → warehouse kind (inventory only, never sells)
+ */
+export function buildEntityMappingSuggestions(
+  shopifyLocations: Array<{ id: string; name: string; active: boolean; legacy: boolean }>
+): EntityMappingSuggestion[] {
+  const entities = listPayrollEntities();
+  const existing = listReconEntityPosLocations();
+  const counts = getReconOrderCountsByLocation();
+
+  // Build lookups
+  const existingById = new Map<string, typeof existing[number]>();
+  for (const m of existing) {
+    if (m.shopify_location_id) existingById.set(String(m.shopify_location_id), m);
+  }
+
+  function fuzzyEntity(name: string): { id: number; location: string } | null {
+    const lower = name.toLowerCase();
+    for (const e of entities) {
+      const key = e.location.toLowerCase();
+      // entity.location is "Greenvale" / "Huntington" / "Hempstead"
+      if (lower.includes(key)) return { id: e.id, location: e.location };
+    }
+    return null;
+  }
+
+  function suggestKind(name: string): "pos" | "fulfillment" | "warehouse" | "inactive" {
+    const lower = name.toLowerCase();
+    if (/amityville|syosset|warehouse|whse|w\/?h\b/.test(lower)) return "warehouse";
+    return "pos";
+  }
+
+  function defaultEntityForWarehouse(): { id: number; location: string } | null {
+    // Warehouses sit under SD Ski and Patio Inc (Greenvale entity) per user.
+    for (const e of entities) {
+      if (/greenvale/i.test(e.location)) return { id: e.id, location: e.location };
+    }
+    return entities[0] ? { id: entities[0].id, location: entities[0].location } : null;
+  }
+
+  const out: EntityMappingSuggestion[] = [];
+  for (const loc of shopifyLocations) {
+    const kind = suggestKind(loc.name);
+    let suggested: { id: number; location: string } | null = null;
+    if (kind === "warehouse") {
+      suggested = defaultEntityForWarehouse();
+    } else {
+      suggested = fuzzyEntity(loc.name);
+    }
+    const cur = existingById.get(String(loc.id)) || null;
+    const stats = counts.get(String(loc.id)) || { orders: 0, total: 0 };
+
+    out.push({
+      shopify_location_id: String(loc.id),
+      shopify_location_name: loc.name,
+      active: !!loc.active,
+      legacy: !!loc.legacy,
+      order_count_365d: stats.orders,
+      total_sales_365d: stats.total,
+      suggested_entity_id: suggested?.id ?? null,
+      suggested_entity_location: suggested?.location ?? null,
+      suggested_kind: kind,
+      current_mapping_id: cur?.id ?? null,
+      current_entity_id: cur?.entity_id ?? null,
+      current_entity_location: cur?.entity_location ?? null,
+      current_kind: cur?.kind ?? null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Bulk-saves the confirmed mapping. Idempotent. For each row:
+ *   - If shopify_location_id already exists in recon_entity_pos_locations,
+ *     UPDATE its entity_id, name, kind, active.
+ *   - Else, if there is a seeded shell row for the target entity with
+ *     shopify_location_id IS NULL, fill it in (UPDATE).
+ *   - Else, INSERT a new row.
+ *
+ * Skips rows with suggested_kind = 'inactive' (no-op).
+ *
+ * Returns counts. Never throws on individual row issues — collects errors.
+ */
+export type EntityMappingBulkSaveInput = Array<{
+  shopify_location_id: string;
+  shopify_location_name: string;
+  entity_id: number;
+  kind: "pos" | "fulfillment" | "warehouse" | "inactive";
+}>;
+
+export type EntityMappingBulkSaveResult = {
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errors: Array<{ shopify_location_id: string; message: string }>;
+};
+
+export function bulkSaveReconEntityPosLocations(
+  rows: EntityMappingBulkSaveInput
+): EntityMappingBulkSaveResult {
+  const now = new Date().toISOString();
+  const result: EntityMappingBulkSaveResult = { inserted: 0, updated: 0, skipped: 0, errors: [] };
+
+  const txn = sqlite.transaction((items: EntityMappingBulkSaveInput) => {
+    for (const r of items) {
+      try {
+        if (r.kind === "inactive") {
+          // Treat inactive as "deactivate any existing row for this shopify location id"
+          const exists = sqlite.prepare(
+            `SELECT id FROM recon_entity_pos_locations WHERE shopify_location_id = ? LIMIT 1`
+          ).get(r.shopify_location_id) as { id: number } | undefined;
+          if (exists) {
+            sqlite.prepare(`
+              UPDATE recon_entity_pos_locations
+              SET active = 0, updated_at = ?
+              WHERE id = ?
+            `).run(now, exists.id);
+            result.updated++;
+          } else {
+            result.skipped++;
+          }
+          continue;
+        }
+
+        // 1) Exact match on shopify_location_id?
+        const byId = sqlite.prepare(
+          `SELECT id FROM recon_entity_pos_locations WHERE shopify_location_id = ? LIMIT 1`
+        ).get(r.shopify_location_id) as { id: number } | undefined;
+
+        if (byId) {
+          sqlite.prepare(`
+            UPDATE recon_entity_pos_locations
+            SET entity_id = ?, shopify_location_name = ?, kind = ?, active = 1, updated_at = ?
+            WHERE id = ?
+          `).run(r.entity_id, r.shopify_location_name, r.kind, now, byId.id);
+          result.updated++;
+          continue;
+        }
+
+        // 2) Seeded shell row (unmapped) for the same entity + kind? Fill it in.
+        // Only for kind='pos' since shells are seeded as 'pos'.
+        if (r.kind === "pos") {
+          const shell = sqlite.prepare(`
+            SELECT id FROM recon_entity_pos_locations
+            WHERE entity_id = ? AND shopify_location_id IS NULL AND kind = 'pos'
+            LIMIT 1
+          `).get(r.entity_id) as { id: number } | undefined;
+          if (shell) {
+            sqlite.prepare(`
+              UPDATE recon_entity_pos_locations
+              SET shopify_location_id = ?, shopify_location_name = ?, active = 1, updated_at = ?
+              WHERE id = ?
+            `).run(r.shopify_location_id, r.shopify_location_name, now, shell.id);
+            result.updated++;
+            continue;
+          }
+        }
+
+        // 3) Fresh insert.
+        sqlite.prepare(`
+          INSERT INTO recon_entity_pos_locations
+            (entity_id, shopify_location_id, shopify_location_name, kind, active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, ?, ?)
+        `).run(r.entity_id, r.shopify_location_id, r.shopify_location_name, r.kind, now, now);
+        result.inserted++;
+      } catch (e: any) {
+        result.errors.push({
+          shopify_location_id: r.shopify_location_id,
+          message: e?.message ?? String(e),
+        });
+      }
+    }
+  });
+
+  txn(rows);
+  return result;
+}

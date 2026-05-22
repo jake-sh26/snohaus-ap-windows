@@ -82,6 +82,8 @@ import {
   updateReconSettings,
   listReconEntityPosLocations,
   setReconShopifyLocationMapping,
+  buildEntityMappingSuggestions,
+  bulkSaveReconEntityPosLocations,
   getReconCounts,
   listReconSyncLog,
   getZipMapping,
@@ -985,6 +987,49 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
     if (!updated) return res.status(404).json({ message: "Mapping not found" });
     res.json(updated);
+  });
+
+  // --------------------------------------------------------------------------
+  // PR #R3b — Suggested entity ↔ Shopify location mapping
+  // --------------------------------------------------------------------------
+  // GET returns a table where each row is one Shopify location with:
+  //   - live name, active/legacy flags from Shopify
+  //   - last-365d order count + sales total from recon_orders
+  //   - suggested entity (fuzzy match on name)
+  //   - suggested kind (pos / warehouse based on name keywords)
+  //   - current saved mapping (if any) so the UI can pre-fill
+  //
+  // POST bulk-saves the user-confirmed table in one transaction. Idempotent —
+  // re-runnable as new Shopify locations are added in the future.
+  app.get("/api/recon/entity-mapping/suggested", authMiddleware, requirePermission("payroll.view"), async (_req, res) => {
+    try {
+      const locs = await listShopifyLocations();
+      const suggestions = buildEntityMappingSuggestions(locs);
+      const entities = listPayrollEntities().map(e => ({ id: e.id, location: e.location, legal_name: e.legal_name }));
+      res.json({ entities, suggestions });
+    } catch (e: any) {
+      res.status(502).json({ message: e?.message ?? "Failed to build mapping suggestions" });
+    }
+  });
+
+  app.post("/api/recon/entity-mapping/bulk-save", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!rows) return res.status(400).json({ message: "rows[] required" });
+    // Validate each row
+    const cleaned: Array<{ shopify_location_id: string; shopify_location_name: string; entity_id: number; kind: "pos" | "fulfillment" | "warehouse" | "inactive" }> = [];
+    for (const r of rows) {
+      if (!r || typeof r !== "object") continue;
+      const sid = r.shopify_location_id != null ? String(r.shopify_location_id) : null;
+      const sname = r.shopify_location_name != null ? String(r.shopify_location_name) : "";
+      const eid = Number(r.entity_id);
+      const kind = String(r.kind || "pos");
+      if (!sid || !Number.isFinite(eid) || eid <= 0) continue;
+      if (!(["pos", "fulfillment", "warehouse", "inactive"] as const).includes(kind as any)) continue;
+      cleaned.push({ shopify_location_id: sid, shopify_location_name: sname, entity_id: eid, kind: kind as any });
+    }
+    if (cleaned.length === 0) return res.status(400).json({ message: "No valid rows to save" });
+    const result = bulkSaveReconEntityPosLocations(cleaned);
+    res.json(result);
   });
 
   // Bird's-eye-view counters used by the Reconciler landing page so the user
