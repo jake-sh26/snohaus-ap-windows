@@ -92,6 +92,11 @@ import {
   getReconOrderWithLines,
   getReconOrdersWatermark,
   getReconOrdersSummary,
+  // Reconciler (PR #R3)
+  listReconPayoutsSample,
+  getReconPayoutWithTransactions,
+  getReconPayoutsWatermark,
+  getReconPayoutsSummary,
 } from "./storage";
 import {
   getShopifyReconConfig,
@@ -107,6 +112,9 @@ import {
   syncOrdersIncremental,
   transformShopifyOrder,
 } from "./shopify-recon-orders";
+import {
+  syncPayoutsIncremental,
+} from "./shopify-recon-payouts";
 import {
   handleShopifyWebhook,
   ensureShopifyWebhooks,
@@ -1106,6 +1114,42 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/recon/orders/:id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const detail = getReconOrderWithLines(String(req.params.id));
     if (!detail) return res.status(404).json({ message: "Order not found" });
+    res.json(detail);
+  });
+
+  // --------------------------------------------------------------------------
+  // PR #R3 — Shopify Payments payouts + balance_transactions sync
+  // --------------------------------------------------------------------------
+  // Manual trigger — mirrors the orders sync route. Daily cron in server/index.ts
+  // calls the same function. Returns counters synchronously.
+  app.post("/api/recon/shopify/sync/payouts", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const triggeredBy = `manual:${req.user?.email || "unknown"}`;
+    const result = await syncPayoutsIncremental(triggeredBy);
+    res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // Current payouts watermark (read-only).
+  app.get("/api/recon/shopify/payouts-watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json({ payouts_watermark: getReconPayoutsWatermark() });
+  });
+
+  // Sample of recent payouts — each row carries txn_count + chargeback_count
+  // so the user can spot chargeback-bearing payouts at a glance.
+  app.get("/api/recon/payouts", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
+    res.json(listReconPayoutsSample(limit));
+  });
+
+  // Aggregated summary of all ingested payouts — powers the "Payouts summary"
+  // card in the Test Console.
+  app.get("/api/recon/shopify/payouts-summary", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    res.json(getReconPayoutsSummary());
+  });
+
+  // Single payout detail (payout + balance_transactions) for forensic drill-down.
+  app.get("/api/recon/payouts/:id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const detail = getReconPayoutWithTransactions(String(req.params.id));
+    if (!detail) return res.status(404).json({ message: "Payout not found" });
     res.json(detail);
   });
 

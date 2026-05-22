@@ -965,6 +965,19 @@ function bootstrapSchema() {
       ON recon_balance_transactions(type);
   `);
 
+  // PR #R3 additive columns: chargeback flag + adjustment_reason. Keep these
+  // try/catch so existing DBs upgrade without dropping data.
+  try {
+    sqlite.exec(`ALTER TABLE recon_balance_transactions ADD COLUMN chargeback INTEGER NOT NULL DEFAULT 0`);
+  } catch { /* column exists */ }
+  try {
+    sqlite.exec(`ALTER TABLE recon_balance_transactions ADD COLUMN adjustment_reason TEXT`);
+  } catch { /* column exists */ }
+  try {
+    sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_recon_balance_txn_chargeback
+      ON recon_balance_transactions(chargeback) WHERE chargeback = 1`);
+  } catch { /* exists */ }
+
   // ----- Allocations -----
   // Derived: the allocator computes one row per order per receiving entity.
   // For most orders that's a single row (100% to the store of sale). Digital
@@ -3742,4 +3755,269 @@ export function getReconOrderWithLines(orderId: string): {
     .prepare(`SELECT * FROM recon_line_items WHERE order_id = ? ORDER BY id ASC`)
     .all(orderId);
   return { order, lines };
+}
+
+// ============================================================================
+// PR #R3 — Shopify payouts + balance_transactions storage helpers.
+// ----------------------------------------------------------------------------
+// A payout = one settlement deposit from Shopify Payments. Each payout has
+// many balance_transactions (charge, refund, fee, adjustment, dispute_*).
+// We store both verbatim so the catch-all decomposition in PR #R5 has full
+// forensic detail per entity per month.
+// ============================================================================
+
+export type ReconPayoutUpsert = {
+  id: string;
+  payout_date: string;
+  currency: string | null;
+  amount: number;
+  status: string | null;
+  summary_json: string | null;
+  raw_json: string | null;
+};
+
+export type ReconBalanceTxnUpsert = {
+  id: string;
+  payout_id: string | null;
+  type: string;
+  processed_at: string | null;
+  amount: number;
+  fee: number;
+  net: number | null;
+  currency: string | null;
+  source_order_id: string | null;
+  source_transaction_id: string | null;
+  chargeback: number;       // 0/1
+  adjustment_reason: string | null;
+  raw_json: string | null;
+};
+
+export function upsertReconPayout(row: ReconPayoutUpsert): "inserted" | "updated" {
+  const existing = sqlite
+    .prepare(`SELECT id FROM recon_payouts WHERE id = ?`)
+    .get(row.id) as { id: string } | undefined;
+  const now = new Date().toISOString();
+
+  if (!existing) {
+    sqlite
+      .prepare(`
+        INSERT INTO recon_payouts (
+          id, payout_date, currency, amount, status, summary_json,
+          raw_json, ingested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id, row.payout_date, row.currency, row.amount, row.status,
+        row.summary_json, row.raw_json, now,
+      );
+    return "inserted";
+  }
+
+  // Preserve plaid_transaction_id / matched_at / matched_by — those are
+  // populated by the Plaid matcher in PR #R5 and must never be clobbered
+  // by a re-ingest of the Shopify-side payout row.
+  sqlite
+    .prepare(`
+      UPDATE recon_payouts SET
+        payout_date = ?, currency = ?, amount = ?, status = ?,
+        summary_json = ?, raw_json = ?, ingested_at = ?
+      WHERE id = ?
+    `)
+    .run(
+      row.payout_date, row.currency, row.amount, row.status,
+      row.summary_json, row.raw_json, now, row.id,
+    );
+  return "updated";
+}
+
+/**
+ * Replace ALL balance_transactions for a given payout in one transaction.
+ * Delete-then-insert matches replaceReconLineItems() — simpler than per-row
+ * upsert and Shopify can reshape the list (refunds split, fees re-attributed)
+ * on later pulls. Safe because nothing downstream foreign-keys to balance_txn
+ * IDs except via payout_id, which we re-write.
+ */
+export function replaceReconBalanceTransactions(
+  payoutId: string,
+  txns: ReconBalanceTxnUpsert[],
+): number {
+  const now = new Date().toISOString();
+  const tx = sqlite.transaction(() => {
+    sqlite.prepare(`DELETE FROM recon_balance_transactions WHERE payout_id = ?`).run(payoutId);
+    const ins = sqlite.prepare(`
+      INSERT INTO recon_balance_transactions (
+        id, payout_id, type, processed_at, amount, fee, net, currency,
+        source_order_id, source_transaction_id, chargeback, adjustment_reason,
+        raw_json, ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const t of txns) {
+      ins.run(
+        t.id, t.payout_id, t.type, t.processed_at, t.amount, t.fee, t.net, t.currency,
+        t.source_order_id, t.source_transaction_id, t.chargeback, t.adjustment_reason,
+        t.raw_json, now,
+      );
+    }
+  });
+  tx();
+  return txns.length;
+}
+
+/**
+ * Watermark for the payouts polling job. We walk by `date` (settlement date)
+ * which is what the Shopify payouts API filters/sorts on. Null on first run
+ * → caller falls back to settings.initial_sync_from.
+ */
+export function getReconPayoutsWatermark(): string | null {
+  const row = sqlite
+    .prepare(`
+      SELECT cursor FROM recon_sync_log
+      WHERE kind = 'payouts' AND status = 'success' AND cursor IS NOT NULL
+      ORDER BY finished_at DESC
+      LIMIT 1
+    `)
+    .get() as { cursor: string } | undefined;
+  return row?.cursor ?? null;
+}
+
+export function listReconPayoutsSample(limit = 50): Array<{
+  id: string;
+  payout_date: string;
+  amount: number;
+  status: string | null;
+  currency: string | null;
+  txn_count: number;
+  chargeback_count: number;
+  ingested_at: string;
+}> {
+  return sqlite
+    .prepare(`
+      SELECT
+        p.id, p.payout_date, p.amount, p.status, p.currency, p.ingested_at,
+        (SELECT COUNT(*) FROM recon_balance_transactions bt WHERE bt.payout_id = p.id)        AS txn_count,
+        (SELECT COUNT(*) FROM recon_balance_transactions bt WHERE bt.payout_id = p.id AND bt.chargeback = 1) AS chargeback_count
+      FROM recon_payouts p
+      ORDER BY p.payout_date DESC
+      LIMIT ?
+    `)
+    .all(Math.min(500, Math.max(1, limit))) as any;
+}
+
+export function getReconPayoutWithTransactions(payoutId: string): {
+  payout: any;
+  transactions: any[];
+} | null {
+  const payout = sqlite
+    .prepare(`SELECT * FROM recon_payouts WHERE id = ?`)
+    .get(payoutId);
+  if (!payout) return null;
+  const transactions = sqlite
+    .prepare(`
+      SELECT * FROM recon_balance_transactions
+      WHERE payout_id = ?
+      ORDER BY processed_at ASC, id ASC
+    `)
+    .all(payoutId);
+  return { payout, transactions };
+}
+
+/**
+ * Aggregated payouts summary for the Test Console "Payouts summary" card.
+ * Mirrors the shape of getReconOrdersSummary() so the UI cards feel symmetric.
+ */
+export type ReconPayoutsSummary = {
+  total_payouts: number;
+  total_balance_transactions: number;
+  earliest_payout_at: string | null;
+  latest_payout_at: string | null;
+  gross_payout_amount: number;
+  total_fees: number;
+  total_chargebacks: number;
+  chargeback_count: number;
+  unmatched_payouts: number;
+  by_month: Array<{ month: string; payouts: number; amount: number; chargebacks: number }>;
+  by_status: Array<{ status: string | null; payouts: number; amount: number }>;
+  by_txn_type: Array<{ type: string; count: number; amount: number; fees: number }>;
+};
+
+export function getReconPayoutsSummary(): ReconPayoutsSummary {
+  const totals = sqlite
+    .prepare(`
+      SELECT
+        COUNT(*)                       AS total_payouts,
+        MIN(payout_date)               AS earliest_payout_at,
+        MAX(payout_date)               AS latest_payout_at,
+        COALESCE(SUM(amount), 0)       AS gross_payout_amount,
+        SUM(CASE WHEN plaid_transaction_id IS NULL THEN 1 ELSE 0 END) AS unmatched_payouts
+      FROM recon_payouts
+    `)
+    .get() as any;
+
+  const txnTotals = sqlite
+    .prepare(`
+      SELECT
+        COUNT(*)                                                AS total_balance_transactions,
+        COALESCE(SUM(fee), 0)                                   AS total_fees,
+        COALESCE(SUM(CASE WHEN chargeback = 1 THEN amount ELSE 0 END), 0) AS total_chargebacks,
+        SUM(CASE WHEN chargeback = 1 THEN 1 ELSE 0 END)         AS chargeback_count
+      FROM recon_balance_transactions
+    `)
+    .get() as any;
+
+  const by_month = sqlite
+    .prepare(`
+      SELECT
+        substr(payout_date, 1, 7)         AS month,
+        COUNT(*)                          AS payouts,
+        COALESCE(SUM(amount), 0)          AS amount,
+        COALESCE((
+          SELECT COUNT(*) FROM recon_balance_transactions bt
+          WHERE bt.payout_id IN (
+            SELECT id FROM recon_payouts p2
+            WHERE substr(p2.payout_date, 1, 7) = substr(recon_payouts.payout_date, 1, 7)
+          ) AND bt.chargeback = 1
+        ), 0)                             AS chargebacks
+      FROM recon_payouts
+      GROUP BY substr(payout_date, 1, 7)
+      ORDER BY month DESC
+      LIMIT 36
+    `)
+    .all() as Array<{ month: string; payouts: number; amount: number; chargebacks: number }>;
+
+  const by_status = sqlite
+    .prepare(`
+      SELECT status, COUNT(*) AS payouts, COALESCE(SUM(amount), 0) AS amount
+      FROM recon_payouts
+      GROUP BY status
+      ORDER BY payouts DESC
+    `)
+    .all() as Array<{ status: string | null; payouts: number; amount: number }>;
+
+  const by_txn_type = sqlite
+    .prepare(`
+      SELECT
+        type,
+        COUNT(*)                  AS count,
+        COALESCE(SUM(amount), 0)  AS amount,
+        COALESCE(SUM(fee), 0)     AS fees
+      FROM recon_balance_transactions
+      GROUP BY type
+      ORDER BY count DESC
+    `)
+    .all() as Array<{ type: string; count: number; amount: number; fees: number }>;
+
+  return {
+    total_payouts: totals.total_payouts ?? 0,
+    total_balance_transactions: Number(txnTotals.total_balance_transactions ?? 0),
+    earliest_payout_at: totals.earliest_payout_at ?? null,
+    latest_payout_at: totals.latest_payout_at ?? null,
+    gross_payout_amount: Number(totals.gross_payout_amount ?? 0),
+    total_fees: Number(txnTotals.total_fees ?? 0),
+    total_chargebacks: Number(txnTotals.total_chargebacks ?? 0),
+    chargeback_count: Number(txnTotals.chargeback_count ?? 0),
+    unmatched_payouts: Number(totals.unmatched_payouts ?? 0),
+    by_month,
+    by_status,
+    by_txn_type,
+  };
 }

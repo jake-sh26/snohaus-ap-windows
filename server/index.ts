@@ -224,11 +224,32 @@ app.use((req, res, next) => {
           console.error(`[shopify-recon] orders sync failed: ${e?.message ?? e}`);
         }
       };
+      // PR #R3 — payouts polling. No webhooks for payouts (Shopify doesn't offer
+      // a payout webhook for app-level installs), so this poller is the only
+      // path. Less frequent than orders since payouts settle ~daily.
+      const runShopifyPayoutsSync = async () => {
+        try {
+          const { getShopifyReconConfig } = await import("./shopify-recon");
+          if (!getShopifyReconConfig()) return;
+          const { syncPayoutsIncremental } = await import("./shopify-recon-payouts");
+          const r = await syncPayoutsIncremental("cron");
+          if (r.error) {
+            console.error(`[shopify-recon] payouts sync error: ${r.error}`);
+          } else {
+            log(`Shopify payouts sync: ${r.payoutsIngested} payouts (${r.inserted} new, ${r.updated} updated), ${r.balanceTransactionsIngested} balance txns, ${r.chargebacksDetected} chargebacks across ${r.pages} pages`);
+          }
+        } catch (e: any) {
+          console.error(`[shopify-recon] payouts sync failed: ${e?.message ?? e}`);
+        }
+      };
       // Stagger — boot tasks already happen at +5/+7/+8s, run shopify at +9s
       // so it doesn't compete with QBO/alias/line-item backfills.
       setTimeout(runShopifyBootstrap, 9000);
       setTimeout(runShopifyOrdersSync, 12000);
-      // Polling safety net every 6 hours (webhooks are the primary path).
+      // Run payouts first time at +18s, then every 12h (payouts settle ~daily).
+      setTimeout(runShopifyPayoutsSync, 18000);
+      setInterval(runShopifyPayoutsSync, 12 * 60 * 60 * 1000);
+      // Polling safety net every 6 hours (webhooks are the primary path for orders).
       setInterval(runShopifyOrdersSync, 6 * 60 * 60 * 1000);
 
       // Start backup scheduler (hourly local, daily Drive, weekly full)

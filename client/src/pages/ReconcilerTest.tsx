@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -73,6 +73,43 @@ type OrdersSummary = {
   by_financial_status: Array<{ financial_status: string | null; orders: number }>;
   gift_card_orders: number;
   channel_liable_orders: number;
+};
+// PR #R3 — Shopify Payments payouts + balance_transactions
+type PayoutsWatermark = { payouts_watermark: string | null };
+type PayoutsSyncResult = {
+  pages: number;
+  payoutsIngested: number;
+  inserted: number;
+  updated: number;
+  balanceTransactionsIngested: number;
+  chargebacksDetected: number;
+  watermark: string | null;
+  syncLogId: number;
+  error?: string;
+};
+type PayoutSample = {
+  id: string;
+  payout_date: string;
+  amount: number;
+  status: string | null;
+  currency: string | null;
+  txn_count: number;
+  chargeback_count: number;
+  ingested_at: string;
+};
+type PayoutsSummary = {
+  total_payouts: number;
+  total_balance_transactions: number;
+  earliest_payout_at: string | null;
+  latest_payout_at: string | null;
+  gross_payout_amount: number;
+  total_fees: number;
+  total_chargebacks: number;
+  chargeback_count: number;
+  unmatched_payouts: number;
+  by_month: Array<{ month: string; payouts: number; amount: number; chargebacks: number }>;
+  by_status: Array<{ status: string | null; payouts: number; amount: number }>;
+  by_txn_type: Array<{ type: string; count: number; amount: number; fees: number }>;
 };
 
 function money(n: number | null | undefined): string {
@@ -216,6 +253,33 @@ export default function ReconcilerTest() {
   const summaryQ = useQuery<OrdersSummary>({
     queryKey: ["/api/recon/shopify/orders-summary"],
     refetchInterval: 30_000,
+  });
+
+  // --- Payouts (PR #R3) ---
+  const payoutsWatermarkQ = useQuery<PayoutsWatermark>({
+    queryKey: ["/api/recon/shopify/payouts-watermark"],
+  });
+  const payoutsSampleQ = useQuery<PayoutSample[]>({
+    queryKey: ["/api/recon/payouts"],
+    enabled: !!statusQ.data?.configured,
+  });
+  const payoutsSummaryQ = useQuery<PayoutsSummary>({
+    queryKey: ["/api/recon/shopify/payouts-summary"],
+    refetchInterval: 30_000,
+  });
+  const payoutsSyncMut = useMutation<PayoutsSyncResult>({
+    mutationFn: () => jsonPost("/api/recon/shopify/sync/payouts"),
+    onSuccess: (r) => {
+      setLastAction(
+        r.error
+          ? `Payouts sync error: ${r.error}`
+          : `Payouts sync done: ${r.payoutsIngested} payouts (${r.inserted} new, ${r.updated} updated), ${r.balanceTransactionsIngested} balance txns, ${r.chargebacksDetected} chargebacks`,
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/shopify/payouts-watermark"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/payouts"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/shopify/payouts-summary"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
+    },
   });
 
   const cfg = statusQ.data;
@@ -583,6 +647,227 @@ export default function ReconcilerTest() {
               </div>
 
               <Button size="sm" variant="outline" onClick={() => summaryQ.refetch()}>
+                <RefreshCw className="size-4 mr-1.5" /> Refresh summary
+              </Button>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ===== 2c. Payouts sync — PR #R3 ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><Banknote className="size-4" /> Payouts sync</CardTitle>
+          <CardDescription>
+            Pulls Shopify Payments deposits + balance transactions (charges, refunds, fees, chargebacks).
+            Runs every 12 hours automatically. Click to force a pull now.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+            <div className="font-medium">Current watermark</div>
+            <div className="font-mono text-xs">{payoutsWatermarkQ.data?.payouts_watermark ?? "(none — first run)"}</div>
+            <div className="font-medium">Payouts in DB</div>
+            <div className="font-mono text-xs">
+              {payoutsSampleQ.data ? `${payoutsSampleQ.data.length} (most recent shown below)` : "—"}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2 pt-2">
+            <Button
+              size="sm"
+              onClick={() => payoutsSyncMut.mutate()}
+              disabled={!configured || payoutsSyncMut.isPending}
+            >
+              {payoutsSyncMut.isPending
+                ? <RefreshCw className="size-4 mr-1.5 animate-spin" />
+                : <RefreshCw className="size-4 mr-1.5" />}
+              Sync now
+            </Button>
+          </div>
+          {payoutsSyncMut.data && (
+            <div className={`text-sm rounded-md border p-3 ${payoutsSyncMut.data.error ? "border-red-200 bg-red-50" : "border-green-200 bg-green-50"}`}>
+              {payoutsSyncMut.data.error ? (
+                <div className="text-red-800"><AlertTriangle className="size-4 inline mr-1" />{payoutsSyncMut.data.error}</div>
+              ) : (
+                <div className="text-green-800">
+                  Synced <b>{payoutsSyncMut.data.payoutsIngested}</b> payouts across <b>{payoutsSyncMut.data.pages}</b> page(s) —
+                  {" "}{payoutsSyncMut.data.inserted} new, {payoutsSyncMut.data.updated} updated.
+                  {" "}<b>{payoutsSyncMut.data.balanceTransactionsIngested}</b> balance transactions,
+                  {" "}<b className={payoutsSyncMut.data.chargebacksDetected > 0 ? "text-amber-700" : undefined}>
+                    {payoutsSyncMut.data.chargebacksDetected}
+                  </b> chargeback(s).
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Recent payouts sample */}
+          {payoutsSampleQ.data && payoutsSampleQ.data.length > 0 && (
+            <div className="pt-2">
+              <div className="text-sm font-medium mb-1.5">Recent payouts (most recent first)</div>
+              <div className="border rounded-md overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 text-xs text-muted-foreground">
+                    <tr>
+                      <th className="text-left px-3 py-1.5 font-medium">Payout ID</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Date</th>
+                      <th className="text-right px-3 py-1.5 font-medium">Amount</th>
+                      <th className="text-left px-3 py-1.5 font-medium">Status</th>
+                      <th className="text-right px-3 py-1.5 font-medium">Txns</th>
+                      <th className="text-right px-3 py-1.5 font-medium">Chargebacks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payoutsSampleQ.data.slice(0, 25).map((p) => (
+                      <tr key={p.id} className="border-t">
+                        <td className="px-3 py-1.5 font-mono text-xs">{p.id}</td>
+                        <td className="px-3 py-1.5 font-mono text-xs">{p.payout_date}</td>
+                        <td className="px-3 py-1.5 text-right font-mono">{money(p.amount)}</td>
+                        <td className="px-3 py-1.5 font-mono text-xs">{p.status ?? "—"}</td>
+                        <td className="px-3 py-1.5 text-right font-mono">{num(p.txn_count)}</td>
+                        <td className={`px-3 py-1.5 text-right font-mono ${p.chargeback_count > 0 ? "text-amber-700 font-semibold" : ""}`}>
+                          {p.chargeback_count > 0
+                            ? <span className="inline-flex items-center gap-1"><ShieldAlert className="size-3.5" />{num(p.chargeback_count)}</span>
+                            : num(p.chargeback_count)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ===== 2d. Payouts summary — PR #R3 ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><BarChart3 className="size-4" /> Payouts summary</CardTitle>
+          <CardDescription>
+            Aggregated view of Shopify Payments. Use this to validate the totals against your bank deposits before PR #R5 builds the Plaid matcher.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {payoutsSummaryQ.isLoading && <div className="text-sm text-muted-foreground">Loading…</div>}
+          {payoutsSummaryQ.data && (
+            <>
+              {/* Top-line metrics */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground">Total payouts</div>
+                  <div className="text-2xl font-semibold">{num(payoutsSummaryQ.data.total_payouts)}</div>
+                  <div className="text-xs text-muted-foreground mt-0.5">{num(payoutsSummaryQ.data.total_balance_transactions)} balance txns</div>
+                </div>
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground">Gross paid out</div>
+                  <div className="text-2xl font-semibold">{money(payoutsSummaryQ.data.gross_payout_amount)}</div>
+                  <div className="text-xs text-muted-foreground mt-0.5">Fees: {money(payoutsSummaryQ.data.total_fees)}</div>
+                </div>
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground flex items-center gap-1"><ShieldAlert className="size-3" /> Chargebacks</div>
+                  <div className={`text-2xl font-semibold ${payoutsSummaryQ.data.chargeback_count > 0 ? "text-amber-700" : ""}`}>
+                    {num(payoutsSummaryQ.data.chargeback_count)}
+                  </div>
+                  <div className="text-xs text-muted-foreground mt-0.5">{money(payoutsSummaryQ.data.total_chargebacks)} disputed</div>
+                </div>
+                <div className="border rounded-md p-3">
+                  <div className="text-xs text-muted-foreground flex items-center gap-1"><CalendarRange className="size-3" /> Date range</div>
+                  <div className="text-sm font-semibold mt-1">{shortDate(payoutsSummaryQ.data.earliest_payout_at)}</div>
+                  <div className="text-xs text-muted-foreground">to {shortDate(payoutsSummaryQ.data.latest_payout_at)}</div>
+                </div>
+              </div>
+
+              {/* Flags */}
+              <div className="flex flex-wrap gap-2 text-xs">
+                <Badge variant="outline">Unmatched to bank: {num(payoutsSummaryQ.data.unmatched_payouts)}</Badge>
+              </div>
+
+              {/* Per-month */}
+              <div>
+                <div className="text-sm font-medium mb-1.5 flex items-center gap-1.5"><CalendarRange className="size-4" /> By month</div>
+                <div className="border rounded-md overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="bg-muted/50 text-xs text-muted-foreground">
+                      <tr>
+                        <th className="text-left px-3 py-1.5 font-medium">Month</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Payouts</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Amount</th>
+                        <th className="text-right px-3 py-1.5 font-medium">Chargebacks</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {payoutsSummaryQ.data.by_month.map((r) => (
+                        <tr key={r.month} className="border-t">
+                          <td className="px-3 py-1.5">{monthLabel(r.month)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{num(r.payouts)}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{money(r.amount)}</td>
+                          <td className={`px-3 py-1.5 text-right font-mono ${r.chargebacks > 0 ? "text-amber-700" : ""}`}>
+                            {num(r.chargebacks)}
+                          </td>
+                        </tr>
+                      ))}
+                      {payoutsSummaryQ.data.by_month.length === 0 && (
+                        <tr><td colSpan={4} className="px-3 py-3 text-center text-muted-foreground">No payouts yet</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* By status + by txn type */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <div className="text-sm font-medium mb-1.5">By status</div>
+                  <div className="border rounded-md overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50 text-xs text-muted-foreground">
+                        <tr>
+                          <th className="text-left px-3 py-1.5 font-medium">Status</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Payouts</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Amount</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {payoutsSummaryQ.data.by_status.map((r, i) => (
+                          <tr key={`${r.status ?? "null"}-${i}`} className="border-t">
+                            <td className="px-3 py-1.5 font-mono text-xs">{r.status ?? "(unknown)"}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{num(r.payouts)}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{money(r.amount)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-sm font-medium mb-1.5">By transaction type</div>
+                  <div className="border rounded-md overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50 text-xs text-muted-foreground">
+                        <tr>
+                          <th className="text-left px-3 py-1.5 font-medium">Type</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Count</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Amount</th>
+                          <th className="text-right px-3 py-1.5 font-medium">Fees</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {payoutsSummaryQ.data.by_txn_type.map((r, i) => (
+                          <tr key={`${r.type}-${i}`} className="border-t">
+                            <td className="px-3 py-1.5 font-mono text-xs">{r.type}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{num(r.count)}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{money(r.amount)}</td>
+                            <td className="px-3 py-1.5 text-right font-mono">{money(r.fees)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <Button size="sm" variant="outline" onClick={() => payoutsSummaryQ.refetch()}>
                 <RefreshCw className="size-4 mr-1.5" /> Refresh summary
               </Button>
             </>
