@@ -36,7 +36,8 @@ export function getAcumaticaErrorLog(limit = 20) { return getIntegrationErrorLog
 export function clearAcumaticaErrorLog() { clearIntegrationErrorLog("acumatica"); }
 import { processInvoicePdf } from "./invoice-pipeline";
 
-const DB_PATH = path.resolve(process.cwd(), "data.db");
+import { getDbPath } from "./db-path";
+const DB_PATH = getDbPath(); // PR #R4j: NSSM-safe path
 
 let lastRunAt: string | null = null;
 let lastRunSummary: AcumaticaRunResult | null = null;

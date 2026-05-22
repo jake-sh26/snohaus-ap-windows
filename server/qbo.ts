@@ -26,7 +26,8 @@ export function getQboErrorLog(limit = 20) { return getIntegrationErrorLog("qbo"
 export function clearQboErrorLog() { clearIntegrationErrorLog("qbo"); }
 
 // Re-use the same SQLite database file as storage.ts
-const DB_PATH = path.resolve(process.cwd(), "data.db");
+import { getDbPath } from "./db-path";
+const DB_PATH = getDbPath(); // PR #R4j: NSSM-safe path
 let _db: ReturnType<typeof Database> | null = null;
 function getDb() {
   if (!_db) {

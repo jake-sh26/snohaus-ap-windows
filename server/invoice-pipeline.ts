@@ -20,7 +20,8 @@ import { getQboStatus, searchBills, searchPayments } from "./qbo";
 import { findDuplicateInvoice } from "./dup-detector";
 import { parsePaymentTermsFallback } from "./payment-terms-parser";
 
-const DB_PATH = path.resolve(process.cwd(), "data.db");
+import { getDbPath } from "./db-path";
+const DB_PATH = getDbPath(); // PR #R4j: NSSM-safe path
 
 function getDb() {
   return new Database(DB_PATH);
