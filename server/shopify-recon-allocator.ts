@@ -815,6 +815,181 @@ export function getAllocationRollup(month: string): AllocationRollupRow[] {
 }
 
 /**
+ * PR #R4k-diag — Compute the UTC instants that bound a calendar month
+ * in store time (America/New_York). DST-safe: walks an Intl.DateTimeFormat
+ * to find the actual UTC offset for the first instant of the target month
+ * and the first instant of the following month.
+ *
+ * Returns ISO-8601 UTC strings suitable for use as SQL `created_at` bounds.
+ */
+export function getStoreTimeMonthBoundsUtc(month: string, tz = "America/New_York"): {
+  start_utc: string;
+  end_utc: string;
+} {
+  const [y, m] = month.split("-").map(Number);
+  // Find the UTC instant whose store-time representation is YYYY-MM-01 00:00:00.
+  // We bracket-search: start with the naive UTC midnight, then ask Intl what
+  // that maps to in store time, and shift by the resulting offset.
+  const findUtcMidnight = (yy: number, mm: number): Date => {
+    // Start at the naive instant (treat YYYY-MM-01 00:00 as if it were UTC).
+    const naive = new Date(Date.UTC(yy, mm - 1, 1, 0, 0, 0));
+    // Format that instant in store time; the difference tells us the offset.
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    const parts = Object.fromEntries(
+      fmt.formatToParts(naive).map((p) => [p.type, p.value])
+    );
+    // What instant did we *want*? Local midnight of yy-mm-01. What do we have?
+    const haveLocal = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour) === 24 ? 0 : Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second)
+    );
+    // Shift the naive instant by the offset between what-we-want and what-we-have.
+    return new Date(naive.getTime() + (naive.getTime() - haveLocal));
+  };
+  const startDate = findUtcMidnight(y, m);
+  const endDate = m === 12 ? findUtcMidnight(y + 1, 1) : findUtcMidnight(y, m + 1);
+  return {
+    start_utc: startDate.toISOString(),
+    end_utc: endDate.toISOString(),
+  };
+}
+
+/**
+ * PR #R4k-diag — Same shape as getAllocationRollup() but bounds the month
+ * in store time (America/New_York) instead of UTC, so the result is directly
+ * comparable to Shopify Finance reports.
+ *
+ * Read-only diagnostic — does NOT replace the canonical UTC rollup yet.
+ */
+export function getAllocationRollupStoreTime(
+  month: string,
+  tz = "America/New_York"
+): AllocationRollupRow[] {
+  const { start_utc, end_utc } = getStoreTimeMonthBoundsUtc(month, tz);
+  return sqlite
+    .prepare(
+      `SELECT
+         a.entity_id,
+         e.location AS entity_location,
+         COUNT(DISTINCT a.order_id) AS orders,
+         COUNT(a.line_item_id) AS line_items,
+         SUM(CASE
+               WHEN COALESCE(li.is_gift_card, 0) = 1
+                    AND COALESCE(li.requires_shipping, 1) = 0
+               THEN 0
+               ELSE a.gross_amount
+             END) AS gross_total,
+         SUM(CASE
+               WHEN COALESCE(li.is_gift_card, 0) = 1
+                    AND COALESCE(li.requires_shipping, 1) = 0
+               THEN a.gross_amount
+               ELSE 0
+             END) AS gc_issuance_total,
+         SUM(a.tax_amount) AS tax_total
+       FROM recon_allocations a
+       JOIN recon_orders o ON o.id = a.order_id
+       LEFT JOIN recon_line_items li ON li.id = a.line_item_id
+       LEFT JOIN payroll_entities e ON e.id = a.entity_id
+       WHERE o.created_at >= ? AND o.created_at < ?
+       GROUP BY a.entity_id, e.location
+       ORDER BY a.entity_id ASC`
+    )
+    .all(start_utc, end_utc) as AllocationRollupRow[];
+}
+
+/**
+ * PR #R4k-diag — Diagnose the timezone discrepancy for a given month:
+ * count and sum the orders that fall inside the UTC bucket but outside the
+ * store-time bucket (and vice versa). These are the edge-of-month orders
+ * that drive variance between reconciler totals and Shopify Finance.
+ */
+export function getMonthBoundaryDiag(
+  month: string,
+  tz = "America/New_York"
+): {
+  month: string;
+  tz: string;
+  utc_bounds: { start: string; end: string };
+  store_bounds_as_utc: { start: string; end: string };
+  // Orders in UTC bucket but NOT in store-time bucket (added to UTC by mistake)
+  in_utc_not_store: { order_count: number; gross_sum: number; tax_sum: number; samples: any[] };
+  // Orders in store-time bucket but NOT in UTC bucket (missing from UTC)
+  in_store_not_utc: { order_count: number; gross_sum: number; tax_sum: number; samples: any[] };
+} {
+  const [y, m] = month.split("-").map(Number);
+  const utc_start = `${month}-01T00:00:00Z`;
+  const utc_end =
+    m === 12
+      ? `${y + 1}-01-01T00:00:00Z`
+      : `${y}-${String(m + 1).padStart(2, "0")}-01T00:00:00Z`;
+  const { start_utc, end_utc } = getStoreTimeMonthBoundsUtc(month, tz);
+
+  const edgeQuery = (whereClause: string, args: any[]) => {
+    const rows = sqlite
+      .prepare(
+        `SELECT a.order_id, o.created_at, o.name AS order_name,
+                SUM(a.gross_amount) AS gross, SUM(a.tax_amount) AS tax
+           FROM recon_allocations a
+           JOIN recon_orders o ON o.id = a.order_id
+           WHERE ${whereClause}
+           GROUP BY a.order_id, o.created_at, o.name
+           ORDER BY o.created_at ASC`
+      )
+      .all(...args) as Array<{
+      order_id: string;
+      created_at: string;
+      order_name: string | null;
+      gross: number;
+      tax: number;
+    }>;
+    const order_count = rows.length;
+    const gross_sum = rows.reduce((s, r) => s + (r.gross ?? 0), 0);
+    const tax_sum = rows.reduce((s, r) => s + (r.tax ?? 0), 0);
+    return { order_count, gross_sum, tax_sum, samples: rows.slice(0, 25) };
+  };
+
+  // In UTC bucket but NOT in store bucket:
+  //   created_at >= utc_start AND < utc_end
+  //   AND (created_at < start_utc OR created_at >= end_utc)
+  const inUtcNotStore = edgeQuery(
+    `o.created_at >= ? AND o.created_at < ?
+     AND (o.created_at < ? OR o.created_at >= ?)`,
+    [utc_start, utc_end, start_utc, end_utc]
+  );
+
+  // In store bucket but NOT in UTC bucket:
+  //   created_at >= start_utc AND < end_utc
+  //   AND (created_at < utc_start OR created_at >= utc_end)
+  const inStoreNotUtc = edgeQuery(
+    `o.created_at >= ? AND o.created_at < ?
+     AND (o.created_at < ? OR o.created_at >= ?)`,
+    [start_utc, end_utc, utc_start, utc_end]
+  );
+
+  return {
+    month,
+    tz,
+    utc_bounds: { start: utc_start, end: utc_end },
+    store_bounds_as_utc: { start: start_utc, end: end_utc },
+    in_utc_not_store: inUtcNotStore,
+    in_store_not_utc: inStoreNotUtc,
+  };
+}
+
+/**
  * Are we ready to run the engine? Mapping config readiness + COA readiness.
  */
 export function getAllocationReadiness(): {
