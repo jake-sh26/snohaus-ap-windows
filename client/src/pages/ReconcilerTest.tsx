@@ -415,6 +415,9 @@ export default function ReconcilerTest() {
   // Local draft of cell selections so the user can edit before saving.
   const [coaDraft, setCoaDraft] = useState<Record<string, string | null>>({});
   const [coaSavedFlash, setCoaSavedFlash] = useState(false);
+  // Inline status for the upload row (visible right next to the button so the
+  // user doesn't have to look at the bottom status line).
+  const [coaUploadStatus, setCoaUploadStatus] = useState<Record<number, { kind: "ok" | "err" | "working"; msg: string }>>({});
   // Track which cells have been edited locally (so we know what to save).
   const cellKey = (entityId: number, role: string) => `${entityId}::${role}`;
   const getCellValue = (entityId: number, role: string): string | null => {
@@ -425,12 +428,20 @@ export default function ReconcilerTest() {
   };
   const coaImportMut = useMutation<CoaImportResult, Error, { entityId: number; rows: CoaAccountRow[] }>({
     mutationFn: ({ entityId, rows }) => jsonPost<CoaImportResult>(`/api/recon/coa/import/${entityId}`, { rows }),
-    onSuccess: (r) => {
-      setLastAction(r.error ? `COA import error: ${r.error}` : `COA imported: ${r.inserted} new, ${r.updated} updated, ${r.deactivated} deactivated`);
+    onSuccess: (r, vars) => {
+      const msg = r.error
+        ? `Import error: ${r.error}`
+        : `Imported ${r.inserted} new, ${r.updated} updated, ${r.deactivated} deactivated`;
+      setLastAction(`COA: ${msg}`);
+      setCoaUploadStatus(prev => ({ ...prev, [vars.entityId]: { kind: r.error ? "err" : "ok", msg } }));
       qc.invalidateQueries({ queryKey: ["/api/recon/coa/import-status"] });
       qc.invalidateQueries({ queryKey: ["/api/recon/coa/mapping-matrix"] });
     },
-    onError: (e: any) => setLastAction(`COA import failed: ${e?.message ?? e}`),
+    onError: (e: any, vars) => {
+      const msg = `Upload failed: ${e?.message ?? e}`;
+      setLastAction(`COA: ${msg}`);
+      setCoaUploadStatus(prev => ({ ...prev, [vars.entityId]: { kind: "err", msg } }));
+    },
   });
   const coaSaveMut = useMutation<CoaBulkSaveResult, Error, Array<{ entity_id: number; logical_role: string; qbo_account_name: string | null }>>({
     mutationFn: (rows) => jsonPost<CoaBulkSaveResult>("/api/recon/coa/mapping/bulk-save", { rows }),
@@ -471,19 +482,29 @@ export default function ReconcilerTest() {
     if (field.length > 0 || row.length > 0) { row.push(field); out.push(row); }
 
     // Find the header row. QBO exports often have 1-3 preamble rows.
+    // Header column variants we accept (case-insensitive, trimmed):
+    //   name   : "account", "name", "account name", "full name"
+    //   number : "number", "acct #", "acct#", "account number", "account #"
+    //   type   : "type", "account type"
+    //   detail : "detail type", "detail_type"
+    const nameAliases = ["account name", "account", "name", "full name"];
+    const numberAliases = ["account number", "number", "acct #", "acct#", "account #", "#"];
+    const typeAliases = ["account type", "type"];
+    const detailAliases = ["detail type", "detail_type"];
     let headerIdx = -1;
     for (let i = 0; i < out.length && i < 10; i++) {
       const r = out[i].map(s => s.toLowerCase().trim());
-      if (r.some(s => s === "account" || s === "name") && r.some(s => s === "type" || s === "account type")) {
+      if (r.some(s => nameAliases.includes(s)) && r.some(s => typeAliases.includes(s))) {
         headerIdx = i; break;
       }
     }
     if (headerIdx === -1) return [];
     const header = out[headerIdx].map(s => s.toLowerCase().trim());
-    const colName = header.findIndex(h => h === "account" || h === "name");
-    const colNumber = header.findIndex(h => h === "number" || h === "acct #" || h === "acct#" || h === "account number");
-    const colType = header.findIndex(h => h === "type" || h === "account type");
-    const colDetail = header.findIndex(h => h === "detail type" || h === "detail_type");
+    const findCol = (aliases: string[]) => header.findIndex(h => aliases.includes(h));
+    const colName = findCol(nameAliases);
+    const colNumber = findCol(numberAliases);
+    const colType = findCol(typeAliases);
+    const colDetail = findCol(detailAliases);
 
     const rows: CoaAccountRow[] = [];
     for (let i = headerIdx + 1; i < out.length; i++) {
@@ -501,17 +522,25 @@ export default function ReconcilerTest() {
   }
 
   function handleCoaCsvUpload(entityId: number, file: File) {
+    setCoaUploadStatus(prev => ({ ...prev, [entityId]: { kind: "working", msg: `Reading ${file.name}…` } }));
     const reader = new FileReader();
     reader.onload = () => {
       const text = String(reader.result || "");
       const rows = parseCoaCsv(text);
       if (rows.length === 0) {
-        setLastAction(`COA parse error: no rows detected in ${file.name}`);
+        const msg = `No account rows detected in ${file.name}. Expected QBO export with columns: Account name, Account type (Account number + Detail type optional).`;
+        setLastAction(`COA: ${msg}`);
+        setCoaUploadStatus(prev => ({ ...prev, [entityId]: { kind: "err", msg } }));
         return;
       }
+      setCoaUploadStatus(prev => ({ ...prev, [entityId]: { kind: "working", msg: `Parsed ${rows.length} rows, uploading…` } }));
       coaImportMut.mutate({ entityId, rows });
     };
-    reader.onerror = () => setLastAction(`COA read error: ${file.name}`);
+    reader.onerror = () => {
+      const msg = `Could not read ${file.name}`;
+      setLastAction(`COA: ${msg}`);
+      setCoaUploadStatus(prev => ({ ...prev, [entityId]: { kind: "err", msg } }));
+    };
     reader.readAsText(file);
   }
 
@@ -1497,6 +1526,17 @@ export default function ReconcilerTest() {
                     />
                   </label>
                 </div>
+                {coaUploadStatus[row.entity_id] && (
+                  <div className={
+                    "col-span-12 mt-1 text-xs " +
+                    (coaUploadStatus[row.entity_id].kind === "ok" ? "text-green-700" :
+                     coaUploadStatus[row.entity_id].kind === "err" ? "text-amber-700" : "text-muted-foreground")
+                  }>
+                    {coaUploadStatus[row.entity_id].kind === "ok" && <Check className="inline size-3 mr-1" />}
+                    {coaUploadStatus[row.entity_id].kind === "err" && <AlertTriangle className="inline size-3 mr-1" />}
+                    {coaUploadStatus[row.entity_id].msg}
+                  </div>
+                )}
               </div>
             ))}
           </div>
