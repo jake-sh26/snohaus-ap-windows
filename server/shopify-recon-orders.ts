@@ -315,16 +315,74 @@ function bumpIso(iso: string): string {
 }
 
 /**
- * PR #R4b — backfill fulfillments for orders already in the DB.
+ * PR #R4c — in-memory progress tracker for the backfill so the UI can poll
+ * status while it runs. Keyed by syncLogId. Cleaned up automatically after
+ * the job finishes (we leave the final entry for ~5 min so a slow client
+ * poll still gets the final tally).
+ */
+export type FulfillmentBackfillProgress = {
+  syncLogId: number;
+  state: "running" | "success" | "failure";
+  pages: number;
+  total_pages_estimate: number | null;
+  orders_scanned: number;
+  orders_updated: number;
+  fulfillments_written: number;
+  errors: number;
+  startedAt: string;
+  finishedAt: string | null;
+  error?: string;
+  message?: string;
+};
+const backfillProgress = new Map<number, FulfillmentBackfillProgress>();
+export function getBackfillProgress(syncLogId: number): FulfillmentBackfillProgress | null {
+  return backfillProgress.get(syncLogId) ?? null;
+}
+export function listRecentBackfillProgress(): FulfillmentBackfillProgress[] {
+  return Array.from(backfillProgress.values()).sort((a, b) => b.syncLogId - a.syncLogId).slice(0, 10);
+}
+function setBackfillProgress(syncLogId: number, patch: Partial<FulfillmentBackfillProgress>) {
+  const prev = backfillProgress.get(syncLogId);
+  const merged: FulfillmentBackfillProgress = {
+    syncLogId,
+    state: "running",
+    pages: 0,
+    total_pages_estimate: null,
+    orders_scanned: 0,
+    orders_updated: 0,
+    fulfillments_written: 0,
+    errors: 0,
+    startedAt: prev?.startedAt ?? new Date().toISOString(),
+    finishedAt: null,
+    ...prev,
+    ...patch,
+  };
+  backfillProgress.set(syncLogId, merged);
+  // Evict entries older than 30 minutes to keep the map bounded.
+  const cutoff = Date.now() - 30 * 60_000;
+  const stale: number[] = [];
+  backfillProgress.forEach((v, k) => {
+    if (v.finishedAt && Date.parse(v.finishedAt) < cutoff) stale.push(k);
+  });
+  for (const k of stale) backfillProgress.delete(k);
+}
+
+/**
+ * PR #R4b/R4c — backfill fulfillments for orders already in the DB.
  *
  * Existing orders ingested before R4b have no rows in recon_order_fulfillments
- * because the transform didn't extract them. This walks orders in a date
- * range, re-pulls EACH order from /orders/{id}.json (which includes the full
- * fulfillments array), and rewrites the fulfillment table only.
+ * because the transform didn't extract them. This rewrites the fulfillment
+ * table only — order/line item rows are NOT touched.
  *
- * Order/line item rows are NOT touched — we only call replaceReconFulfillments
- * — so this is safe to run repeatedly. Targeted re-runs of a specific month
- * will only touch that month's orders.
+ * R4c rewrite: instead of one /orders/{id}.json request per order (rate-limit
+ * heavy: 700+ requests for a month, frequent 429s), we paginate the list
+ * endpoint /orders.json?fields=id,fulfillments&created_at_min/max=...&limit=250.
+ * Same data, ~3-4 requests per month, no rate limiting issues.
+ *
+ * We then intersect the returned IDs with what's actually in our local
+ * recon_orders table — only orders we know about get fulfillment rows
+ * written. If Shopify has orders we haven't synced yet, they're skipped
+ * (the regular orders sync will pick them up + their fulfillments).
  */
 export async function backfillFulfillments(
   triggeredBy: string,
@@ -334,27 +392,29 @@ export async function backfillFulfillments(
   orders_updated: number;
   fulfillments_written: number;
   errors: number;
+  pages: number;
   syncLogId: number;
   error?: string;
 }> {
   const cfg = getShopifyReconConfig();
   if (!cfg) {
     return {
-      orders_scanned: 0, orders_updated: 0, fulfillments_written: 0, errors: 0,
+      orders_scanned: 0, orders_updated: 0, fulfillments_written: 0, errors: 0, pages: 0,
       syncLogId: -1, error: "Shopify reconciler not configured",
     };
   }
-  // We use the orders sync log kind so existing UI doesn't have to change.
   const syncLogId = startReconSync("fulfillments-backfill", triggeredBy, opts.sinceIso);
+  setBackfillProgress(syncLogId, { state: "running", message: "Loading local order index…" });
 
+  let pages = 0;
   let scanned = 0;
   let updated = 0;
   let totalFulfillments = 0;
   let errors = 0;
 
   try {
-    // Pull the list of order IDs in the date range from local DB — no need
-    // to round-trip Shopify just to get IDs we already have.
+    // Build a Set of order IDs we have locally in this date range. The list
+    // endpoint may return orders we haven't synced yet; we skip those.
     const { sqlite } = await import("./storage");
     const localOrders = sqlite
       .prepare(
@@ -363,55 +423,97 @@ export async function backfillFulfillments(
           : `SELECT id FROM recon_orders WHERE created_at >= ? ORDER BY created_at ASC`
       )
       .all(...(opts.untilIso ? [opts.sinceIso, opts.untilIso] : [opts.sinceIso])) as Array<{ id: string }>;
+    const localIds = new Set(localOrders.map((r) => String(r.id)));
+    setBackfillProgress(syncLogId, {
+      total_pages_estimate: Math.max(1, Math.ceil(localOrders.length / PAGE_LIMIT)),
+      message: `Backfilling ${localOrders.length} orders…`,
+    });
 
-    for (const row of localOrders) {
-      scanned++;
-      try {
-        const res = await shopifyRestCall(cfg, `/orders/${row.id}.json`, {
-          query: { fields: "id,fulfillments" },
-        });
-        const order = res.json?.order;
-        if (!order) continue;
-        const rawFulfillments = Array.isArray(order.fulfillments) ? order.fulfillments : [];
-        const fulfillments: ReconFulfillmentUpsert[] = rawFulfillments.map((f: any) => {
-          const lineItemIds = Array.isArray(f.line_items)
-            ? f.line_items.map((li: any) => (li?.id != null ? String(li.id) : null)).filter(Boolean)
-            : [];
-          return {
-            id: String(f.id),
-            order_id: String(order.id),
-            location_id: f.location_id != null ? String(f.location_id) : null,
-            status: f.status ?? null,
-            shipment_status: f.shipment_status ?? null,
-            created_at: f.created_at ?? null,
-            updated_at: f.updated_at ?? null,
-            tracking_company: f.tracking_company ?? null,
-            tracking_number: f.tracking_number ?? null,
-            line_item_ids_json: JSON.stringify(lineItemIds),
-            raw_json: JSON.stringify(f),
-          };
-        });
-        const written = replaceReconFulfillments(String(order.id), fulfillments);
-        totalFulfillments += written;
-        if (written > 0) updated++;
-      } catch (e: any) {
-        errors++;
-        srWarn("fulfillments-backfill", `order ${row.id}: ${e?.message ?? e}`);
+    let nextUrl: string | null = null;
+    do {
+      pages++;
+      const res = nextUrl
+        ? await shopifyRestCall(cfg, nextUrl)
+        : await shopifyRestCall(cfg, "/orders.json", {
+            query: {
+              status: "any",
+              limit: PAGE_LIMIT,
+              created_at_min: opts.sinceIso,
+              ...(opts.untilIso ? { created_at_max: opts.untilIso } : {}),
+              fields: "id,fulfillments",
+              order: "created_at asc",
+            },
+          });
+      const orders = (res.json?.orders || []) as any[];
+      for (const order of orders) {
+        const oid = order?.id != null ? String(order.id) : null;
+        if (!oid) continue;
+        scanned++;
+        // Skip orders we don't have locally yet — regular sync will pick them up.
+        if (!localIds.has(oid)) continue;
+        try {
+          const rawFulfillments = Array.isArray(order.fulfillments) ? order.fulfillments : [];
+          const fulfillments: ReconFulfillmentUpsert[] = rawFulfillments.map((f: any) => {
+            const lineItemIds = Array.isArray(f.line_items)
+              ? f.line_items.map((li: any) => (li?.id != null ? String(li.id) : null)).filter(Boolean)
+              : [];
+            return {
+              id: String(f.id),
+              order_id: oid,
+              location_id: f.location_id != null ? String(f.location_id) : null,
+              status: f.status ?? null,
+              shipment_status: f.shipment_status ?? null,
+              created_at: f.created_at ?? null,
+              updated_at: f.updated_at ?? null,
+              tracking_company: f.tracking_company ?? null,
+              tracking_number: f.tracking_number ?? null,
+              line_item_ids_json: JSON.stringify(lineItemIds),
+              raw_json: JSON.stringify(f),
+            };
+          });
+          const written = replaceReconFulfillments(oid, fulfillments);
+          totalFulfillments += written;
+          if (written > 0) updated++;
+        } catch (e: any) {
+          errors++;
+          srWarn("fulfillments-backfill", `order ${oid}: ${e?.message ?? e}`);
+        }
       }
-    }
+      nextUrl = parseNextPageUrl(res.linkHeader);
+      setBackfillProgress(syncLogId, {
+        pages, orders_scanned: scanned, orders_updated: updated,
+        fulfillments_written: totalFulfillments, errors,
+      });
+      if (pages > 50) {
+        srWarn("fulfillments-backfill", `stopping at ${pages} pages — narrow the date range`);
+        break;
+      }
+    } while (nextUrl);
 
     finishReconSync(syncLogId, {
       status: errors > scanned / 2 ? "failure" : "success",
       rows_ingested: totalFulfillments,
       cursor: opts.untilIso ?? opts.sinceIso,
     });
-    return { orders_scanned: scanned, orders_updated: updated, fulfillments_written: totalFulfillments, errors, syncLogId };
+    setBackfillProgress(syncLogId, {
+      state: errors > scanned / 2 ? "failure" : "success",
+      pages, orders_scanned: scanned, orders_updated: updated,
+      fulfillments_written: totalFulfillments, errors,
+      finishedAt: new Date().toISOString(),
+      message: "Done",
+    });
+    return { orders_scanned: scanned, orders_updated: updated, fulfillments_written: totalFulfillments, errors, pages, syncLogId };
   } catch (e: any) {
     const msg = e?.message ?? String(e);
     srError("fulfillments-backfill", `backfill failed: ${msg}`);
+    setBackfillProgress(syncLogId, {
+      state: "failure", error: msg, finishedAt: new Date().toISOString(),
+      pages, orders_scanned: scanned, orders_updated: updated,
+      fulfillments_written: totalFulfillments, errors,
+    });
     finishReconSync(syncLogId, {
       status: "failure", rows_ingested: totalFulfillments, error_message: msg,
     });
-    return { orders_scanned: scanned, orders_updated: updated, fulfillments_written: totalFulfillments, errors, syncLogId, error: msg };
+    return { orders_scanned: scanned, orders_updated: updated, fulfillments_written: totalFulfillments, errors, pages, syncLogId, error: msg };
   }
 }
