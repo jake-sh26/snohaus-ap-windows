@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
-import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check, BookOpen, Upload } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check, BookOpen, Upload, Calculator, Layers } from "lucide-react";
 
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
@@ -187,6 +187,61 @@ type CoaMatrix = {
 };
 type CoaImportResult = { ok: boolean; entity_id: number; inserted: number; updated: number; deactivated: number; error?: string };
 type CoaBulkSaveResult = { ok: boolean; inserted: number; updated: number; cleared: number; errors: Array<{ entity_id: number; logical_role: string; message: string }>; error?: string };
+
+// ---- PR #R4: allocation engine types ----
+type AllocationMethod =
+  | "pos_location"
+  | "fulfillment_location"
+  | "warehouse_rollup"
+  | "zip_lookup"
+  | "prior_year_pro_rata"
+  | "manual_override"
+  | "needs_review";
+type AllocReadiness = {
+  has_pos_mappings: boolean;
+  pos_mapping_count: number;
+  unmapped_active_locations: number;
+  has_sd_entity: boolean;
+  has_zip_lookups: boolean;
+  zip_lookup_count: number;
+  has_pro_rata: boolean;
+  pro_rata_year: number | null;
+};
+type AllocRunSummary = {
+  ok: boolean;
+  month: string;
+  orders_processed: number;
+  line_items_processed: number;
+  allocations_written: number;
+  by_method: Record<AllocationMethod, number>;
+  needs_review_orders: number;
+  failed_orders: number;
+  warnings: string[];
+  ran_at: string;
+  error?: string;
+};
+type AllocNeedsReviewRow = {
+  order_id: string;
+  order_name: string | null;
+  order_created_at: string;
+  source_name: string | null;
+  location_id: string | null;
+  line_item_id: string | null;
+  sku: string | null;
+  title: string | null;
+  gross_amount: number;
+  tax_amount: number;
+  reason: string | null;
+  current_entity_id: number;
+};
+type AllocRollupRow = {
+  entity_id: number;
+  entity_location: string | null;
+  orders: number;
+  line_items: number;
+  gross_total: number;
+  tax_total: number;
+};
 
 function money(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -454,6 +509,60 @@ export default function ReconcilerTest() {
       qc.invalidateQueries({ queryKey: ["/api/recon/coa/mapping-matrix"] });
     },
     onError: (e: any) => setLastAction(`COA save failed: ${e?.message ?? e}`),
+  });
+
+  // ---- PR #R4: allocation engine state + hooks ----
+  // Default the run/rollup month to the most recent fully-closed month so
+  // blind validation against Feb 2026 / Jan 2026 / Nov 2025 is one click.
+  const defaultAllocMonth = (() => {
+    const d = new Date();
+    d.setUTCDate(1);
+    d.setUTCMonth(d.getUTCMonth() - 1);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  })();
+  const [allocMonth, setAllocMonth] = useState<string>(defaultAllocMonth);
+  const [allocLastSummary, setAllocLastSummary] = useState<AllocRunSummary | null>(null);
+  const [overrideDraft, setOverrideDraft] = useState<Record<string, number | "">>({});
+
+  const allocReadinessQ = useQuery<AllocReadiness>({
+    queryKey: ["/api/recon/allocations/readiness"],
+  });
+  const allocNeedsReviewQ = useQuery<{ rows: AllocNeedsReviewRow[] }>({
+    queryKey: ["/api/recon/allocations/needs-review", allocMonth],
+    queryFn: () => jsonGet(`/api/recon/allocations/needs-review?month=${encodeURIComponent(allocMonth)}`),
+  });
+  const allocRollupQ = useQuery<{ rows: AllocRollupRow[] }>({
+    queryKey: ["/api/recon/allocations/rollup", allocMonth],
+    queryFn: () => jsonGet(`/api/recon/allocations/rollup?month=${encodeURIComponent(allocMonth)}`),
+  });
+
+  const allocRunMut = useMutation<AllocRunSummary, Error, string>({
+    mutationFn: (month) => jsonPost<AllocRunSummary>("/api/recon/allocations/run", { month }),
+    onSuccess: (r) => {
+      setAllocLastSummary(r);
+      const errMsg = r.error ? ` (error: ${r.error})` : "";
+      setLastAction(
+        `Allocation: ${r.orders_processed} orders, ${r.allocations_written} rows, ` +
+        `${r.needs_review_orders} need review, ${r.failed_orders} failed${errMsg}`
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/needs-review"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/rollup"] });
+    },
+    onError: (e: any) => setLastAction(`Allocation run failed: ${e?.message ?? e}`),
+  });
+
+  const overrideMut = useMutation<
+    { ok: boolean; updated: number },
+    Error,
+    { order_id: string; line_item_id: string | null; entity_id: number }
+  >({
+    mutationFn: (args) => jsonPost("/api/recon/allocations/override", args),
+    onSuccess: (r, vars) => {
+      setLastAction(`Override saved: order ${vars.order_id} → entity ${vars.entity_id} (${r.updated} rows)`);
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/needs-review"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/allocations/rollup"] });
+    },
+    onError: (e: any) => setLastAction(`Override failed: ${e?.message ?? e}`),
   });
 
   // Parses a QBO COA CSV (Account Type, Detail Type, Name, Number variants).
@@ -1668,7 +1777,258 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
-      {/* ===== 8. Error log ===== */}
+      {/* ===== 8. Allocation engine (PR #R4) ===== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><Calculator className="size-4" /> Allocation engine</CardTitle>
+          <CardDescription>
+            For each order, decide which legal entity owns the sale. Read-only — nothing is
+            posted to QBO yet. Run a month, then review the per-entity rollup and any orders
+            that need a manual call.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* --- Readiness banner --- */}
+          {allocReadinessQ.data && (() => {
+            const r = allocReadinessQ.data;
+            const blockers: string[] = [];
+            const warnings: string[] = [];
+            if (!r.has_sd_entity) blockers.push("No SD Ski/Patio entity configured");
+            if (!r.has_pos_mappings) blockers.push("No POS ↔ entity mappings saved (configure in card #5)");
+            if (r.unmapped_active_locations > 0) warnings.push(`${r.unmapped_active_locations} active POS location(s) still unmapped`);
+            if (!r.has_zip_lookups) warnings.push("No ZIP ↔ entity lookups configured (digital gift cards will be flagged)");
+            if (!r.has_pro_rata) warnings.push("No prior-year pro-rata configured (used as last-resort fallback)");
+            const ok = blockers.length === 0;
+            return (
+              <div className={`rounded border p-3 text-sm ${ok ? "border-green-300 bg-green-50" : "border-red-300 bg-red-50"}`}>
+                <div className="flex items-center gap-2 font-medium">
+                  {ok ? <CheckCircle2 className="size-4 text-green-700" /> : <XCircle className="size-4 text-red-700" />}
+                  {ok ? "Ready to run" : "Not ready — fix blockers below"}
+                </div>
+                {blockers.length > 0 && (
+                  <ul className="mt-2 ml-5 list-disc text-red-700">
+                    {blockers.map((b, i) => <li key={i}>{b}</li>)}
+                  </ul>
+                )}
+                {warnings.length > 0 && (
+                  <ul className="mt-2 ml-5 list-disc text-amber-800">
+                    {warnings.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                )}
+                <div className="mt-2 text-xs text-muted-foreground">
+                  POS mappings: {r.pos_mapping_count} · ZIP lookups: {r.zip_lookup_count} ·
+                  Pro-rata year: {r.pro_rata_year ?? "—"}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* --- Run controls --- */}
+          <div className="flex flex-wrap items-end gap-3">
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">Month</label>
+              <input
+                type="month"
+                value={allocMonth}
+                onChange={(e) => setAllocMonth(e.target.value)}
+                className="border rounded px-2 py-1.5 text-sm font-mono"
+              />
+            </div>
+            <Button
+              onClick={() => allocRunMut.mutate(allocMonth)}
+              disabled={allocRunMut.isPending || !allocReadinessQ.data?.has_pos_mappings || !allocReadinessQ.data?.has_sd_entity}
+            >
+              <RefreshCw className={`size-4 mr-1.5 ${allocRunMut.isPending ? "animate-spin" : ""}`} />
+              {allocRunMut.isPending ? "Running…" : `Run allocation for ${monthLabel(allocMonth)}`}
+            </Button>
+            {allocLastSummary && (
+              <Badge variant={allocLastSummary.failed_orders > 0 ? "destructive" : "secondary"} className="text-xs">
+                Last run: {allocLastSummary.orders_processed} orders → {allocLastSummary.allocations_written} rows
+              </Badge>
+            )}
+          </div>
+
+          {/* --- Run summary --- */}
+          {allocLastSummary && (
+            <div className="rounded border bg-muted/30 p-3 text-sm space-y-2">
+              <div className="font-medium flex items-center gap-2">
+                <Layers className="size-4" /> Run summary — {monthLabel(allocLastSummary.month)}
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                <div><span className="text-muted-foreground">Orders processed:</span> <span className="font-mono">{num(allocLastSummary.orders_processed)}</span></div>
+                <div><span className="text-muted-foreground">Line items:</span> <span className="font-mono">{num(allocLastSummary.line_items_processed)}</span></div>
+                <div><span className="text-muted-foreground">Allocation rows:</span> <span className="font-mono">{num(allocLastSummary.allocations_written)}</span></div>
+                <div><span className="text-muted-foreground">Needs review:</span> <span className={`font-mono ${allocLastSummary.needs_review_orders > 0 ? "text-amber-700" : ""}`}>{num(allocLastSummary.needs_review_orders)}</span></div>
+                <div><span className="text-muted-foreground">Failed:</span> <span className={`font-mono ${allocLastSummary.failed_orders > 0 ? "text-red-700" : ""}`}>{num(allocLastSummary.failed_orders)}</span></div>
+                <div><span className="text-muted-foreground">Ran at:</span> <span className="font-mono">{shortTime(allocLastSummary.ran_at)}</span></div>
+              </div>
+              <div className="text-xs">
+                <div className="text-muted-foreground mb-1">By method:</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {Object.entries(allocLastSummary.by_method).map(([m, n]) => (
+                    n > 0 ? <Badge key={m} variant="outline" className="font-mono">{m}: {num(n)}</Badge> : null
+                  ))}
+                </div>
+              </div>
+              {allocLastSummary.warnings && allocLastSummary.warnings.length > 0 && (
+                <div className="text-xs text-amber-800">
+                  <div className="font-medium">Warnings:</div>
+                  <ul className="ml-5 list-disc">
+                    {allocLastSummary.warnings.slice(0, 8).map((w, i) => <li key={i}>{w}</li>)}
+                    {allocLastSummary.warnings.length > 8 && <li>… and {allocLastSummary.warnings.length - 8} more</li>}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* --- Per-entity rollup --- */}
+          <div>
+            <div className="text-sm font-medium mb-2">Per-entity rollup — {monthLabel(allocMonth)}</div>
+            {allocRollupQ.isLoading ? (
+              <div className="text-sm text-muted-foreground">Loading…</div>
+            ) : !allocRollupQ.data || allocRollupQ.data.rows.length === 0 ? (
+              <div className="text-sm text-muted-foreground italic">No allocations yet for this month. Click “Run allocation” above.</div>
+            ) : (
+              <div className="overflow-x-auto border rounded">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 text-xs">
+                    <tr>
+                      <th className="text-left px-2 py-1.5">Entity</th>
+                      <th className="text-right px-2 py-1.5">Orders</th>
+                      <th className="text-right px-2 py-1.5">Line items</th>
+                      <th className="text-right px-2 py-1.5">Gross</th>
+                      <th className="text-right px-2 py-1.5">Tax</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allocRollupQ.data.rows.map((row) => (
+                      <tr key={row.entity_id} className="border-t">
+                        <td className="px-2 py-1.5">{row.entity_location ?? `Entity #${row.entity_id}`}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">{num(row.orders)}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">{num(row.line_items)}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">{money(row.gross_total)}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">{money(row.tax_total)}</td>
+                      </tr>
+                    ))}
+                    {(() => {
+                      const t = allocRollupQ.data.rows.reduce(
+                        (acc, r) => ({
+                          orders: acc.orders + r.orders,
+                          line_items: acc.line_items + r.line_items,
+                          gross: acc.gross + (r.gross_total ?? 0),
+                          tax: acc.tax + (r.tax_total ?? 0),
+                        }),
+                        { orders: 0, line_items: 0, gross: 0, tax: 0 }
+                      );
+                      return (
+                        <tr className="border-t bg-muted/30 font-medium">
+                          <td className="px-2 py-1.5">Total</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{num(t.orders)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{num(t.line_items)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{money(t.gross)}</td>
+                          <td className="px-2 py-1.5 text-right font-mono">{money(t.tax)}</td>
+                        </tr>
+                      );
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* --- Needs review --- */}
+          <div>
+            <div className="text-sm font-medium mb-2 flex items-center gap-2">
+              <ShieldAlert className="size-4 text-amber-700" />
+              Needs review {allocNeedsReviewQ.data && allocNeedsReviewQ.data.rows.length > 0 && (
+                <Badge variant="secondary" className="text-xs">{allocNeedsReviewQ.data.rows.length}</Badge>
+              )}
+            </div>
+            {allocNeedsReviewQ.isLoading ? (
+              <div className="text-sm text-muted-foreground">Loading…</div>
+            ) : !allocNeedsReviewQ.data || allocNeedsReviewQ.data.rows.length === 0 ? (
+              <div className="text-sm text-muted-foreground italic">No orders need manual review for this month.</div>
+            ) : (
+              <div className="overflow-x-auto border rounded">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 text-xs">
+                    <tr>
+                      <th className="text-left px-2 py-1.5">Order</th>
+                      <th className="text-left px-2 py-1.5">Date</th>
+                      <th className="text-left px-2 py-1.5">Source</th>
+                      <th className="text-left px-2 py-1.5">Item</th>
+                      <th className="text-right px-2 py-1.5">Gross</th>
+                      <th className="text-left px-2 py-1.5">Reason</th>
+                      <th className="text-left px-2 py-1.5">Override → entity</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allocNeedsReviewQ.data.rows.slice(0, 50).map((r, i) => {
+                      const k = `${r.order_id}::${r.line_item_id ?? "_"}`;
+                      const draft = overrideDraft[k] ?? "";
+                      const entities = coaMatrixQ.data?.entities ?? [];
+                      return (
+                        <tr key={i} className="border-t align-top">
+                          <td className="px-2 py-1.5 font-mono text-xs">{r.order_name ?? r.order_id}</td>
+                          <td className="px-2 py-1.5 text-xs">{shortDate(r.order_created_at)}</td>
+                          <td className="px-2 py-1.5 text-xs">{r.source_name ?? "—"}</td>
+                          <td className="px-2 py-1.5 text-xs">
+                            {r.title ?? r.sku ?? "—"}
+                            {r.line_item_id && <div className="text-muted-foreground font-mono">li {r.line_item_id}</div>}
+                          </td>
+                          <td className="px-2 py-1.5 text-right font-mono text-xs">{money(r.gross_amount)}</td>
+                          <td className="px-2 py-1.5 text-xs text-amber-800">{r.reason ?? "—"}</td>
+                          <td className="px-2 py-1.5 text-xs">
+                            <div className="flex items-center gap-1.5">
+                              <select
+                                value={draft}
+                                onChange={(e) => setOverrideDraft(prev => ({
+                                  ...prev,
+                                  [k]: e.target.value === "" ? "" : Number(e.target.value),
+                                }))}
+                                className="border rounded px-1.5 py-1 text-xs"
+                              >
+                                <option value="">— select —</option>
+                                {entities.map(e => (
+                                  <option key={e.id} value={e.id}>{e.location}</option>
+                                ))}
+                              </select>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={draft === "" || overrideMut.isPending}
+                                onClick={() => {
+                                  if (draft === "") return;
+                                  overrideMut.mutate({
+                                    order_id: r.order_id,
+                                    line_item_id: r.line_item_id,
+                                    entity_id: Number(draft),
+                                  });
+                                  setOverrideDraft(prev => ({ ...prev, [k]: "" }));
+                                }}
+                              >
+                                <Save className="size-3 mr-1" /> Save
+                              </Button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {allocNeedsReviewQ.data.rows.length > 50 && (
+                  <div className="text-xs text-muted-foreground p-2 border-t">
+                    Showing first 50 of {allocNeedsReviewQ.data.rows.length} rows.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ===== 9. Error log ===== */}
       {errorLogQ.data && errorLogQ.data.length > 0 && (
         <Card>
           <CardHeader>

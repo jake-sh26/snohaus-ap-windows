@@ -131,6 +131,13 @@ import {
   SHOPIFY_RECON_WEBHOOK_TOPICS,
 } from "./shopify-recon-webhooks";
 import {
+  runAllocationEngine,
+  listNeedsReview,
+  applyAllocationOverride,
+  getAllocationRollup,
+  getAllocationReadiness,
+} from "./shopify-recon-allocator";
+import {
   shopifyInstallHandler,
   shopifyCallbackHandler,
   shopifyInstallUrlHandler,
@@ -1318,6 +1325,72 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.json({ ok: true, ...result });
     } catch (e: any) {
       res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    }
+  });
+
+  // ---- PR #R4 — Allocation engine (read-only Phase 1) ----
+  // Allocates each order line_item + shipping + tax to a legal entity
+  // (SD Ski/Patio, SH Hempstead, SH Huntington) using a layered set of
+  // methods: pos_location → fulfillment_location → warehouse_rollup →
+  // zip_lookup (digital gift cards) → prior_year_pro_rata → manual_override
+  // → needs_review. This is purely a read-only computation; no QBO posting.
+  app.get("/api/recon/allocations/readiness", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    try {
+      res.json(getAllocationReadiness());
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  app.post("/api/recon/allocations/run", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const month = String(req.body?.month ?? "").trim();
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ error: "month must be YYYY-MM" });
+    }
+    try {
+      const summary = runAllocationEngine(month);
+      res.json({ ok: true, ...summary });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    }
+  });
+
+  app.get("/api/recon/allocations/needs-review", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = typeof req.query.month === "string" && /^\d{4}-\d{2}$/.test(req.query.month)
+      ? req.query.month
+      : undefined;
+    try {
+      res.json({ rows: listNeedsReview(month) });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  app.post("/api/recon/allocations/override", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const order_id = String(req.body?.order_id ?? "").trim();
+    const line_item_id = req.body?.line_item_id == null ? null : String(req.body.line_item_id).trim();
+    const entity_id = Number(req.body?.entity_id);
+    if (!order_id || !Number.isFinite(entity_id)) {
+      return res.status(400).json({ error: "order_id and numeric entity_id required" });
+    }
+    const user = String(req.user?.email ?? req.user?.id ?? "system");
+    try {
+      const result = applyAllocationOverride({ order_id, line_item_id, entity_id, user });
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+    }
+  });
+
+  app.get("/api/recon/allocations/rollup", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = typeof req.query.month === "string" ? req.query.month : "";
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ error: "month must be YYYY-MM" });
+    }
+    try {
+      res.json({ rows: getAllocationRollup(month) });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
     }
   });
 
