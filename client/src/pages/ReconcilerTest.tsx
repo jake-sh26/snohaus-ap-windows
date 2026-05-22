@@ -9,7 +9,7 @@
  * to register/reset webhook subscriptions on the Shopify side and the manual
  * sync trigger (which is also automated on boot + every 6h).
  */
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -331,32 +331,64 @@ export default function ReconcilerTest() {
       qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
     },
   });
-  // PR #R4b — Fulfillment backfill. For orders ingested before R4b shipped,
+  // PR #R4b/R4c — Fulfillment backfill. For orders ingested before R4b shipped,
   // re-pulls each order's fulfillments[] only and rewrites recon_order_fulfillments.
-  // Order/line item rows are NOT touched. Used to make past months' allocations
-  // pick up the correct online-store ship-from location.
+  // Order/line item rows are NOT touched. R4c uses the list endpoint so a month
+  // is ~3-4 API calls instead of 700+, and we poll progress while it runs.
   type FulfillmentBackfillResult = {
     orders_scanned: number;
     orders_updated: number;
     fulfillments_written: number;
     errors: number;
+    pages: number;
     syncLogId: number;
     error?: string;
   };
+  type BackfillProgress = {
+    syncLogId: number;
+    state: "running" | "success" | "failure";
+    pages: number;
+    total_pages_estimate: number | null;
+    orders_scanned: number;
+    orders_updated: number;
+    fulfillments_written: number;
+    errors: number;
+    startedAt: string;
+    finishedAt: string | null;
+    error?: string;
+    message?: string;
+  };
   const [backfillSince, setBackfillSince] = useState<string>("");
   const [backfillUntil, setBackfillUntil] = useState<string>("");
+  const [backfillProgress, setBackfillProgress] = useState<BackfillProgress | null>(null);
   const fulfillmentBackfillMut = useMutation<FulfillmentBackfillResult, Error, { since: string; until?: string }>({
     mutationFn: (args) => jsonPost<FulfillmentBackfillResult>("/api/recon/shopify/sync/fulfillments-backfill", args),
     onSuccess: (r) => {
       setLastAction(
         r.error
           ? `Fulfillment backfill error: ${r.error}`
-          : `Backfill: ${r.orders_scanned} scanned, ${r.orders_updated} updated, ${r.fulfillments_written} fulfillment rows written, ${r.errors} errors`,
+          : `Backfill: ${r.orders_scanned} scanned, ${r.orders_updated} updated, ${r.fulfillments_written} fulfillment rows written, ${r.errors} errors (${r.pages} page(s))`,
       );
       qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
     },
     onError: (e: any) => setLastAction(`Fulfillment backfill failed: ${e?.message ?? e}`),
   });
+  // Poll progress every 1.5s while a backfill is running.
+  useEffect(() => {
+    if (!fulfillmentBackfillMut.isPending) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch("/api/recon/shopify/sync/fulfillments-backfill/progress", { credentials: "include" });
+        if (!res.ok) return;
+        const j = await res.json();
+        if (!cancelled && j.progress) setBackfillProgress(j.progress as BackfillProgress);
+      } catch { /* ignore poll errors */ }
+    };
+    void tick();
+    const id = window.setInterval(tick, 1500);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [fulfillmentBackfillMut.isPending]);
   const registerMut = useMutation<WebhookRegResult>({
     mutationFn: () => jsonPost("/api/recon/shopify/webhooks/register"),
     onSuccess: (r) => setLastAction(`Webhooks: ${r.results.map(x => `${x.topic}=${x.state}`).join(", ")}`),
@@ -940,7 +972,7 @@ export default function ReconcilerTest() {
                   type="date"
                   value={backfillSince}
                   onChange={(e) => setBackfillSince(e.target.value)}
-                  className="border rounded px-2 py-1.5 text-sm font-mono"
+                  className="border rounded px-2 py-1.5 text-sm font-mono bg-background text-foreground [color-scheme:light_dark]"
                 />
               </div>
               <div>
@@ -949,24 +981,42 @@ export default function ReconcilerTest() {
                   type="date"
                   value={backfillUntil}
                   onChange={(e) => setBackfillUntil(e.target.value)}
-                  className="border rounded px-2 py-1.5 text-sm font-mono"
+                  className="border rounded px-2 py-1.5 text-sm font-mono bg-background text-foreground [color-scheme:light_dark]"
                 />
               </div>
               <Button
                 size="sm"
                 variant="outline"
                 disabled={!configured || !backfillSince || fulfillmentBackfillMut.isPending}
-                onClick={() =>
+                onClick={() => {
+                  setBackfillProgress(null);
                   fulfillmentBackfillMut.mutate({
                     since: backfillSince,
                     until: backfillUntil || undefined,
-                  })
-                }
+                  });
+                }}
               >
                 <RefreshCw className={`size-4 mr-1.5 ${fulfillmentBackfillMut.isPending ? "animate-spin" : ""}`} />
                 {fulfillmentBackfillMut.isPending ? "Backfilling…" : "Backfill fulfillments"}
               </Button>
             </div>
+            {fulfillmentBackfillMut.isPending && backfillProgress && (
+              <div className="text-xs rounded-md border border-blue-200 bg-blue-50 p-2.5 text-blue-900">
+                <div className="flex items-center gap-2">
+                  <RefreshCw className="size-3.5 animate-spin" />
+                  <span className="font-medium">{backfillProgress.message ?? "Working…"}</span>
+                </div>
+                <div className="mt-1 font-mono">
+                  page {backfillProgress.pages}
+                  {backfillProgress.total_pages_estimate ? ` / ~${backfillProgress.total_pages_estimate}` : ""}
+                  {" — "}
+                  {backfillProgress.orders_scanned} scanned,
+                  {" "}{backfillProgress.orders_updated} updated,
+                  {" "}{backfillProgress.fulfillments_written} fulfillments
+                  {backfillProgress.errors > 0 ? `, ${backfillProgress.errors} errors` : ""}
+                </div>
+              </div>
+            )}
             {fulfillmentBackfillMut.data && (
               <div
                 className={`text-sm rounded-md border p-3 ${
@@ -2085,7 +2135,7 @@ export default function ReconcilerTest() {
                                   ...prev,
                                   [k]: e.target.value === "" ? "" : Number(e.target.value),
                                 }))}
-                                className="border rounded px-1.5 py-1 text-xs"
+                                className="border rounded px-1.5 py-1 text-xs bg-background text-foreground"
                               >
                                 <option value="">— select —</option>
                                 {entities.map(e => (

@@ -121,6 +121,8 @@ import {
   syncOrdersIncremental,
   transformShopifyOrder,
   backfillFulfillments,
+  getBackfillProgress,
+  listRecentBackfillProgress,
 } from "./shopify-recon-orders";
 import {
   syncPayoutsIncremental,
@@ -1171,6 +1173,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const untilIso = until ? `${until}T00:00:00Z` : undefined;
     const result = await backfillFulfillments(triggeredBy, { sinceIso, untilIso });
     res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // PR #R4c — progress poll for the fulfillment backfill. Returns the most
+  // recent in-progress or completed run, or by syncLogId if specified.
+  app.get("/api/recon/shopify/sync/fulfillments-backfill/progress", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    const idStr = String(req.query.syncLogId || "").trim();
+    if (idStr) {
+      const id = parseInt(idStr, 10);
+      const p = Number.isFinite(id) ? getBackfillProgress(id) : null;
+      return res.json({ progress: p });
+    }
+    const recent = listRecentBackfillProgress();
+    res.json({ progress: recent[0] ?? null, recent });
   });
 
   // Current orders watermark (read-only) — shown in the Settings UI so the user
