@@ -735,13 +735,42 @@ export function applyAllocationOverride(args: {
 
 /**
  * Per-entity per-month allocation rollup (used by the summary card).
+ *
+ * PR #R4k — Gift-card carve-out. Shopify's Net sales / Gross sales reports
+ * exclude gift card issuance — the face value of a sold GC is recorded as a
+ * LIABILITY, not revenue, until the customer redeems it. To make our rollup
+ * tie out to Shopify (and to QBO once we wire JE posting in Phase 2), we now
+ * split the per-entity total into two columns:
+ *
+ *   gross_total            — merchandise revenue only, matches Shopify Net
+ *                            sales (after discounts, before refunds).
+ *   gc_issuance_total      — face value of digital gift cards issued in the
+ *                            month, allocated to the issuer entity by the
+ *                            R4d issuance cascade (customer_affinity →
+ *                            zip_radius → fallback_sd). Mirrors Shopify's
+ *                            "Net sales from gift cards" finance report.
+ *
+ * "Total Shopify activity" — if you want a single number that ties to
+ * Shopify's gross-sales-minus-discounts — is `gross_total + gc_issuance_total`.
+ *
+ * GC detection rule MUST mirror the allocator's branch at allocateLineItem():
+ * a digital gift card has line_items.is_gift_card = 1 AND requires_shipping = 0.
+ * Physical gift cards (requires_shipping = 1) ship like regular merchandise
+ * and ARE counted as gross revenue, which also matches Shopify's treatment
+ * (Shopify distinguishes by product type, and physical GC products typically
+ * carry actual SKU/inventory).
  */
 export type AllocationRollupRow = {
   entity_id: number;
   entity_location: string | null;
   orders: number;
   line_items: number;
+  // Merchandise gross only (excludes digital GC issuance) — ties to
+  // Shopify Net sales + |Returns|.
   gross_total: number;
+  // PR #R4k — digital GC issuance face value, allocated to the issuer
+  // entity. Ties to Shopify "Net sales from gift cards" report.
+  gc_issuance_total: number;
   tax_total: number;
 };
 
@@ -749,6 +778,11 @@ export function getAllocationRollup(month: string): AllocationRollupRow[] {
   const [y, m] = month.split("-").map(Number);
   const start = `${month}-01T00:00:00Z`;
   const end = m === 12 ? `${y + 1}-01-01T00:00:00Z` : `${y}-${String(m + 1).padStart(2, "0")}-01T00:00:00Z`;
+  // Join recon_line_items so we can branch on is_gift_card + requires_shipping.
+  // LEFT JOIN with COALESCE preserves any historical allocation rows whose
+  // line_item_id is null (cross-entity GC redemption legs, manual overrides
+  // without a specific line) — those are treated as merchandise (gc=0,
+  // ships=1) so they fall into gross_total, matching pre-R4k behaviour.
   return sqlite
     .prepare(
       `SELECT
@@ -756,10 +790,22 @@ export function getAllocationRollup(month: string): AllocationRollupRow[] {
          e.location AS entity_location,
          COUNT(DISTINCT a.order_id) AS orders,
          COUNT(a.line_item_id) AS line_items,
-         SUM(a.gross_amount) AS gross_total,
+         SUM(CASE
+               WHEN COALESCE(li.is_gift_card, 0) = 1
+                    AND COALESCE(li.requires_shipping, 1) = 0
+               THEN 0
+               ELSE a.gross_amount
+             END) AS gross_total,
+         SUM(CASE
+               WHEN COALESCE(li.is_gift_card, 0) = 1
+                    AND COALESCE(li.requires_shipping, 1) = 0
+               THEN a.gross_amount
+               ELSE 0
+             END) AS gc_issuance_total,
          SUM(a.tax_amount) AS tax_total
        FROM recon_allocations a
        JOIN recon_orders o ON o.id = a.order_id
+       LEFT JOIN recon_line_items li ON li.id = a.line_item_id
        LEFT JOIN payroll_entities e ON e.id = a.entity_id
        WHERE o.created_at >= ? AND o.created_at < ?
        GROUP BY a.entity_id, e.location
