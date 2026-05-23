@@ -127,6 +127,7 @@ import {
   transformShopifyOrder,
   backfillFulfillments,
   backfillRefundsFromRawJson,
+  repullStaleRefunds,
   getBackfillProgress,
   listRecentBackfillProgress,
   getActiveBackfillProgress,
@@ -1254,6 +1255,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const sinceIso = `${since}T00:00:00Z`;
     const untilIso = until ? `${until}T00:00:00Z` : undefined;
     const result = await backfillRefundsFromRawJson(triggeredBy, { sinceIso, untilIso });
+    res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // PR #R4l-a-fix — Re-pull stale refund data from Shopify for variance
+  // exceptions. Catches the Pattern-1 case where Shopify shows the order as
+  // refunded but our local raw_json.refunds[] is empty (missed webhook, or
+  // updated_at not bumped). Bounded by `limit` (default 100, max 500) to
+  // avoid rate-limit surprises.
+  app.post("/api/recon/refunds/repull-stale", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const limit = req.body?.limit != null ? Number(req.body.limit) : undefined;
+    if (limit != null && (!Number.isFinite(limit) || limit < 1 || limit > 500)) {
+      return res.status(400).json({ message: "`limit` must be an integer between 1 and 500" });
+    }
+    const triggeredBy = `manual:${req.user?.email || "unknown"}`;
+    const result = await repullStaleRefunds(triggeredBy, { limit });
     res.status(result.error ? 502 : 200).json(result);
   });
 
