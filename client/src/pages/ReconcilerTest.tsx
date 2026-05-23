@@ -461,6 +461,61 @@ export default function ReconcilerTest() {
     },
     onError: (e: any) => setLastAction(`Stop request failed: ${e?.message ?? e}`),
   });
+
+  // ---- PR #R4l-a: Refunds backfill (raw_json, no Shopify API) -----------
+  // Refunds backfill is a pure local re-parse of the raw_json column on every
+  // order in the date range, so we don't need the same progress-poll machinery
+  // as the fulfillments backfill (which makes hundreds of Shopify API calls).
+  // This typically finishes in <30s for a year of history. We surface the
+  // single-shot response inline like the original syncMut UX.
+  type RefundsBackfillResult = {
+    orders_scanned: number;
+    orders_updated: number;
+    refunds_written: number;
+    refund_lines_written: number;
+    variance_flags_set: number;
+    errors: number;
+    syncLogId: number;
+    error?: string;
+  };
+  const refundsBackfillMut = useMutation<RefundsBackfillResult, Error, { since: string; until?: string }>({
+    mutationFn: (args) => jsonPost<RefundsBackfillResult>("/api/recon/refunds/backfill", args),
+    onSuccess: (r) => {
+      if (r.error) {
+        setLastAction(`Refunds backfill error: ${r.error}`);
+        return;
+      }
+      setLastAction(
+        `Refunds backfill: ${r.orders_scanned} scanned, ${r.orders_updated} with refunds, ` +
+          `${r.refunds_written} refunds + ${r.refund_lines_written} lines written, ` +
+          `${r.variance_flags_set} variance flags, ${r.errors} errors.`,
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/orders"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/refunds/variances"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
+    },
+    onError: (e: any) => setLastAction(`Refunds backfill failed: ${e?.message ?? e}`),
+  });
+
+  // List of orders that failed the per-order refund variance check. Polled
+  // alongside other recon data so the badge updates after every sync.
+  const refundVariancesQ = useQuery<{
+    orders: Array<{
+      id: string;
+      order_number: string | null;
+      name: string | null;
+      created_at: string;
+      total_price: number | null;
+      current_total_price: number | null;
+      total_refunded: number | null;
+      refund_variance_amount: number | null;
+    }>;
+    count: number;
+  }>({
+    queryKey: ["/api/recon/refunds/variances"],
+    queryFn: () => jsonGet("/api/recon/refunds/variances?limit=200"),
+    refetchInterval: 30_000,
+  });
   const registerMut = useMutation<WebhookRegResult>({
     mutationFn: () => jsonPost("/api/recon/shopify/webhooks/register"),
     onSuccess: (r) => setLastAction(`Webhooks: ${r.results.map(x => `${x.topic}=${x.state}`).join(", ")}`),
@@ -1236,6 +1291,121 @@ export default function ReconcilerTest() {
                   </div>
                 )}
               </div>
+            )}
+          </div>
+
+          {/* ===== PR #R4l-a: Refunds backfill (raw_json, no API calls) ===== */}
+          <Separator className="my-2" />
+          <div className="space-y-2">
+            <div className="text-sm font-medium flex items-center gap-1.5">
+              <RefreshCw className="size-4" /> Refunds backfill (PR #R4l-a)
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Re-parses <code className="text-[10px]">raw_json</code> on every order in the date range
+              to populate <code className="text-[10px]">recon_refunds</code> + <code className="text-[10px]">recon_refund_line_items</code>
+              and the post-refund <code className="text-[10px]">current_*</code> columns.
+              No Shopify API calls — finishes in seconds. Run this once after
+              the R4l-a deploy, then re-run if you ever re-sync orders to repopulate refunds.
+              Uses the <b>Since</b>/<b>Until</b> dates above.
+            </div>
+            <div className="flex flex-wrap items-end gap-3">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!configured || !backfillSince || refundsBackfillMut.isPending}
+                onClick={() => {
+                  refundsBackfillMut.mutate({
+                    since: backfillSince,
+                    until: backfillUntil || undefined,
+                  });
+                }}
+              >
+                <RefreshCw className={`size-4 mr-1.5 ${refundsBackfillMut.isPending ? "animate-spin" : ""}`} />
+                {refundsBackfillMut.isPending ? "Backfilling refunds…" : "Backfill refunds (range)"}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!configured || refundsBackfillMut.isPending}
+                onClick={() => {
+                  const floor = settingsQ.data?.initial_sync_from || "2025-01-01";
+                  const ok = window.confirm(
+                    `Backfill refunds for ALL orders since ${floor}? This is a local-only operation — typically <30s.`,
+                  );
+                  if (!ok) return;
+                  refundsBackfillMut.mutate({ since: floor });
+                }}
+              >
+                <RefreshCw className={`size-4 mr-1.5 ${refundsBackfillMut.isPending ? "animate-spin" : ""}`} />
+                Backfill refunds (all history)
+              </Button>
+            </div>
+            {refundsBackfillMut.data && (
+              <div
+                className={`text-sm rounded-md border p-3 ${
+                  refundsBackfillMut.data.error
+                    ? "border-red-200 bg-red-50"
+                    : refundsBackfillMut.data.variance_flags_set > 0
+                    ? "border-amber-200 bg-amber-50"
+                    : "border-green-200 bg-green-50"
+                }`}
+              >
+                {refundsBackfillMut.data.error ? (
+                  <div className="text-red-800">
+                    <AlertTriangle className="size-4 inline mr-1" />
+                    {refundsBackfillMut.data.error}
+                  </div>
+                ) : (
+                  <div className={refundsBackfillMut.data.variance_flags_set > 0 ? "text-amber-900" : "text-green-800"}>
+                    Scanned <b>{refundsBackfillMut.data.orders_scanned}</b>,{" "}
+                    refunds on <b>{refundsBackfillMut.data.orders_updated}</b> order(s),{" "}
+                    wrote <b>{refundsBackfillMut.data.refunds_written}</b> refunds +{" "}
+                    <b>{refundsBackfillMut.data.refund_lines_written}</b> refund line(s).
+                    {refundsBackfillMut.data.variance_flags_set > 0 && (
+                      <>
+                        {" "}
+                        <AlertTriangle className="size-4 inline mr-0.5" />
+                        <b>{refundsBackfillMut.data.variance_flags_set}</b> order(s) flagged as variance exceptions.
+                      </>
+                    )}
+                    {refundsBackfillMut.data.errors > 0 ? ` ${refundsBackfillMut.data.errors} error(s).` : ""}
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Variance exceptions list — always rendered if any exist, even
+                without a fresh backfill run, so a stale flag is still visible. */}
+            {refundVariancesQ.data && refundVariancesQ.data.count > 0 && (
+              <details className="text-xs rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-1.5">
+                <summary className="cursor-pointer select-none font-medium text-amber-900">
+                  <AlertTriangle className="size-3.5 inline mr-1" />
+                  {refundVariancesQ.data.count} order(s) with refund variance &gt; $0.01
+                </summary>
+                <div className="mt-2 max-h-60 overflow-y-auto">
+                  <table className="w-full text-[11px] font-mono">
+                    <thead className="sticky top-0 bg-amber-50">
+                      <tr className="text-left">
+                        <th className="px-1 py-1">Order</th>
+                        <th className="px-1 py-1">Total</th>
+                        <th className="px-1 py-1">Current</th>
+                        <th className="px-1 py-1">Refunded</th>
+                        <th className="px-1 py-1">Variance</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {refundVariancesQ.data.orders.slice(0, 50).map((o) => (
+                        <tr key={o.id} className="border-t border-amber-200/50">
+                          <td className="px-1 py-0.5">{o.name ?? `#${o.order_number ?? o.id}`}</td>
+                          <td className="px-1 py-0.5">${(o.total_price ?? 0).toFixed(2)}</td>
+                          <td className="px-1 py-0.5">${(o.current_total_price ?? 0).toFixed(2)}</td>
+                          <td className="px-1 py-0.5">${(o.total_refunded ?? 0).toFixed(2)}</td>
+                          <td className="px-1 py-0.5 font-medium">${(o.refund_variance_amount ?? 0).toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
             )}
           </div>
         </CardContent>
