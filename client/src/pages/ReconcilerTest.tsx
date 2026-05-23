@@ -497,6 +497,37 @@ export default function ReconcilerTest() {
     onError: (e: any) => setLastAction(`Refunds backfill failed: ${e?.message ?? e}`),
   });
 
+  // ---- PR #R4l-a-fix: Re-pull stale refunds from Shopify -------------------
+  // For Pattern-1 orders (refunded per Shopify but no local refund rows). One
+  // Shopify API call per candidate; bounded by `limit` to stay under the rate
+  // limit. The leaky-bucket in shopifyRestCall handles throttling.
+  type StaleRefundsRepullResult = {
+    candidates_found: number;
+    re_pulled: number;
+    refunds_added: number;
+    variances_cleared: number;
+    errors: number;
+    syncLogId: number;
+    error?: string;
+  };
+  const repullStaleRefundsMut = useMutation<StaleRefundsRepullResult, Error, { limit?: number }>({
+    mutationFn: (args) => jsonPost<StaleRefundsRepullResult>("/api/recon/refunds/repull-stale", args),
+    onSuccess: (r) => {
+      if (r.error) {
+        setLastAction(`Stale refunds re-pull error: ${r.error}`);
+        return;
+      }
+      setLastAction(
+        `Re-pull: ${r.candidates_found} candidates, ${r.re_pulled} re-pulled, ` +
+          `${r.refunds_added} new refund row(s), ${r.variances_cleared} variance(s) cleared, ${r.errors} error(s).`,
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/orders"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/refunds/variances"] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/sync-log"] });
+    },
+    onError: (e: any) => setLastAction(`Stale refunds re-pull failed: ${e?.message ?? e}`),
+  });
+
   // List of orders that failed the per-order refund variance check. Polled
   // alongside other recon data so the badge updates after every sync.
   const refundVariancesQ = useQuery<{
@@ -1373,6 +1404,33 @@ export default function ReconcilerTest() {
                 )}
               </div>
             )}
+            {/* PR #R4l-a-fix — Re-pull stale refunds button. Shopify API calls,
+                one per candidate. Bounded by limit to stay under rate caps. */}
+            <div className="flex flex-wrap items-end gap-3 pt-1">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!configured || repullStaleRefundsMut.isPending}
+                onClick={() => {
+                  const ok = window.confirm(
+                    "Re-pull up to 100 orders flagged as variance exceptions (or fully-refunded with no local refunds) from Shopify? Makes ~1 Shopify API call per candidate.",
+                  );
+                  if (!ok) return;
+                  repullStaleRefundsMut.mutate({ limit: 100 });
+                }}
+              >
+                <RefreshCw className={`size-4 mr-1.5 ${repullStaleRefundsMut.isPending ? "animate-spin" : ""}`} />
+                {repullStaleRefundsMut.isPending ? "Re-pulling from Shopify…" : "Re-pull stale refunds (Shopify API)"}
+              </Button>
+              {repullStaleRefundsMut.data && !repullStaleRefundsMut.data.error && (
+                <div className="text-xs text-muted-foreground">
+                  {repullStaleRefundsMut.data.candidates_found} candidate(s),{" "}
+                  {repullStaleRefundsMut.data.re_pulled} re-pulled,{" "}
+                  <b>{repullStaleRefundsMut.data.refunds_added}</b> new refund(s),{" "}
+                  <b>{repullStaleRefundsMut.data.variances_cleared}</b> variance(s) cleared.
+                </div>
+              )}
+            </div>
             {/* Variance exceptions list — always rendered if any exist, even
                 without a fresh backfill run, so a stale flag is still visible. */}
             {refundVariancesQ.data && refundVariancesQ.data.count > 0 && (

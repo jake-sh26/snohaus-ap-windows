@@ -132,15 +132,29 @@ export function transformShopifyOrder(o: any): {
   // when this is missing.
   const locationId = o.location_id != null ? String(o.location_id) : null;
 
-  // ---- Refunds (PR #R4l-a) ------------------------------------------------
+  // ---- Refunds (PR #R4l-a, math fixed in #R4l-a-fix) ----------------------
   // Shopify ships the full refunds[] array on every /orders.json payload, so
   // we extract it inline here — no separate API call needed for backfill.
   //
-  // Per-refund totals are SUM(refund_line_items) + SUM(order_adjustments).
-  // Note that adjustments cover shipping refunds AND restocking fees (which
-  // appear as a NEGATIVE adjustment from the merchant's POV — i.e. "we kept
-  // some of the refund as a fee" reduces the cash refunded). We pass both
-  // through verbatim and let downstream consumers sum signed amounts.
+  // Sign convention for order_adjustments[]:
+  //   * Shopify's `amount` is the SIGNED delta to merchant cash.
+  //   * Shipping refunds appear as NEGATIVE amount (e.g. -15.00) meaning cash
+  //     left the merchant on top of the line refunds.
+  //   * Restocking fees the merchant retains also appear as NEGATIVE on the
+  //     refund_discrepancy adjustment line — but Shopify also writes a
+  //     corresponding `refund_discrepancy` adjustment that, when positive,
+  //     means merchant KEPT cash instead of refunding it.
+  //
+  // Per-refund cash-out invariant we enforce:
+  //   customer_cash_out = items_subtotal + items_tax
+  //                       + |adjustments where amount<0|   (shipping refunds)
+  //                       - |adjustments where amount>0|   (merchant retained)
+  //
+  // i.e. negative adjustment amounts represent additional cash going OUT to
+  // the customer (shipping refund), positive amounts represent cash retained
+  // BY the merchant (restocking fee, discrepancy). The order-level invariant
+  // total_price - current_total_price = Σ customer_cash_out holds across
+  // every refund pattern Shopify ships.
   const rawRefunds = Array.isArray(o.refunds) ? o.refunds : [];
   const refunds: ReconRefundUpsert[] = [];
   const refund_lines: ReconRefundLineItemUpsert[] = [];
@@ -182,16 +196,24 @@ export function transformShopifyOrder(o: any): {
     }
 
     // order_adjustments[] — shipping refunds + restocking-fee adjustments.
-    // Stored as kind='adjustment' rows so the rollup can sum line + adj in
-    // one query.
+    // Signed amounts. Negative = more cash out to customer; positive = cash
+    // retained by merchant (restocking fee, discrepancy).
     const adjs = Array.isArray(r.order_adjustments) ? r.order_adjustments : [];
-    let adjAmount = 0;
-    let adjTax = 0;
+    let adjAmountSigned = 0;   // signed sum, for storage/audit
+    let adjTaxSigned = 0;
+    let extraCashOut = 0;      // |negative adjustment amounts| → adds to refund
+    let merchantRetained = 0;  // |positive adjustment amounts| → subtracts from refund
+    let extraTaxOut = 0;
+    let taxRetained = 0;
     for (const a of adjs) {
       const amt = numOr0(a.amount);
       const tax = numOr0(a.tax_amount);
-      adjAmount += amt;
-      adjTax += tax;
+      adjAmountSigned += amt;
+      adjTaxSigned += tax;
+      if (amt < 0) extraCashOut += -amt;
+      else merchantRetained += amt;
+      if (tax < 0) extraTaxOut += -tax;
+      else taxRetained += tax;
       refund_lines.push({
         // Adjustments use Shopify's adjustment id, prefixed to avoid PK
         // collision with refund_line_items (both id namespaces overlap).
@@ -201,9 +223,9 @@ export function transformShopifyOrder(o: any): {
         kind: "adjustment",
         line_item_id: null,
         quantity: 0,
-        // Adjustments come in signed amounts; store absolute and let downstream
-        // interpret. Most are negative-to-merchant (more cash out) so we keep
-        // the sign by storing amt as-is in subtotal. Tax mirrors.
+        // Store the SIGNED amount as-is so the raw_json round-trips cleanly
+        // and audits can see the original direction. The rollup uses the
+        // canonical formula below, not these raw values.
         subtotal: amt,
         total_tax: tax,
         restock_type: null,
@@ -212,7 +234,14 @@ export function transformShopifyOrder(o: any): {
       });
     }
 
-    const rTotal = rSubtotal + rTax + adjAmount + adjTax;
+    // Canonical customer cash refunded for this refund.
+    // Always ≥ 0 (we floor at 0 in case Shopify ever sends an inverted
+    // adjustment that exceeds the item refund — we'd rather log a 0 refund
+    // and trip the variance flag than store negative cash).
+    const rTotal = Math.max(
+      0,
+      rSubtotal + rTax + extraCashOut + extraTaxOut - merchantRetained - taxRetained,
+    );
     refunds.push({
       id: refundId,
       order_id: orderId,
@@ -222,8 +251,8 @@ export function transformShopifyOrder(o: any): {
       subtotal: rSubtotal,
       total_tax: rTax,
       total_refunded: rTotal,
-      adjustment_amount: adjAmount,
-      adjustment_tax: adjTax,
+      adjustment_amount: adjAmountSigned,
+      adjustment_tax: adjTaxSigned,
       restocked,
       raw_json: JSON.stringify(r),
     });
@@ -357,25 +386,27 @@ export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount:
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { sqlite } = require("./storage");
   const ord = sqlite
-    .prepare(`SELECT total_price, current_total_price FROM recon_orders WHERE id = ?`)
-    .get(orderId) as { total_price: number | null; current_total_price: number | null } | undefined;
+    .prepare(`SELECT total_price, current_total_price, financial_status FROM recon_orders WHERE id = ?`)
+    .get(orderId) as { total_price: number | null; current_total_price: number | null; financial_status: string | null } | undefined;
   if (!ord) return { flag: 0, amount: 0 };
+  // Shopify's invariant: total_price - current_total_price = customer cash refunded.
+  // current_total_price is post-refund; if Shopify omitted it we already filled it
+  // from total_price - aggregateRefundedTotal in transformShopifyOrder, so falling
+  // back to total_price here means "no refund expected" (variance = -actual which
+  // will correctly flag if there are unexpected refund rows).
   const expected =
     (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+  // PR #R4l-a-fix: use recon_refunds.total_refunded (canonical, sign-corrected)
+  // instead of re-summing recon_refund_line_items which stores SIGNED adjustment
+  // amounts and can't be summed without sign-aware logic.
   const actual = (sqlite
     .prepare(
-      `SELECT COALESCE(SUM(subtotal + total_tax), 0) AS total
-       FROM recon_refund_line_items
-       WHERE order_id = ? AND kind = 'item'`
+      `SELECT COALESCE(SUM(total_refunded), 0) AS total
+       FROM recon_refunds
+       WHERE order_id = ?`
     )
     .get(orderId) as { total: number }).total;
-  const adj = (sqlite
-    .prepare(
-      `SELECT COALESCE(SUM(subtotal + total_tax), 0) AS total
-       FROM recon_refund_line_items
-       WHERE order_id = ? AND kind = 'adjustment'`
-    )
-    .get(orderId) as { total: number }).total;
+  const adj = 0; // adjustments already folded into total_refunded above
   // Variance: how far off our cash-refunded total (items+tax+adjustments) is
   // from Shopify's own delta between total_price and current_total_price.
   const variance = expected - (actual + adj);
@@ -998,6 +1029,146 @@ export async function backfillRefundsFromRawJson(
       refunds_written: refundsWritten,
       refund_lines_written: linesWritten,
       variance_flags_set: varianceFlags,
+      errors,
+      syncLogId,
+      error: msg,
+    };
+  }
+}
+
+// ============================================================================
+// PR #R4l-a-fix — Re-pull stale refund data from Shopify.
+// ----------------------------------------------------------------------------
+// Some orders in the variance list have current_total_price < total_price
+// (Shopify says cash was refunded) but our refunds[] array is empty. Root
+// cause: webhook missed the refund event, or the order was ingested before
+// the refund existed and was never re-synced because Shopify didn't bump
+// updated_at when the refund posted (yes, Shopify has this bug).
+//
+// Fix: query for variance-flagged orders with NO refund rows, re-fetch each
+// from Shopify's /orders/{id}.json (the FULL payload, which always includes
+// the current refunds[] array), and re-ingest. This is the ONLY path in the
+// reconciler that makes Shopify API calls during variance recovery, so we
+// cap it at 100 orders per run to stay well under the leaky-bucket budget.
+// ============================================================================
+
+export type StaleRefundsRepullResult = {
+  candidates_found: number;
+  re_pulled: number;
+  refunds_added: number;
+  variances_cleared: number;
+  errors: number;
+  error?: string;
+  syncLogId: number;
+};
+
+export async function repullStaleRefunds(
+  triggeredBy: string,
+  opts: { limit?: number } = {},
+): Promise<StaleRefundsRepullResult> {
+  const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+  const syncLogId = startReconSync("refunds-repull", triggeredBy, new Date().toISOString());
+  let candidates = 0;
+  let rePulled = 0;
+  let refundsAdded = 0;
+  let variancesCleared = 0;
+  let errors = 0;
+
+  try {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) throw new Error("Shopify reconciler not configured");
+    const { sqlite } = await import("./storage");
+
+    // Candidates: orders flagged as variance exceptions OR with no refund rows
+    // despite a current_total_price < total_price gap, OR with financial_status
+    // in ('refunded','partially_refunded') and no refund rows. We union all
+    // three cases so we catch every stale-refund pattern in one pass.
+    const rows = sqlite
+      .prepare(`
+        SELECT o.id
+        FROM recon_orders o
+        LEFT JOIN (
+          SELECT order_id, COUNT(*) AS n FROM recon_refunds GROUP BY order_id
+        ) rc ON rc.order_id = o.id
+        WHERE (
+          o.refund_variance_flag = 1
+          OR (o.financial_status IN ('refunded','partially_refunded') AND COALESCE(rc.n, 0) = 0)
+          OR ((COALESCE(o.current_total_price, o.total_price) < o.total_price - 0.01) AND COALESCE(rc.n, 0) = 0)
+        )
+        ORDER BY o.created_at DESC
+        LIMIT ?
+      `)
+      .all(limit) as Array<{ id: string }>;
+
+    candidates = rows.length;
+
+    for (const row of rows) {
+      try {
+        // Per-order Shopify fetch — returns the canonical payload including
+        // refunds[] + order_adjustments[]. ~300ms per call; leaky-bucket
+        // in shopifyRestCall keeps us under the rate limit.
+        const res = await shopifyRestCall(cfg, `/orders/${row.id}.json`);
+        const o = res.json?.order;
+        if (!o) {
+          errors++;
+          srWarn("refunds-repull", `order ${row.id}: Shopify returned no order body`);
+          continue;
+        }
+        // Hydrate FOs too while we're here — fresh data is fresh data.
+        let foPayload: any[] | null = null;
+        try {
+          foPayload = await fetchFulfillmentOrdersForOrder(cfg, String(o.id));
+        } catch (e: any) {
+          srWarn("refunds-repull", `order ${o?.id} FO fetch failed: ${e?.message ?? e}`);
+        }
+        const beforeRefunds = (sqlite
+          .prepare(`SELECT COUNT(*) AS n FROM recon_refunds WHERE order_id = ?`)
+          .get(row.id) as { n: number }).n;
+        const beforeVariance = (sqlite
+          .prepare(`SELECT refund_variance_flag AS f FROM recon_orders WHERE id = ?`)
+          .get(row.id) as { f: number | null })?.f ?? 0;
+        upsertOrderFromShopify(o, foPayload);
+        const afterRefunds = (sqlite
+          .prepare(`SELECT COUNT(*) AS n FROM recon_refunds WHERE order_id = ?`)
+          .get(row.id) as { n: number }).n;
+        const afterVariance = (sqlite
+          .prepare(`SELECT refund_variance_flag AS f FROM recon_orders WHERE id = ?`)
+          .get(row.id) as { f: number | null })?.f ?? 0;
+        rePulled++;
+        refundsAdded += Math.max(0, afterRefunds - beforeRefunds);
+        if (beforeVariance === 1 && afterVariance === 0) variancesCleared++;
+      } catch (e: any) {
+        errors++;
+        srWarn("refunds-repull", `order ${row.id}: ${e?.message ?? e}`);
+      }
+    }
+
+    finishReconSync(syncLogId, {
+      status: errors > candidates / 2 ? "failure" : "success",
+      rows_ingested: rePulled,
+      cursor: new Date().toISOString(),
+    });
+    return {
+      candidates_found: candidates,
+      re_pulled: rePulled,
+      refunds_added: refundsAdded,
+      variances_cleared: variancesCleared,
+      errors,
+      syncLogId,
+    };
+  } catch (e: any) {
+    const msg = e?.message ?? String(e);
+    srError("refunds-repull", `re-pull failed: ${msg}`);
+    finishReconSync(syncLogId, {
+      status: "failure",
+      rows_ingested: rePulled,
+      error_message: msg,
+    });
+    return {
+      candidates_found: candidates,
+      re_pulled: rePulled,
+      refunds_added: refundsAdded,
+      variances_cleared: variancesCleared,
       errors,
       syncLogId,
       error: msg,
