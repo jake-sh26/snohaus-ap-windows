@@ -336,37 +336,24 @@ export function transformShopifyOrder(o: any): {
     aggregateRefundedTotal += rTotal;
   }
 
-  // ---- transactions_refunded (PR #R4l-a-fix3) ----
-  // Sum of refund.transactions[] for every refund where the transaction is
-  // kind='refund' AND status='success'. This is CASH TRUTH — the actual
-  // gateway refund transactions Shopify posted, scoped per-refund.
-  //
-  // Why nested under refunds[] (not top-level transactions[]):
-  //   * Shopify's /orders.json and /orders/{id}.json payloads do NOT ship
-  //     the top-level order.transactions[] array — that lives at the
-  //     /orders/{id}/transactions.json sub-resource and requires a separate
-  //     API call.
-  //   * Each refund object DOES carry its own transactions[] inline (the
-  //     gateway-side refund txns associated with that refund) and ships
-  //     in the standard order payload. No extra API call needed.
-  //
-  // For orders with no refunds[] (which therefore have no nested tx data)
-  // we leave transactions_refunded null so the variance check falls back
-  // to (total_price - current_total_price) instead.
+  // ---- transactions_refunded (PR #R4l-a-fix2, restored in fix6) ----
+  // Read the top-level order.transactions[] array. In normal /orders.json
+  // payloads this is absent and transactionsRefunded stays null — which is
+  // exactly what the variance check needs to fall through to its
+  // (total_price - current_total_price) path. The fix3 change to read nested
+  // refunds[].transactions[] was the regression that took variance from 9 to
+  // 260+: nested gateway-cash includes GC refund txns that are NOT in our
+  // line-value sum, so the two never agreed.
+  const rawTransactions = Array.isArray(o.transactions) ? o.transactions : [];
   let transactionsRefunded: number | null = null;
-  for (const r of rawRefunds) {
-    const rTxs = Array.isArray(r.transactions) ? r.transactions : [];
-    for (const tx of rTxs) {
+  if (rawTransactions.length > 0) {
+    transactionsRefunded = 0;
+    for (const tx of rawTransactions) {
       if (tx?.kind === "refund" && tx?.status === "success") {
-        if (transactionsRefunded == null) transactionsRefunded = 0;
         transactionsRefunded += numOr0(tx.amount);
       }
     }
   }
-  // Orders with NO refunds at all also have no refund transactions — keep
-  // transactions_refunded null so variance check uses the (total - current)
-  // fallback, which is correct for those (both 0).
-  if (rawRefunds.length === 0) transactionsRefunded = null;
 
   // ---- current_* fields — the post-refund snapshot Shopify computes.
   // Defensive fallback: if Shopify omits them (older payloads), derive from
@@ -535,23 +522,16 @@ export function recomputeRefundVariance(orderId: string): {
     )
     .get(orderId) as { total: number }).total;
 
-  // Count refund rows to identify zero-activity orders.
-  const refundRowCount = (sqlite
-    .prepare(`SELECT COUNT(*) AS c FROM recon_refunds WHERE order_id = ?`)
-    .get(orderId) as { c: number }).c;
-
-  // Expected: three-way decision from fix3 (kept here — same logic).
-  //   1. transactions_refunded present → cash truth from nested refunds[].transactions[].
-  //   2. No refund rows locally        → expected = 0 (manually-edited / no-cash-moved).
-  //   3. Otherwise                     → fall back to (total − current_total_price).
-  let expected: number;
-  if (ord.transactions_refunded != null) {
-    expected = ord.transactions_refunded;
-  } else if (refundRowCount === 0) {
-    expected = 0;
-  } else {
-    expected = (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
-  }
+  // Expected: byte-exact fix2 logic.
+  //   transactions_refunded != null → cash truth from top-level transactions[].
+  //   otherwise                    → (total_price − current_total_price).
+  // Top-level transactions[] is absent in standard /orders.json payloads, so
+  // the second path is the live one for nearly every order. This is what
+  // produced the known-good 9 exceptions.
+  const expected =
+    ord.transactions_refunded != null
+      ? ord.transactions_refunded
+      : (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
 
   const variance = expected - actual;
   const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
