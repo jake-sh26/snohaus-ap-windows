@@ -261,31 +261,37 @@ export function transformShopifyOrder(o: any): {
     aggregateRefundedTotal += rTotal;
   }
 
-  // ---- transactions_refunded (PR #R4l-a-fix2) ----
-  // Sum of order.transactions[] where kind='refund' AND status='success'.
-  // This is CASH TRUTH — every successful refund transaction Shopify has
-  // posted to the gateway. It is what the variance check ties against.
+  // ---- transactions_refunded (PR #R4l-a-fix3) ----
+  // Sum of refund.transactions[] for every refund where the transaction is
+  // kind='refund' AND status='success'. This is CASH TRUTH — the actual
+  // gateway refund transactions Shopify posted, scoped per-refund.
   //
-  // Why we trust this over (total_price - current_total_price):
-  //   * Manually-edited orders (Shopify Admin order editor) zero out
-  //     current_total_price without creating any refund transaction — the
-  //     order was structurally voided, no cash actually moved.
-  //   * refund_discrepancy adjustments carry signed presentment amounts
-  //     that don't correspond to cash direction; the gateway transaction
-  //     does.
+  // Why nested under refunds[] (not top-level transactions[]):
+  //   * Shopify's /orders.json and /orders/{id}.json payloads do NOT ship
+  //     the top-level order.transactions[] array — that lives at the
+  //     /orders/{id}/transactions.json sub-resource and requires a separate
+  //     API call.
+  //   * Each refund object DOES carry its own transactions[] inline (the
+  //     gateway-side refund txns associated with that refund) and ships
+  //     in the standard order payload. No extra API call needed.
   //
-  // For orders without transactions[] in raw_json (legacy/test payloads) we
-  // fall back to the aggregateRefundedTotal we just computed.
-  const rawTransactions = Array.isArray(o.transactions) ? o.transactions : [];
+  // For orders with no refunds[] (which therefore have no nested tx data)
+  // we leave transactions_refunded null so the variance check falls back
+  // to (total_price - current_total_price) instead.
   let transactionsRefunded: number | null = null;
-  if (rawTransactions.length > 0) {
-    transactionsRefunded = 0;
-    for (const tx of rawTransactions) {
+  for (const r of rawRefunds) {
+    const rTxs = Array.isArray(r.transactions) ? r.transactions : [];
+    for (const tx of rTxs) {
       if (tx?.kind === "refund" && tx?.status === "success") {
+        if (transactionsRefunded == null) transactionsRefunded = 0;
         transactionsRefunded += numOr0(tx.amount);
       }
     }
   }
+  // Orders with NO refunds at all also have no refund transactions — keep
+  // transactions_refunded null so variance check uses the (total - current)
+  // fallback, which is correct for those (both 0).
+  if (rawRefunds.length === 0) transactionsRefunded = null;
 
   // ---- current_* fields — the post-refund snapshot Shopify computes.
   // Defensive fallback: if Shopify omits them (older payloads), derive from
@@ -426,15 +432,6 @@ export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount:
     } | undefined;
   if (!ord) return { flag: 0, amount: 0 };
 
-  // PR #R4l-a-fix2 — variance target is cash-truth from transactions[]
-  // whenever Shopify gave us that array. Falls back to the Shopify-stated
-  // delta (total - current_total) only for legacy payloads with no
-  // transactions array, since that's the best we have for those.
-  const expected =
-    ord.transactions_refunded != null
-      ? ord.transactions_refunded
-      : (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
-
   // Actual: canonical sign-corrected sum from recon_refunds.
   const actual = (sqlite
     .prepare(
@@ -443,6 +440,27 @@ export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount:
        WHERE order_id = ?`
     )
     .get(orderId) as { total: number }).total;
+
+  // PR #R4l-a-fix3 — variance target priority:
+  //   1. If we have transactions_refunded (refunds[] had nested gateway txns),
+  //      that is cash truth — use it.
+  //   2. If we have neither transactions data NOR any refund rows, this
+  //      order has no refund activity to reconcile. Variance = 0 (the
+  //      (total - current_total) gap on manually-edited orders is a
+  //      separate signal, not a refund accounting variance).
+  //   3. Otherwise (we have refund rows but no nested transactions, e.g.
+  //      legacy payloads), fall back to (total - current_total_price)
+  //      which is the best we can do without the gateway data.
+  let expected: number;
+  if (ord.transactions_refunded != null) {
+    expected = ord.transactions_refunded;
+  } else if (actual === 0) {
+    // No refunds recorded AND no gateway transaction data → nothing
+    // to reconcile against. Match actual so variance is zero.
+    expected = 0;
+  } else {
+    expected = (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+  }
   const variance = expected - actual;
   const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
   setReconOrderRefundVariance(orderId, flag, variance);
