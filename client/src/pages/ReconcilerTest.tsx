@@ -539,6 +539,7 @@ export default function ReconcilerTest() {
       total_price: number | null;
       current_total_price: number | null;
       total_refunded: number | null;
+      transactions_refunded: number | null;
       refund_variance_amount: number | null;
     }>;
     count: number;
@@ -1447,6 +1448,7 @@ export default function ReconcilerTest() {
                         <th className="px-1 py-1">Total</th>
                         <th className="px-1 py-1">Current</th>
                         <th className="px-1 py-1">Refunded</th>
+                        <th className="px-1 py-1">Tx Cash</th>
                         <th className="px-1 py-1">Variance</th>
                       </tr>
                     </thead>
@@ -1457,6 +1459,11 @@ export default function ReconcilerTest() {
                           <td className="px-1 py-0.5">${(o.total_price ?? 0).toFixed(2)}</td>
                           <td className="px-1 py-0.5">${(o.current_total_price ?? 0).toFixed(2)}</td>
                           <td className="px-1 py-0.5">${(o.total_refunded ?? 0).toFixed(2)}</td>
+                          <td className="px-1 py-0.5">
+                            {o.transactions_refunded == null
+                              ? "—"
+                              : `$${o.transactions_refunded.toFixed(2)}`}
+                          </td>
                           <td className="px-1 py-0.5 font-medium">${(o.refund_variance_amount ?? 0).toFixed(2)}</td>
                         </tr>
                       ))}
