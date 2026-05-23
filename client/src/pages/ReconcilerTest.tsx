@@ -530,6 +530,9 @@ export default function ReconcilerTest() {
 
   // List of orders that failed the per-order refund variance check. Polled
   // alongside other recon data so the badge updates after every sync.
+  // PR #R4l-a-fix4 — the variance endpoint now returns a `refund_variance_kind`
+  // tag per row plus an aggregate `by_kind` breakdown. The four kinds are
+  // documented in server/shopify-recon-orders.ts → recomputeRefundVariance.
   const refundVariancesQ = useQuery<{
     orders: Array<{
       id: string;
@@ -541,8 +544,11 @@ export default function ReconcilerTest() {
       total_refunded: number | null;
       transactions_refunded: number | null;
       refund_variance_amount: number | null;
+      refund_variance_kind: string | null;
     }>;
     count: number;
+    total_count: number;
+    by_kind: Array<{ kind: string | null; count: number }>;
   }>({
     queryKey: ["/api/recon/refunds/variances"],
     queryFn: () => jsonGet("/api/recon/refunds/variances?limit=200"),
@@ -1438,13 +1444,53 @@ export default function ReconcilerTest() {
               <details className="text-xs rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-1.5">
                 <summary className="cursor-pointer select-none font-medium text-amber-900">
                   <AlertTriangle className="size-3.5 inline mr-1" />
-                  {refundVariancesQ.data.count} order(s) with refund variance &gt; $0.01
+                  {refundVariancesQ.data.total_count ?? refundVariancesQ.data.count} order(s) flagged with refund variance
                 </summary>
+                {/* Per-kind summary chips — fix4 narrowed per-order variance to
+                    these 4 named patterns; everything else is reconciled at the
+                    payout level instead (see R5). */}
+                {refundVariancesQ.data.by_kind && refundVariancesQ.data.by_kind.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {refundVariancesQ.data.by_kind.map((k) => {
+                      const label = k.kind ?? "unclassified";
+                      const color =
+                        k.kind === "math_mismatch"
+                          ? "bg-red-100 text-red-900 border-red-300"
+                          : k.kind === "instant_void"
+                            ? "bg-orange-100 text-orange-900 border-orange-300"
+                            : k.kind === "manual_edit"
+                              ? "bg-blue-100 text-blue-900 border-blue-300"
+                              : k.kind === "refund_discrepancy_only"
+                                ? "bg-slate-100 text-slate-800 border-slate-300"
+                                : "bg-amber-100 text-amber-900 border-amber-300";
+                      return (
+                        <span
+                          key={label}
+                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-medium ${color}`}
+                          title={
+                            k.kind === "math_mismatch"
+                              ? "True accounting error: Σ refunds.total_refunded ≠ (total_price − current_total_price) within $0.01"
+                              : k.kind === "instant_void"
+                                ? "Order created and ≥99% refunded within 10 minutes — mis-rung pattern"
+                                : k.kind === "manual_edit"
+                                  ? "Order zeroed via Shopify Admin editor (no refunds[] rows)"
+                                  : k.kind === "refund_discrepancy_only"
+                                    ? "refunds[] exists but no line items and no gateway transactions — decorative adjustment"
+                                    : "Unclassified variance"
+                          }
+                        >
+                          {label}: <b>{k.count}</b>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
                 <div className="mt-2 max-h-60 overflow-y-auto">
                   <table className="w-full text-[11px] font-mono">
                     <thead className="sticky top-0 bg-amber-50">
                       <tr className="text-left">
                         <th className="px-1 py-1">Order</th>
+                        <th className="px-1 py-1">Kind</th>
                         <th className="px-1 py-1">Total</th>
                         <th className="px-1 py-1">Current</th>
                         <th className="px-1 py-1">Refunded</th>
@@ -1456,6 +1502,7 @@ export default function ReconcilerTest() {
                       {refundVariancesQ.data.orders.slice(0, 50).map((o) => (
                         <tr key={o.id} className="border-t border-amber-200/50">
                           <td className="px-1 py-0.5">{o.name ?? `#${o.order_number ?? o.id}`}</td>
+                          <td className="px-1 py-0.5">{o.refund_variance_kind ?? "—"}</td>
                           <td className="px-1 py-0.5">${(o.total_price ?? 0).toFixed(2)}</td>
                           <td className="px-1 py-0.5">${(o.current_total_price ?? 0).toFixed(2)}</td>
                           <td className="px-1 py-0.5">${(o.total_refunded ?? 0).toFixed(2)}</td>

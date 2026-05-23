@@ -67,6 +67,73 @@ export function transformShopifyOrder(o: any): {
     num(o.total_tip) ??
     null;
 
+  // ---- Exchange detection (PR #R4l-a-fix4) ----
+  // When a customer exchanges a returned item for a different item, Shopify
+  // ADDS the new item as a line on the ORIGINAL order — not a new order. That
+  // new line carries the ORIGINAL order's created_at on every field except the
+  // fulfillment that delivered it. If we don't detect this, exchanges that
+  // cross a month boundary recognize revenue in the wrong month.
+  //
+  // Detection signal: a fulfillment whose line_items include a line_item_id
+  // that does NOT match any original line item we've seen at order-creation
+  // time. But because Shopify already mutated line_items[] by the time we see
+  // the order, we instead reason backward:
+  //   * If a refund has restock_type ∈ {return, cancel} on at least one item,
+  //     AND a fulfillment exists whose created_at is meaningfully after the
+  //     refund's processed_at, those fulfilled line items are the exchange
+  //     replacements.
+  // We build a map { line_item_id -> { recognized_at, refund_id } } here, then
+  // attach it to each line below.
+  const exchangeLineMap = new Map<string, { recognized_at: string; refund_id: string }>();
+  {
+    const rawRefundsForExchangeScan = Array.isArray(o.refunds) ? o.refunds : [];
+    const rawFulfillmentsForExchangeScan = Array.isArray(o.fulfillments) ? o.fulfillments : [];
+    // Sort refunds with any restocking event by processed_at ascending so we
+    // pair each exchange-fulfillment with the earliest refund it could have
+    // resulted from. (Worst-case order has multiple refund+exchange cycles.)
+    const restockingRefunds = rawRefundsForExchangeScan
+      .filter((r: any) => {
+        const rli = Array.isArray(r.refund_line_items) ? r.refund_line_items : [];
+        return rli.some((li: any) => li?.restock_type === "return" || li?.restock_type === "cancel");
+      })
+      .sort((a: any, b: any) => String(a.processed_at ?? a.created_at ?? "").localeCompare(String(b.processed_at ?? b.created_at ?? "")));
+    if (restockingRefunds.length > 0 && rawFulfillmentsForExchangeScan.length > 0) {
+      const orderCreatedAt = String(o.created_at ?? "");
+      for (const f of rawFulfillmentsForExchangeScan) {
+        const fCreatedAt = String(f.created_at ?? "");
+        // Tolerance: 60 seconds. A fulfillment created within a minute of the
+        // order itself is the original-order fulfillment, not an exchange.
+        if (!fCreatedAt || !orderCreatedAt) continue;
+        const orderMs = Date.parse(orderCreatedAt);
+        const fMs = Date.parse(fCreatedAt);
+        if (!Number.isFinite(orderMs) || !Number.isFinite(fMs)) continue;
+        if (fMs - orderMs < 60_000) continue;
+        // This fulfillment is later than order creation — candidate for exchange.
+        // Pair it with the latest restocking refund processed BEFORE the
+        // fulfillment was created (the exchange flow: customer returns, staff
+        // immediately fulfills replacement item).
+        const pairedRefund = restockingRefunds
+          .filter((r: any) => {
+            const rWhen = Date.parse(String(r.processed_at ?? r.created_at ?? ""));
+            return Number.isFinite(rWhen) && rWhen <= fMs;
+          })
+          .pop(); // latest qualifying
+        if (!pairedRefund) continue;
+        const refundId = String(pairedRefund.id);
+        const fLineItems = Array.isArray(f.line_items) ? f.line_items : [];
+        for (const fli of fLineItems) {
+          const liId = fli?.id != null ? String(fli.id) : null;
+          if (!liId) continue;
+          // First write wins — if a line item somehow appears in multiple
+          // exchange fulfillments, the earliest exchange owns it.
+          if (!exchangeLineMap.has(liId)) {
+            exchangeLineMap.set(liId, { recognized_at: fCreatedAt, refund_id: refundId });
+          }
+        }
+      }
+    }
+  }
+
   // ---- Lines ----
   const rawLines = Array.isArray(o.line_items) ? o.line_items : [];
   const lines: ReconLineItemUpsert[] = rawLines.map((li: any) => {
@@ -91,8 +158,14 @@ export function transformShopifyOrder(o: any): {
       jurisdiction_name: tl?.jurisdiction_name ?? null,
       jurisdiction_type: tl?.jurisdiction_type ?? null,
     }));
+    // PR #R4l-a-fix4 — exchange-aware recognition date. Default to order time;
+    // override to the exchange-fulfillment time when this line was added later.
+    const liId = String(li.id);
+    const exchangeInfo = exchangeLineMap.get(liId);
+    const recognized_at = exchangeInfo?.recognized_at ?? o.created_at ?? null;
+    const added_via_exchange_refund_id = exchangeInfo?.refund_id ?? null;
     return {
-      id: String(li.id),
+      id: liId,
       order_id: String(o.id),
       product_id: li.product_id != null ? String(li.product_id) : null,
       variant_id: li.variant_id != null ? String(li.variant_id) : null,
@@ -111,6 +184,8 @@ export function transformShopifyOrder(o: any): {
       is_gift_card: li.gift_card === true ? 1 : 0,
       requires_shipping: li.requires_shipping === true ? 1 : 0,
       raw_json: JSON.stringify(li),
+      recognized_at,
+      added_via_exchange_refund_id,
     };
   });
 
@@ -405,35 +480,74 @@ export function transformShopifyOrder(o: any): {
 }
 
 /**
- * PR #R4l-a — per-order variance check. The accounting invariant is:
- *   Σ refund_line_items.subtotal (kind='item') ≈ total_price - current_total_price
- * (allowing for shipping refunds and restocking adjustments to make up the
- * tax-and-adjustment portion). Within $0.01 = OK; beyond = hard fail. The
- * check is split out so backfill and live ingest can both call it.
+ * Per-order anomaly check (PR #R4l-a, rewritten in fix4).
  *
- * Returns the signed variance amount (>0 means refunds-side is short) and a
- * flag (1 = beyond tolerance) and writes both to the recon_orders row.
+ * BACKGROUND — why this got rewritten:
+ *   Earlier iterations (fix2/fix3) tried to use Shopify's gateway transaction
+ *   sum (`transactions_refunded`) as the cash-truth target for a per-order
+ *   line-value variance check. That premise was WRONG. Two views of one order
+ *   are legitimately different numbers:
+ *     A. Line-value refunded ≡ Σ recon_refunds.total_refunded
+ *        ≡ (total_price − current_total_price) within $0.01 normally.
+ *        This is the P&L view: revenue reversed when items returned.
+ *     B. Gateway cash refunded ≡ Σ refunds[].transactions[kind='refund'].amount
+ *        ≡ transactions_refunded.
+ *        This is the bank view: cash that actually moved back through Stripe.
+ *   A and B legitimately diverge whenever the original order was paid via
+ *   gift card, when an exchange offset the refund, or when the customer got
+ *   store credit. Comparing them per-order produces hundreds of false
+ *   positives at any retailer.
+ *
+ *   The correct cash reconciliation is at the PAYOUT level (PR #R5), not
+ *   per-order. Per-order, we only flag four NAMED anomaly patterns that
+ *   indicate real data problems requiring human triage.
+ *
+ * THE FOUR PATTERNS (refund_variance_kind values):
+ *   * 'math_mismatch'         Σ recon_refunds.total_refunded does not match
+ *                             (total_price − current_total_price) within $0.01.
+ *                             This is a true accounting error (e.g. our refund
+ *                             ETL math diverges from Shopify's snapshot).
+ *   * 'manual_edit'           current_total_price = 0, total_price > 0, AND no
+ *                             refunds[] rows. Order was zeroed out via Shopify
+ *                             Admin's order editor without a refund record.
+ *                             Inventory moved but no refund accounting exists.
+ *   * 'refund_discrepancy_only' refunds[] exists but with NO line items and NO
+ *                             gateway transactions — only decorative
+ *                             order_adjustments. Common 2023-era Shopify quirk;
+ *                             usually safe to ignore but worth surfacing.
+ *   * 'instant_void'          Order created and fully refunded (≥ 99% of
+ *                             total_price) within 10 minutes. Mis-rung sale
+ *                             pattern; net dollar effect is zero but should be
+ *                             reviewed for register misuse.
+ *
+ * Returns the kind (or null if clean), the signed diagnostic amount, and the
+ * flag. Writes all three to recon_orders via setReconOrderRefundVariance.
  */
-export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount: number } {
-  // Use a local import to avoid pulling the entire storage barrel into the
-  // transform fast path.
+export function recomputeRefundVariance(orderId: string): {
+  flag: 0 | 1;
+  amount: number;
+  kind: string | null;
+} {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { sqlite } = require("./storage");
   const ord = sqlite
     .prepare(
-      `SELECT total_price, current_total_price, transactions_refunded, financial_status
+      `SELECT total_price, current_total_price, created_at, raw_json
        FROM recon_orders WHERE id = ?`
     )
     .get(orderId) as {
       total_price: number | null;
       current_total_price: number | null;
-      transactions_refunded: number | null;
-      financial_status: string | null;
+      created_at: string | null;
+      raw_json: string | null;
     } | undefined;
-  if (!ord) return { flag: 0, amount: 0 };
+  if (!ord) return { flag: 0, amount: 0, kind: null };
 
-  // Actual: canonical sign-corrected sum from recon_refunds.
-  const actual = (sqlite
+  const totalPrice = ord.total_price ?? 0;
+  const currentTotalPrice = ord.current_total_price ?? totalPrice;
+
+  // Refund line-value sum (canonical P&L refund total).
+  const lineValueRefunded = (sqlite
     .prepare(
       `SELECT COALESCE(SUM(total_refunded), 0) AS total
        FROM recon_refunds
@@ -441,30 +555,99 @@ export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount:
     )
     .get(orderId) as { total: number }).total;
 
-  // PR #R4l-a-fix3 — variance target priority:
-  //   1. If we have transactions_refunded (refunds[] had nested gateway txns),
-  //      that is cash truth — use it.
-  //   2. If we have neither transactions data NOR any refund rows, this
-  //      order has no refund activity to reconcile. Variance = 0 (the
-  //      (total - current_total) gap on manually-edited orders is a
-  //      separate signal, not a refund accounting variance).
-  //   3. Otherwise (we have refund rows but no nested transactions, e.g.
-  //      legacy payloads), fall back to (total - current_total_price)
-  //      which is the best we can do without the gateway data.
-  let expected: number;
-  if (ord.transactions_refunded != null) {
-    expected = ord.transactions_refunded;
-  } else if (actual === 0) {
-    // No refunds recorded AND no gateway transaction data → nothing
-    // to reconcile against. Match actual so variance is zero.
-    expected = 0;
-  } else {
-    expected = (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+  // Refund row count + restock-row count drive the discrepancy-only detector.
+  const refundCounts = sqlite
+    .prepare(
+      `SELECT
+         COUNT(*) AS refund_rows,
+         COALESCE(SUM(CASE WHEN kind = 'item' THEN 1 ELSE 0 END), 0) AS item_rows,
+         COALESCE(SUM(CASE WHEN kind = 'adjustment' THEN 1 ELSE 0 END), 0) AS adj_rows,
+         MIN(processed_at) AS earliest_refund_at
+       FROM recon_refunds r
+       LEFT JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+       WHERE r.order_id = ?`
+    )
+    .get(orderId) as {
+      refund_rows: number;
+      item_rows: number;
+      adj_rows: number;
+      earliest_refund_at: string | null;
+    };
+
+  // Pattern detection. Order matters — most-specific first.
+
+  // (1) manual_edit: total > 0, current = 0, AND we have NO refund rows.
+  //     Shopify lets the user zero an order via the admin editor with no
+  //     refund record. The (total - current) gap can't be reconciled.
+  if (totalPrice > 0 && currentTotalPrice <= 0.01 && refundCounts.refund_rows === 0) {
+    const amt = totalPrice - currentTotalPrice;
+    setReconOrderRefundVariance(orderId, 1, amt, "manual_edit");
+    return { flag: 1, amount: amt, kind: "manual_edit" };
   }
-  const variance = expected - actual;
-  const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
-  setReconOrderRefundVariance(orderId, flag, variance);
-  return { flag, amount: variance };
+
+  // (2) refund_discrepancy_only: refund rows exist but with no item lines AND
+  //     no gateway transactions (we infer the latter from raw_json since the
+  //     transactions live nested under refunds[].transactions[]).
+  if (refundCounts.refund_rows > 0 && refundCounts.item_rows === 0) {
+    let hasAnyGatewayTx = false;
+    try {
+      const raw = ord.raw_json ? JSON.parse(ord.raw_json) : null;
+      const rawRefunds = Array.isArray(raw?.refunds) ? raw.refunds : [];
+      for (const r of rawRefunds) {
+        const rTxs = Array.isArray(r?.transactions) ? r.transactions : [];
+        if (rTxs.some((tx: any) => tx?.kind === "refund" && tx?.status === "success")) {
+          hasAnyGatewayTx = true;
+          break;
+        }
+      }
+    } catch {
+      // Treat parse failure as "unknown" — skip this branch rather than false-flag.
+      hasAnyGatewayTx = true;
+    }
+    if (!hasAnyGatewayTx) {
+      const amt = lineValueRefunded; // diagnostic
+      setReconOrderRefundVariance(orderId, 1, amt, "refund_discrepancy_only");
+      return { flag: 1, amount: amt, kind: "refund_discrepancy_only" };
+    }
+  }
+
+  // (3) instant_void: order created and a refund covering ≥ 99% of total_price
+  //     was processed within 10 minutes. Net dollar effect zero, but the order
+  //     was likely mis-rung. (#31365 pattern.)
+  if (
+    totalPrice > 0 &&
+    refundCounts.refund_rows > 0 &&
+    refundCounts.earliest_refund_at &&
+    ord.created_at
+  ) {
+    const createdMs = Date.parse(ord.created_at);
+    const refundMs = Date.parse(refundCounts.earliest_refund_at);
+    if (
+      Number.isFinite(createdMs) &&
+      Number.isFinite(refundMs) &&
+      refundMs - createdMs <= 10 * 60 * 1000 &&
+      lineValueRefunded >= totalPrice * 0.99
+    ) {
+      const amt = lineValueRefunded;
+      setReconOrderRefundVariance(orderId, 1, amt, "instant_void");
+      return { flag: 1, amount: amt, kind: "instant_void" };
+    }
+  }
+
+  // (4) math_mismatch: Σ line-value-refunds disagrees with Shopify's
+  //     (total_price − current_total_price) by more than $0.01. This is the
+  //     only true accounting error — our refund math diverges from Shopify's
+  //     own snapshot of "what's left on the order."
+  const shopifyDelta = totalPrice - currentTotalPrice;
+  const mathVariance = shopifyDelta - lineValueRefunded;
+  if (Math.abs(mathVariance) > 0.01) {
+    setReconOrderRefundVariance(orderId, 1, mathVariance, "math_mismatch");
+    return { flag: 1, amount: mathVariance, kind: "math_mismatch" };
+  }
+
+  // Clean order — clear any prior flag.
+  setReconOrderRefundVariance(orderId, 0, 0, null);
+  return { flag: 0, amount: 0, kind: null };
 }
 
 

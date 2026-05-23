@@ -1273,9 +1273,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.status(result.error ? 502 : 200).json(result);
   });
 
-  // PR #R4l-a — list orders with refund_variance_flag = 1. These are the
-  // hard-fail accounting exceptions the rollup must surface instead of
-  // silently rolling up. UI lists them so the user can drill into each.
+  // PR #R4l-a (rewritten for fix4) — list orders with refund_variance_flag = 1
+  // along with per-kind counts so the UI can break the list down by anomaly
+  // pattern. The four kinds are documented in recomputeRefundVariance.
   app.get("/api/recon/refunds/variances", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
     const { sqlite } = require("./storage");
@@ -1283,14 +1283,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .prepare(`
         SELECT id, order_number, name, created_at,
                total_price, current_total_price, total_refunded,
-               transactions_refunded, refund_variance_amount
+               transactions_refunded, refund_variance_amount, refund_variance_kind
         FROM recon_orders
         WHERE refund_variance_flag = 1
         ORDER BY ABS(refund_variance_amount) DESC
         LIMIT ?
       `)
       .all(limit);
-    res.json({ orders: rows, count: rows.length });
+    const kindCounts = sqlite
+      .prepare(`
+        SELECT refund_variance_kind AS kind, COUNT(*) AS count
+        FROM recon_orders
+        WHERE refund_variance_flag = 1
+        GROUP BY refund_variance_kind
+      `)
+      .all() as { kind: string | null; count: number }[];
+    const totalCount = (sqlite
+      .prepare(`SELECT COUNT(*) AS c FROM recon_orders WHERE refund_variance_flag = 1`)
+      .get() as { c: number }).c;
+    res.json({
+      orders: rows,
+      count: rows.length,
+      total_count: totalCount,
+      by_kind: kindCounts,
+    });
   });
 
   // Current orders watermark (read-only) — shown in the Settings UI so the user

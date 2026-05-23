@@ -956,6 +956,29 @@ function bootstrapSchema() {
       ON recon_line_items(tax_channel_liable);
   `);
 
+  // PR #R4l-a-fix4 — Exchange-aware revenue recognition. When a customer exchanges
+  // a returned item for a different item, Shopify ADDS the new line item to the
+  // ORIGINAL order (#28232 → Parry suit appears on the Dec 23 order even though
+  // the customer received it on Dec 27). If we naively use order.created_at as
+  // the rev-rec date for every line, exchanges that cross month boundaries land
+  // in the wrong month's books.
+  //
+  // `recognized_at` defaults to order.created_at and is overridden to the
+  // exchange-fulfillment's created_at when we detect a line was added via
+  // exchange. `added_via_exchange_refund_id` is the refund_id that created the
+  // exchange (links the new line to the return that triggered it; null for
+  // normal lines). Together they let the monthly rollup (PR #R5) book revenue
+  // in the correct month per line.
+  ensureColumns("recon_line_items", [
+    { name: "recognized_at", defn: "TEXT" },
+    { name: "added_via_exchange_refund_id", defn: "TEXT" },
+  ]);
+  // Index for month-bucket queries in the rollup.
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_recon_line_items_recognized_at
+      ON recon_line_items(recognized_at);
+  `);
+
   // ----- Shopify refunds (PR #R4l-a) -----
   // One row per refund on an order. Shopify nests refund_line_items inside,
   // and we store those in recon_refund_line_items. Together these let us
@@ -1239,16 +1262,34 @@ function bootstrapSchema() {
     { name: "current_subtotal_price", defn: "REAL" },
     { name: "current_total_price", defn: "REAL" },
     { name: "current_total_tax", defn: "REAL" },
-    // Hard-fail flag set by the rollup variance check (R4l-c):
-    // 1 = our refund total disagrees with the cash-truth ground source
-    //     beyond $0.01. The order is excluded from rollup totals and surfaced
-    //     as an exception in the UI.
+    // PR #R4l-a — refund_variance_flag: 1 when this order has an accounting
+    // anomaly that needs human triage. Pre-fix4 this flag conflated several
+    // legitimate scenarios (exchanges, gift-card payments, voids) with real
+    // anomalies and over-flagged. Post-fix4 we only flag four NAMED patterns,
+    // each carrying refund_variance_kind so the UI can show the reason.
     { name: "refund_variance_flag", defn: "INTEGER NOT NULL DEFAULT 0" },
     { name: "refund_variance_amount", defn: "REAL" },
-    // PR #R4l-a-fix2 — sum of order.transactions[] where kind='refund' and
-    // status='success'. This is the cash-truth source for refunds and is
-    // what the variance check ties against (current_total_price proved
-    // unreliable for manually-edited orders and refund_discrepancy adjustments).
+    // PR #R4l-a-fix4 — one of:
+    //   'math_mismatch'         — Σ recon_refunds.total_refunded disagrees with
+    //                             (total_price − current_total_price) by > $0.01.
+    //                             This is the original PR #R4l-a check and is the
+    //                             only true accounting error.
+    //   'manual_edit'           — current_total_price = 0 but total_price > 0
+    //                             AND no refunds[] rows (order zeroed via Shopify's
+    //                             order editor, no refund record).
+    //   'refund_discrepancy_only' — refunds[] exists but with NO line items and
+    //                               NO gateway transactions; only decorative
+    //                               order_adjustments.
+    //   'instant_void'          — order created and fully refunded (≥99% of
+    //                             total_price) within 10 minutes by the same staff.
+    //                             Indicates a mis-rung sale that was immediately
+    //                             voided (often re-rung as a new order).
+    { name: "refund_variance_kind", defn: "TEXT" },
+    // PR #R4l-a-fix2 — sum of order.refunds[].transactions[] where kind='refund'
+    // and status='success'. This is the GATEWAY cash refunded — NOT the same as
+    // total_refunded (line-value refunded). The two legitimately differ on
+    // exchanges, gift-card payments, and voids. Used for per-payout reconciliation
+    // (PR #R5), NOT for per-order variance flagging (that's what fix3 got wrong).
     { name: "transactions_refunded", defn: "REAL" },
   ]);
 
@@ -3918,6 +3959,14 @@ export type ReconLineItemUpsert = {
   is_gift_card: number;
   requires_shipping: number;
   raw_json: string;
+  // PR #R4l-a-fix4 — revenue recognition date. Defaults to order.created_at;
+  // overridden to fulfillment.created_at when this line was added as an exchange
+  // replacement (so revenue lands in the month the exchange happened, not the
+  // month the original order was created).
+  recognized_at?: string | null;
+  // The refund_id whose return triggered this line's addition to the order via
+  // exchange. NULL for normal lines that were on the order at creation.
+  added_via_exchange_refund_id?: string | null;
 };
 
 /**
@@ -4019,8 +4068,9 @@ export function replaceReconLineItems(
         id, order_id, product_id, variant_id, sku, title, variant_title,
         quantity, price, total_discount, line_subtotal, line_tax_total,
         tax_channel_liable, tax_lines_json, is_gift_card, requires_shipping,
-        raw_json, ingested_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        raw_json, ingested_at,
+        recognized_at, added_via_exchange_refund_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const li of lines) {
       ins.run(
@@ -4028,6 +4078,7 @@ export function replaceReconLineItems(
         li.quantity, li.price, li.total_discount, li.line_subtotal, li.line_tax_total,
         li.tax_channel_liable, li.tax_lines_json, li.is_gift_card, li.requires_shipping,
         li.raw_json, now,
+        li.recognized_at ?? null, li.added_via_exchange_refund_id ?? null,
       );
     }
   });
@@ -4137,19 +4188,21 @@ export function getReconRefundsForOrder(orderId: string): {
 }
 
 /**
- * PR #R4l-a — set the refund_variance_flag / refund_variance_amount columns
- * on recon_orders. Called by the per-order variance check after refunds ETL.
- * `amount` is the discrepancy in dollars between (total_price - current_total_price)
- * and Σ refund_line_items.subtotal; positive means refunds total is short.
+ * PR #R4l-a (rewritten for fix4) — set the variance flag, amount, and kind
+ * columns on recon_orders. Called by the per-order variance check after
+ * refunds ETL. See refund_variance_kind in ensureColumns for the enum values.
+ * `amount` is the diagnostic discrepancy in dollars (sign-significant); used
+ * for sort-by-magnitude in the UI but its meaning depends on the kind.
  */
 export function setReconOrderRefundVariance(
   orderId: string,
   flag: 0 | 1,
   amount: number,
+  kind: string | null,
 ): void {
   sqlite
-    .prepare(`UPDATE recon_orders SET refund_variance_flag = ?, refund_variance_amount = ? WHERE id = ?`)
-    .run(flag, amount, orderId);
+    .prepare(`UPDATE recon_orders SET refund_variance_flag = ?, refund_variance_amount = ?, refund_variance_kind = ? WHERE id = ?`)
+    .run(flag, amount, kind, orderId);
 }
 
 /**
