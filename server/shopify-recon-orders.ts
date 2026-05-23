@@ -475,31 +475,31 @@ export function transformShopifyOrder(o: any): {
 }
 
 /**
- * Per-order refund variance check (PR #R4l-a — reverted to fix2 logic in fix5).
+ * Per-order refund variance check (PR #R4l-a, simplified in fix8).
  *
- * fix4 replaced this with a 4-pattern classifier (math_mismatch, manual_edit,
- * refund_discrepancy_only, instant_void). The instant_void heuristic flagged
- * any same-day register return as an anomaly — which is normal retail — and
- * blew the variance list back up to 83. Reverting to the fix2 algorithm gets
- * us back to the known-good 9 exceptions we hadn't yet resolved.
+ * The ONLY accounting invariant that holds per-order is:
  *
- * fix2 algorithm:
- *   expected =
- *     transactions_refunded != null  → transactions_refunded  (cash truth)
- *     else if no refund rows         → 0                       (no activity)
- *     else                           → total_price − current_total_price  (legacy fallback)
- *   actual   = Σ recon_refunds.total_refunded
- *   variance = expected − actual; flag when |variance| > $0.01.
+ *   Σ recon_refunds.total_refunded  ≈  (total_price − current_total_price)
  *
- * The legitimate divergence between line-value-refunded (P&L) and gateway-cash-refunded
- * still exists — we just don't try to reconcile it per-order. R5 payout reconciliation
- * is where cash-truth lives.
+ * Both sides are LINE-VALUE views — what came off the P&L. Within $0.01
+ * is healthy; beyond is a real math error in our refund ETL.
  *
- * Schema notes:
- *   * recon_orders.refund_variance_kind column is preserved from fix4 (in case we
- *     want to attach a tag later) but always set to null here.
- *   * recon_line_items.recognized_at and added_via_exchange_refund_id are written
- *     by transformShopifyOrder regardless — R5 will use them.
+ * What we deliberately do NOT check per-order:
+ *   * Gateway cash refunded (transactions_refunded) vs line-value refunded.
+ *     Those legitimately diverge whenever the customer was refunded to
+ *     gift card / store credit, when an exchange offset the refund, or
+ *     when the original order was paid via GC. Comparing them per-order
+ *     produced ~250 false positives. Cash reconciliation lives at the
+ *     payout level (PR #R5) where the divergence resolves cleanly.
+ *
+ * What this catches (the original 9 exceptions are all in here):
+ *   * #21876 family: current = total but refund row exists. (total − current) = 0,
+ *     recon_refunds_total > 0 → variance flagged. Shopify wrote a refund row
+ *     without moving current_total_price (refund_discrepancy adjustment).
+ *   * #21747 family: current = 0, no refund rows. (total − current) = total,
+ *     recon_refunds_total = 0 → variance flagged. Manual-edit via Admin editor
+ *     zeroed the order without recording a refund.
+ *   * #38088 ($0.23): genuine rounding edge in our refund ETL math.
  */
 export function recomputeRefundVariance(orderId: string): {
   flag: 0 | 1;
@@ -510,19 +510,18 @@ export function recomputeRefundVariance(orderId: string): {
   const { sqlite } = require("./storage");
   const ord = sqlite
     .prepare(
-      `SELECT total_price, current_total_price, transactions_refunded, financial_status
-       FROM recon_orders WHERE id = ?`
+      `SELECT total_price, current_total_price FROM recon_orders WHERE id = ?`
     )
     .get(orderId) as {
       total_price: number | null;
       current_total_price: number | null;
-      transactions_refunded: number | null;
-      financial_status: string | null;
     } | undefined;
   if (!ord) return { flag: 0, amount: 0, kind: null };
 
-  // Actual: canonical sign-corrected sum from recon_refunds.
-  const actual = (sqlite
+  const lineValueDelta =
+    (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+
+  const reconRefundsTotal = (sqlite
     .prepare(
       `SELECT COALESCE(SUM(total_refunded), 0) AS total
        FROM recon_refunds
@@ -530,31 +529,11 @@ export function recomputeRefundVariance(orderId: string): {
     )
     .get(orderId) as { total: number }).total;
 
-  // Expected: three-way decision (PR #R4l-a-fix7).
-  //   1. transactions_refunded present  → cash truth from gateway tx.
-  //                                       Clears the #21876 family + #38088 rounding.
-  //   2. No refund rows in our DB       → expected = 0 ("nothing to reconcile").
-  //                                       Clears the #21747 family (manual-edit; current_total
-  //                                       was zeroed via Admin editor with no cash movement).
-  //   3. Otherwise                      → fall back to (total − current_total_price).
-  //                                       Legacy payload safety net.
-  const refundRowCount = (sqlite
-    .prepare(`SELECT COUNT(*) AS c FROM recon_refunds WHERE order_id = ?`)
-    .get(orderId) as { c: number }).c;
-  let expected: number;
-  if (ord.transactions_refunded != null) {
-    expected = ord.transactions_refunded;
-  } else if (refundRowCount === 0) {
-    expected = 0;
-  } else {
-    expected = (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
-  }
-
-  const variance = expected - actual;
+  const variance = lineValueDelta - reconRefundsTotal;
   const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
 
   // refund_variance_kind preserved as a column but unused by this algorithm.
-  // Future PRs may classify the remaining variances; until then leave null.
+  // Future PRs may classify the remaining exceptions; until then leave null.
   setReconOrderRefundVariance(orderId, flag, variance, null);
   return { flag, amount: variance, kind: null };
 }
