@@ -1291,6 +1291,24 @@ function bootstrapSchema() {
     // exchanges, gift-card payments, and voids. Used for per-payout reconciliation
     // (PR #R5), NOT for per-order variance flagging (that's what fix3 got wrong).
     { name: "transactions_refunded", defn: "REAL" },
+    // PR #R4l-a-fix9 — disposition framework. When an operator triages a
+    // variance-flagged order, they tag it with one of four dispositions:
+    //   'partial_refund_post_sale'         — DR Sales Returns / CR Cash
+    //   'unverified_return_to_gc'          — DR Sales Returns / CR GC Liability
+    //   'theft_post_sale_revenue_reversal' — DR Sales Returns / CR A/R
+    //   'other'                            — manual review, no auto JE
+    // The disposition decreases Shopify's net sales side; credit side varies
+    // by what actually happened to cash/inventory. Once set, the variance
+    // flag clears (it's considered resolved). Phase 2 PRs read these tags to
+    // post JEs to QBO.
+    { name: "disposition", defn: "TEXT" },
+    { name: "disposition_note", defn: "TEXT" },
+    { name: "disposition_set_at", defn: "TEXT" },
+    { name: "disposition_set_by", defn: "TEXT" },
+    // disposition_amount: the line-value amount the JE should post. Defaults
+    // to (total_price − current_total_price) at save time but operators can
+    // override for partial cases (e.g. partial refund to GC + partial cash).
+    { name: "disposition_amount", defn: "REAL" },
   ]);
 
   // ----- Gift card redemptions (PR #R4e) -----
@@ -4203,6 +4221,43 @@ export function setReconOrderRefundVariance(
   sqlite
     .prepare(`UPDATE recon_orders SET refund_variance_flag = ?, refund_variance_amount = ?, refund_variance_kind = ? WHERE id = ?`)
     .run(flag, amount, kind, orderId);
+}
+
+/**
+ * PR #R4l-a-fix9 — set / clear a disposition tag on a variance-flagged order.
+ * Pass `disposition=null` to clear. When a non-null disposition is saved we
+ * also clear the variance flag (the order is considered triaged/resolved);
+ * recomputeRefundVariance is the source of truth and respects this.
+ */
+export function setReconOrderDisposition(
+  orderId: string,
+  disposition: string | null,
+  note: string | null,
+  amount: number | null,
+  setBy: string,
+): void {
+  const now = new Date().toISOString();
+  if (disposition === null) {
+    sqlite
+      .prepare(
+        `UPDATE recon_orders
+         SET disposition = NULL, disposition_note = NULL,
+             disposition_set_at = NULL, disposition_set_by = NULL,
+             disposition_amount = NULL
+         WHERE id = ?`,
+      )
+      .run(orderId);
+  } else {
+    sqlite
+      .prepare(
+        `UPDATE recon_orders
+         SET disposition = ?, disposition_note = ?,
+             disposition_set_at = ?, disposition_set_by = ?,
+             disposition_amount = ?
+         WHERE id = ?`,
+      )
+      .run(disposition, note, now, setBy, amount, orderId);
+  }
 }
 
 /**

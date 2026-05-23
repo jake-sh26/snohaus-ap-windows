@@ -1273,23 +1273,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.status(result.error ? 502 : 200).json(result);
   });
 
-  // PR #R4l-a (rewritten for fix4) — list orders with refund_variance_flag = 1
-  // along with per-kind counts so the UI can break the list down by anomaly
-  // pattern. The four kinds are documented in recomputeRefundVariance.
+  // PR #R4l-a (rewritten in fix4, dispositions added in fix9) — list orders
+  // with refund_variance_flag = 1 (open triage queue) plus, optionally,
+  // already-resolved orders (disposition IS NOT NULL) so the UI can show a
+  // "resolved" section. Each open row carries a server-suggested disposition
+  // so the dropdown can pre-fill.
   app.get("/api/recon/refunds/variances", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    const includeResolved = req.query.include_resolved === "1" || req.query.include_resolved === "true";
     const { sqlite } = require("./storage");
-    const rows = sqlite
+    const { suggestDisposition } = require("./shopify-recon-orders");
+    const openRows = sqlite
       .prepare(`
         SELECT id, order_number, name, created_at,
                total_price, current_total_price, total_refunded,
-               transactions_refunded, refund_variance_amount, refund_variance_kind
+               transactions_refunded, refund_variance_amount, refund_variance_kind,
+               disposition, disposition_note, disposition_amount,
+               disposition_set_at, disposition_set_by
         FROM recon_orders
         WHERE refund_variance_flag = 1
         ORDER BY ABS(refund_variance_amount) DESC
         LIMIT ?
       `)
-      .all(limit);
+      .all(limit) as any[];
+    // Decorate each open row with the server's suggested disposition + rationale.
+    const orders = openRows.map((o) => {
+      const sug = suggestDisposition(o.id);
+      return {
+        ...o,
+        suggested_disposition: sug?.disposition ?? null,
+        suggested_confidence: sug?.confidence ?? null,
+        suggested_rationale: sug?.rationale ?? null,
+      };
+    });
     const kindCounts = sqlite
       .prepare(`
         SELECT refund_variance_kind AS kind, COUNT(*) AS count
@@ -1301,12 +1317,93 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const totalCount = (sqlite
       .prepare(`SELECT COUNT(*) AS c FROM recon_orders WHERE refund_variance_flag = 1`)
       .get() as { c: number }).c;
+    // Resolved = disposition tagged (irrespective of flag); used for audit trail.
+    let resolved: any[] = [];
+    let resolvedCount = 0;
+    if (includeResolved) {
+      resolved = sqlite
+        .prepare(`
+          SELECT id, order_number, name, created_at,
+                 total_price, current_total_price, total_refunded,
+                 refund_variance_amount,
+                 disposition, disposition_note, disposition_amount,
+                 disposition_set_at, disposition_set_by
+          FROM recon_orders
+          WHERE disposition IS NOT NULL
+          ORDER BY disposition_set_at DESC
+          LIMIT ?
+        `)
+        .all(limit) as any[];
+      resolvedCount = (sqlite
+        .prepare(`SELECT COUNT(*) AS c FROM recon_orders WHERE disposition IS NOT NULL`)
+        .get() as { c: number }).c;
+    }
+    // Per-disposition counts — useful summary chips in the UI.
+    const byDisposition = sqlite
+      .prepare(`
+        SELECT disposition, COUNT(*) AS count
+        FROM recon_orders
+        WHERE disposition IS NOT NULL
+        GROUP BY disposition
+      `)
+      .all() as { disposition: string; count: number }[];
     res.json({
-      orders: rows,
-      count: rows.length,
+      orders,
+      count: orders.length,
       total_count: totalCount,
       by_kind: kindCounts,
+      by_disposition: byDisposition,
+      resolved,
+      resolved_count: resolvedCount,
     });
+  });
+
+  // PR #R4l-a-fix9 — set / clear a disposition on a variance-flagged order.
+  // POST body: { disposition: 'partial_refund_post_sale' | 'unverified_return_to_gc'
+  //                          | 'theft_post_sale_revenue_reversal' | 'other' | null,
+  //              note?: string, amount?: number }
+  // Setting disposition=null clears it and re-flags the order (re-runs variance).
+  app.post("/api/recon/orders/:id/disposition", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const orderId = String(req.params.id);
+    const { disposition, note, amount } = req.body ?? {};
+    const VALID = [
+      "partial_refund_post_sale",
+      "unverified_return_to_gc",
+      "theft_post_sale_revenue_reversal",
+      "other",
+    ];
+    if (disposition !== null && disposition !== undefined && !VALID.includes(disposition)) {
+      return res.status(400).json({ message: `Invalid disposition. Allowed: ${VALID.join(", ")} or null to clear.` });
+    }
+    const { sqlite, setReconOrderDisposition } = require("./storage");
+    const exists = sqlite.prepare(`SELECT id FROM recon_orders WHERE id = ?`).get(orderId);
+    if (!exists) return res.status(404).json({ message: "Order not found" });
+    // Default disposition_amount to (total_price − current_total_price) when
+    // setting a disposition without an explicit amount. Operators can override.
+    let dispAmount: number | null = null;
+    if (disposition !== null && disposition !== undefined) {
+      if (typeof amount === "number" && Number.isFinite(amount)) {
+        dispAmount = amount;
+      } else {
+        const row = sqlite
+          .prepare(`SELECT total_price, current_total_price FROM recon_orders WHERE id = ?`)
+          .get(orderId) as { total_price: number | null; current_total_price: number | null } | undefined;
+        if (row) {
+          dispAmount = (row.total_price ?? 0) - (row.current_total_price ?? row.total_price ?? 0);
+        }
+      }
+    }
+    setReconOrderDisposition(
+      orderId,
+      disposition ?? null,
+      typeof note === "string" ? note : null,
+      dispAmount,
+      req.user?.email || "unknown",
+    );
+    // Re-run variance — clears the flag if disposition was set, restores if cleared.
+    const { recomputeRefundVariance } = require("./shopify-recon-orders");
+    const v = recomputeRefundVariance(orderId);
+    res.json({ ok: true, order_id: orderId, disposition: disposition ?? null, variance: v });
   });
 
   // Current orders watermark (read-only) — shown in the Settings UI so the user

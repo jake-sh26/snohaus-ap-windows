@@ -475,14 +475,104 @@ export function transformShopifyOrder(o: any): {
 }
 
 /**
- * Per-order refund variance check (PR #R4l-a, simplified in fix8).
+ * Per-order refund variance tolerance (PR #R4l-a-fix9).
+ *
+ * Widened from $0.01 to $1.00 per user request — a handful of orders carry
+ * a few cents to a few dollars of legitimate rounding drift (per-line tax
+ * rounded then summed vs. our refund ETL's rollup math). $1.00 absorbs that
+ * without masking the real anomalies, which sit at hundreds to thousands
+ * of dollars (#21747 = $1140, #21735 = $330, etc).
+ *
+ * Anything bigger than this is either (a) a true math bug worth investigating
+ * or (b) a real business event that needs a disposition tag.
+ */
+const REFUND_VARIANCE_TOLERANCE = 1.0;
+
+/**
+ * PR #R4l-a-fix9 — suggest a disposition for a variance-flagged order based on
+ * data shape. UI pre-fills the dropdown with this; operators can override.
+ *
+ * Patterns (all derived from the 9 originals):
+ *   * current = total AND refund row exists       → partial_refund_post_sale
+ *   * manual edit (current < total, no refund)    → unverified_return_to_gc
+ *     (operator can change to theft_post_sale_revenue_reversal if it was theft)
+ *   * everything else                              → other (manual review)
+ *
+ * Returns null when no confident suggestion exists.
+ */
+export function suggestDisposition(
+  orderId: string,
+): { disposition: string; confidence: "high" | "medium"; rationale: string } | null {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { sqlite } = require("./storage");
+  const ord = sqlite
+    .prepare(
+      `SELECT total_price, current_total_price FROM recon_orders WHERE id = ?`,
+    )
+    .get(orderId) as {
+      total_price: number | null;
+      current_total_price: number | null;
+    } | undefined;
+  if (!ord) return null;
+  const total = ord.total_price ?? 0;
+  const current = ord.current_total_price ?? total;
+  const refundCount = (sqlite
+    .prepare(`SELECT COUNT(*) AS c FROM recon_refunds WHERE order_id = ?`)
+    .get(orderId) as { c: number }).c;
+  const refundsTotal = (sqlite
+    .prepare(
+      `SELECT COALESCE(SUM(total_refunded), 0) AS total FROM recon_refunds WHERE order_id = ?`,
+    )
+    .get(orderId) as { total: number }).total;
+
+  // Pattern: current_total_price unchanged from total_price but refund row exists.
+  // Shopify wrote the refund without moving current; net sales tied out on the
+  // store report but our delta math sees a gap. "Real partial refund" — cash out.
+  if (refundCount > 0 && Math.abs(total - current) < 0.01 && refundsTotal > 0.01) {
+    return {
+      disposition: "partial_refund_post_sale",
+      confidence: "high",
+      rationale: "Refund row exists with cash out; current_total_price unchanged.",
+    };
+  }
+
+  // Pattern: manual edit — current = 0 or substantially < total, no refund rows.
+  // Default suggestion is unverified_return_to_gc (most common); operator must
+  // confirm. If it was actually theft, they pick theft_post_sale_revenue_reversal.
+  if (refundCount === 0 && total - current > 0.01) {
+    return {
+      disposition: "unverified_return_to_gc",
+      confidence: "medium",
+      rationale:
+        "Manual edit (current < total, no refund row). Most common cause: return without receipt → GC. Confirm if theft instead.",
+    };
+  }
+
+  return null;
+}
+
+export const DISPOSITIONS = [
+  "partial_refund_post_sale",
+  "unverified_return_to_gc",
+  "theft_post_sale_revenue_reversal",
+  "other",
+] as const;
+export type Disposition = (typeof DISPOSITIONS)[number];
+
+/**
+ * Per-order refund variance check (PR #R4l-a, simplified in fix8, dispositions
+ * + widened tolerance added in fix9).
  *
  * The ONLY accounting invariant that holds per-order is:
  *
  *   Σ recon_refunds.total_refunded  ≈  (total_price − current_total_price)
  *
- * Both sides are LINE-VALUE views — what came off the P&L. Within $0.01
- * is healthy; beyond is a real math error in our refund ETL.
+ * Both sides are LINE-VALUE views — what came off the P&L. Within $1.00
+ * is healthy; beyond is either a real math bug or a business event that
+ * needs a disposition tag.
+ *
+ * If `disposition` is set on the order, the flag is cleared (the order is
+ * considered resolved — an operator has tagged how to handle it accounting-wise).
  *
  * What we deliberately do NOT check per-order:
  *   * Gateway cash refunded (transactions_refunded) vs line-value refunded.
@@ -499,7 +589,6 @@ export function transformShopifyOrder(o: any): {
  *   * #21747 family: current = 0, no refund rows. (total − current) = total,
  *     recon_refunds_total = 0 → variance flagged. Manual-edit via Admin editor
  *     zeroed the order without recording a refund.
- *   * #38088 ($0.23): genuine rounding edge in our refund ETL math.
  */
 export function recomputeRefundVariance(orderId: string): {
   flag: 0 | 1;
@@ -510,11 +599,12 @@ export function recomputeRefundVariance(orderId: string): {
   const { sqlite } = require("./storage");
   const ord = sqlite
     .prepare(
-      `SELECT total_price, current_total_price FROM recon_orders WHERE id = ?`
+      `SELECT total_price, current_total_price, disposition FROM recon_orders WHERE id = ?`,
     )
     .get(orderId) as {
       total_price: number | null;
       current_total_price: number | null;
+      disposition: string | null;
     } | undefined;
   if (!ord) return { flag: 0, amount: 0, kind: null };
 
@@ -530,10 +620,18 @@ export function recomputeRefundVariance(orderId: string): {
     .get(orderId) as { total: number }).total;
 
   const variance = lineValueDelta - reconRefundsTotal;
-  const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
+
+  // Disposition set → operator has triaged this order, clear the flag even if
+  // the math still doesn't match (a disposition IS the resolution).
+  const flag: 0 | 1 =
+    ord.disposition !== null && ord.disposition !== undefined
+      ? 0
+      : Math.abs(variance) > REFUND_VARIANCE_TOLERANCE
+        ? 1
+        : 0;
 
   // refund_variance_kind preserved as a column but unused by this algorithm.
-  // Future PRs may classify the remaining exceptions; until then leave null.
+  // Phase 2 reads `disposition` instead for JE routing.
   setReconOrderRefundVariance(orderId, flag, variance, null);
   return { flag, amount: variance, kind: null };
 }
