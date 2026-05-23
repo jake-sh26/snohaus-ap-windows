@@ -22,11 +22,33 @@ import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangl
 // One row per variance-flagged order. Pre-fills the dropdown with the server's
 // suggested disposition (data-shape match) and lets the operator confirm/change
 // and add an optional note. Saving fires onSave, parent dispatches the API call.
+// Note on the "Cash" label below: in accounting, "Cash" is the asset-account
+// family that covers cash, bank, AND credit-card clearing / merchant deposit
+// receivables — everything that resolves to a deposit. A credit-card refund
+// debits Sales Returns and credits the merchant-deposit / clearing account,
+// which rolls into the Cash asset bucket. We use "refund to original tender"
+// in the UI to avoid confusion with paper-cash refunds.
 const DISPOSITION_OPTIONS: Array<{ value: string; label: string; je: string }> = [
-  { value: "partial_refund_post_sale", label: "Partial refund (cash)", je: "DR Sales Returns / CR Cash" },
-  { value: "unverified_return_to_gc", label: "Unverified return → GC", je: "DR Sales Returns / CR GC Liability" },
-  { value: "theft_post_sale_revenue_reversal", label: "Theft (revenue reversal)", je: "DR Sales Returns / CR A/R (Acumatica handles COGS)" },
-  { value: "other", label: "Other (manual review)", je: "No auto JE — flag for review" },
+  {
+    value: "partial_refund_post_sale",
+    label: "Refund to original tender (card/cash)",
+    je: "DR Sales Returns / CR Cash (asset family: bank, merchant deposit, paper cash)",
+  },
+  {
+    value: "unverified_return_to_gc",
+    label: "Unverified return → gift card",
+    je: "DR Sales Returns / CR Gift Card Liability",
+  },
+  {
+    value: "theft_post_sale_revenue_reversal",
+    label: "Theft (revenue reversal)",
+    je: "DR Sales Returns / CR A/R (Acumatica handles COGS / inventory write-off)",
+  },
+  {
+    value: "other",
+    label: "Other (manual review)",
+    je: "No auto JE — flag for review",
+  },
 ];
 function TriageRow({
   row,

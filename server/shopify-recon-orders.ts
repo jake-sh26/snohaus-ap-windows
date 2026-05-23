@@ -551,6 +551,25 @@ export function suggestDisposition(
   return null;
 }
 
+// PR #R4l-a-fix9 — disposition vocabulary read by Phase 2 (#R6–#R9) for JE
+// posting to QBO. Each disposition maps to a (debit, credit) account pair:
+//
+//   partial_refund_post_sale          DR Sales Returns / CR Shopify Payments
+//                                                          clearing  (a.k.a.
+//                                     merchant-deposit receivable / undeposited
+//                                     funds — the same account where daily
+//                                     card batches land before they sweep to
+//                                     the bank). For paper-cash refunds this
+//                                     would post to the cash drawer GL, but
+//                                     in practice ~all of these are card
+//                                     refunds that net out of the next payout.
+//   unverified_return_to_gc           DR Sales Returns / CR Gift Card Liability
+//   theft_post_sale_revenue_reversal  DR Sales Returns / CR A/R
+//                                     (Acumatica handles inventory + COGS)
+//   other                             No auto JE — flag for manual review
+//
+// Every disposition decreases Shopify-side net sales so QBO ties out to
+// Shopify Finance Summary. Credit side reflects what cash/inventory did.
 export const DISPOSITIONS = [
   "partial_refund_post_sale",
   "unverified_return_to_gc",
