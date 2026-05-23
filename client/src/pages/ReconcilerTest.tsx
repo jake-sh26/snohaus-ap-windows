@@ -18,6 +18,94 @@ import { Separator } from "@/components/ui/separator";
 import { apiRequest } from "@/lib/queryClient";
 import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check, BookOpen, Upload, Calculator, Layers } from "lucide-react";
 
+// ----- PR #R4l-a-fix9: disposition triage row -----
+// One row per variance-flagged order. Pre-fills the dropdown with the server's
+// suggested disposition (data-shape match) and lets the operator confirm/change
+// and add an optional note. Saving fires onSave, parent dispatches the API call.
+const DISPOSITION_OPTIONS: Array<{ value: string; label: string; je: string }> = [
+  { value: "partial_refund_post_sale", label: "Partial refund (cash)", je: "DR Sales Returns / CR Cash" },
+  { value: "unverified_return_to_gc", label: "Unverified return → GC", je: "DR Sales Returns / CR GC Liability" },
+  { value: "theft_post_sale_revenue_reversal", label: "Theft (revenue reversal)", je: "DR Sales Returns / CR A/R (Acumatica handles COGS)" },
+  { value: "other", label: "Other (manual review)", je: "No auto JE — flag for review" },
+];
+function TriageRow({
+  row,
+  onSave,
+  saving,
+}: {
+  row: {
+    id: string;
+    name: string | null;
+    order_number: string | null;
+    total_price: number | null;
+    current_total_price: number | null;
+    total_refunded: number | null;
+    refund_variance_amount: number | null;
+    disposition: string | null;
+    disposition_note: string | null;
+    suggested_disposition: string | null;
+    suggested_confidence: "high" | "medium" | null;
+    suggested_rationale: string | null;
+  };
+  onSave: (disposition: string, note: string | undefined) => void;
+  saving: boolean;
+}) {
+  // Initial dropdown value: operator's prior pick (if any), else server suggestion,
+  // else empty (forces explicit choice). Note defaults to the row's saved note.
+  const initialDisp = row.disposition ?? row.suggested_disposition ?? "";
+  const [disp, setDisp] = useState<string>(initialDisp);
+  const [note, setNote] = useState<string>(row.disposition_note ?? "");
+  const canSave = disp !== "" && (disp !== row.disposition || note !== (row.disposition_note ?? ""));
+  return (
+    <tr className="border-t border-amber-200/50 align-top">
+      <td className="px-1 py-0.5 font-mono whitespace-nowrap">{row.name ?? `#${row.order_number ?? row.id}`}</td>
+      <td className="px-1 py-0.5 font-mono text-right">${(row.total_price ?? 0).toFixed(2)}</td>
+      <td className="px-1 py-0.5 font-mono text-right">${(row.current_total_price ?? 0).toFixed(2)}</td>
+      <td className="px-1 py-0.5 font-mono text-right">${(row.total_refunded ?? 0).toFixed(2)}</td>
+      <td className="px-1 py-0.5 font-mono text-right font-medium">${(row.refund_variance_amount ?? 0).toFixed(2)}</td>
+      <td className="px-1 py-0.5">
+        <select
+          className="w-full rounded border border-amber-300 bg-white text-[11px] px-1 py-0.5"
+          value={disp}
+          onChange={(e) => setDisp(e.target.value)}
+          title={row.suggested_rationale ?? undefined}
+        >
+          <option value="">— pick —</option>
+          {DISPOSITION_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value} title={o.je}>
+              {o.label}
+              {row.suggested_disposition === o.value ? " ★" : ""}
+            </option>
+          ))}
+        </select>
+        {row.suggested_disposition && row.disposition == null && (
+          <div className="text-[10px] text-amber-800/80 mt-0.5" title={row.suggested_rationale ?? undefined}>
+            suggested ({row.suggested_confidence})
+          </div>
+        )}
+      </td>
+      <td className="px-1 py-0.5">
+        <input
+          className="w-full rounded border border-amber-300 bg-white text-[11px] px-1 py-0.5"
+          placeholder="optional note"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      </td>
+      <td className="px-1 py-0.5">
+        <button
+          type="button"
+          className="rounded bg-amber-900 text-white text-[11px] px-2 py-0.5 disabled:opacity-40 disabled:cursor-not-allowed"
+          disabled={!canSave || saving}
+          onClick={() => onSave(disp, note.trim() === "" ? undefined : note)}
+        >
+          {saving ? "…" : "Save"}
+        </button>
+      </td>
+    </tr>
+  );
+}
+
 // ----- typed responses (loose — backend already validates) -----
 type TokenStatus = { hasToken: boolean; expiresAt: string | null; expiresInSec: number | null };
 type Status = {
@@ -533,26 +621,60 @@ export default function ReconcilerTest() {
   // PR #R4l-a-fix4 — the variance endpoint now returns a `refund_variance_kind`
   // tag per row plus an aggregate `by_kind` breakdown. The four kinds are
   // documented in server/shopify-recon-orders.ts → recomputeRefundVariance.
+  // PR #R4l-a-fix9 — variance list now also carries per-row server-suggested
+  // dispositions + any disposition already saved by an operator. The same
+  // endpoint optionally returns the resolved queue (include_resolved=1).
+  type VarianceRow = {
+    id: string;
+    order_number: string | null;
+    name: string | null;
+    created_at: string;
+    total_price: number | null;
+    current_total_price: number | null;
+    total_refunded: number | null;
+    transactions_refunded: number | null;
+    refund_variance_amount: number | null;
+    refund_variance_kind: string | null;
+    disposition: string | null;
+    disposition_note: string | null;
+    disposition_amount: number | null;
+    disposition_set_at: string | null;
+    disposition_set_by: string | null;
+    suggested_disposition: string | null;
+    suggested_confidence: "high" | "medium" | null;
+    suggested_rationale: string | null;
+  };
   const refundVariancesQ = useQuery<{
-    orders: Array<{
-      id: string;
-      order_number: string | null;
-      name: string | null;
-      created_at: string;
-      total_price: number | null;
-      current_total_price: number | null;
-      total_refunded: number | null;
-      transactions_refunded: number | null;
-      refund_variance_amount: number | null;
-      refund_variance_kind: string | null;
-    }>;
+    orders: VarianceRow[];
     count: number;
     total_count: number;
     by_kind: Array<{ kind: string | null; count: number }>;
+    by_disposition: Array<{ disposition: string; count: number }>;
+    resolved: VarianceRow[];
+    resolved_count: number;
   }>({
     queryKey: ["/api/recon/refunds/variances"],
-    queryFn: () => jsonGet("/api/recon/refunds/variances?limit=200"),
+    queryFn: () => jsonGet("/api/recon/refunds/variances?limit=200&include_resolved=1"),
     refetchInterval: 30_000,
+  });
+  // PR #R4l-a-fix9 — save a disposition. On success the variance row clears
+  // from the open list (server flips refund_variance_flag to 0).
+  const setDispositionMut = useMutation<
+    { ok: boolean; order_id: string; disposition: string | null },
+    Error,
+    { orderId: string; disposition: string | null; note?: string; amount?: number }
+  >({
+    mutationFn: ({ orderId, disposition, note, amount }) =>
+      jsonPost(`/api/recon/orders/${encodeURIComponent(orderId)}/disposition`, { disposition, note, amount }),
+    onSuccess: (r) => {
+      setLastAction(
+        r.disposition
+          ? `Order ${r.order_id} tagged as ${r.disposition}.`
+          : `Order ${r.order_id} disposition cleared.`,
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/refunds/variances"] });
+    },
+    onError: (e: any) => setLastAction(`Disposition save failed: ${e?.message ?? e}`),
   });
   const registerMut = useMutation<WebhookRegResult>({
     mutationFn: () => jsonPost("/api/recon/shopify/webhooks/register"),
@@ -1438,80 +1560,99 @@ export default function ReconcilerTest() {
                 </div>
               )}
             </div>
-            {/* Variance exceptions list — always rendered if any exist, even
-                without a fresh backfill run, so a stale flag is still visible. */}
+            {/* PR #R4l-a-fix9 — variance triage. Each open row gets a dropdown
+                pre-filled with the server's suggested disposition; operator
+                picks one of four named dispositions (or 'other') and saves.
+                Saving clears the variance flag. Tolerance is now $1.00 — the
+                handful of cents/dollars of legitimate rounding drift no longer
+                clutter this list. Resolved orders appear in the collapsible
+                section below for audit trail. */}
             {refundVariancesQ.data && refundVariancesQ.data.count > 0 && (
-              <details className="text-xs rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-1.5">
+              <details open className="text-xs rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-1.5">
                 <summary className="cursor-pointer select-none font-medium text-amber-900">
                   <AlertTriangle className="size-3.5 inline mr-1" />
-                  {refundVariancesQ.data.total_count ?? refundVariancesQ.data.count} order(s) flagged with refund variance
+                  {refundVariancesQ.data.total_count ?? refundVariancesQ.data.count} order(s) need triage
+                  <span className="ml-2 text-amber-800/70 font-normal">(tolerance $1.00 — above this needs a disposition tag)</span>
                 </summary>
-                {/* Per-kind summary chips — fix4 narrowed per-order variance to
-                    these 4 named patterns; everything else is reconciled at the
-                    payout level instead (see R5). */}
-                {refundVariancesQ.data.by_kind && refundVariancesQ.data.by_kind.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {refundVariancesQ.data.by_kind.map((k) => {
-                      const label = k.kind ?? "unclassified";
-                      const color =
-                        k.kind === "math_mismatch"
-                          ? "bg-red-100 text-red-900 border-red-300"
-                          : k.kind === "instant_void"
-                            ? "bg-orange-100 text-orange-900 border-orange-300"
-                            : k.kind === "manual_edit"
-                              ? "bg-blue-100 text-blue-900 border-blue-300"
-                              : k.kind === "refund_discrepancy_only"
-                                ? "bg-slate-100 text-slate-800 border-slate-300"
-                                : "bg-amber-100 text-amber-900 border-amber-300";
-                      return (
-                        <span
-                          key={label}
-                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-medium ${color}`}
-                          title={
-                            k.kind === "math_mismatch"
-                              ? "True accounting error: Σ refunds.total_refunded ≠ (total_price − current_total_price) within $0.01"
-                              : k.kind === "instant_void"
-                                ? "Order created and ≥99% refunded within 10 minutes — mis-rung pattern"
-                                : k.kind === "manual_edit"
-                                  ? "Order zeroed via Shopify Admin editor (no refunds[] rows)"
-                                  : k.kind === "refund_discrepancy_only"
-                                    ? "refunds[] exists but no line items and no gateway transactions — decorative adjustment"
-                                    : "Unclassified variance"
+                <div className="mt-2 max-h-[28rem] overflow-y-auto">
+                  <table className="w-full text-[11px]">
+                    <thead className="sticky top-0 bg-amber-50 font-mono">
+                      <tr className="text-left">
+                        <th className="px-1 py-1">Order</th>
+                        <th className="px-1 py-1 text-right">Total</th>
+                        <th className="px-1 py-1 text-right">Current</th>
+                        <th className="px-1 py-1 text-right">Refunded</th>
+                        <th className="px-1 py-1 text-right">Variance</th>
+                        <th className="px-1 py-1">Disposition</th>
+                        <th className="px-1 py-1">Note</th>
+                        <th className="px-1 py-1"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {refundVariancesQ.data.orders.map((o) => (
+                        <TriageRow
+                          key={o.id}
+                          row={o}
+                          onSave={(d, note) =>
+                            setDispositionMut.mutate({ orderId: o.id, disposition: d, note })
                           }
-                        >
-                          {label}: <b>{k.count}</b>
-                        </span>
-                      );
-                    })}
+                          saving={setDispositionMut.isPending && setDispositionMut.variables?.orderId === o.id}
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            )}
+            {/* Resolved — collapsed by default. Audit trail of every order an
+                operator has triaged, with the disposition tag + who tagged it. */}
+            {refundVariancesQ.data && refundVariancesQ.data.resolved_count > 0 && (
+              <details className="text-xs rounded-md border border-emerald-200 bg-emerald-50/60 px-2.5 py-1.5">
+                <summary className="cursor-pointer select-none font-medium text-emerald-900">
+                  <CheckCircle2 className="size-3.5 inline mr-1" />
+                  {refundVariancesQ.data.resolved_count} order(s) resolved
+                </summary>
+                {refundVariancesQ.data.by_disposition && refundVariancesQ.data.by_disposition.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {refundVariancesQ.data.by_disposition.map((d) => (
+                      <span
+                        key={d.disposition}
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-medium bg-emerald-100 text-emerald-900 border-emerald-300"
+                      >
+                        {d.disposition}: <b>{d.count}</b>
+                      </span>
+                    ))}
                   </div>
                 )}
                 <div className="mt-2 max-h-60 overflow-y-auto">
                   <table className="w-full text-[11px] font-mono">
-                    <thead className="sticky top-0 bg-amber-50">
+                    <thead className="sticky top-0 bg-emerald-50">
                       <tr className="text-left">
                         <th className="px-1 py-1">Order</th>
-                        <th className="px-1 py-1">Kind</th>
-                        <th className="px-1 py-1">Total</th>
-                        <th className="px-1 py-1">Current</th>
-                        <th className="px-1 py-1">Refunded</th>
-                        <th className="px-1 py-1">Tx Cash</th>
-                        <th className="px-1 py-1">Variance</th>
+                        <th className="px-1 py-1">Disposition</th>
+                        <th className="px-1 py-1 text-right">Amount</th>
+                        <th className="px-1 py-1">Note</th>
+                        <th className="px-1 py-1">Tagged by</th>
+                        <th className="px-1 py-1"></th>
                       </tr>
                     </thead>
                     <tbody>
-                      {refundVariancesQ.data.orders.slice(0, 50).map((o) => (
-                        <tr key={o.id} className="border-t border-amber-200/50">
+                      {refundVariancesQ.data.resolved.map((o) => (
+                        <tr key={o.id} className="border-t border-emerald-200/50">
                           <td className="px-1 py-0.5">{o.name ?? `#${o.order_number ?? o.id}`}</td>
-                          <td className="px-1 py-0.5">{o.refund_variance_kind ?? "—"}</td>
-                          <td className="px-1 py-0.5">${(o.total_price ?? 0).toFixed(2)}</td>
-                          <td className="px-1 py-0.5">${(o.current_total_price ?? 0).toFixed(2)}</td>
-                          <td className="px-1 py-0.5">${(o.total_refunded ?? 0).toFixed(2)}</td>
+                          <td className="px-1 py-0.5">{o.disposition}</td>
+                          <td className="px-1 py-0.5 text-right">${(o.disposition_amount ?? 0).toFixed(2)}</td>
+                          <td className="px-1 py-0.5 truncate max-w-[18rem]" title={o.disposition_note ?? ""}>{o.disposition_note ?? "—"}</td>
+                          <td className="px-1 py-0.5">{o.disposition_set_by ?? "—"}</td>
                           <td className="px-1 py-0.5">
-                            {o.transactions_refunded == null
-                              ? "—"
-                              : `$${o.transactions_refunded.toFixed(2)}`}
+                            <button
+                              className="text-emerald-900 underline hover:text-emerald-700"
+                              onClick={() => setDispositionMut.mutate({ orderId: o.id, disposition: null })}
+                              disabled={setDispositionMut.isPending}
+                            >
+                              clear
+                            </button>
                           </td>
-                          <td className="px-1 py-0.5 font-medium">${(o.refund_variance_amount ?? 0).toFixed(2)}</td>
                         </tr>
                       ))}
                     </tbody>
