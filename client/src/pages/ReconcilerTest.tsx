@@ -184,6 +184,35 @@ type OrdersSummary = {
   gift_card_orders: number;
   channel_liable_orders: number;
 };
+// PR #R5a — Shopify Finance Summary diff
+type FinanceSummaryLocal = {
+  month: string;
+  gross_sales: number;
+  discounts: number;
+  returns: number;
+  net_sales: number;
+  shipping: number;
+  taxes: number;
+  total_sales: number;
+  net_sales_gift_cards: number;
+  order_count: number;
+  refund_count: number;
+};
+type FinanceDiffLine = {
+  field: string;
+  ours: number;
+  shopify: number | null;
+  diff: number | null;
+  ok: boolean | null;
+};
+type FinanceDiffResult = {
+  month: string;
+  ours: FinanceSummaryLocal;
+  shopify: Record<string, any> | null;
+  lines: FinanceDiffLine[];
+  all_ok: boolean | null;
+  tolerance: number;
+};
 // PR #R3 — Shopify Payments payouts + balance_transactions
 type PayoutsWatermark = { payouts_watermark: string | null };
 type PayoutsSyncResult = {
@@ -380,6 +409,23 @@ function monthLabel(yyyyMm: string): string {
   const [y, m] = yyyyMm.split("-").map(Number);
   if (!y || !m) return yyyyMm;
   return new Date(y, m - 1, 1).toLocaleDateString("en-US", { year: "numeric", month: "short" });
+}
+
+// ----- PR #R5a: Shopify Finance Summary fields -----
+// Mirrors the order of lines in Shopify Admin → Analytics → Finance summary.
+// Labels match Shopify's own wording so the operator can read top-to-bottom.
+const FINANCE_FIELDS: Array<{ key: string; label: string }> = [
+  { key: "gross_sales", label: "Gross sales" },
+  { key: "discounts", label: "Discounts" },
+  { key: "returns", label: "Returns" },
+  { key: "net_sales", label: "Net sales" },
+  { key: "shipping", label: "Shipping" },
+  { key: "taxes", label: "Taxes" },
+  { key: "total_sales", label: "Total sales" },
+  { key: "net_sales_gift_cards", label: "Net sales (gift cards)" },
+];
+function prettyFinanceField(key: string): string {
+  return FINANCE_FIELDS.find((f) => f.key === key)?.label ?? key;
 }
 
 // ----- helpers -----
@@ -751,6 +797,71 @@ export default function ReconcilerTest() {
   const summaryQ = useQuery<OrdersSummary>({
     queryKey: ["/api/recon/shopify/orders-summary"],
     refetchInterval: 30_000,
+  });
+
+  // --- PR #R5a: Shopify Finance Summary diff ---
+  // Plan A: operator pastes Shopify's Admin → Analytics → Finance summary numbers
+  // for a month; we compute the same formulas locally and show a line-by-line
+  // diff. The premise (per user): same inputs + same formulas = same outputs.
+  // Any non-zero diff is a bug in our ingest/formula — not a judgment call.
+  // Plan B (future R5b): pull Shopify's numbers directly via ShopifyQL GraphQL.
+  const [financeMonth, setFinanceMonth] = useState<string>(() => {
+    // Default: last completed month (today minus ~15 days, formatted YYYY-MM)
+    const d = new Date();
+    d.setDate(1);
+    d.setMonth(d.getMonth() - 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  });
+  // Draft inputs (string so empty stays empty; parsed at save time).
+  const [shopifyDraft, setShopifyDraft] = useState<Record<string, string>>({
+    gross_sales: "",
+    discounts: "",
+    returns: "",
+    net_sales: "",
+    shipping: "",
+    taxes: "",
+    total_sales: "",
+    net_sales_gift_cards: "",
+  });
+  const financeDiffQ = useQuery<FinanceDiffResult>({
+    queryKey: ["/api/recon/finance/diff", financeMonth],
+    queryFn: () => jsonGet(`/api/recon/finance/diff/${encodeURIComponent(financeMonth)}`),
+    enabled: /^\d{4}-\d{2}$/.test(financeMonth),
+  });
+  // When the diff loads with an existing snapshot, hydrate the draft so the
+  // operator sees what was saved last time (and can edit + re-save).
+  useEffect(() => {
+    const snap = financeDiffQ.data?.shopify;
+    if (!snap) {
+      setShopifyDraft({
+        gross_sales: "", discounts: "", returns: "", net_sales: "",
+        shipping: "", taxes: "", total_sales: "", net_sales_gift_cards: "",
+      });
+      return;
+    }
+    setShopifyDraft({
+      gross_sales: snap.gross_sales == null ? "" : String(snap.gross_sales),
+      discounts: snap.discounts == null ? "" : String(snap.discounts),
+      returns: snap.returns == null ? "" : String(snap.returns),
+      net_sales: snap.net_sales == null ? "" : String(snap.net_sales),
+      shipping: snap.shipping == null ? "" : String(snap.shipping),
+      taxes: snap.taxes == null ? "" : String(snap.taxes),
+      total_sales: snap.total_sales == null ? "" : String(snap.total_sales),
+      net_sales_gift_cards: snap.net_sales_gift_cards == null ? "" : String(snap.net_sales_gift_cards),
+    });
+  }, [financeMonth, financeDiffQ.data?.shopify]);
+  const financeSnapshotMut = useMutation<
+    { ok: boolean; month: string },
+    Error,
+    { month: string; values: Record<string, number | null> }
+  >({
+    mutationFn: ({ month, values }) =>
+      jsonPost("/api/recon/finance/snapshot", { month, ...values, source_label: "manual_entry" }),
+    onSuccess: (r) => {
+      setLastAction(`Saved Shopify Finance Summary for ${monthLabel(r.month)}`);
+      qc.invalidateQueries({ queryKey: ["/api/recon/finance/diff", r.month] });
+    },
+    onError: (e: any) => setLastAction(`Snapshot save failed: ${e?.message ?? e}`),
   });
 
   // --- Payouts (PR #R3) ---
@@ -1683,6 +1794,204 @@ export default function ReconcilerTest() {
               </details>
             )}
           </div>
+        </CardContent>
+      </Card>
+
+      {/* ===== 2a. Shopify Finance Summary diff — PR #R5a ===== */}
+      {/* User-driven reconciliation: paste Shopify Admin's Finance Summary values
+          for a month and confirm our computed numbers match exactly. The whole
+          point of Phase 1: if same inputs + same formulas don't produce the
+          same outputs, that's a bug to fix — not an accounting judgment. */}
+      <Card data-testid="card-finance-diff">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Calculator className="size-4" /> Shopify Finance Summary diff
+          </CardTitle>
+          <CardDescription>
+            Bulk-match check: paste Shopify Admin's <strong>Finance summary (All channels)</strong>{" "}
+            for the selected month. We compute the same formulas from our ingested data and
+            show a line-by-line diff. Any non-zero variance is a bug in our ingest — not an
+            accounting question. Tolerance: <strong>$0.01</strong>.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Month picker */}
+          <div className="flex flex-wrap items-end gap-2">
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">Month</label>
+              <input
+                type="month"
+                className="border rounded-md px-2 py-1 text-sm"
+                value={financeMonth}
+                onChange={(e) => setFinanceMonth(e.target.value)}
+                data-testid="input-finance-month"
+              />
+            </div>
+            <div className="text-xs text-muted-foreground pb-2">
+              ({monthLabel(financeMonth)})
+            </div>
+            <div className="flex-1" />
+            {financeDiffQ.data && (
+              <div className="pb-2">
+                {financeDiffQ.data.all_ok === true ? (
+                  <Badge className="bg-green-600 hover:bg-green-600" data-testid="badge-finance-ok">
+                    <CheckCircle2 className="size-3 mr-1" /> Matches Shopify
+                  </Badge>
+                ) : financeDiffQ.data.all_ok === false ? (
+                  <Badge variant="destructive" data-testid="badge-finance-mismatch">
+                    <XCircle className="size-3 mr-1" /> Mismatch — see diff below
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" data-testid="badge-finance-no-snapshot">
+                    No Shopify values pasted yet
+                  </Badge>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Diagnostics row */}
+          {financeDiffQ.data?.ours && (
+            <div className="flex gap-2 text-xs text-muted-foreground">
+              <span>Orders: {num(financeDiffQ.data.ours.order_count)}</span>
+              <span>·</span>
+              <span>Refunds: {num(financeDiffQ.data.ours.refund_count)}</span>
+              <span>·</span>
+              <span>Bucketing: EST (created_at for orders, processed_at for refunds)</span>
+            </div>
+          )}
+
+          {/* Side-by-side diff table */}
+          {financeDiffQ.isLoading && (
+            <div className="text-sm text-muted-foreground">Computing local summary…</div>
+          )}
+          {financeDiffQ.data && (
+            <div className="border rounded-md overflow-hidden">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/50 text-xs text-muted-foreground">
+                  <tr>
+                    <th className="text-left px-3 py-1.5 font-medium w-1/3">Line</th>
+                    <th className="text-right px-3 py-1.5 font-medium">Ours</th>
+                    <th className="text-right px-3 py-1.5 font-medium">Shopify (paste below)</th>
+                    <th className="text-right px-3 py-1.5 font-medium">Diff</th>
+                    <th className="text-center px-3 py-1.5 font-medium w-12">OK</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {financeDiffQ.data.lines.map((line) => (
+                    <tr
+                      key={line.field}
+                      className={`border-t ${
+                        line.ok === false ? "bg-red-50 dark:bg-red-950/30" : ""
+                      }`}
+                      data-testid={`row-finance-${line.field}`}
+                    >
+                      <td className="px-3 py-1.5 font-medium">{prettyFinanceField(line.field)}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">{money(line.ours)}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">
+                        {line.shopify == null ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          money(line.shopify)
+                        )}
+                      </td>
+                      <td
+                        className={`px-3 py-1.5 text-right tabular-nums ${
+                          line.ok === false ? "font-semibold text-red-700 dark:text-red-400" : ""
+                        }`}
+                      >
+                        {line.diff == null ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          money(line.diff)
+                        )}
+                      </td>
+                      <td className="px-3 py-1.5 text-center">
+                        {line.ok === true ? (
+                          <CheckCircle2 className="size-4 text-green-600 inline" />
+                        ) : line.ok === false ? (
+                          <XCircle className="size-4 text-red-600 inline" />
+                        ) : (
+                          <span className="text-muted-foreground text-xs">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Paste-from-Shopify input grid */}
+          <details className="border rounded-md" open={!financeDiffQ.data?.shopify}>
+            <summary className="cursor-pointer px-3 py-2 text-sm font-medium bg-muted/30 hover:bg-muted/50">
+              {financeDiffQ.data?.shopify
+                ? "Edit Shopify values (last saved: " +
+                  (financeDiffQ.data.shopify.captured_at
+                    ? shortDate(financeDiffQ.data.shopify.captured_at)
+                    : "—") +
+                  ")"
+                : "Paste Shopify Finance Summary values"}
+            </summary>
+            <div className="p-3 space-y-3">
+              <div className="text-xs text-muted-foreground">
+                In Shopify Admin go to <strong>Analytics → Reports → Finance summary</strong>,
+                set the date range to the full month, and confirm channel = <em>All channels</em>.
+                Paste the dollar amounts below (no $ or commas required, but accepted).
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                {FINANCE_FIELDS.map((f) => (
+                  <div key={f.key}>
+                    <label className="text-xs text-muted-foreground block mb-1">
+                      {f.label}
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="0.00"
+                      className="border rounded-md px-2 py-1 text-sm w-full font-mono"
+                      value={shopifyDraft[f.key]}
+                      onChange={(e) =>
+                        setShopifyDraft({ ...shopifyDraft, [f.key]: e.target.value })
+                      }
+                      data-testid={`input-shopify-${f.key}`}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    const values: Record<string, number | null> = {};
+                    for (const f of FINANCE_FIELDS) {
+                      const raw = shopifyDraft[f.key].replace(/[$,\s]/g, "");
+                      if (raw === "") {
+                        values[f.key] = null;
+                      } else {
+                        const n = Number(raw);
+                        values[f.key] = Number.isFinite(n) ? n : null;
+                      }
+                    }
+                    financeSnapshotMut.mutate({ month: financeMonth, values });
+                  }}
+                  disabled={financeSnapshotMut.isPending}
+                  data-testid="button-save-shopify-snapshot"
+                >
+                  <Save className="size-3 mr-1" />
+                  {financeSnapshotMut.isPending ? "Saving…" : "Save Shopify values"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => financeDiffQ.refetch()}
+                  data-testid="button-refresh-finance-diff"
+                >
+                  <RefreshCw className="size-3 mr-1" /> Refresh
+                </Button>
+              </div>
+            </div>
+          </details>
         </CardContent>
       </Card>
 

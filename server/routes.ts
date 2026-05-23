@@ -1406,6 +1406,84 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ok: true, order_id: orderId, disposition: disposition ?? null, variance: v });
   });
 
+  // --------------------------------------------------------------------------
+  // PR #R5a — Shopify Finance Summary diff (all-channels reconciliation)
+  // --------------------------------------------------------------------------
+  // Premise: Shopify's Finance Summary is a deterministic query over the same
+  // orders + refunds we ingest. Same inputs + same formulas = same outputs.
+  // Any non-zero diff is a bug to fix, not an accounting judgment.
+  //
+  // Workflow:
+  //   1. Operator picks a month, GETs the local rollup ("ours")
+  //   2. Operator exports/copies Shopify Admin → Analytics → Finance Summary
+  //      for the same month, POSTs the values via /snapshot endpoint
+  //   3. Operator GETs the /diff endpoint — side-by-side, all_ok true/false
+  //   4. If all_ok is false, drill into specific orders and fix the ingest bug
+
+  // Local rollup only — no snapshot required. Useful for spot-checking.
+  app.get("/api/recon/finance/local/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { computeLocalFinanceSummary } = require("./shopify-finance-diff");
+    res.json(computeLocalFinanceSummary(month));
+  });
+
+  // Diff (ours vs Shopify snapshot). Returns null per line if no snapshot.
+  app.get("/api/recon/finance/diff/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const tolerance = Number(req.query.tolerance);
+    const { computeFinanceDiff } = require("./shopify-finance-diff");
+    res.json(
+      computeFinanceDiff(month, {
+        tolerance: Number.isFinite(tolerance) ? tolerance : undefined,
+      }),
+    );
+  });
+
+  // Save / overwrite a Shopify snapshot for a month. Operator pastes values
+  // from the Admin Finance Summary export. All money fields optional — a
+  // partial save (just net_sales, say) is allowed; missing fields show as null
+  // in the diff (no comparison for that line).
+  app.post("/api/recon/finance/snapshot", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const b = req.body ?? {};
+    if (!b.month || !/^\d{4}-\d{2}$/.test(b.month)) {
+      return res.status(400).json({ message: "month is required and must be YYYY-MM" });
+    }
+    const num = (v: any): number | null => {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const { upsertShopifySnapshot } = require("./shopify-finance-diff");
+    upsertShopifySnapshot({
+      month: b.month,
+      snapshot_kind: b.snapshot_kind ?? "all_channels",
+      gross_sales: num(b.gross_sales),
+      discounts: num(b.discounts),
+      returns: num(b.returns),
+      net_sales: num(b.net_sales),
+      shipping: num(b.shipping),
+      taxes: num(b.taxes),
+      total_sales: num(b.total_sales),
+      net_sales_gift_cards: num(b.net_sales_gift_cards),
+      source_label: typeof b.source_label === "string" ? b.source_label : "manual_entry",
+      raw_input: typeof b.raw_input === "string" ? b.raw_input : null,
+      captured_by: req.user?.email || "unknown",
+    });
+    res.json({ ok: true, month: b.month });
+  });
+
+  // List recent snapshots — last 36 months for the UI's history dropdown.
+  app.get("/api/recon/finance/snapshots", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    const { listShopifySnapshots } = require("./shopify-finance-diff");
+    res.json({ snapshots: listShopifySnapshots(36) });
+  });
+
   // Current orders watermark (read-only) — shown in the Settings UI so the user
   // knows where the incremental pull will resume from on next run.
   app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
