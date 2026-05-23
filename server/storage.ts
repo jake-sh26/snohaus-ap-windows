@@ -1240,11 +1240,16 @@ function bootstrapSchema() {
     { name: "current_total_price", defn: "REAL" },
     { name: "current_total_tax", defn: "REAL" },
     // Hard-fail flag set by the rollup variance check (R4l-c):
-    // 1 = (total_price - current_total_price) disagrees with Σ refund subtotal
+    // 1 = our refund total disagrees with the cash-truth ground source
     //     beyond $0.01. The order is excluded from rollup totals and surfaced
     //     as an exception in the UI.
     { name: "refund_variance_flag", defn: "INTEGER NOT NULL DEFAULT 0" },
     { name: "refund_variance_amount", defn: "REAL" },
+    // PR #R4l-a-fix2 — sum of order.transactions[] where kind='refund' and
+    // status='success'. This is the cash-truth source for refunds and is
+    // what the variance check ties against (current_total_price proved
+    // unreliable for manually-edited orders and refund_discrepancy adjustments).
+    { name: "transactions_refunded", defn: "REAL" },
   ]);
 
   // ----- Gift card redemptions (PR #R4e) -----
@@ -3883,6 +3888,9 @@ export type ReconOrderUpsert = {
   current_subtotal_price?: number | null;
   current_total_price?: number | null;
   current_total_tax?: number | null;
+  // PR #R4l-a-fix2 — Sum of order.transactions[] where kind='refund' AND
+  // status='success'. Ground-truth cash refunded (used as variance target).
+  transactions_refunded?: number | null;
   customer_id: string | null;
   customer_email: string | null;
   billing_zip: string | null;
@@ -3944,10 +3952,11 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
           source_name, location_id, currency, subtotal, total_tax,
           total_discounts, total_shipping, total_tips, total_price,
           total_refunded, current_subtotal_price, current_total_price, current_total_tax,
+          transactions_refunded,
           customer_id, customer_email, billing_zip,
           shipping_zip, has_gift_card, tax_channel_liable, raw_json,
           ingested_at, ingest_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
       `)
       .run(
         row.id, row.order_number, row.name, row.created_at, row.processed_at, row.updated_at,
@@ -3955,6 +3964,7 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
         row.source_name, row.location_id, row.currency, row.subtotal, row.total_tax,
         row.total_discounts, row.total_shipping, row.total_tips, row.total_price,
         row.total_refunded ?? 0, cSubtotal, cTotalPrice, cTotalTax,
+        row.transactions_refunded ?? null,
         row.customer_id, row.customer_email, row.billing_zip,
         row.shipping_zip, row.has_gift_card, row.tax_channel_liable, row.raw_json,
         now,
@@ -3970,6 +3980,7 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
         source_name = ?, location_id = ?, currency = ?, subtotal = ?, total_tax = ?,
         total_discounts = ?, total_shipping = ?, total_tips = ?, total_price = ?,
         total_refunded = ?, current_subtotal_price = ?, current_total_price = ?, current_total_tax = ?,
+        transactions_refunded = ?,
         customer_id = ?, customer_email = ?, billing_zip = ?,
         shipping_zip = ?, has_gift_card = ?, tax_channel_liable = ?, raw_json = ?,
         ingested_at = ?, ingest_version = ingest_version + 1
@@ -3981,6 +3992,7 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
       row.source_name, row.location_id, row.currency, row.subtotal, row.total_tax,
       row.total_discounts, row.total_shipping, row.total_tips, row.total_price,
       row.total_refunded ?? 0, cSubtotal, cTotalPrice, cTotalTax,
+      row.transactions_refunded ?? null,
       row.customer_id, row.customer_email, row.billing_zip,
       row.shipping_zip, row.has_gift_card, row.tax_channel_liable, row.raw_json,
       now, row.id,

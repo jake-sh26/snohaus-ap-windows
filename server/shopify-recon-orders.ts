@@ -261,6 +261,32 @@ export function transformShopifyOrder(o: any): {
     aggregateRefundedTotal += rTotal;
   }
 
+  // ---- transactions_refunded (PR #R4l-a-fix2) ----
+  // Sum of order.transactions[] where kind='refund' AND status='success'.
+  // This is CASH TRUTH — every successful refund transaction Shopify has
+  // posted to the gateway. It is what the variance check ties against.
+  //
+  // Why we trust this over (total_price - current_total_price):
+  //   * Manually-edited orders (Shopify Admin order editor) zero out
+  //     current_total_price without creating any refund transaction — the
+  //     order was structurally voided, no cash actually moved.
+  //   * refund_discrepancy adjustments carry signed presentment amounts
+  //     that don't correspond to cash direction; the gateway transaction
+  //     does.
+  //
+  // For orders without transactions[] in raw_json (legacy/test payloads) we
+  // fall back to the aggregateRefundedTotal we just computed.
+  const rawTransactions = Array.isArray(o.transactions) ? o.transactions : [];
+  let transactionsRefunded: number | null = null;
+  if (rawTransactions.length > 0) {
+    transactionsRefunded = 0;
+    for (const tx of rawTransactions) {
+      if (tx?.kind === "refund" && tx?.status === "success") {
+        transactionsRefunded += numOr0(tx.amount);
+      }
+    }
+  }
+
   // ---- current_* fields — the post-refund snapshot Shopify computes.
   // Defensive fallback: if Shopify omits them (older payloads), derive from
   // total_price minus aggregate refunded. Modern payloads (2023-10+) always
@@ -309,6 +335,8 @@ export function transformShopifyOrder(o: any): {
     shipping_zip: shippingZip,
     has_gift_card: orderHasGiftCard,
     tax_channel_liable: orderChannelLiable,
+    // PR #R4l-a-fix2 — cash-truth refund total from transactions[].
+    transactions_refunded: transactionsRefunded,
     raw_json: JSON.stringify(o),
   };
 
@@ -386,19 +414,28 @@ export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount:
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { sqlite } = require("./storage");
   const ord = sqlite
-    .prepare(`SELECT total_price, current_total_price, financial_status FROM recon_orders WHERE id = ?`)
-    .get(orderId) as { total_price: number | null; current_total_price: number | null; financial_status: string | null } | undefined;
+    .prepare(
+      `SELECT total_price, current_total_price, transactions_refunded, financial_status
+       FROM recon_orders WHERE id = ?`
+    )
+    .get(orderId) as {
+      total_price: number | null;
+      current_total_price: number | null;
+      transactions_refunded: number | null;
+      financial_status: string | null;
+    } | undefined;
   if (!ord) return { flag: 0, amount: 0 };
-  // Shopify's invariant: total_price - current_total_price = customer cash refunded.
-  // current_total_price is post-refund; if Shopify omitted it we already filled it
-  // from total_price - aggregateRefundedTotal in transformShopifyOrder, so falling
-  // back to total_price here means "no refund expected" (variance = -actual which
-  // will correctly flag if there are unexpected refund rows).
+
+  // PR #R4l-a-fix2 — variance target is cash-truth from transactions[]
+  // whenever Shopify gave us that array. Falls back to the Shopify-stated
+  // delta (total - current_total) only for legacy payloads with no
+  // transactions array, since that's the best we have for those.
   const expected =
-    (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
-  // PR #R4l-a-fix: use recon_refunds.total_refunded (canonical, sign-corrected)
-  // instead of re-summing recon_refund_line_items which stores SIGNED adjustment
-  // amounts and can't be summed without sign-aware logic.
+    ord.transactions_refunded != null
+      ? ord.transactions_refunded
+      : (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+
+  // Actual: canonical sign-corrected sum from recon_refunds.
   const actual = (sqlite
     .prepare(
       `SELECT COALESCE(SUM(total_refunded), 0) AS total
@@ -406,14 +443,12 @@ export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount:
        WHERE order_id = ?`
     )
     .get(orderId) as { total: number }).total;
-  const adj = 0; // adjustments already folded into total_refunded above
-  // Variance: how far off our cash-refunded total (items+tax+adjustments) is
-  // from Shopify's own delta between total_price and current_total_price.
-  const variance = expected - (actual + adj);
+  const variance = expected - actual;
   const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
   setReconOrderRefundVariance(orderId, flag, variance);
   return { flag, amount: variance };
 }
+
 
 /**
  * Fetch fulfillment_orders for a given order id via the dedicated endpoint.

@@ -1283,7 +1283,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .prepare(`
         SELECT id, order_number, name, created_at,
                total_price, current_total_price, total_refunded,
-               refund_variance_amount
+               transactions_refunded, refund_variance_amount
         FROM recon_orders
         WHERE refund_variance_flag = 1
         ORDER BY ABS(refund_variance_amount) DESC
