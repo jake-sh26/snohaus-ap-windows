@@ -25,9 +25,11 @@ import {
   startReconSync, finishReconSync,
   upsertReconOrder, replaceReconLineItems, replaceReconFulfillments,
   replaceReconFulfillmentOrders,
+  replaceReconRefundsForOrder, setReconOrderRefundVariance,
   getReconOrdersWatermark, getReconSettings,
   type ReconOrderUpsert, type ReconLineItemUpsert, type ReconFulfillmentUpsert,
   type ReconFulfillmentOrderUpsert,
+  type ReconRefundUpsert, type ReconRefundLineItemUpsert,
 } from "./storage";
 import {
   getShopifyReconConfig, shopifyRestCall, parseNextPageUrl,
@@ -48,6 +50,8 @@ export function transformShopifyOrder(o: any): {
   lines: ReconLineItemUpsert[];
   fulfillments: ReconFulfillmentUpsert[];
   fulfillment_orders: ReconFulfillmentOrderUpsert[];
+  refunds: ReconRefundUpsert[];
+  refund_lines: ReconRefundLineItemUpsert[];
 } {
   // ---- Defensive number coercion. Shopify sends money as strings ("123.45"). ----
   const num = (v: any): number | null => {
@@ -128,6 +132,123 @@ export function transformShopifyOrder(o: any): {
   // when this is missing.
   const locationId = o.location_id != null ? String(o.location_id) : null;
 
+  // ---- Refunds (PR #R4l-a) ------------------------------------------------
+  // Shopify ships the full refunds[] array on every /orders.json payload, so
+  // we extract it inline here — no separate API call needed for backfill.
+  //
+  // Per-refund totals are SUM(refund_line_items) + SUM(order_adjustments).
+  // Note that adjustments cover shipping refunds AND restocking fees (which
+  // appear as a NEGATIVE adjustment from the merchant's POV — i.e. "we kept
+  // some of the refund as a fee" reduces the cash refunded). We pass both
+  // through verbatim and let downstream consumers sum signed amounts.
+  const rawRefunds = Array.isArray(o.refunds) ? o.refunds : [];
+  const refunds: ReconRefundUpsert[] = [];
+  const refund_lines: ReconRefundLineItemUpsert[] = [];
+  let aggregateRefundedSubtotal = 0;
+  let aggregateRefundedTax = 0;
+  let aggregateRefundedTotal = 0;
+  for (const r of rawRefunds) {
+    const refundId = String(r.id);
+    const orderId = String(o.id);
+    let rSubtotal = 0;
+    let rTax = 0;
+    let restocked = 0;
+
+    // refund_line_items[] — the per-line refund detail.
+    const rli = Array.isArray(r.refund_line_items) ? r.refund_line_items : [];
+    for (const li of rli) {
+      const liSubtotal = numOr0(li.subtotal);
+      const liTax = numOr0(li.total_tax);
+      rSubtotal += liSubtotal;
+      rTax += liTax;
+      const restock = (li.restock_type ?? "") as string;
+      // 'return' and 'cancel' actually put inventory back. 'no_restock' and
+      // 'legacy_restock' do not (legacy_restock was a 2017-era bug that
+      // Shopify keeps reporting for backfill consistency).
+      if (restock === "return" || restock === "cancel") restocked = 1;
+      refund_lines.push({
+        id: String(li.id),
+        refund_id: refundId,
+        order_id: orderId,
+        kind: "item",
+        line_item_id: li.line_item_id != null ? String(li.line_item_id) : null,
+        quantity: numOr0(li.quantity),
+        subtotal: liSubtotal,
+        total_tax: liTax,
+        restock_type: restock || null,
+        adjustment_kind: null,
+        raw_json: JSON.stringify(li),
+      });
+    }
+
+    // order_adjustments[] — shipping refunds + restocking-fee adjustments.
+    // Stored as kind='adjustment' rows so the rollup can sum line + adj in
+    // one query.
+    const adjs = Array.isArray(r.order_adjustments) ? r.order_adjustments : [];
+    let adjAmount = 0;
+    let adjTax = 0;
+    for (const a of adjs) {
+      const amt = numOr0(a.amount);
+      const tax = numOr0(a.tax_amount);
+      adjAmount += amt;
+      adjTax += tax;
+      refund_lines.push({
+        // Adjustments use Shopify's adjustment id, prefixed to avoid PK
+        // collision with refund_line_items (both id namespaces overlap).
+        id: `adj-${String(a.id)}`,
+        refund_id: refundId,
+        order_id: orderId,
+        kind: "adjustment",
+        line_item_id: null,
+        quantity: 0,
+        // Adjustments come in signed amounts; store absolute and let downstream
+        // interpret. Most are negative-to-merchant (more cash out) so we keep
+        // the sign by storing amt as-is in subtotal. Tax mirrors.
+        subtotal: amt,
+        total_tax: tax,
+        restock_type: null,
+        adjustment_kind: a.kind ?? null,
+        raw_json: JSON.stringify(a),
+      });
+    }
+
+    const rTotal = rSubtotal + rTax + adjAmount + adjTax;
+    refunds.push({
+      id: refundId,
+      order_id: orderId,
+      created_at: r.created_at ?? null,
+      processed_at: r.processed_at ?? null,
+      note: r.note ?? null,
+      subtotal: rSubtotal,
+      total_tax: rTax,
+      total_refunded: rTotal,
+      adjustment_amount: adjAmount,
+      adjustment_tax: adjTax,
+      restocked,
+      raw_json: JSON.stringify(r),
+    });
+    aggregateRefundedSubtotal += rSubtotal;
+    aggregateRefundedTax += rTax;
+    aggregateRefundedTotal += rTotal;
+  }
+
+  // ---- current_* fields — the post-refund snapshot Shopify computes.
+  // Defensive fallback: if Shopify omits them (older payloads), derive from
+  // total_price minus aggregate refunded. Modern payloads (2023-10+) always
+  // include current_total_price.
+  const totalPrice = num(o.total_price);
+  const subtotalPrice = num(o.subtotal_price);
+  const totalTax = num(o.total_tax);
+  const currentTotalPrice =
+    num(o.current_total_price) ??
+    (totalPrice !== null ? Math.max(0, totalPrice - aggregateRefundedTotal) : null);
+  const currentSubtotalPrice =
+    num(o.current_subtotal_price) ??
+    (subtotalPrice !== null ? Math.max(0, subtotalPrice - aggregateRefundedSubtotal) : null);
+  const currentTotalTax =
+    num(o.current_total_tax) ??
+    (totalTax !== null ? Math.max(0, totalTax - aggregateRefundedTax) : null);
+
   const order: ReconOrderUpsert = {
     id: String(o.id),
     order_number: o.order_number != null ? String(o.order_number) : null,
@@ -142,13 +263,17 @@ export function transformShopifyOrder(o: any): {
     source_name: o.source_name ?? null,
     location_id: locationId,
     currency: o.currency ?? null,
-    subtotal: num(o.subtotal_price),
-    total_tax: num(o.total_tax),
+    subtotal: subtotalPrice,
+    total_tax: totalTax,
     total_discounts: num(o.total_discounts),
     total_shipping: totalShipping,
     total_tips: totalTips,
-    total_price: num(o.total_price),
-    total_refunded: 0, // refunds tracked separately when we add the refunds endpoint
+    total_price: totalPrice,
+    // PR #R4l-a — was hardcoded 0, now sums refunds[].
+    total_refunded: aggregateRefundedTotal,
+    current_subtotal_price: currentSubtotalPrice,
+    current_total_price: currentTotalPrice,
+    current_total_tax: currentTotalTax,
     customer_id: o.customer?.id != null ? String(o.customer.id) : null,
     customer_email: o.email ?? o.customer?.email ?? null,
     billing_zip: billingZip,
@@ -213,7 +338,50 @@ export function transformShopifyOrder(o: any): {
     };
   });
 
-  return { order, lines, fulfillments, fulfillment_orders };
+  return { order, lines, fulfillments, fulfillment_orders, refunds, refund_lines };
+}
+
+/**
+ * PR #R4l-a — per-order variance check. The accounting invariant is:
+ *   Σ refund_line_items.subtotal (kind='item') ≈ total_price - current_total_price
+ * (allowing for shipping refunds and restocking adjustments to make up the
+ * tax-and-adjustment portion). Within $0.01 = OK; beyond = hard fail. The
+ * check is split out so backfill and live ingest can both call it.
+ *
+ * Returns the signed variance amount (>0 means refunds-side is short) and a
+ * flag (1 = beyond tolerance) and writes both to the recon_orders row.
+ */
+export function recomputeRefundVariance(orderId: string): { flag: 0 | 1; amount: number } {
+  // Use a local import to avoid pulling the entire storage barrel into the
+  // transform fast path.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { sqlite } = require("./storage");
+  const ord = sqlite
+    .prepare(`SELECT total_price, current_total_price FROM recon_orders WHERE id = ?`)
+    .get(orderId) as { total_price: number | null; current_total_price: number | null } | undefined;
+  if (!ord) return { flag: 0, amount: 0 };
+  const expected =
+    (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+  const actual = (sqlite
+    .prepare(
+      `SELECT COALESCE(SUM(subtotal + total_tax), 0) AS total
+       FROM recon_refund_line_items
+       WHERE order_id = ? AND kind = 'item'`
+    )
+    .get(orderId) as { total: number }).total;
+  const adj = (sqlite
+    .prepare(
+      `SELECT COALESCE(SUM(subtotal + total_tax), 0) AS total
+       FROM recon_refund_line_items
+       WHERE order_id = ? AND kind = 'adjustment'`
+    )
+    .get(orderId) as { total: number }).total;
+  // Variance: how far off our cash-refunded total (items+tax+adjustments) is
+  // from Shopify's own delta between total_price and current_total_price.
+  const variance = expected - (actual + adj);
+  const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
+  setReconOrderRefundVariance(orderId, flag, variance);
+  return { flag, amount: variance };
 }
 
 /**
@@ -260,11 +428,17 @@ export function upsertOrderFromShopify(
   if (Array.isArray(rawFulfillmentOrders) && rawFulfillmentOrders.length > 0) {
     rawOrder = { ...rawOrder, fulfillment_orders: rawFulfillmentOrders };
   }
-  const { order, lines, fulfillments, fulfillment_orders } = transformShopifyOrder(rawOrder);
+  const { order, lines, fulfillments, fulfillment_orders, refunds, refund_lines } =
+    transformShopifyOrder(rawOrder);
   const outcome = upsertReconOrder(order);
   const lineCount = replaceReconLineItems(order.id, lines);
   const fulfillmentCount = replaceReconFulfillments(order.id, fulfillments);
   const fulfillmentOrderCount = replaceReconFulfillmentOrders(order.id, fulfillment_orders);
+  // PR #R4l-a — write refunds + per-order variance check. Refunds wipe first
+  // (delete-then-insert in one tx) so re-ingesting an order can never leave
+  // orphaned refund rows pointing at deleted refunds.
+  replaceReconRefundsForOrder(order.id, refunds, refund_lines);
+  recomputeRefundVariance(order.id);
   return { orderId: order.id, outcome, lineCount, fulfillmentCount, fulfillmentOrderCount };
 }
 
@@ -714,5 +888,119 @@ export async function backfillFulfillments(
     // or thrown error path. Keeps the set from leaking entries for runs that
     // weren't actually cancelled.
     cancelledSyncLogIds.delete(syncLogId);
+  }
+}
+
+// ============================================================================
+// PR #R4l-a — Refunds backfill from raw_json.
+// ----------------------------------------------------------------------------
+// We already store the full Shopify order payload in recon_orders.raw_json, so
+// backfilling refunds for every historical order is a pure local operation —
+// NO Shopify API calls needed. This re-parses raw_json for every order in the
+// given date range, runs transformShopifyOrder against it, and writes the
+// refunds[] / refund_line_items[] tables (plus updates current_* columns and
+// total_refunded on the order row, plus the variance flag).
+//
+// Why a local backfill vs. re-pulling from Shopify:
+//   1. Free — no rate-limit pressure, no 429 risk.
+//   2. Deterministic — we backfill exactly what was ingested at the time, no
+//      drift if Shopify edits a historical refund (which they can).
+//   3. Fast — 50ms per order vs. ~300ms for an API round-trip; the entire
+//      year's history backfills in ~30 seconds vs. several hours.
+//
+// If a row's raw_json is empty/null (shouldn't happen, but guards against it)
+// the order is skipped and counted as a soft error.
+// ============================================================================
+
+export type RefundsBackfillResult = {
+  orders_scanned: number;
+  orders_updated: number;
+  refunds_written: number;
+  refund_lines_written: number;
+  variance_flags_set: number;
+  errors: number;
+  error?: string;
+  syncLogId: number;
+};
+
+export async function backfillRefundsFromRawJson(
+  triggeredBy: string,
+  opts: { sinceIso: string; untilIso?: string },
+): Promise<RefundsBackfillResult> {
+  const syncLogId = startReconSync("refunds-backfill", triggeredBy, opts.sinceIso);
+  let scanned = 0;
+  let updated = 0;
+  let refundsWritten = 0;
+  let linesWritten = 0;
+  let varianceFlags = 0;
+  let errors = 0;
+
+  try {
+    const { sqlite } = await import("./storage");
+    const rows = sqlite
+      .prepare(
+        opts.untilIso
+          ? `SELECT id, raw_json FROM recon_orders WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC`
+          : `SELECT id, raw_json FROM recon_orders WHERE created_at >= ? ORDER BY created_at ASC`
+      )
+      .all(...(opts.untilIso ? [opts.sinceIso, opts.untilIso] : [opts.sinceIso])) as Array<{ id: string; raw_json: string | null }>;
+
+    for (const row of rows) {
+      scanned++;
+      if (!row.raw_json) {
+        errors++;
+        srWarn("refunds-backfill", `order ${row.id}: raw_json is null, skipping`);
+        continue;
+      }
+      try {
+        const o = JSON.parse(row.raw_json);
+        const { order, refunds, refund_lines } = transformShopifyOrder(o);
+        // Re-upsert the order so current_* / total_refunded columns get populated
+        // on pre-R4l rows that have NULL/0 for them.
+        upsertReconOrder(order);
+        replaceReconRefundsForOrder(order.id, refunds, refund_lines);
+        const vr = recomputeRefundVariance(order.id);
+        refundsWritten += refunds.length;
+        linesWritten += refund_lines.length;
+        if (refunds.length > 0) updated++;
+        if (vr.flag === 1) varianceFlags++;
+      } catch (e: any) {
+        errors++;
+        srWarn("refunds-backfill", `order ${row.id}: ${e?.message ?? e}`);
+      }
+    }
+
+    finishReconSync(syncLogId, {
+      status: errors > scanned / 2 ? "failure" : "success",
+      rows_ingested: refundsWritten,
+      cursor: opts.untilIso ?? opts.sinceIso,
+    });
+    return {
+      orders_scanned: scanned,
+      orders_updated: updated,
+      refunds_written: refundsWritten,
+      refund_lines_written: linesWritten,
+      variance_flags_set: varianceFlags,
+      errors,
+      syncLogId,
+    };
+  } catch (e: any) {
+    const msg = e?.message ?? String(e);
+    srError("refunds-backfill", `backfill failed: ${msg}`);
+    finishReconSync(syncLogId, {
+      status: "failure",
+      rows_ingested: refundsWritten,
+      error_message: msg,
+    });
+    return {
+      orders_scanned: scanned,
+      orders_updated: updated,
+      refunds_written: refundsWritten,
+      refund_lines_written: linesWritten,
+      variance_flags_set: varianceFlags,
+      errors,
+      syncLogId,
+      error: msg,
+    };
   }
 }

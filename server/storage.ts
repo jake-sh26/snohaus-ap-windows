@@ -956,6 +956,84 @@ function bootstrapSchema() {
       ON recon_line_items(tax_channel_liable);
   `);
 
+  // ----- Shopify refunds (PR #R4l-a) -----
+  // One row per refund on an order. Shopify nests refund_line_items inside,
+  // and we store those in recon_refund_line_items. Together these let us
+  // compute *actual* net revenue per order, which is what Shopify Finance
+  // reports show. Pre-R4l we only stored line_items[] (frozen at order time)
+  // and total_refunded was hardcoded to 0 — see the TODO that lived at
+  // server/shopify-recon-orders.ts line 151.
+  //
+  // CRITICAL: the variance check guarded by this table is:
+  //   Σ recon_refund_line_items.subtotal  ==  total_price - current_total_price
+  // for each order. If that doesn't hold within $0.01 the rollup flags the
+  // order as a hard-fail exception (per R4l-c).
+  //
+  // refund_line_item.kind = 'item' for line-item refunds (with a non-null
+  // line_item_id, quantity, subtotal, total_tax) or 'adjustment' for the
+  // bag of order_adjustments that don't tie to a specific line (shipping
+  // refunds, restocking-fee credits/debits). We keep both in one table so
+  // the rollup can sum them uniformly.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_refunds (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      created_at TEXT,
+      processed_at TEXT,
+      note TEXT,
+      -- Sum of all refund_line_items.subtotal on this refund. Pre-tax.
+      subtotal REAL NOT NULL DEFAULT 0,
+      -- Sum of all refund_line_items.total_tax on this refund.
+      total_tax REAL NOT NULL DEFAULT 0,
+      -- subtotal + total_tax + any adjustment amount. The actual cash refunded.
+      total_refunded REAL NOT NULL DEFAULT 0,
+      -- Sum of order_adjustments[].amount on this refund. Shipping + restocking.
+      adjustment_amount REAL NOT NULL DEFAULT 0,
+      adjustment_tax REAL NOT NULL DEFAULT 0,
+      -- True if any refund_line_item restocks (returned to inventory). For audit.
+      restocked INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_refunds_order
+      ON recon_refunds(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_refunds_processed_at
+      ON recon_refunds(processed_at);
+  `);
+
+  // refund_line_items — line-level detail. One row per refunded line on a
+  // refund, plus one row per order_adjustment (kind='adjustment'). We always
+  // join through recon_refunds for the order — but order_id is denormalized
+  // here too for fast per-order roll-up without the join.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_refund_line_items (
+      id TEXT PRIMARY KEY,
+      refund_id TEXT NOT NULL REFERENCES recon_refunds(id) ON DELETE CASCADE,
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      -- 'item' = refund_line_item; 'adjustment' = order_adjustment
+      kind TEXT NOT NULL,
+      -- The original line_item.id this refund line refers to (null for adjustments).
+      line_item_id TEXT,
+      quantity REAL DEFAULT 0,
+      -- Pre-tax refund amount for this line. Always non-negative even though
+      -- the conceptual journal entry is a reduction (Dr Revenue).
+      subtotal REAL NOT NULL DEFAULT 0,
+      -- Tax refunded on this line (sum across tax_lines on this refund line).
+      total_tax REAL NOT NULL DEFAULT 0,
+      -- 'no_restock' | 'cancel' | 'return' | 'legacy_restock' | 'shipping' (for adjustments)
+      restock_type TEXT,
+      -- For adjustments: 'shipping_refund' | 'refund_discrepancy' | other.
+      adjustment_kind TEXT,
+      raw_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_refund_li_refund
+      ON recon_refund_line_items(refund_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_refund_li_order
+      ON recon_refund_line_items(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_refund_li_line_item
+      ON recon_refund_line_items(line_item_id);
+  `);
+
   // ----- Shopify order fulfillments (PR #R4b) -----
   // One row per fulfillment record on an order. Critical for online sales:
   // the order-level `location_id` is null for online orders, but each
@@ -1149,6 +1227,24 @@ function bootstrapSchema() {
     { name: "order_id", defn: "TEXT" },
     { name: "gc_id", defn: "TEXT" },
     { name: "created_at", defn: "TEXT" },
+  ]);
+
+  // PR #R4l-a — add Shopify "current" totals to recon_orders. These are the
+  // *post-refund* equivalents of subtotal/total_price and are what Shopify
+  // Finance reports use as net sales. Existing prod DBs have recon_orders
+  // already, so we patch the columns in via ALTER TABLE here (the CREATE
+  // TABLE statement higher up does NOT include these — we keep that schema
+  // unchanged for fresh installs after the migration block runs).
+  ensureColumns("recon_orders", [
+    { name: "current_subtotal_price", defn: "REAL" },
+    { name: "current_total_price", defn: "REAL" },
+    { name: "current_total_tax", defn: "REAL" },
+    // Hard-fail flag set by the rollup variance check (R4l-c):
+    // 1 = (total_price - current_total_price) disagrees with Σ refund subtotal
+    //     beyond $0.01. The order is excluded from rollup totals and surfaced
+    //     as an exception in the UI.
+    { name: "refund_variance_flag", defn: "INTEGER NOT NULL DEFAULT 0" },
+    { name: "refund_variance_amount", defn: "REAL" },
   ]);
 
   // ----- Gift card redemptions (PR #R4e) -----
@@ -3781,6 +3877,12 @@ export type ReconOrderUpsert = {
   total_tips: number | null;
   total_price: number | null;
   total_refunded: number | null;
+  // PR #R4l-a — Shopify's post-refund snapshot fields. Optional in the type
+  // because pre-R4l call sites pass undefined; the upsert defaults them to
+  // mirror their original counterparts when refunds == 0.
+  current_subtotal_price?: number | null;
+  current_total_price?: number | null;
+  current_total_tax?: number | null;
   customer_id: string | null;
   customer_email: string | null;
   billing_zip: string | null;
@@ -3825,6 +3927,14 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
 
   const now = new Date().toISOString();
 
+  // PR #R4l-a — default current_* to their non-current counterparts. Shopify
+  // sends the current_* fields on every order payload but the test fixtures
+  // and older callers may omit them; defaulting like this means an order
+  // with zero refunds always reads `current_total_price == total_price`.
+  const cSubtotal = row.current_subtotal_price ?? row.subtotal;
+  const cTotalPrice = row.current_total_price ?? row.total_price;
+  const cTotalTax = row.current_total_tax ?? row.total_tax;
+
   if (!existing) {
     sqlite
       .prepare(`
@@ -3833,17 +3943,19 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
           cancelled_at, closed_at, financial_status, fulfillment_status,
           source_name, location_id, currency, subtotal, total_tax,
           total_discounts, total_shipping, total_tips, total_price,
-          total_refunded, customer_id, customer_email, billing_zip,
+          total_refunded, current_subtotal_price, current_total_price, current_total_tax,
+          customer_id, customer_email, billing_zip,
           shipping_zip, has_gift_card, tax_channel_liable, raw_json,
           ingested_at, ingest_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
       `)
       .run(
         row.id, row.order_number, row.name, row.created_at, row.processed_at, row.updated_at,
         row.cancelled_at, row.closed_at, row.financial_status, row.fulfillment_status,
         row.source_name, row.location_id, row.currency, row.subtotal, row.total_tax,
         row.total_discounts, row.total_shipping, row.total_tips, row.total_price,
-        row.total_refunded ?? 0, row.customer_id, row.customer_email, row.billing_zip,
+        row.total_refunded ?? 0, cSubtotal, cTotalPrice, cTotalTax,
+        row.customer_id, row.customer_email, row.billing_zip,
         row.shipping_zip, row.has_gift_card, row.tax_channel_liable, row.raw_json,
         now,
       );
@@ -3857,7 +3969,8 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
         cancelled_at = ?, closed_at = ?, financial_status = ?, fulfillment_status = ?,
         source_name = ?, location_id = ?, currency = ?, subtotal = ?, total_tax = ?,
         total_discounts = ?, total_shipping = ?, total_tips = ?, total_price = ?,
-        total_refunded = ?, customer_id = ?, customer_email = ?, billing_zip = ?,
+        total_refunded = ?, current_subtotal_price = ?, current_total_price = ?, current_total_tax = ?,
+        customer_id = ?, customer_email = ?, billing_zip = ?,
         shipping_zip = ?, has_gift_card = ?, tax_channel_liable = ?, raw_json = ?,
         ingested_at = ?, ingest_version = ingest_version + 1
       WHERE id = ?
@@ -3867,7 +3980,8 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
       row.cancelled_at, row.closed_at, row.financial_status, row.fulfillment_status,
       row.source_name, row.location_id, row.currency, row.subtotal, row.total_tax,
       row.total_discounts, row.total_shipping, row.total_tips, row.total_price,
-      row.total_refunded ?? 0, row.customer_id, row.customer_email, row.billing_zip,
+      row.total_refunded ?? 0, cSubtotal, cTotalPrice, cTotalTax,
+      row.customer_id, row.customer_email, row.billing_zip,
       row.shipping_zip, row.has_gift_card, row.tax_channel_liable, row.raw_json,
       now, row.id,
     );
@@ -3907,6 +4021,123 @@ export function replaceReconLineItems(
   });
   tx();
   return lines.length;
+}
+
+// ----------------------------------------------------------------------------
+// PR #R4l-a — Refund upsert helpers. Mirror replaceReconLineItems exactly:
+// delete every refund row for an order (cascades to refund_line_items) and
+// re-insert from the freshly-transformed Shopify payload. Single transaction
+// so partial writes are impossible.
+// ----------------------------------------------------------------------------
+
+export type ReconRefundUpsert = {
+  id: string;
+  order_id: string;
+  created_at: string | null;
+  processed_at: string | null;
+  note: string | null;
+  subtotal: number;
+  total_tax: number;
+  total_refunded: number;
+  adjustment_amount: number;
+  adjustment_tax: number;
+  restocked: number;
+  raw_json: string | null;
+};
+
+export type ReconRefundLineItemUpsert = {
+  id: string;
+  refund_id: string;
+  order_id: string;
+  kind: "item" | "adjustment";
+  line_item_id: string | null;
+  quantity: number;
+  subtotal: number;
+  total_tax: number;
+  restock_type: string | null;
+  adjustment_kind: string | null;
+  raw_json: string | null;
+};
+
+export function replaceReconRefundsForOrder(
+  orderId: string,
+  refunds: ReconRefundUpsert[],
+  refundLineItems: ReconRefundLineItemUpsert[],
+): { refunds: number; lines: number } {
+  const now = new Date().toISOString();
+  const tx = sqlite.transaction(() => {
+    // CASCADE on recon_refunds.id deletes refund_line_items, but we also
+    // wipe by order_id defensively in case an old row exists with a refund
+    // id that's no longer present in the new payload.
+    sqlite.prepare(`DELETE FROM recon_refund_line_items WHERE order_id = ?`).run(orderId);
+    sqlite.prepare(`DELETE FROM recon_refunds WHERE order_id = ?`).run(orderId);
+    if (refunds.length === 0) return;
+    const insR = sqlite.prepare(`
+      INSERT INTO recon_refunds (
+        id, order_id, created_at, processed_at, note,
+        subtotal, total_tax, total_refunded,
+        adjustment_amount, adjustment_tax, restocked,
+        raw_json, ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const r of refunds) {
+      insR.run(
+        r.id, r.order_id, r.created_at, r.processed_at, r.note,
+        r.subtotal, r.total_tax, r.total_refunded,
+        r.adjustment_amount, r.adjustment_tax, r.restocked,
+        r.raw_json, now,
+      );
+    }
+    const insL = sqlite.prepare(`
+      INSERT INTO recon_refund_line_items (
+        id, refund_id, order_id, kind, line_item_id,
+        quantity, subtotal, total_tax,
+        restock_type, adjustment_kind, raw_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const li of refundLineItems) {
+      insL.run(
+        li.id, li.refund_id, li.order_id, li.kind, li.line_item_id,
+        li.quantity, li.subtotal, li.total_tax,
+        li.restock_type, li.adjustment_kind, li.raw_json,
+      );
+    }
+  });
+  tx();
+  return { refunds: refunds.length, lines: refundLineItems.length };
+}
+
+/**
+ * Read all refunds + nested refund_line_items for one order. Used by the
+ * order detail endpoint to show the refund timeline in the UI.
+ */
+export function getReconRefundsForOrder(orderId: string): {
+  refunds: any[];
+  refund_line_items: any[];
+} {
+  const refunds = sqlite
+    .prepare(`SELECT * FROM recon_refunds WHERE order_id = ? ORDER BY processed_at ASC, created_at ASC`)
+    .all(orderId);
+  const refund_line_items = sqlite
+    .prepare(`SELECT * FROM recon_refund_line_items WHERE order_id = ? ORDER BY refund_id ASC, id ASC`)
+    .all(orderId);
+  return { refunds, refund_line_items };
+}
+
+/**
+ * PR #R4l-a — set the refund_variance_flag / refund_variance_amount columns
+ * on recon_orders. Called by the per-order variance check after refunds ETL.
+ * `amount` is the discrepancy in dollars between (total_price - current_total_price)
+ * and Σ refund_line_items.subtotal; positive means refunds total is short.
+ */
+export function setReconOrderRefundVariance(
+  orderId: string,
+  flag: 0 | 1,
+  amount: number,
+): void {
+  sqlite
+    .prepare(`UPDATE recon_orders SET refund_variance_flag = ?, refund_variance_amount = ? WHERE id = ?`)
+    .run(flag, amount, orderId);
 }
 
 /**
@@ -4154,6 +4385,8 @@ export function getReconOrdersSummary(): ReconOrdersSummary {
 export function getReconOrderWithLines(orderId: string): {
   order: any;
   lines: any[];
+  refunds: any[];
+  refund_line_items: any[];
 } | null {
   const order = sqlite
     .prepare(`SELECT * FROM recon_orders WHERE id = ?`)
@@ -4162,7 +4395,10 @@ export function getReconOrderWithLines(orderId: string): {
   const lines = sqlite
     .prepare(`SELECT * FROM recon_line_items WHERE order_id = ? ORDER BY id ASC`)
     .all(orderId);
-  return { order, lines };
+  // PR #R4l-a — attach refunds + nested lines so the order detail UI can
+  // show the post-refund picture alongside the original line items.
+  const { refunds, refund_line_items } = getReconRefundsForOrder(orderId);
+  return { order, lines, refunds, refund_line_items };
 }
 
 // ============================================================================

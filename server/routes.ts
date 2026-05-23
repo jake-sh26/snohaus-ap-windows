@@ -126,6 +126,7 @@ import {
   syncOrdersIncremental,
   transformShopifyOrder,
   backfillFulfillments,
+  backfillRefundsFromRawJson,
   getBackfillProgress,
   listRecentBackfillProgress,
   getActiveBackfillProgress,
@@ -1234,6 +1235,46 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (requestCancelBackfill(id)) cancelled.push(id);
     }
     res.json({ cancelled });
+  });
+
+  // PR #R4l-a — Refunds backfill from raw_json. No Shopify API calls; just
+  // re-parses the stored payload for every order in the range and writes
+  // refunds + variance flags. Date range required so the user can run it
+  // per-month without re-processing the entire history every time.
+  app.post("/api/recon/refunds/backfill", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const since = String(req.body?.since || "").trim();
+    const until = req.body?.until ? String(req.body.until).trim() : undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+      return res.status(400).json({ message: "`since` is required as YYYY-MM-DD" });
+    }
+    if (until && !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+      return res.status(400).json({ message: "`until` must be YYYY-MM-DD when provided" });
+    }
+    const triggeredBy = `manual:${req.user?.email || "unknown"}`;
+    const sinceIso = `${since}T00:00:00Z`;
+    const untilIso = until ? `${until}T00:00:00Z` : undefined;
+    const result = await backfillRefundsFromRawJson(triggeredBy, { sinceIso, untilIso });
+    res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // PR #R4l-a — list orders with refund_variance_flag = 1. These are the
+  // hard-fail accounting exceptions the rollup must surface instead of
+  // silently rolling up. UI lists them so the user can drill into each.
+  app.get("/api/recon/refunds/variances", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    const { sqlite } = require("./storage");
+    const rows = sqlite
+      .prepare(`
+        SELECT id, order_number, name, created_at,
+               total_price, current_total_price, total_refunded,
+               refund_variance_amount
+        FROM recon_orders
+        WHERE refund_variance_flag = 1
+        ORDER BY ABS(refund_variance_amount) DESC
+        LIMIT ?
+      `)
+      .all(limit);
+    res.json({ orders: rows, count: rows.length });
   });
 
   // Current orders watermark (read-only) — shown in the Settings UI so the user
