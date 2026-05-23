@@ -336,20 +336,28 @@ export function transformShopifyOrder(o: any): {
     aggregateRefundedTotal += rTotal;
   }
 
-  // ---- transactions_refunded (PR #R4l-a-fix2, restored in fix6) ----
-  // Read the top-level order.transactions[] array. In normal /orders.json
-  // payloads this is absent and transactionsRefunded stays null — which is
-  // exactly what the variance check needs to fall through to its
-  // (total_price - current_total_price) path. The fix3 change to read nested
-  // refunds[].transactions[] was the regression that took variance from 9 to
-  // 260+: nested gateway-cash includes GC refund txns that are NOT in our
-  // line-value sum, so the two never agreed.
-  const rawTransactions = Array.isArray(o.transactions) ? o.transactions : [];
+  // ---- transactions_refunded (PR #R4l-a-fix7) ----
+  // CASH TRUTH from nested refunds[].transactions[]. Top-level transactions[]
+  // is not shipped in /orders.json payloads; the nested array under each
+  // refund IS shipped and contains the gateway-side refund transactions for
+  // that refund (kind='refund', status='success').
+  //
+  // We deliberately keep transactionsRefunded NULL when no refunds exist on
+  // the order. That null is the signal recomputeRefundVariance uses to fall
+  // through to its "no refund activity to reconcile" branch — see the fn doc.
+  //
+  // History: fix6 reverted to top-level transactions[] which is always absent,
+  // so transactionsRefunded stayed null for every order — the variance check
+  // then fell back to (total - current) for everyone, producing 9 exceptions
+  // we already diagnosed. fix7 restores fix3's nested read so the 4 #21876-
+  // family orders + #38088 rounding case can ACTUALLY match their gateway
+  // refund amounts and clear.
   let transactionsRefunded: number | null = null;
-  if (rawTransactions.length > 0) {
-    transactionsRefunded = 0;
-    for (const tx of rawTransactions) {
+  for (const r of rawRefunds) {
+    const rTxs = Array.isArray(r.transactions) ? r.transactions : [];
+    for (const tx of rTxs) {
       if (tx?.kind === "refund" && tx?.status === "success") {
+        if (transactionsRefunded == null) transactionsRefunded = 0;
         transactionsRefunded += numOr0(tx.amount);
       }
     }
@@ -522,16 +530,25 @@ export function recomputeRefundVariance(orderId: string): {
     )
     .get(orderId) as { total: number }).total;
 
-  // Expected: byte-exact fix2 logic.
-  //   transactions_refunded != null → cash truth from top-level transactions[].
-  //   otherwise                    → (total_price − current_total_price).
-  // Top-level transactions[] is absent in standard /orders.json payloads, so
-  // the second path is the live one for nearly every order. This is what
-  // produced the known-good 9 exceptions.
-  const expected =
-    ord.transactions_refunded != null
-      ? ord.transactions_refunded
-      : (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+  // Expected: three-way decision (PR #R4l-a-fix7).
+  //   1. transactions_refunded present  → cash truth from gateway tx.
+  //                                       Clears the #21876 family + #38088 rounding.
+  //   2. No refund rows in our DB       → expected = 0 ("nothing to reconcile").
+  //                                       Clears the #21747 family (manual-edit; current_total
+  //                                       was zeroed via Admin editor with no cash movement).
+  //   3. Otherwise                      → fall back to (total − current_total_price).
+  //                                       Legacy payload safety net.
+  const refundRowCount = (sqlite
+    .prepare(`SELECT COUNT(*) AS c FROM recon_refunds WHERE order_id = ?`)
+    .get(orderId) as { c: number }).c;
+  let expected: number;
+  if (ord.transactions_refunded != null) {
+    expected = ord.transactions_refunded;
+  } else if (refundRowCount === 0) {
+    expected = 0;
+  } else {
+    expected = (ord.total_price ?? 0) - (ord.current_total_price ?? ord.total_price ?? 0);
+  }
 
   const variance = expected - actual;
   const flag: 0 | 1 = Math.abs(variance) > 0.01 ? 1 : 0;
