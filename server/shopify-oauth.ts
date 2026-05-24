@@ -42,6 +42,7 @@ function oauthWarn(scope: string, msg: string) {
  */
 const REQUIRED_SCOPES = [
   "read_all_orders",
+  "read_analytics",
   "read_assigned_fulfillment_orders",
   "read_customers",
   "read_fulfillments",
@@ -51,10 +52,16 @@ const REQUIRED_SCOPES = [
   "read_merchant_managed_fulfillment_orders",
   "read_orders",
   "read_products",
+  "read_reports",
   "read_shopify_payments_disputes",
   "read_shopify_payments_payouts",
   "read_third_party_fulfillment_orders",
 ].join(",");
+
+// PR #R5b — added `read_analytics` and `read_reports` to enable
+// `shopifyqlQuery` (Shopify's Finance Summary data source). The user must
+// re-install the app via /api/auth/shopify/install after deploy to grant
+// the new scopes; the existing token works for everything else.
 
 /**
  * Verify Shopify's HMAC signature on an install callback. Shopify signs all
