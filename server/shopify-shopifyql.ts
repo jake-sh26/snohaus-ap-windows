@@ -302,21 +302,21 @@ export async function pullFinanceSummary(
   assertIsoDate(startDate, "startDate");
   assertIsoDate(endDate, "endDate");
 
-  // ShopifyQL date literals are single-quoted strings. The `sales` dataset is
-  // the canonical Finance Summary source — it exposes gross_sales, discounts,
-  // returns, net_sales, shipping, taxes, total_sales, and orders (count).
+  // The `sales` dataset is the canonical Finance Summary source. Per Shopify
+  // dev docs syntax reference and community.shopify.dev (Dec 2025), the time
+  // filter on `sales` is SINCE/UNTIL with date literals — NOT a WHERE clause
+  // on processed_at/created_at (those columns don't exist on `sales`; they
+  // live on the `orders` dataset, which itself is not a valid FROM clause).
   //
-  // Verified against Shopify dev docs (2025-12) and community.shopify.dev
-  // confirmations: `FROM sales` works, `FROM orders` returns "Invalid dataset
-  // in FROM clause". Earlier comments in this file claiming `sales` was
-  // deprecated were incorrect — that 2023 community post has been reversed.
-  //
-  // We include `orders` (the count metric) for sanity vs our own count of
-  // distinct order ids in recon_orders.
+  // bucketBy is therefore informational only on this dataset. We keep the
+  // parameter on the API surface for forward-compat (in case Shopify exposes
+  // both buckets later) and stamp it into the returned payload so callers
+  // know which bucket the numbers represent. The `sales` dataset already
+  // buckets by Shopify's standard Finance Summary date logic (processed_at).
   const q = [
     "FROM sales",
     "SHOW gross_sales, discounts, returns, net_sales, shipping, taxes, total_sales, orders",
-    `WHERE ${bucketBy} >= '${startDate}' AND ${bucketBy} <= '${endDate} 23:59:59'`,
+    `SINCE '${startDate}' UNTIL '${endDate}'`,
   ].join("\n");
 
   const result = await runShopifyql(q);
