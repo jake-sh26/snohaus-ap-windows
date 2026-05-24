@@ -1624,7 +1624,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS recognized_month,
         o.financial_status, o.fulfillment_status, o.source_name,
         o.total_price, o.subtotal, o.total_discounts, o.total_shipping, o.total_tax, o.total_refunded,
+        o.current_subtotal_price, o.current_total_price, o.current_total_tax,
         o.has_gift_card,
+        (SELECT COUNT(*) FROM recon_refunds r WHERE r.order_id = o.id) AS refund_count,
+        (SELECT COALESCE(SUM(rli.subtotal), 0) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id AND rli.kind = 'item') AS refund_item_subtotal_sum,
+        (SELECT COALESCE(SUM(rli.total_tax), 0) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id AND rli.kind = 'item') AS refund_item_tax_sum,
+        (SELECT COALESCE(SUM(rli.subtotal), 0) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'refund_discrepancy') AS refund_discrepancy_sum,
+        (SELECT COALESCE(SUM(rli.subtotal), 0) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'shipping_refund') AS shipping_refund_sum,
         (SELECT COALESCE(SUM(li.price * li.quantity), 0)
            FROM recon_line_items li WHERE li.order_id = o.id) AS line_gross,
         -- PR #R5a-fix2 — expose both discount columns and the MAX-of-the-two
