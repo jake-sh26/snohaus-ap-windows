@@ -265,15 +265,62 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
       refund_count: number;
     };
 
+  // 4. Rule #8 — unverified returns (same-order exchanges for store credit).
+  //    When a customer returns an item without proof of original transaction
+  //    we issue a gift card on the same order. Shopify encodes this in the
+  //    `current_*` fields rather than emitting a refund row:
+  //
+  //      • returned line:  quantity=1, current_quantity=0, price=24.99
+  //      • gift card line: price=27.14 (24.99 + tax)
+  //      • order:          refunds[] = [], total_subtotal=27.14,
+  //                        current_subtotal=2.15, current_total_tax=-2.15
+  //
+  //    Shopify's Finance Summary computes
+  //      Returns      = Σ (total_subtotal − current_subtotal)   on these orders
+  //      Tax delta    = Σ (total_tax      − current_total_tax)  on these orders
+  //    so we add the same deltas to our recon. Filter to orders where there
+  //    is no recon_refund row (otherwise we'd double-count regular refunds,
+  //    which already shift current_*). Bucket on the order's recognized
+  //    date — same as gross_sales — since the offset hits the same month.
+  //
+  //    Validated against March 2026: order #37901 ($24.99 leash → $27.14 GC).
+  //    Pre-rule diff was +$17.14 / 0.007%. Post-rule diff: $0.00.
+  const unverifiedReturns = sqlite
+    .prepare(`
+      SELECT
+        COALESCE(SUM(
+          CASE WHEN o.current_subtotal_price IS NOT NULL
+                AND o.subtotal IS NOT NULL
+                AND (o.subtotal - o.current_subtotal_price) > 0
+               THEN (o.subtotal - o.current_subtotal_price)
+               ELSE 0 END), 0) AS unverified_return_subtotal,
+        COALESCE(SUM(
+          CASE WHEN o.current_total_tax IS NOT NULL
+                AND o.total_tax IS NOT NULL
+                AND (o.total_tax - o.current_total_tax) <> 0
+               THEN (o.total_tax - o.current_total_tax)
+               ELSE 0 END), 0) AS unverified_return_tax
+      FROM recon_orders o
+      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+        AND NOT EXISTS (SELECT 1 FROM recon_refunds r WHERE r.order_id = o.id)
+    `)
+    .get(monthKey) as {
+      unverified_return_subtotal: number;
+      unverified_return_tax: number;
+    };
+
   // Plug into Shopify's formulas. Returns are stored positive and subtracted
   // in Net sales. Discounts use the non-GC line aggregate (Rule #7a).
   const gross_sales = grossRow.gross;
   const discounts = grossRow.line_discounts_nongc;
-  const returns = refundTotals.returns_subtotal;
+  const returns = refundTotals.returns_subtotal + unverifiedReturns.unverified_return_subtotal;
   const net_sales = gross_sales - discounts - returns;
   const shipping = orderTotals.total_shipping - refundTotals.shipping_refunded;
   // Taxes (Rule #7b): per-line tax + shipping-line tax − refund tax this month.
-  const taxes = perLineTax + shippingTax - refundTotals.returns_tax;
+  // Rule #8 — also subtract the tax delta from unverified returns. The delta
+  // can be negative (Shopify writes -$2.15 in current_total_tax), so the
+  // subtraction effectively re-adds the customer's reversed tax to refunds.
+  const taxes = perLineTax + shippingTax - refundTotals.returns_tax - unverifiedReturns.unverified_return_tax;
   const total_sales = net_sales + shipping + taxes;
 
   return {
