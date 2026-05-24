@@ -1610,6 +1610,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         o.has_gift_card,
         (SELECT COALESCE(SUM(li.price * li.quantity), 0)
            FROM recon_line_items li WHERE li.order_id = o.id) AS line_gross,
+        -- PR #R5a-fix2 — expose both discount columns and the MAX-of-the-two
+        -- (the actual aggregator used by computeLocalFinanceSummary) so diagnostics
+        -- can spot discount-code orders without re-parsing raw_json.
+        (SELECT COALESCE(SUM(li.total_discount), 0)
+           FROM recon_line_items li WHERE li.order_id = o.id AND li.is_gift_card = 0) AS line_total_discount,
+        (SELECT COALESCE(SUM(COALESCE(li.discount_allocations_total, 0)), 0)
+           FROM recon_line_items li WHERE li.order_id = o.id AND li.is_gift_card = 0) AS line_alloc_discount,
+        (SELECT COALESCE(SUM(MAX(li.total_discount, COALESCE(li.discount_allocations_total, 0))), 0)
+           FROM recon_line_items li WHERE li.order_id = o.id AND li.is_gift_card = 0) AS line_effective_discount,
         (SELECT COUNT(*) FROM recon_line_items li WHERE li.order_id = o.id) AS line_count,
         (SELECT COUNT(*) FROM recon_line_items li WHERE li.order_id = o.id AND li.is_gift_card = 1) AS gift_card_lines
       FROM recon_orders o
@@ -1644,6 +1653,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let succeeded = 0;
     let failed = 0;
     let recognizedAtChanged = 0;
+    let discountAllocBackfilled = 0;
     const errors: { order_id: string; error: string }[] = [];
 
     for (const row of rows) {
@@ -1655,19 +1665,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // how many lines actually moved (most won't change — only orders with
         // late fulfillments + refunds, i.e. exchanges).
         const beforeRows = sqlite
-          .prepare(`SELECT id, recognized_at FROM recon_line_items WHERE order_id = ?`)
-          .all(row.id) as { id: string; recognized_at: string | null }[];
-        const before = new Map(beforeRows.map((r: { id: string; recognized_at: string | null }) => [r.id, r.recognized_at]));
+          .prepare(`SELECT id, recognized_at, COALESCE(discount_allocations_total, 0) AS dat FROM recon_line_items WHERE order_id = ?`)
+          .all(row.id) as { id: string; recognized_at: string | null; dat: number }[];
+        const beforeRA = new Map(beforeRows.map((r: { id: string; recognized_at: string | null; dat: number }) => [r.id, r.recognized_at]));
+        const beforeDAT = new Map(beforeRows.map((r: { id: string; recognized_at: string | null; dat: number }) => [r.id, r.dat]));
 
         if (!dryRun) {
           upsertOrderFromShopify(raw);
         }
 
         const afterRows = sqlite
-          .prepare(`SELECT id, recognized_at FROM recon_line_items WHERE order_id = ?`)
-          .all(row.id) as { id: string; recognized_at: string | null }[];
-        for (const a of afterRows as { id: string; recognized_at: string | null }[]) {
-          if (before.get(a.id) !== a.recognized_at) recognizedAtChanged++;
+          .prepare(`SELECT id, recognized_at, COALESCE(discount_allocations_total, 0) AS dat FROM recon_line_items WHERE order_id = ?`)
+          .all(row.id) as { id: string; recognized_at: string | null; dat: number }[];
+        for (const a of afterRows as { id: string; recognized_at: string | null; dat: number }[]) {
+          if (beforeRA.get(a.id) !== a.recognized_at) recognizedAtChanged++;
+          // Count any line whose newly-written discount_allocations_total > 0
+          // (was 0 before the backfill ran, because the column didn't exist yet).
+          if ((beforeDAT.get(a.id) ?? 0) === 0 && (a.dat ?? 0) > 0) discountAllocBackfilled++;
         }
         succeeded++;
       } catch (e: any) {
@@ -1682,6 +1696,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       succeeded,
       failed,
       recognized_at_lines_changed: recognizedAtChanged,
+      discount_allocations_backfilled: discountAllocBackfilled,
       errors,
       note: dryRun
         ? "Dry run — no writes performed."
