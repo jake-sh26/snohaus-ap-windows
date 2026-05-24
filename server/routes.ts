@@ -1744,6 +1744,82 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ month, count: rows.length, total_retained: Math.round(total * 100) / 100, orders: rows });
   });
 
+  // Debug endpoint — lists every refund line item bucketed into a given month
+  // using the SAME bucketing logic as the returns_subtotal aggregator in
+  // shopify-finance-diff.ts (refund.processed_at, -5 hours offset).
+  //
+  // Purpose: hunt the Dec 2025 returns over-count of +$81.56. We need to see
+  // every refund row that hits Dec on its own processed_at so we can compare
+  // against Shopify's Finance Summary detail and identify which one(s) Shopify
+  // excludes (or which the aggregator double-counts).
+  app.get("/api/recon/finance/debug/refunds/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const rows = sqlite.prepare(`
+      SELECT
+        r.id                                                                        AS refund_id,
+        r.order_id                                                                  AS order_id,
+        o.name                                                                      AS order_name,
+        r.processed_at                                                              AS refund_processed_at,
+        r.created_at                                                                AS refund_created_at,
+        substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7)  AS bucket_month,
+        o.created_at                                                                AS order_created_at,
+        o.processed_at                                                              AS order_processed_at,
+        o.financial_status                                                          AS financial_status,
+        o.current_total_price                                                       AS current_total_price,
+        o.current_subtotal_price                                                    AS current_subtotal_price,
+        o.current_total_tax                                                         AS current_total_tax,
+        COALESCE(SUM(CASE WHEN rli.kind = 'item' THEN rli.subtotal ELSE 0 END), 0)  AS item_subtotal,
+        COALESCE(SUM(CASE WHEN rli.kind = 'item' THEN rli.total_tax ELSE 0 END), 0) AS item_tax,
+        COALESCE(SUM(CASE WHEN rli.kind = 'adjustment'
+                            AND rli.adjustment_kind = 'shipping_refund'
+                          THEN ABS(rli.subtotal) ELSE 0 END), 0)                    AS shipping_refund_subtotal,
+        COALESCE(SUM(CASE WHEN rli.kind = 'adjustment'
+                            AND rli.adjustment_kind = 'shipping_refund'
+                          THEN ABS(rli.total_tax) ELSE 0 END), 0)                   AS shipping_refund_tax,
+        COALESCE(SUM(CASE WHEN rli.kind = 'adjustment'
+                            AND rli.adjustment_kind = 'restocking_fee'
+                          THEN rli.subtotal ELSE 0 END), 0)                         AS restocking_fee,
+        COALESCE(SUM(CASE WHEN rli.kind = 'adjustment'
+                            AND rli.adjustment_kind = 'refund_discrepancy'
+                          THEN rli.subtotal ELSE 0 END), 0)                         AS refund_discrepancy,
+        COUNT(rli.id)                                                               AS line_count,
+        GROUP_CONCAT(rli.kind || ':' || COALESCE(rli.adjustment_kind, '') || '=' || rli.subtotal, ' | ') AS line_summary
+      FROM recon_refunds r
+      JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+      LEFT JOIN recon_orders o ON o.id = r.order_id
+      WHERE substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+      GROUP BY r.id
+      ORDER BY item_subtotal DESC
+    `).all(month) as any[];
+    const totals = rows.reduce((acc: any, r: any) => {
+      acc.item_subtotal += Number(r.item_subtotal || 0);
+      acc.item_tax += Number(r.item_tax || 0);
+      acc.shipping_refund_subtotal += Number(r.shipping_refund_subtotal || 0);
+      acc.shipping_refund_tax += Number(r.shipping_refund_tax || 0);
+      acc.restocking_fee += Number(r.restocking_fee || 0);
+      acc.refund_discrepancy += Number(r.refund_discrepancy || 0);
+      return acc;
+    }, { item_subtotal: 0, item_tax: 0, shipping_refund_subtotal: 0, shipping_refund_tax: 0, restocking_fee: 0, refund_discrepancy: 0 });
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    res.json({
+      month,
+      refund_count: rows.length,
+      totals: {
+        item_subtotal: round2(totals.item_subtotal),
+        item_tax: round2(totals.item_tax),
+        shipping_refund_subtotal: round2(totals.shipping_refund_subtotal),
+        shipping_refund_tax: round2(totals.shipping_refund_tax),
+        restocking_fee: round2(totals.restocking_fee),
+        refund_discrepancy: round2(totals.refund_discrepancy),
+      },
+      refunds: rows,
+    });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
