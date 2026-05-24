@@ -169,8 +169,14 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
       SELECT
         COALESCE(SUM(CASE WHEN rli.kind = 'item' THEN rli.subtotal ELSE 0 END), 0)             AS returns_subtotal,
         COALESCE(SUM(rli.total_tax), 0)                                                        AS returns_tax,
+        -- ABS() because order_adjustments subtotals are ingested with Shopify's
+        -- raw sign (negative = outflow), unlike refund_line_items 'item' rows
+        -- which are stored positive. Without ABS, the formula
+        -- 'shipping = total_shipping - shipping_refunded' double-negates and
+        -- adds the refund back to shipping (verified on Apr 2026: $74.95 + $14.99
+        -- = $89.94 instead of correct $59.96).
         COALESCE(SUM(CASE WHEN rli.kind = 'adjustment' AND rli.adjustment_kind = 'shipping_refund'
-                          THEN rli.subtotal ELSE 0 END), 0)                                    AS shipping_refunded,
+                          THEN ABS(rli.subtotal) ELSE 0 END), 0)                               AS shipping_refunded,
         COUNT(DISTINCT r.id)                                                                   AS refund_count
       FROM recon_refunds r
       JOIN recon_refund_line_items rli ON rli.refund_id = r.id
