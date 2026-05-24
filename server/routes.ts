@@ -1498,6 +1498,98 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
   });
 
+  // DRY RUN: returns what computeLocalFinanceSummary WOULD return if we shipped
+  // Rule #6 (gift-card line exclusion + line-level recognized_at bucketing).
+  // Pure read — no code path changed. Confirm $0.00 vs Shopify here BEFORE we
+  // touch shopify-finance-diff.ts.
+  app.get("/api/recon/finance/debug/dryrun-rule6/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+
+    // 1. Gross sales / discounts / order count: bucket LINES on li.recognized_at
+    //    (falling back to o.processed_at, then o.created_at), exclude gift cards.
+    const grossRow = sqlite.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN li.is_gift_card = 0
+                          THEN li.price * li.quantity ELSE 0 END), 0)        AS gross,
+        COALESCE(SUM(CASE WHEN li.is_gift_card = 0
+                          THEN li.total_discount ELSE 0 END), 0)             AS line_discounts_nongc,
+        COALESCE(SUM(CASE WHEN li.is_gift_card = 1
+                          THEN li.total_discount ELSE 0 END), 0)             AS line_discounts_gc,
+        COALESCE(SUM(CASE WHEN li.is_gift_card = 1
+                          THEN li.price * li.quantity - li.total_discount
+                          ELSE 0 END), 0)                                    AS gc_net_sales,
+        COUNT(DISTINCT CASE WHEN li.is_gift_card = 0 THEN li.order_id END)   AS order_count
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+      WHERE substr(datetime(
+        COALESCE(li.recognized_at, o.processed_at, o.created_at),
+        '-5 hours'), 1, 7) = ?
+    `).get(month);
+
+    // 2. Order-level shipping/tax/discounts (still order-bucketed for now).
+    const orderTotals = sqlite.prepare(`
+      SELECT
+        COALESCE(SUM(total_discounts), 0)                   AS total_discounts,
+        COALESCE(SUM(total_shipping),  0)                   AS total_shipping,
+        COALESCE(SUM(total_tax),       0)                   AS total_tax
+      FROM recon_orders o
+      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+    `).get(month);
+
+    // 3. Refunds: bucket on r.processed_at (unchanged from current behavior).
+    const refundTotals = sqlite.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN rli.kind = 'item' THEN rli.subtotal ELSE 0 END), 0) AS returns_subtotal,
+        COALESCE(SUM(rli.total_tax), 0)                                            AS returns_tax,
+        COALESCE(SUM(CASE WHEN rli.kind = 'adjustment' AND rli.adjustment_kind = 'shipping_refund'
+                          THEN ABS(rli.subtotal) ELSE 0 END), 0)                   AS shipping_refunded,
+        COUNT(DISTINCT r.id)                                                       AS refund_count
+      FROM recon_refunds r
+      JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+      WHERE substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+    `).get(month);
+
+    // Apply Rule #6: subtract GC line discounts from order discounts.
+    const gross_sales = grossRow.gross;
+    const discounts = orderTotals.total_discounts - grossRow.line_discounts_gc;
+    const returns = refundTotals.returns_subtotal;
+    const net_sales = gross_sales - discounts - returns;
+    const shipping = orderTotals.total_shipping - refundTotals.shipping_refunded;
+    const taxes = orderTotals.total_tax - refundTotals.returns_tax;
+    const total_sales = net_sales + shipping + taxes;
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+
+    res.json({
+      month,
+      proposed: {
+        gross_sales: r2(gross_sales),
+        discounts: r2(discounts),
+        returns: r2(returns),
+        net_sales: r2(net_sales),
+        shipping: r2(shipping),
+        taxes: r2(taxes),
+        total_sales: r2(total_sales),
+        net_sales_gift_cards: r2(grossRow.gc_net_sales),
+        order_count: grossRow.order_count,
+        refund_count: refundTotals.refund_count,
+      },
+      _diagnostics: {
+        line_discounts_nongc: r2(grossRow.line_discounts_nongc),
+        line_discounts_gc: r2(grossRow.line_discounts_gc),
+        total_discounts_raw: r2(orderTotals.total_discounts),
+        total_shipping_raw: r2(orderTotals.total_shipping),
+        total_tax_raw: r2(orderTotals.total_tax),
+        returns_tax: r2(refundTotals.returns_tax),
+        shipping_refunded: r2(refundTotals.shipping_refunded),
+      },
+      note: "Dry run — returns what computeLocalFinanceSummary would return under Rule #6 (gift-card exclusion + li.recognized_at bucketing). Live diff endpoint still uses old logic.",
+    });
+  });
+
   // Debug: list every order our recon bucketed into this month, so we can diff
   // against Shopify's ShopifyQL `FROM sales` order_name list and identify the
   // exact orders that disagree. Returns per-order gross/discounts/refund flags
