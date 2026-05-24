@@ -112,13 +112,23 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   // March (DST start) and November (DST end) are within an hour of midnight
   // for at most a handful of orders per year; if a diff shows up there we
   // can swap to a proper TZ library.
-  // Filter for the target month using created_at; refunds use processed_at.
+  //
+  // Rule #5 (recognized_at bucketing): Shopify's ShopifyQL `sales` dataset
+  // buckets revenue on processed_at (when money actually moved), NOT on
+  // created_at (when the order was placed). For draft orders / late-paid
+  // orders these can differ by days or months. To match Shopify we bucket
+  // on COALESCE(processed_at, created_at) — the order's recognition date,
+  // falling back to creation when processed_at is unset (rare, e.g. fully
+  // unpaid orders).
+  //
+  // Refunds were already bucketed on processed_at correctly (returns matched
+  // exactly on April pre-Rule#5). This rule changes the ORDER side.
   const STORE_TZ_OFFSET_HOURS = -5; // EST; close enough for now
   const tzExpr = `datetime(?1, '${STORE_TZ_OFFSET_HOURS} hours')`;
   void tzExpr; // (we inline the offset literally below to keep prepared statements simple)
 
   // 1. Gross sales = Σ line.price × line.quantity, for line items on orders
-  //    whose store-local created_at month matches.
+  //    whose store-local recognized month matches (Rule #5).
   const grossRow = sqlite
     .prepare(`
       SELECT
@@ -130,7 +140,7 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
         COUNT(DISTINCT li.order_id)                         AS order_count
       FROM recon_line_items li
       JOIN recon_orders o ON o.id = li.order_id
-      WHERE substr(datetime(o.created_at, '-5 hours'), 1, 7) = ?
+      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
     `)
     .get(monthKey) as {
       gross: number;
@@ -152,7 +162,7 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
         COALESCE(SUM(total_shipping),  0)                   AS total_shipping,
         COALESCE(SUM(total_tax),       0)                   AS total_tax
       FROM recon_orders o
-      WHERE substr(datetime(o.created_at, '-5 hours'), 1, 7) = ?
+      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
     `)
     .get(monthKey) as {
       total_discounts: number;
