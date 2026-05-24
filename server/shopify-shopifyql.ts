@@ -39,6 +39,23 @@ function logWarn(scope: string, msg: string) {
   recordIntegrationWarn("shopify-shopifyql", scope, msg);
 }
 
+/**
+ * Normalize a single cell value. Money columns come back as numeric strings
+ * in some Admin API versions ("123.45") and as numbers in others — always
+ * return JS numbers for money. Leave everything else as-is.
+ */
+function normalizeCell(v: any, isMoney: boolean): string | number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return v;
+  if (isMoney && typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : v;
+  }
+  if (typeof v === "string") return v;
+  // Fallback for booleans / objects — stringify so callers don't crash.
+  return String(v);
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -104,23 +121,22 @@ export async function runShopifyql(queryText: string): Promise<ShopifyqlResult> 
 
   const url = `https://${cfg.shopDomain}/admin/api/${cfg.apiVersion}/graphql.json`;
 
-  // We ask for `subType` too because Mechanic's reference example showed it
-  // is sometimes useful for currency vs unit-count distinction. Harmless to
-  // request — Shopify ignores unknown fields. (Confirmed against
-  // shopifyqlQuery docs page on 2026-05-24.)
+  // shopifyqlQuery returns a flat ShopifyqlQueryResponse object with both
+  // `tableData` and `parseErrors` as direct fields — NOT a union with
+  // TableResponse / ParseError variants (which was an older API shape).
+  // Confirmed against shopify.dev docs on 2026-05-24 after the initial
+  // R5b deploy hit a "No such type TableResponse" GraphQL error.
+  //
+  // tableData.rows is an array of row objects (NOT row arrays + rowData).
+  // parseErrors is an array of strings.
   const gqlBody = {
     query: `query ShopifyQL($q: String!) {
   shopifyqlQuery(query: $q) {
-    __typename
-    ... on TableResponse {
-      tableData {
-        columns { name dataType displayName }
-        rowData
-      }
+    tableData {
+      columns { name dataType displayName }
+      rows
     }
-    ... on ParseError {
-      parseErrors { code message }
-    }
+    parseErrors
   }
 }`,
     variables: { q: queryText },
@@ -200,22 +216,23 @@ export async function runShopifyql(queryText: string): Promise<ShopifyqlResult> 
       throw new Error("shopifyqlQuery returned no data");
     }
 
-    // ParseError variant — return as parseErrors, no rows.
-    if (Array.isArray(sq.parseErrors) && sq.parseErrors.length > 0) {
-      return {
-        query: queryText,
-        columns: [],
-        rows: [],
-        parseErrors: sq.parseErrors.map((e: any) => ({
-          message: String(e.message ?? ""),
-          code: e.code ? String(e.code) : undefined,
-        })),
-      };
-    }
+    // Parse errors (query syntax / column-not-found) come back as a
+    // string array. Surface them to the caller as structured objects.
+    const parseErrorsRaw: any[] = Array.isArray(sq.parseErrors) ? sq.parseErrors : [];
+    const parseErrors = parseErrorsRaw.map((e: any) =>
+      typeof e === "string"
+        ? { message: e }
+        : { message: String(e?.message ?? e), code: e?.code ? String(e.code) : undefined },
+    );
 
-    // TableResponse variant.
+    // If there are parse errors AND no tableData, return early so callers
+    // get a clean parseErrors array. If tableData is present (some queries
+    // return both — e.g. warnings), continue and include both.
     const td = sq.tableData;
     if (!td) {
+      if (parseErrors.length > 0) {
+        return { query: queryText, columns: [], rows: [], parseErrors };
+      }
       logErr("shape", `shopifyqlQuery had no tableData and no parseErrors`);
       throw new Error("shopifyqlQuery: empty response");
     }
@@ -226,31 +243,31 @@ export async function runShopifyql(queryText: string): Promise<ShopifyqlResult> 
       displayName: String(c.displayName),
     }));
 
-    // `rowData` is an array of arrays in column order. Convert to keyed
-    // objects so callers don't have to track index positions.
-    const rowData: any[][] = Array.isArray(td.rowData) ? td.rowData : [];
-    const rows: ShopifyqlRow[] = rowData.map((arr) => {
-      const r: ShopifyqlRow = {};
-      for (let i = 0; i < columns.length; i++) {
-        const v = arr[i];
-        // Money columns come back as strings in some API versions ("123.45")
-        // and as numbers in others. Normalize numerics to JS numbers, leave
-        // strings (e.g. month labels) alone.
-        if (v === null || v === undefined) {
-          r[columns[i].name] = null;
-        } else if (typeof v === "number") {
-          r[columns[i].name] = v;
-        } else if (typeof v === "string" && columns[i].dataType === "MONEY") {
-          const n = Number(v);
-          r[columns[i].name] = Number.isFinite(n) ? n : v;
-        } else {
-          r[columns[i].name] = v;
+    // tableData.rows is an array of keyed-object rows (each row already has
+    // column-name keys). No need to zip against the columns array. Money
+    // columns come back as strings in some API versions — normalize them.
+    const rawRows: any[] = Array.isArray(td.rows) ? td.rows : [];
+    const moneyColumns = new Set(columns.filter((c) => c.dataType === "MONEY").map((c) => c.name));
+    const rows: ShopifyqlRow[] = rawRows.map((rawRow) => {
+      // Defensive: if Shopify ever returns row-as-array again, zip it.
+      if (Array.isArray(rawRow)) {
+        const r: ShopifyqlRow = {};
+        for (let i = 0; i < columns.length; i++) {
+          const name = columns[i].name;
+          const v = rawRow[i];
+          r[name] = normalizeCell(v, moneyColumns.has(name));
         }
+        return r;
+      }
+      // Normal case: rawRow is already an object keyed by column name.
+      const r: ShopifyqlRow = {};
+      for (const name of Object.keys(rawRow || {})) {
+        r[name] = normalizeCell(rawRow[name], moneyColumns.has(name));
       }
       return r;
     });
 
-    return { query: queryText, columns, rows, parseErrors: [] };
+    return { query: queryText, columns, rows, parseErrors };
   }
 }
 
