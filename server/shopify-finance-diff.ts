@@ -331,9 +331,23 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   //    revenue (zero on full returns where the discrepancy was a Shopify-side
   //    payout rounding artifact, like #37402 and #35100).
   //
-  //    Validated against March 2026 dump: 3 orders have refund_discrepancy
-  //    adjustments in March. Only #35232 has current_total_price > 0 ($10.00).
-  //    Sum = $10.00, matches the residual exactly. April 2026: 0 matches.
+  //    Important caveat: refund_discrepancy is also used by Shopify for tiny
+  //    payment-processor rounding artifacts unrelated to return fees (e.g.
+  //    a ±$1.08 pair on order #35518 in Feb 2026). In those cases the order's
+  //    `current_total_price` reflects an unrelated unrefunded balance (e.g.
+  //    customer kept some items) and should NOT be booked as retained revenue.
+  //
+  //    Discriminator: a real return-shipping-fee case has
+  //      MAX(|refund_discrepancy.amount|) >= current_total_price
+  //    because the discrepancy represents the FULL cash refund and the fee
+  //    is some smaller fraction of it (e.g. #35232: $220 rd / $10 fee = 4.5%).
+  //    Rounding-artifact cases fail this check because rd is tiny vs ctp.
+  //
+  //    Validated against:
+  //      • March 2026: 3 rd orders, only #35232 fires ($10.00 fee). ✓
+  //      • Feb 2026: #35518 had rd=±$1.08 but ctp=$154.26 — correctly excluded
+  //        by the rd >= ctp check (avoiding a $154.26 false positive).
+  //      • April 2026: 0 rd orders.
   const retainedFees = sqlite
     .prepare(`
       SELECT COALESCE(SUM(o.current_total_price), 0) AS retained_total
@@ -343,11 +357,21 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
         AND EXISTS (
           SELECT 1
           FROM recon_refunds r
-          JOIN recon_refund_line_items rli ON rli.refund_id = r.id
           WHERE r.order_id = o.id
-            AND rli.kind = 'adjustment'
-            AND rli.adjustment_kind = 'refund_discrepancy'
+            AND EXISTS (
+              SELECT 1 FROM recon_refund_line_items rli
+               WHERE rli.refund_id = r.id
+                 AND rli.kind = 'adjustment'
+                 AND rli.adjustment_kind = 'refund_discrepancy'
+            )
             AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+            AND (
+              SELECT MAX(ABS(rli2.subtotal))
+              FROM recon_refund_line_items rli2
+              WHERE rli2.refund_id = r.id
+                AND rli2.kind = 'adjustment'
+                AND rli2.adjustment_kind = 'refund_discrepancy'
+            ) >= o.current_total_price
         )
     `)
     .get(monthKey) as { retained_total: number };
