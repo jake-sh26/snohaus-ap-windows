@@ -131,6 +131,7 @@ import {
   backfillFulfillments,
   backfillRefundsFromRawJson,
   repullStaleRefunds,
+  repullSingleOrderByName,
   getBackfillProgress,
   listRecentBackfillProgress,
   getActiveBackfillProgress,
@@ -1274,6 +1275,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const triggeredBy = `manual:${req.user?.email || "unknown"}`;
     const result = await repullStaleRefunds(triggeredBy, { limit });
     res.status(result.error ? 502 : 200).json(result);
+  });
+
+  // PR #R5a-fix3 — Manual single-order re-pull. The stale-refund heuristic
+  // only finds orders whose financial_status or current_total_price tipped us
+  // off, but Shopify sometimes posts a refund without bumping either field
+  // (or before our last incremental sync). This endpoint takes an order name
+  // ("#37901") and unconditionally re-pulls that one order from Shopify,
+  // re-ingesting refunds[] and fulfillment_orders[]. Use case: operator sees
+  // a Shopify Finance Summary line item that doesn't appear in our diff and
+  // wants to fix it without waiting for the next scheduled stale-refund run.
+  app.post("/api/recon/orders/repull-by-name", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const name = String(req.body?.name ?? "").trim();
+    if (!name) return res.status(400).json({ message: "`name` is required, e.g. '#37901'" });
+    if (name.length > 32) return res.status(400).json({ message: "`name` looks malformed (too long)" });
+    const result = await repullSingleOrderByName(name);
+    res.status(result.error && !result.found ? 404 : 200).json(result);
   });
 
   // PR #R4l-a (rewritten in fix4, dispositions added in fix9) — list orders

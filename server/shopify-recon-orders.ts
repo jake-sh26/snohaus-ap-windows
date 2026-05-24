@@ -1440,3 +1440,123 @@ export async function repullStaleRefunds(
     };
   }
 }
+
+// ============================================================================
+// PR #R5a-fix3 — Re-pull a single order from Shopify by name or by id.
+// ----------------------------------------------------------------------------
+// Manual escape-hatch: the operator pastes an order name (e.g. "#37901") into
+// /api/recon/orders/repull-by-name and we re-fetch the canonical order payload
+// from Shopify, including the current refunds[] array. Solves the case where
+// a refund was added to an order after our last ingest and none of the
+// stale-refund heuristics in repullStaleRefunds() flagged it (e.g. the order
+// is still financial_status='paid' because Shopify hasn't reconciled the
+// refund into the status yet, or current_total_price still equals total_price).
+//
+// Returns enough detail to confirm what changed, so we can validate the fix
+// without spelunking the DB.
+// ============================================================================
+
+export type SingleOrderRepullResult = {
+  found: boolean;
+  order_id: string | null;
+  order_name: string | null;
+  refunds_before: number;
+  refunds_after: number;
+  refunds_added: number;
+  total_refunded_before: number;
+  total_refunded_after: number;
+  financial_status_before: string | null;
+  financial_status_after: string | null;
+  ingest_version_after: number | null;
+  error?: string;
+};
+
+export async function repullSingleOrderByName(
+  orderName: string,
+): Promise<SingleOrderRepullResult> {
+  const empty: SingleOrderRepullResult = {
+    found: false,
+    order_id: null,
+    order_name: orderName,
+    refunds_before: 0,
+    refunds_after: 0,
+    refunds_added: 0,
+    total_refunded_before: 0,
+    total_refunded_after: 0,
+    financial_status_before: null,
+    financial_status_after: null,
+    ingest_version_after: null,
+  };
+  try {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return { ...empty, error: "Shopify reconciler not configured" };
+    const { sqlite } = await import("./storage");
+
+    // Normalise: accept "#37901" or "37901". Shopify stores names with the hash.
+    const normalised = orderName.startsWith("#") ? orderName : `#${orderName}`;
+
+    // Look up our cached order to get the Shopify numeric id (we keep it as the
+    // primary key). If we don't have the order at all there's nothing to do via
+    // this endpoint — a fresh order would come in through the regular sync path.
+    const row = sqlite
+      .prepare(
+        `SELECT id, name, financial_status, total_refunded
+           FROM recon_orders WHERE name = ? LIMIT 1`,
+      )
+      .get(normalised) as
+      | { id: string; name: string; financial_status: string | null; total_refunded: number | null }
+      | undefined;
+    if (!row) return { ...empty, error: `Order ${normalised} not found in local DB. Run the regular sync first.` };
+
+    const orderId = row.id;
+    const before = {
+      refunds: (sqlite.prepare(`SELECT COUNT(*) AS n FROM recon_refunds WHERE order_id = ?`).get(orderId) as { n: number }).n,
+      total_refunded: row.total_refunded ?? 0,
+      financial_status: row.financial_status,
+    };
+
+    // Hit Shopify with the same per-order endpoint repullStaleRefunds uses.
+    const res = await shopifyRestCall(cfg, `/orders/${orderId}.json`);
+    const o = res.json?.order;
+    if (!o) return { ...empty, order_id: orderId, error: `Shopify returned no order body for ${normalised}` };
+
+    // Hydrate FOs the same way repullStaleRefunds does so exchange-detection
+    // gets the latest fulfillment events too.
+    let foPayload: any[] | null = null;
+    try {
+      foPayload = await fetchFulfillmentOrdersForOrder(cfg, String(o.id));
+    } catch (e: any) {
+      srWarn("repull-by-name", `order ${o?.id} FO fetch failed: ${e?.message ?? e}`);
+    }
+
+    upsertOrderFromShopify(o, foPayload);
+
+    const afterRow = sqlite
+      .prepare(
+        `SELECT financial_status, total_refunded, ingest_version
+           FROM recon_orders WHERE id = ?`,
+      )
+      .get(orderId) as
+      | { financial_status: string | null; total_refunded: number | null; ingest_version: number | null }
+      | undefined;
+    const afterRefunds = (sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM recon_refunds WHERE order_id = ?`)
+      .get(orderId) as { n: number }).n;
+
+    return {
+      found: true,
+      order_id: orderId,
+      order_name: normalised,
+      refunds_before: before.refunds,
+      refunds_after: afterRefunds,
+      refunds_added: Math.max(0, afterRefunds - before.refunds),
+      total_refunded_before: before.total_refunded,
+      total_refunded_after: afterRow?.total_refunded ?? 0,
+      financial_status_before: before.financial_status,
+      financial_status_after: afterRow?.financial_status ?? null,
+      ingest_version_after: afterRow?.ingest_version ?? null,
+    };
+  } catch (e: any) {
+    return { ...empty, error: e?.message ?? String(e) };
+  }
+}
