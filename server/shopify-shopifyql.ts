@@ -315,8 +315,18 @@ export async function pullFinanceSummary(
   // buckets by Shopify's standard Finance Summary date logic (processed_at).
   const q = [
     "FROM sales",
-    "SHOW gross_sales, discounts, returns, net_sales, shipping, taxes, total_sales, orders",
-    `SINCE '${startDate}' UNTIL '${endDate}'`,
+    // Column names verified live via /api/recon/shopifyql/run probing
+    // (2026-05-24). Note `shipping_charges` — NOT `shipping`, `total_shipping`,
+    // or any other variant. The other 7 names match Shopify Admin's CSV
+    // export headers verbatim.
+    "SHOW gross_sales, discounts, returns, net_sales, shipping_charges, taxes, total_sales, orders",
+    // Dates are NOT string-quoted in ShopifyQL — the ANTLR grammar expects a
+    // bare DATE_ token (yyyy-MM-dd). Quoting them yields:
+    //   "Syntax input mismatch - mismatched input ''2026-03-01''
+    //    expecting {'+','-',IDENTIFIER_,INTEGER_,DATE_}"
+    // startDate/endDate are already asserted YYYY-MM-DD above, so direct
+    // interpolation is safe (no injection risk — only digits and dashes).
+    `SINCE ${startDate} UNTIL ${endDate}`,
   ].join("\n");
 
   const result = await runShopifyql(q);
@@ -344,7 +354,9 @@ export async function pullFinanceSummary(
     discounts: num(row?.discounts),
     returns: num(row?.returns),
     net_sales: num(row?.net_sales),
-    shipping: num(row?.shipping),
+    // ShopifyQL column is `shipping_charges`; we surface it as `shipping` on
+    // our API to match the Finance Summary PDF section header.
+    shipping: num(row?.shipping_charges),
     taxes: num(row?.taxes),
     total_sales: num(row?.total_sales),
     orders: num(row?.orders),
