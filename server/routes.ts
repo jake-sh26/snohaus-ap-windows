@@ -1498,6 +1498,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
   });
 
+  // Debug: list every order our recon bucketed into this month, so we can diff
+  // against Shopify's ShopifyQL `FROM sales` order_name list and identify the
+  // exact orders that disagree. Returns per-order gross/discounts/refund flags
+  // so the operator can spot draft/cancelled/test orders that Shopify excludes.
+  app.get("/api/recon/finance/debug/orders/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const orders = sqlite.prepare(`
+      SELECT
+        o.id, o.order_number, o.name,
+        o.created_at, o.processed_at, o.cancelled_at,
+        substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS recognized_month,
+        o.financial_status, o.fulfillment_status, o.source_name,
+        o.total_price, o.subtotal, o.total_discounts, o.total_shipping, o.total_tax, o.total_refunded,
+        o.has_gift_card,
+        (SELECT COALESCE(SUM(li.price * li.quantity), 0)
+           FROM recon_line_items li WHERE li.order_id = o.id) AS line_gross,
+        (SELECT COUNT(*) FROM recon_line_items li WHERE li.order_id = o.id) AS line_count,
+        (SELECT COUNT(*) FROM recon_line_items li WHERE li.order_id = o.id AND li.is_gift_card = 1) AS gift_card_lines
+      FROM recon_orders o
+      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+      ORDER BY o.processed_at, o.created_at
+    `).all(month);
+    res.json({
+      month,
+      order_count: orders.length,
+      orders,
+      note: "All orders whose recognized_month (COALESCE(processed_at, created_at) shifted -5h) matches this month. This is the same bucket used by computeLocalFinanceSummary.",
+    });
+  });
+
   // Save / overwrite a Shopify snapshot for a month. Operator pastes values
   // from the Admin Finance Summary export. All money fields optional — a
   // partial save (just net_sales, say) is allowed; missing fields show as null
