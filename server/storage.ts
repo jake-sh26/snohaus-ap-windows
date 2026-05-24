@@ -972,6 +972,11 @@ function bootstrapSchema() {
   ensureColumns("recon_line_items", [
     { name: "recognized_at", defn: "TEXT" },
     { name: "added_via_exchange_refund_id", defn: "TEXT" },
+    // PR #R5a-fix2 (Rule #7c) — sum of li.discount_allocations[].amount. For
+    // discount-code orders this is the real per-line discount; li.total_discount
+    // is $0.00 for those. The rollup uses MAX(total_discount, this) to match
+    // Shopify Finance Summary exactly.
+    { name: "discount_allocations_total", defn: "REAL NOT NULL DEFAULT 0" },
   ]);
   // Index for month-bucket queries in the rollup.
   sqlite.exec(`
@@ -3970,6 +3975,9 @@ export type ReconLineItemUpsert = {
   quantity: number;
   price: number | null;
   total_discount: number;
+  // PR #R5a-fix2 (Rule #7c) — sum of li.discount_allocations[].amount, persisted
+  // so the monthly rollup can pick the larger of (total_discount, alloc_sum).
+  discount_allocations_total?: number;
   line_subtotal: number | null;
   line_tax_total: number;
   tax_channel_liable: number;
@@ -4087,8 +4095,9 @@ export function replaceReconLineItems(
         quantity, price, total_discount, line_subtotal, line_tax_total,
         tax_channel_liable, tax_lines_json, is_gift_card, requires_shipping,
         raw_json, ingested_at,
-        recognized_at, added_via_exchange_refund_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        recognized_at, added_via_exchange_refund_id,
+        discount_allocations_total
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const li of lines) {
       ins.run(
@@ -4097,6 +4106,7 @@ export function replaceReconLineItems(
         li.tax_channel_liable, li.tax_lines_json, li.is_gift_card, li.requires_shipping,
         li.raw_json, now,
         li.recognized_at ?? null, li.added_via_exchange_refund_id ?? null,
+        li.discount_allocations_total ?? 0,
       );
     }
   });

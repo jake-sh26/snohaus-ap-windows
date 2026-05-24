@@ -139,6 +139,12 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   // include order-level codes that Shopify allocates per-line in the Finance
   // Summary anyway, so the line aggregate is the correct view.
   //
+  // Rule #7c (PR #R5a-fix2): for discount-CODE orders Shopify writes the per-
+  // line share to li.discount_allocations[].amount and leaves li.total_discount
+  // at 0.00. The Finance Summary uses MAX(total_discount, alloc_sum) per line.
+  // Validated against March 2026: line-only aggregate $64,811.72 →
+  // MAX aggregate $66,842.69 (matches Shopify exactly).
+  //
   // Rule #7b (per-line tax): taxes = SUM(li.tax_lines[].price) on non-GC
   // lines + SUM(shipping_line.tax_lines[].price), minus the month's refund
   // tax. Order-level total_tax can drift a few dollars from per-line per-
@@ -151,9 +157,11 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
         COALESCE(SUM(CASE WHEN li.is_gift_card = 0
                           THEN li.price * li.quantity ELSE 0 END), 0)        AS gross,
         COALESCE(SUM(CASE WHEN li.is_gift_card = 0
-                          THEN li.total_discount ELSE 0 END), 0)             AS line_discounts_nongc,
+                          THEN MAX(li.total_discount, COALESCE(li.discount_allocations_total, 0))
+                          ELSE 0 END), 0)                                    AS line_discounts_nongc,
         COALESCE(SUM(CASE WHEN li.is_gift_card = 1
-                          THEN li.price * li.quantity - li.total_discount
+                          THEN li.price * li.quantity
+                               - MAX(li.total_discount, COALESCE(li.discount_allocations_total, 0))
                           ELSE 0 END), 0)                                    AS gc_net_sales,
         COUNT(DISTINCT CASE WHEN li.is_gift_card = 0 THEN li.order_id END)   AS order_count
       FROM recon_line_items li

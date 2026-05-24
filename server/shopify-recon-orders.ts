@@ -155,7 +155,20 @@ export function transformShopifyOrder(o: any): {
     const qty = numOr0(li.quantity);
     const price = num(li.price);
     const totalDiscount = numOr0(li.total_discount);
-    const lineSubtotal = price !== null ? (price * qty - totalDiscount) : null;
+    // PR #R5a-fix2 (Rule #7c) — Shopify's Finance Summary report counts a line's
+    // discount as the MAX of (li.total_discount, sum(li.discount_allocations[].amount)).
+    // For orders that use a *discount_code* ("End of season", "Charitable donation",
+    // "JMM F&F", etc.) Shopify sets line.total_discount = 0 and instead writes the
+    // per-line share to li.discount_allocations[].amount. Our previous aggregation
+    // missed ~$2,031 of March discounts for that reason. We persist the allocation
+    // sum so the rollup can pick the larger of the two without re-parsing raw_json.
+    const discountAllocations = Array.isArray(li.discount_allocations) ? li.discount_allocations : [];
+    const discountAllocTotal = discountAllocations.reduce((acc: number, da: any) => {
+      const amt = num(da?.amount);
+      return acc + (amt ?? 0);
+    }, 0);
+    const effectiveDiscount = Math.max(totalDiscount, discountAllocTotal);
+    const lineSubtotal = price !== null ? (price * qty - effectiveDiscount) : null;
     // Normalised tax_lines for storage — preserve everything we'll need for NY
     // county-level filings (jurisdiction codes are inside `tax_lines[].jurisdiction*`).
     const taxLinesNormalized = taxLines.map((tl: any) => ({
@@ -185,6 +198,7 @@ export function transformShopifyOrder(o: any): {
       quantity: qty,
       price,
       total_discount: totalDiscount,
+      discount_allocations_total: discountAllocTotal,
       line_subtotal: lineSubtotal,
       line_tax_total: lineTaxTotal,
       tax_channel_liable: lineChannelLiable,
