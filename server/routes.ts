@@ -1446,7 +1446,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
     const { sqlite } = require("./storage");
     const orders = sqlite.prepare(`
-      SELECT id, shopify_order_id, order_name, created_at,
+      SELECT id, order_number, name, created_at,
              total_shipping, total_discounts, total_tax, total_price
       FROM recon_orders o
       WHERE substr(datetime(o.created_at, '-5 hours'), 1, 7) = ?
@@ -1454,14 +1454,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       ORDER BY created_at
     `).all(month);
     const refundAdjustments = sqlite.prepare(`
-      SELECT r.id AS refund_id, r.shopify_refund_id, r.order_id, r.processed_at, r.created_at AS refund_created_at,
-             rli.id AS rli_id, rli.kind, rli.adjustment_kind, rli.subtotal, rli.total_tax,
-             o.order_name, o.shopify_order_id
+      SELECT r.id AS refund_id, r.order_id, r.processed_at, r.created_at AS refund_created_at,
+             rli.id AS rli_id, rli.kind, rli.adjustment_kind, rli.restock_type,
+             rli.subtotal, rli.total_tax,
+             o.name AS order_name, o.order_number
       FROM recon_refunds r
       JOIN recon_refund_line_items rli ON rli.refund_id = r.id
       JOIN recon_orders o ON o.id = r.order_id
       WHERE substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
-        AND (rli.kind = 'adjustment' OR rli.adjustment_kind IS NOT NULL OR LOWER(COALESCE(rli.adjustment_kind, '')) LIKE '%ship%')
+        AND (rli.kind = 'adjustment' OR rli.adjustment_kind IS NOT NULL OR LOWER(COALESCE(rli.restock_type, '')) LIKE '%ship%')
       ORDER BY r.processed_at
     `).all(month);
     const totals = sqlite.prepare(`
