@@ -257,7 +257,28 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
     .prepare(`
       SELECT
         COALESCE(SUM(CASE WHEN rli.kind = 'item' THEN rli.subtotal ELSE 0 END), 0)             AS returns_subtotal,
-        COALESCE(SUM(rli.total_tax), 0)                                                        AS returns_tax,
+        -- Rule #10 — sign convention for refund line item tax:
+        --   item rows store positive total_tax (positive on the wire from Shopify).
+        --   shipping_refund adjustment rows store SIGNED tax_amount, where a
+        --     negative value (e.g. -0.90) means "this much tax is being refunded
+        --     back to the customer" — which should INCREASE returns_tax (so it
+        --     gets subtracted from our reported tax).
+        -- Stored signed, the raw SUM lets the negative cancel/flip the
+        -- subtraction. So we take ABS() of shipping_refund tax to make it
+        -- contribute its full magnitude to returns_tax.
+        -- Other adjustment kinds (restocking_fee, refund_discrepancy) typically
+        -- have tax_amount=0; we leave their handling unchanged.
+        -- Bug found Jan 2026: #25524 had shipping_refund.tax_amount=-0.90
+        -- stored as total_tax=-0.90. Sum-as-stored made the -taxes -=- returns_tax
+        -- formula effectively ADD 0.90 back instead of subtract it (+1.80 overage).
+        -- Same pattern in Dec: #26507 tax_amount=-1.32 → +2.64 overage.
+        COALESCE(SUM(
+          CASE WHEN rli.kind = 'item' THEN rli.total_tax
+               WHEN rli.kind = 'adjustment' AND rli.adjustment_kind = 'shipping_refund'
+                    THEN ABS(rli.total_tax)
+               WHEN rli.kind = 'adjustment' THEN rli.total_tax
+               ELSE 0 END
+        ), 0)                                                                                  AS returns_tax,
         -- ABS() because order_adjustments subtotals are ingested with Shopify's
         -- raw sign (negative = outflow), unlike refund_line_items 'item' rows
         -- which are stored positive. Without ABS, the formula
