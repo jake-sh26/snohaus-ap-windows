@@ -1487,6 +1487,103 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ snapshots: listShopifySnapshots(36) });
   });
 
+  // ------------------------------------------------------------------------
+  // PR #R5b — pull Shopify's own Finance Summary via ShopifyQL.
+  // ------------------------------------------------------------------------
+  // Live pull (no DB write). Returns the {gross_sales, discounts, returns,
+  // net_sales, shipping, taxes, total_sales, orders} totals for the date
+  // range, plus the raw query text and raw row for audit.
+  //
+  // Query params:
+  //   start     YYYY-MM-DD (required)
+  //   end       YYYY-MM-DD (required, inclusive)
+  //   bucket_by processed_at | created_at  (default: processed_at)
+  //
+  // Requires `read_reports` / `read_analytics` scopes on the Shopify token.
+  // If the token is missing those scopes, this returns 502 with a hint to
+  // re-install the app.
+  app.get("/api/recon/shopifyql/summary", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    const bucketBy = String(req.query.bucket_by || "processed_at").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+      return res.status(400).json({ message: "start and end (YYYY-MM-DD) are required" });
+    }
+    if (bucketBy !== "processed_at" && bucketBy !== "created_at") {
+      return res.status(400).json({ message: "bucket_by must be 'processed_at' or 'created_at'" });
+    }
+    try {
+      const { pullFinanceSummary } = require("./shopify-shopifyql");
+      const result = await pullFinanceSummary(start, end, bucketBy);
+      res.json(result);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      const isAuth = /401|403|scope/i.test(msg);
+      res.status(isAuth ? 502 : 500).json({
+        message: msg,
+        hint: isAuth
+          ? "Re-install the Shopify app via /api/auth/shopify/install to grant the read_reports / read_analytics scopes."
+          : undefined,
+      });
+    }
+  });
+
+  // Snapshot a month's ShopifyQL totals into recon_shopify_snapshots so the
+  // existing /api/recon/finance/diff/:month endpoint can compare our local
+  // rollup against it. Body params:
+  //   month     YYYY-MM (required) — used as both the bucket key and the
+  //             date range (first..last day of month)
+  //   bucket_by processed_at | created_at  (default: processed_at)
+  //
+  // Writes a snapshot with source_label = "shopifyql:<bucket_by>" so it
+  // doesn't collide with manually-entered PDF snapshots.
+  app.post("/api/recon/shopifyql/snapshot", authMiddleware, requirePermission("system.manage_config"), async (req: any, res) => {
+    const body = req.body ?? {};
+    const month = String(body.month || "").trim();
+    const bucketBy = String(body.bucket_by || "processed_at").trim();
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "month is required and must be YYYY-MM" });
+    }
+    if (bucketBy !== "processed_at" && bucketBy !== "created_at") {
+      return res.status(400).json({ message: "bucket_by must be 'processed_at' or 'created_at'" });
+    }
+    // Compute first/last day of month. Last day = day 0 of next month.
+    const [y, m] = month.split("-").map((s) => Number(s));
+    const start = `${month}-01`;
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const end = `${month}-${String(lastDay).padStart(2, "0")}`;
+    try {
+      const { pullFinanceSummary } = require("./shopify-shopifyql");
+      const result = await pullFinanceSummary(start, end, bucketBy);
+      const { upsertShopifySnapshot } = require("./shopify-finance-diff");
+      upsertShopifySnapshot({
+        month,
+        snapshot_kind: "all_channels",
+        gross_sales: result.gross_sales,
+        discounts: result.discounts,
+        returns: result.returns,
+        net_sales: result.net_sales,
+        shipping: result.shipping,
+        taxes: result.taxes,
+        total_sales: result.total_sales,
+        net_sales_gift_cards: null, // not in this query; PDF lists separately
+        source_label: `shopifyql:${bucketBy}`,
+        raw_input: JSON.stringify({ query: result.query, raw: result.raw, orders: result.orders }),
+        captured_by: req.user?.email || "unknown",
+      });
+      res.json({ ok: true, month, bucket_by: bucketBy, totals: result });
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      const isAuth = /401|403|scope/i.test(msg);
+      res.status(isAuth ? 502 : 500).json({
+        message: msg,
+        hint: isAuth
+          ? "Re-install the Shopify app via /api/auth/shopify/install to grant the read_reports / read_analytics scopes."
+          : undefined,
+      });
+    }
+  });
+
   // Current orders watermark (read-only) — shown in the Settings UI so the user
   // knows where the incremental pull will resume from on next run.
   app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
