@@ -1701,7 +1701,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             AND rli.kind = 'adjustment'
             AND rli.adjustment_kind = 'refund_discrepancy'
             AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
-        ) AS rd_amounts
+        ) AS rd_amounts,
+        (SELECT COALESCE(SUM(rli.subtotal), 0) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id
+            AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'refund_discrepancy'
+            AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        ) AS rd_net,
+        (SELECT MAX(ABS(rli.subtotal)) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id
+            AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'refund_discrepancy'
+            AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        ) AS rd_max_abs
       FROM recon_orders o
       WHERE o.current_total_price IS NOT NULL
         AND o.current_total_price > 0
@@ -1714,7 +1728,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
         )
       ORDER BY o.current_total_price DESC
-    `).all(month, month, month);
+    `).all(month, month, month, month, month);
     const total = rows.reduce((s: number, r: any) => s + Number(r.current_total_price || 0), 0);
     res.json({ month, count: rows.length, total_retained: Math.round(total * 100) / 100, orders: rows });
   });
