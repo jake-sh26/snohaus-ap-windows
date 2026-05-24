@@ -1434,6 +1434,55 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // Diff (ours vs Shopify snapshot). Returns null per line if no snapshot.
+  // Debug: per-order shipping breakdown for a month. Read-only. Used to find
+  // where our shipping total drifts from Shopify's. Returns each order with
+  // total_shipping, plus each refund-adjustment row that touches shipping,
+  // and the grand totals — so an operator can spot duplicates or missing
+  // shipping-refund rows immediately.
+  app.get("/api/recon/finance/debug/shipping/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const orders = sqlite.prepare(`
+      SELECT id, shopify_order_id, order_name, created_at,
+             total_shipping, total_discounts, total_tax, total_price
+      FROM recon_orders o
+      WHERE substr(datetime(o.created_at, '-5 hours'), 1, 7) = ?
+        AND COALESCE(total_shipping, 0) <> 0
+      ORDER BY created_at
+    `).all(month);
+    const refundAdjustments = sqlite.prepare(`
+      SELECT r.id AS refund_id, r.shopify_refund_id, r.order_id, r.processed_at, r.created_at AS refund_created_at,
+             rli.id AS rli_id, rli.kind, rli.adjustment_kind, rli.subtotal, rli.total_tax,
+             o.order_name, o.shopify_order_id
+      FROM recon_refunds r
+      JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+      JOIN recon_orders o ON o.id = r.order_id
+      WHERE substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        AND (rli.kind = 'adjustment' OR rli.adjustment_kind IS NOT NULL OR LOWER(COALESCE(rli.adjustment_kind, '')) LIKE '%ship%')
+      ORDER BY r.processed_at
+    `).all(month);
+    const totals = sqlite.prepare(`
+      SELECT
+        (SELECT COALESCE(SUM(total_shipping), 0) FROM recon_orders
+          WHERE substr(datetime(created_at, '-5 hours'), 1, 7) = ?) AS total_shipping_charged,
+        (SELECT COALESCE(SUM(CASE WHEN rli.kind = 'adjustment' AND rli.adjustment_kind = 'shipping_refund'
+                                  THEN rli.subtotal ELSE 0 END), 0)
+           FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?) AS shipping_refunded_by_recon
+    `).get(month, month);
+    res.json({
+      month,
+      orders_with_shipping: orders,
+      refund_adjustments_in_month: refundAdjustments,
+      totals,
+      note: "net_shipping (per recon) = total_shipping_charged - shipping_refunded_by_recon",
+    });
+  });
+
   app.get("/api/recon/finance/diff/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
