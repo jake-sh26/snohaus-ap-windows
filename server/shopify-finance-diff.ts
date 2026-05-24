@@ -256,7 +256,21 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
   const refundTotals = sqlite
     .prepare(`
       SELECT
-        COALESCE(SUM(CASE WHEN rli.kind = 'item' THEN rli.subtotal ELSE 0 END), 0)             AS returns_subtotal,
+        -- Rule #11 — exclude gift card refunds from returns_subtotal/tax.
+        -- Gift card SALES are recognized as a liability, not revenue
+        -- (Rule #6 already excludes is_gift_card=1 from gross_sales and
+        -- reports them separately as net_sales_gift_cards). For symmetry,
+        -- refunds of gift card line items must ALSO be excluded from
+        -- Returns — otherwise we'd reduce returns by an amount that was
+        -- never in revenue in the first place.
+        -- Validated on Dec 2025 / order #25819: a $81.56 gift card refund
+        -- (line_item.gift_card=true, restock_type='no_restock', tax=0) was
+        -- our entire Dec returns over-count vs Shopify Finance Summary.
+        -- LEFT JOIN because adjustment rows don't have a line_item_id;
+        -- COALESCE(li.is_gift_card, 0) = 0 keeps adjustments included.
+        COALESCE(SUM(CASE WHEN rli.kind = 'item'
+                            AND COALESCE(li.is_gift_card, 0) = 0
+                          THEN rli.subtotal ELSE 0 END), 0)                                    AS returns_subtotal,
         -- Rule #10 — sign convention for refund line item tax:
         --   item rows store positive total_tax (positive on the wire from Shopify).
         --   shipping_refund adjustment rows store SIGNED tax_amount, where a
@@ -272,8 +286,10 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
         -- stored as total_tax=-0.90. Sum-as-stored made the -taxes -=- returns_tax
         -- formula effectively ADD 0.90 back instead of subtract it (+1.80 overage).
         -- Same pattern in Dec: #26507 tax_amount=-1.32 → +2.64 overage.
+        -- Rule #11: also exclude gift card item tax (always $0 in practice).
         COALESCE(SUM(
-          CASE WHEN rli.kind = 'item' THEN rli.total_tax
+          CASE WHEN rli.kind = 'item' AND COALESCE(li.is_gift_card, 0) = 0
+                    THEN rli.total_tax
                WHEN rli.kind = 'adjustment' AND rli.adjustment_kind = 'shipping_refund'
                     THEN ABS(rli.total_tax)
                WHEN rli.kind = 'adjustment' THEN rli.total_tax
@@ -290,6 +306,7 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
         COUNT(DISTINCT r.id)                                                                   AS refund_count
       FROM recon_refunds r
       JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+      LEFT JOIN recon_line_items li ON li.id = rli.line_item_id
       WHERE substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
     `)
     .get(monthKey) as {
