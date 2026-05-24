@@ -1650,6 +1650,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // Debug endpoint for Rule #9 (retained return-shipping fees). Lists every
+  // order that would be flagged by Rule #9 in :month, with the contributing
+  // current_total_price and refund-side discrepancy details. Read-only.
+  app.get("/api/recon/finance/debug/rule9/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const rows = sqlite.prepare(`
+      SELECT
+        o.name,
+        o.created_at,
+        o.processed_at,
+        o.financial_status,
+        o.total_price,
+        o.current_total_price,
+        o.subtotal,
+        o.current_subtotal_price,
+        o.total_tax,
+        o.current_total_tax,
+        (SELECT COUNT(*) FROM recon_refunds r WHERE r.order_id = o.id) AS refund_count,
+        (SELECT MIN(r.processed_at) FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id
+            AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'refund_discrepancy'
+            AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        ) AS rd_refund_processed_at,
+        (SELECT GROUP_CONCAT(rli.subtotal, ',') FROM recon_refunds r
+           JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id
+            AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'refund_discrepancy'
+            AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        ) AS rd_amounts
+      FROM recon_orders o
+      WHERE o.current_total_price IS NOT NULL
+        AND o.current_total_price > 0
+        AND EXISTS (
+          SELECT 1 FROM recon_refunds r
+            JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+           WHERE r.order_id = o.id
+             AND rli.kind = 'adjustment'
+             AND rli.adjustment_kind = 'refund_discrepancy'
+             AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        )
+      ORDER BY o.current_total_price DESC
+    `).all(month, month, month);
+    const total = rows.reduce((s: number, r: any) => s + Number(r.current_total_price || 0), 0);
+    res.json({ month, count: rows.length, total_retained: Math.round(total * 100) / 100, orders: rows });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
