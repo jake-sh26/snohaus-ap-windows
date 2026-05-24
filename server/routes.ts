@@ -1515,6 +1515,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
   });
 
+  // Debug: dump the internal components of computeLocalFinanceSummary so we
+  // can see exactly which sub-total contributes to each line. Read-only.
+  app.get("/api/recon/finance/debug/components/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { computeLocalFinanceSummary } = require("./shopify-finance-diff");
+    res.json(computeLocalFinanceSummary(month, { includeComponents: true }));
+  });
+
   // DRY RUN: returns what computeLocalFinanceSummary WOULD return if we shipped
   // Rule #6 (gift-card line exclusion + line-level recognized_at bucketing).
   // Pure read — no code path changed. Confirm $0.00 vs Shopify here BEFORE we
