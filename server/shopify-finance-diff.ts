@@ -337,17 +337,22 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   //    `current_total_price` reflects an unrelated unrefunded balance (e.g.
   //    customer kept some items) and should NOT be booked as retained revenue.
   //
-  //    Discriminator: a real return-shipping-fee case has
-  //      MAX(|refund_discrepancy.amount|) >= current_total_price
-  //    because the discrepancy represents the FULL cash refund and the fee
-  //    is some smaller fraction of it (e.g. #35232: $220 rd / $10 fee = 4.5%).
-  //    Rounding-artifact cases fail this check because rd is tiny vs ctp.
+  //    Discriminator (Rule #9d — Jan 2026 #33393 edge case): the SUM of
+  //    refund_discrepancy adjustments on the refund must be > 0 AND
+  //    >= current_total_price. The net-positive check excludes paired
+  //    rd adjustments that net to zero (e.g. #33393 had rd_amounts
+  //    "+43.44, -43.44" — an admin created a discrepancy then reversed it;
+  //    no fee was actually retained, but ctp=$43.44 was an unrelated
+  //    unrefunded balance). The >= ctp check still excludes rounding
+  //    artifacts where rd is tiny vs ctp (e.g. #35518: rd net=0, ctp=154).
   //
   //    Validated against:
   //      • March 2026: 3 rd orders, only #35232 fires ($10.00 fee). ✓
-  //      • Feb 2026: #35518 had rd=±$1.08 but ctp=$154.26 — correctly excluded
-  //        by the rd >= ctp check (avoiding a $154.26 false positive).
+  //      • Feb 2026: #35518 had rd=±$1.08 (net 0) but ctp=$154.26 —
+  //        correctly excluded.
   //      • April 2026: 0 rd orders.
+  //      • Jan 2026: #33393 had rd=+$43.44,-$43.44 (net 0) and ctp=$43.44
+  //        — correctly excluded after fix (was a $43.44 false positive).
   const retainedFees = sqlite
     .prepare(`
       SELECT COALESCE(SUM(o.current_total_price), 0) AS retained_total
@@ -366,7 +371,7 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
             )
             AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
             AND (
-              SELECT MAX(ABS(rli2.subtotal))
+              SELECT COALESCE(SUM(rli2.subtotal), 0)
               FROM recon_refund_line_items rli2
               WHERE rli2.refund_id = r.id
                 AND rli2.kind = 'adjustment'
