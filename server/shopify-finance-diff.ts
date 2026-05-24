@@ -337,28 +337,37 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   //    `current_total_price` reflects an unrelated unrefunded balance (e.g.
   //    customer kept some items) and should NOT be booked as retained revenue.
   //
-  //    Discriminator (Rule #9d — Jan 2026 #33393 edge case): the SUM of
-  //    refund_discrepancy adjustments on the refund must be > 0 AND
-  //    >= current_total_price. The net-positive check excludes paired
-  //    rd adjustments that net to zero (e.g. #33393 had rd_amounts
-  //    "+43.44, -43.44" — an admin created a discrepancy then reversed it;
-  //    no fee was actually retained, but ctp=$43.44 was an unrelated
-  //    unrefunded balance). The >= ctp check still excludes rounding
-  //    artifacts where rd is tiny vs ctp (e.g. #35518: rd net=0, ctp=154).
+  //    Discriminator (Rule #9e — Jan 2026 #33393 / March 2026 #35232):
+  //    The unrefunded balance is a FEE (not retained merchandise) iff:
+  //      current_subtotal_price = 0 AND current_total_tax = 0
+  //      AND current_total_price > 0
+  //    This means "no merch and no tax is outstanding" but money is still
+  //    owed/kept — i.e. a return-shipping fee. Validated against:
   //
-  //    Validated against:
-  //      • March 2026: 3 rd orders, only #35232 fires ($10.00 fee). ✓
-  //      • Feb 2026: #35518 had rd=±$1.08 (net 0) but ctp=$154.26 —
-  //        correctly excluded.
-  //      • April 2026: 0 rd orders.
-  //      • Jan 2026: #33393 had rd=+$43.44,-$43.44 (net 0) and ctp=$43.44
-  //        — correctly excluded after fix (was a $43.44 false positive).
+  //      • #35232 (real fee, fires ✓):
+  //          subtotal=230, current_subtotal_price=0,
+  //          total_tax=0,  current_total_tax=0,
+  //          current_total_price=$10 → pure fee. Fires ✓
+  //      • #33393 (false positive, excluded):
+  //          current_subtotal_price=$39.99 (customer kept merch),
+  //          current_total_tax=$3.45,
+  //          current_total_price=$43.44 → unrefunded merchandise.
+  //          Doesn't fire ✓
+  //      • #35518 (rounding artifact, excluded):
+  //          current_subtotal_price>0 → doesn't fire ✓
+  //
+  //    Note: the previous rd MAX-vs-ctp / SUM-vs-ctp discriminators both
+  //    failed because the rd adjustments are always paired-and-reversed
+  //    in Shopify's wire format (they zero out the discrepancy bookkeeping).
+  //    The actual signal of a retained fee lives in current_*, not rd_*.
   const retainedFees = sqlite
     .prepare(`
       SELECT COALESCE(SUM(o.current_total_price), 0) AS retained_total
       FROM recon_orders o
       WHERE o.current_total_price IS NOT NULL
         AND o.current_total_price > 0
+        AND COALESCE(o.current_subtotal_price, 0) = 0
+        AND COALESCE(o.current_total_tax, 0) = 0
         AND EXISTS (
           SELECT 1
           FROM recon_refunds r
@@ -370,13 +379,6 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
                  AND rli.adjustment_kind = 'refund_discrepancy'
             )
             AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
-            AND (
-              SELECT COALESCE(SUM(rli2.subtotal), 0)
-              FROM recon_refund_line_items rli2
-              WHERE rli2.refund_id = r.id
-                AND rli2.kind = 'adjustment'
-                AND rli2.adjustment_kind = 'refund_discrepancy'
-            ) >= o.current_total_price
         )
     `)
     .get(monthKey) as { retained_total: number };
