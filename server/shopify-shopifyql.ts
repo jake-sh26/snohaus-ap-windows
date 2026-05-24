@@ -302,14 +302,19 @@ export async function pullFinanceSummary(
   assertIsoDate(startDate, "startDate");
   assertIsoDate(endDate, "endDate");
 
-  // ShopifyQL date literals are single-quoted strings. The `orders` dataset
-  // exposes both gross_sales and total_sales — both are MONEY. Per Shopify
-  // Community docs (2025-02): the `sales` dataset is deprecated; use `orders`.
+  // ShopifyQL date literals are single-quoted strings. The `sales` dataset is
+  // the canonical Finance Summary source — it exposes gross_sales, discounts,
+  // returns, net_sales, shipping, taxes, total_sales, and orders (count).
+  //
+  // Verified against Shopify dev docs (2025-12) and community.shopify.dev
+  // confirmations: `FROM sales` works, `FROM orders` returns "Invalid dataset
+  // in FROM clause". Earlier comments in this file claiming `sales` was
+  // deprecated were incorrect — that 2023 community post has been reversed.
   //
   // We include `orders` (the count metric) for sanity vs our own count of
   // distinct order ids in recon_orders.
   const q = [
-    "FROM orders",
+    "FROM sales",
     "SHOW gross_sales, discounts, returns, net_sales, shipping, taxes, total_sales, orders",
     `WHERE ${bucketBy} >= '${startDate}' AND ${bucketBy} <= '${endDate} 23:59:59'`,
   ].join("\n");
