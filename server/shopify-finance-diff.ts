@@ -298,13 +298,24 @@ export function listShopifySnapshots(limit = 36): any[] {
 
 // ----- Diff -----
 // Returns a side-by-side comparison for a single month. Per-line diff is
-// (ours − Shopify); positive means we're over, negative means under. ok=true
-// when |diff| ≤ tolerance (default $0.01 — true accounting tolerance, NOT
-// the variance-flagging tolerance which is $1.00 in fix9).
+// (ours − Shopify) AFTER sign normalization; positive means we're over,
+// negative means under. ok=true when |diff| ≤ tolerance (default $0.01 —
+// true accounting tolerance, NOT the variance-flagging tolerance which is
+// $1.00 in fix9).
+//
+// Sign normalization: ShopifyQL `sales` returns `discounts` and `returns`
+// as NEGATIVE numbers (contra-revenue convention — they're reductions to
+// gross sales). Our local rollup stores them as POSITIVE magnitudes
+// (because we sum the absolute amounts from refunds/discounts). To make
+// the diff economically meaningful we compare magnitudes: shopify_abs =
+// |shopify[field]| for contra-revenue fields. We also surface the raw
+// values so a human can verify nothing weird is happening.
 export type FinanceDiffLine = {
   field: string;
   ours: number;
   shopify: number | null;
+  /** raw value Shopify returned, before sign normalization */
+  shopify_raw?: number | null;
   diff: number | null;
   ok: boolean | null;
 };
@@ -338,14 +349,26 @@ export function computeFinanceDiff(
   const ours = computeLocalFinanceSummary(monthKey);
   const shopify = getShopifySnapshot(monthKey, opts.snapshotKind ?? "all_channels");
 
+  // Fields where Shopify uses contra-revenue (negative) sign convention but
+  // we store positive magnitudes. For these we compare |shopify| to ours.
+  const CONTRA_REVENUE_FIELDS = new Set(["discounts", "returns"]);
+
   const lines: FinanceDiffLine[] = DIFF_FIELDS.map((f) => {
     const o = (ours as any)[f] as number;
     if (!shopify || shopify[f] == null) {
-      return { field: f, ours: o, shopify: null, diff: null, ok: null };
+      return { field: f, ours: o, shopify: null, shopify_raw: null, diff: null, ok: null };
     }
-    const s = Number(shopify[f]);
+    const rawS = Number(shopify[f]);
+    const s = CONTRA_REVENUE_FIELDS.has(f) ? Math.abs(rawS) : rawS;
     const diff = round2(o - s);
-    return { field: f, ours: o, shopify: s, diff, ok: Math.abs(diff) <= tolerance };
+    return {
+      field: f,
+      ours: o,
+      shopify: s,
+      shopify_raw: rawS,
+      diff,
+      ok: Math.abs(diff) <= tolerance,
+    };
   });
 
   const linesWithSnapshot = lines.filter((l) => l.shopify != null);
