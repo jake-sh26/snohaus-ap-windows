@@ -1624,6 +1624,71 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
+  // through the (now broadened) exchange detection logic in
+  // shopify-recon-orders.ts and rewrites recon_line_items including
+  // recognized_at. Idempotent. Run once after R5a-fix1 deploys.
+  //
+  // Body: { dryRun?: boolean, limit?: number }
+  //   dryRun=true returns counts only, no writes.
+  //   limit caps the order count for incremental backfills (default: all).
+  app.post("/api/recon/backfill-recognized-at", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const { sqlite } = require("./storage");
+    const { upsertOrderFromShopify } = require("./shopify-recon-orders");
+    const dryRun = req.body?.dryRun === true;
+    const limit = Number(req.body?.limit);
+    const sql = `SELECT id, raw_json FROM recon_orders WHERE raw_json IS NOT NULL${Number.isFinite(limit) ? " LIMIT " + Math.floor(limit) : ""}`;
+    const rows = sqlite.prepare(sql).all() as { id: string; raw_json: string | null }[];
+
+    let attempted = 0;
+    let succeeded = 0;
+    let failed = 0;
+    let recognizedAtChanged = 0;
+    const errors: { order_id: string; error: string }[] = [];
+
+    for (const row of rows) {
+      attempted++;
+      if (!row.raw_json) continue;
+      try {
+        const raw = typeof row.raw_json === "string" ? JSON.parse(row.raw_json) : row.raw_json;
+        // Count line-level recognized_at deltas BEFORE writing so we can report
+        // how many lines actually moved (most won't change — only orders with
+        // late fulfillments + refunds, i.e. exchanges).
+        const beforeRows = sqlite
+          .prepare(`SELECT id, recognized_at FROM recon_line_items WHERE order_id = ?`)
+          .all(row.id) as { id: string; recognized_at: string | null }[];
+        const before = new Map(beforeRows.map((r: { id: string; recognized_at: string | null }) => [r.id, r.recognized_at]));
+
+        if (!dryRun) {
+          upsertOrderFromShopify(raw);
+        }
+
+        const afterRows = sqlite
+          .prepare(`SELECT id, recognized_at FROM recon_line_items WHERE order_id = ?`)
+          .all(row.id) as { id: string; recognized_at: string | null }[];
+        for (const a of afterRows as { id: string; recognized_at: string | null }[]) {
+          if (before.get(a.id) !== a.recognized_at) recognizedAtChanged++;
+        }
+        succeeded++;
+      } catch (e: any) {
+        failed++;
+        if (errors.length < 20) errors.push({ order_id: row.id, error: String(e?.message ?? e) });
+      }
+    }
+
+    res.json({
+      dryRun,
+      attempted,
+      succeeded,
+      failed,
+      recognized_at_lines_changed: recognizedAtChanged,
+      errors,
+      note: dryRun
+        ? "Dry run — no writes performed."
+        : "Backfill complete. Re-run /api/recon/finance/diff/:month to see the recomputed totals.",
+    });
+  });
+
   // Save / overwrite a Shopify snapshot for a month. Operator pastes values
   // from the Admin Finance Summary export. All money fields optional — a
   // partial save (just net_sales, say) is allowed; missing fields show as null

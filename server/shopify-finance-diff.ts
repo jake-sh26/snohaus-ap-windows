@@ -127,48 +127,106 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   const tzExpr = `datetime(?1, '${STORE_TZ_OFFSET_HOURS} hours')`;
   void tzExpr; // (we inline the offset literally below to keep prepared statements simple)
 
-  // 1. Gross sales = Σ line.price × line.quantity, for line items on orders
-  //    whose store-local recognized month matches (Rule #5).
+  // R5a-fix1 ships the full ruleset proved by recon_v5.py on Apr 2026 ($0.00
+  // across all 7 lines).
+  //
+  // Rule #6 (gift cards out of revenue): exclude is_gift_card=1 lines from
+  // gross, line discounts, and order_count. Gift-card sales appear separately
+  // as net_sales_gift_cards. Pure-GC orders are dropped from order_count.
+  //
+  // Rule #7a (line-level discounts): discounts = SUM(li.total_discount) on
+  // non-GC lines bucketed by recognized_at. Order-level total_discounts can
+  // include order-level codes that Shopify allocates per-line in the Finance
+  // Summary anyway, so the line aggregate is the correct view.
+  //
+  // Rule #7b (per-line tax): taxes = SUM(li.tax_lines[].price) on non-GC
+  // lines + SUM(shipping_line.tax_lines[].price), minus the month's refund
+  // tax. Order-level total_tax can drift a few dollars from per-line per-
+  // jurisdiction rounding; the line aggregate matches Shopify exactly.
+
+  // 1. Gross sales + GC tracking + order count, bucketed on LINE recognized_at.
   const grossRow = sqlite
     .prepare(`
       SELECT
-        COALESCE(SUM(li.price * li.quantity), 0)            AS gross,
-        COALESCE(SUM(li.total_discount), 0)                 AS line_discounts,
+        COALESCE(SUM(CASE WHEN li.is_gift_card = 0
+                          THEN li.price * li.quantity ELSE 0 END), 0)        AS gross,
+        COALESCE(SUM(CASE WHEN li.is_gift_card = 0
+                          THEN li.total_discount ELSE 0 END), 0)             AS line_discounts_nongc,
         COALESCE(SUM(CASE WHEN li.is_gift_card = 1
                           THEN li.price * li.quantity - li.total_discount
-                          ELSE 0 END), 0)                   AS gc_net_sales,
-        COUNT(DISTINCT li.order_id)                         AS order_count
+                          ELSE 0 END), 0)                                    AS gc_net_sales,
+        COUNT(DISTINCT CASE WHEN li.is_gift_card = 0 THEN li.order_id END)   AS order_count
       FROM recon_line_items li
       JOIN recon_orders o ON o.id = li.order_id
-      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+      WHERE substr(datetime(
+        COALESCE(li.recognized_at, o.processed_at, o.created_at),
+        '-5 hours'), 1, 7) = ?
     `)
     .get(monthKey) as {
       gross: number;
-      line_discounts: number;
+      line_discounts_nongc: number;
       gc_net_sales: number;
       order_count: number;
     };
 
-  // 2. Order-level discounts that AREN'T captured at the line level. Shopify's
-  //    Finance Summary "Discounts" total includes both. We approximate via
-  //    recon_orders.total_discounts minus the line-discount sum (which would
-  //    double-count if we just used both). Actually: orders.total_discounts
-  //    is already the full discount including line-level, so just sum that
-  //    and ignore line_discounts (which was for diagnostic only).
-  const orderTotals = sqlite
+  // 2. Per-line tax from tax_lines_json (Rule #7b). Bucket on LINE recognized_at,
+  //    exclude gift-card lines (they're non-taxable anyway, but defensive).
+  const lineTaxRows = sqlite
     .prepare(`
-      SELECT
-        COALESCE(SUM(total_discounts), 0)                   AS total_discounts,
-        COALESCE(SUM(total_shipping),  0)                   AS total_shipping,
-        COALESCE(SUM(total_tax),       0)                   AS total_tax
+      SELECT li.tax_lines_json
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+      WHERE substr(datetime(
+        COALESCE(li.recognized_at, o.processed_at, o.created_at),
+        '-5 hours'), 1, 7) = ?
+        AND li.is_gift_card = 0
+        AND li.tax_lines_json IS NOT NULL
+        AND li.tax_lines_json <> ''
+    `)
+    .all(monthKey) as { tax_lines_json: string }[];
+  let perLineTax = 0;
+  for (const row of lineTaxRows) {
+    try {
+      const tls = JSON.parse(row.tax_lines_json);
+      if (Array.isArray(tls)) {
+        for (const tl of tls) {
+          const p = Number(tl?.price);
+          if (Number.isFinite(p)) perLineTax += p;
+        }
+      }
+    } catch { /* malformed JSON — skip silently */ }
+  }
+
+  // 3. Shipping totals + shipping-line tax_lines (Rule #7b) from raw_json.
+  //    Shopify counts shipping tax inside the Taxes column, not Shipping.
+  //    Orders here are bucketed on ORDER recognized_at (processed_at|created_at)
+  //    — shipping is paid at order time, not at line-recognition time.
+  const shippingOrderRows = sqlite
+    .prepare(`
+      SELECT o.total_shipping, o.raw_json
       FROM recon_orders o
       WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
     `)
-    .get(monthKey) as {
-      total_discounts: number;
-      total_shipping: number;
-      total_tax: number;
-    };
+    .all(monthKey) as { total_shipping: number | null; raw_json: string | null }[];
+  let totalShipping = 0;
+  let shippingTax = 0;
+  for (const row of shippingOrderRows) {
+    totalShipping += Number(row.total_shipping) || 0;
+    if (!row.raw_json) continue;
+    try {
+      const rj = typeof row.raw_json === "string" ? JSON.parse(row.raw_json) : row.raw_json;
+      const shippingLines = Array.isArray(rj?.shipping_lines) ? rj.shipping_lines : [];
+      for (const s of shippingLines) {
+        const tls = Array.isArray(s?.tax_lines) ? s.tax_lines : [];
+        for (const tl of tls) {
+          const p = Number(tl?.price);
+          if (Number.isFinite(p)) shippingTax += p;
+        }
+      }
+    } catch { /* malformed JSON — skip silently */ }
+  }
+
+  const orderTotals = { total_shipping: totalShipping };
 
   // 3. Returns: line-value of refunded items, bucketed on refund processed_at
   //    (not the original order's created_at). Shipping refunds + tax refunds
@@ -199,14 +257,15 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
       refund_count: number;
     };
 
-  // Plug into Shopify's formulas. Discounts and Returns are stored as positive
-  // values, subtracted in the Net sales line.
+  // Plug into Shopify's formulas. Returns are stored positive and subtracted
+  // in Net sales. Discounts use the non-GC line aggregate (Rule #7a).
   const gross_sales = grossRow.gross;
-  const discounts = orderTotals.total_discounts;
+  const discounts = grossRow.line_discounts_nongc;
   const returns = refundTotals.returns_subtotal;
   const net_sales = gross_sales - discounts - returns;
   const shipping = orderTotals.total_shipping - refundTotals.shipping_refunded;
-  const taxes = orderTotals.total_tax - refundTotals.returns_tax;
+  // Taxes (Rule #7b): per-line tax + shipping-line tax − refund tax this month.
+  const taxes = perLineTax + shippingTax - refundTotals.returns_tax;
   const total_sales = net_sales + shipping + taxes;
 
   return {

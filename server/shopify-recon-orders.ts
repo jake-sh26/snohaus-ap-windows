@@ -88,13 +88,23 @@ export function transformShopifyOrder(o: any): {
   {
     const rawRefundsForExchangeScan = Array.isArray(o.refunds) ? o.refunds : [];
     const rawFulfillmentsForExchangeScan = Array.isArray(o.fulfillments) ? o.fulfillments : [];
-    // Sort refunds with any restocking event by processed_at ascending so we
-    // pair each exchange-fulfillment with the earliest refund it could have
-    // resulted from. (Worst-case order has multiple refund+exchange cycles.)
+    // R5a-fix1 (broadened exchange detection):
+    // Originally we required restock_type ∈ {return, cancel} on at least one
+    // refund line. That filter is too narrow — some order-edit flows produce
+    // refund_line_items WITHOUT a restock_type (e.g. POS exchanges where the
+    // returned item is immediately fulfilled as a replacement, or web order
+    // edits that swap a line). Paper recon (recon_v5.py) proved on Apr 2026
+    // that dropping the restock_type filter is required to correctly pair
+    // late fulfillments with their originating refunds, which in turn moves
+    // exchange-replacement lines into the correct recognition month.
+    //
+    // We now accept ANY refund that has at least one refund_line_item as a
+    // pairing candidate. The fulfillment-after-refund timing constraint below
+    // still prevents spurious pairings.
     const restockingRefunds = rawRefundsForExchangeScan
       .filter((r: any) => {
         const rli = Array.isArray(r.refund_line_items) ? r.refund_line_items : [];
-        return rli.some((li: any) => li?.restock_type === "return" || li?.restock_type === "cancel");
+        return rli.length > 0;
       })
       .sort((a: any, b: any) => String(a.processed_at ?? a.created_at ?? "").localeCompare(String(b.processed_at ?? b.created_at ?? "")));
     if (restockingRefunds.length > 0 && rawFulfillmentsForExchangeScan.length > 0) {
