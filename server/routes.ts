@@ -1528,6 +1528,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Generic ShopifyQL passthrough — lets us test arbitrary queries (e.g. when
+  // we're not sure which dataset/column names Shopify accepts) without
+  // shipping a code change. Returns the raw `runShopifyql` result so the
+  // caller sees parseErrors, columns, and rows.
+  //
+  //   POST /api/recon/shopifyql/run  body { query: "FROM sales SHOW total_sales SINCE -7d UNTIL today" }
+  //
+  // Read-only — only requires `payroll.view` and the read_reports scope on the
+  // Shopify token. We intentionally do NOT log the raw query body in case it
+  // contains PII filters.
+  app.post("/api/recon/shopifyql/run", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const query = String((req.body && req.body.query) || "").trim();
+    if (!query) {
+      return res.status(400).json({ message: "body.query is required (a ShopifyQL string)" });
+    }
+    if (query.length > 4000) {
+      return res.status(400).json({ message: "query too long (max 4000 chars)" });
+    }
+    try {
+      const { runShopifyql } = require("./shopify-shopifyql");
+      const result = await runShopifyql(query);
+      res.json(result);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      const isAuth = /401|403|scope/i.test(msg);
+      res.status(isAuth ? 502 : 500).json({
+        message: msg,
+        hint: isAuth
+          ? "Re-install the Shopify app via /api/auth/shopify/install to grant the read_reports / read_analytics scopes."
+          : undefined,
+      });
+    }
+  });
+
   // Snapshot a month's ShopifyQL totals into recon_shopify_snapshots so the
   // existing /api/recon/finance/diff/:month endpoint can compare our local
   // rollup against it. Body params:
