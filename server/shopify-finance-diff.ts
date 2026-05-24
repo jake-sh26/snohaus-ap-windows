@@ -103,9 +103,22 @@ export type FinanceSummaryLocal = {
   // Diagnostics — counts so the operator can sanity-check coverage:
   order_count: number;
   refund_count: number;
+  // Debug components (only present when computeLocalFinanceSummary is called
+  // with { includeComponents: true } via the debug endpoint).
+  _components?: {
+    per_line_tax: number;
+    shipping_tax: number;
+    returns_tax: number;
+    unverified_return_tax: number;
+    retained_fees: number;
+    total_shipping_orders: number;
+    shipping_refunded: number;
+    returns_subtotal: number;
+    unverified_return_subtotal: number;
+  };
 };
 
-export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLocal {
+export function computeLocalFinanceSummary(monthKey: string, opts?: { includeComponents?: boolean }): FinanceSummaryLocal {
   ensureSchemaOnce();
   // Match Shopify's store-local month bucketing. SQLite stores ISO UTC; we
   // shift by -5h (EST) as a coarse approximation. The shoulder days in
@@ -401,7 +414,7 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   // by exactly the fee amount).
   const total_sales = net_sales + shipping + taxes + retainedFees.retained_total;
 
-  return {
+  const result: FinanceSummaryLocal = {
     month: monthKey,
     gross_sales: round2(gross_sales),
     discounts: round2(discounts),
@@ -414,6 +427,20 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
     order_count: grossRow.order_count,
     refund_count: refundTotals.refund_count,
   };
+  if (opts?.includeComponents) {
+    result._components = {
+      per_line_tax: round2(perLineTax),
+      shipping_tax: round2(shippingTax),
+      returns_tax: round2(refundTotals.returns_tax),
+      unverified_return_tax: round2(unverifiedReturns.unverified_return_tax),
+      retained_fees: round2(retainedFees.retained_total),
+      total_shipping_orders: round2(orderTotals.total_shipping),
+      shipping_refunded: round2(refundTotals.shipping_refunded),
+      returns_subtotal: round2(refundTotals.returns_subtotal),
+      unverified_return_subtotal: round2(unverifiedReturns.unverified_return_subtotal),
+    };
+  }
+  return result;
 }
 
 function round2(n: number): number {
