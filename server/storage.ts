@@ -4393,6 +4393,153 @@ export function listReconOrdersSample(limit = 50): Array<{
     .all(Math.min(500, Math.max(1, limit))) as any;
 }
 
+// ============================================================================
+// PR #R5a-pre — paginated, date-range order listing.
+// ----------------------------------------------------------------------------
+// The Test Console DevTools pull script needs to walk arbitrary date windows
+// of historical orders so the paper-recon validator can match the Shopify
+// Finance Summary month-by-month. listReconOrdersSample() caps at the newest
+// 500 rows which is insufficient for any month with > 500 orders or for any
+// recon window that needs cross-month refund parents.
+//
+// Keyset pagination by (date_field, id) — stable under concurrent writes,
+// no offset drift. `field` must be one of the indexed date columns to keep
+// the query plan sane (idx_recon_orders_created_at, idx_recon_orders_processed_at,
+// or a full-scan fallback for updated_at).
+// ============================================================================
+export type ReconOrderRangeField = "created_at" | "updated_at" | "processed_at";
+
+export type ReconOrderRangeRow = {
+  id: string;
+  name: string | null;
+  created_at: string;
+  updated_at: string | null;
+  processed_at: string | null;
+  source_name: string | null;
+  location_id: string | null;
+  financial_status: string | null;
+  total_price: number | null;
+  total_tax: number | null;
+  has_gift_card: number;
+  ingest_version: number;
+};
+
+export type ReconOrderRangePage = {
+  orders: ReconOrderRangeRow[];
+  next_cursor: string | null;
+  total_estimate: number;
+};
+
+/**
+ * List orders whose `field` timestamp falls in [start, end). Keyset cursor is
+ * the encoded (date_field_value, id) of the LAST row of the previous page.
+ * Caller passes back the opaque `next_cursor` to get the next page.
+ *
+ * Hard ceiling of 1000 rows per page to keep response size bounded (the
+ * front-end is a DevTools console snippet doing fetch()).
+ */
+export function listReconOrdersByDateRange(opts: {
+  field: ReconOrderRangeField;
+  start: string; // inclusive ISO
+  end: string;   // exclusive ISO
+  cursor?: string | null;
+  limit?: number;
+}): ReconOrderRangePage {
+  const field: ReconOrderRangeField =
+    opts.field === "updated_at" || opts.field === "processed_at"
+      ? opts.field
+      : "created_at";
+  const limit = Math.min(1000, Math.max(1, Number(opts.limit) || 200));
+  const { start, end } = opts;
+
+  // Decode cursor: "<iso>|<id>"; missing → start of window.
+  let cursorTs: string | null = null;
+  let cursorId: string | null = null;
+  if (opts.cursor) {
+    const [ts, id] = String(opts.cursor).split("|");
+    if (ts && id) { cursorTs = ts; cursorId = id; }
+  }
+
+  // Build WHERE: field >= start AND field < end AND (field, id) > (cursorTs, cursorId).
+  // SQLite tuple comparison via (field > c) OR (field = c AND id > cid).
+  const where: string[] = [`${field} IS NOT NULL`, `${field} >= ?`, `${field} < ?`];
+  const params: any[] = [start, end];
+  if (cursorTs && cursorId) {
+    where.push(`(${field} > ? OR (${field} = ? AND id > ?))`);
+    params.push(cursorTs, cursorTs, cursorId);
+  }
+  params.push(limit + 1); // fetch one extra to know if there's a next page
+
+  const rows = sqlite
+    .prepare(`
+      SELECT id, name, created_at, updated_at, processed_at, source_name,
+             location_id, financial_status, total_price, total_tax,
+             has_gift_card, ingest_version
+      FROM recon_orders
+      WHERE ${where.join(" AND ")}
+      ORDER BY ${field} ASC, id ASC
+      LIMIT ?
+    `)
+    .all(...params) as ReconOrderRangeRow[];
+
+  let nextCursor: string | null = null;
+  if (rows.length > limit) {
+    const last = rows[limit - 1]!;
+    rows.length = limit;
+    const ts = (last as any)[field] as string;
+    nextCursor = `${ts}|${last.id}`;
+  }
+
+  // Cheap estimate: same window without cursor.
+  const totalEstimate = (sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM recon_orders WHERE ${field} IS NOT NULL AND ${field} >= ? AND ${field} < ?`)
+    .get(start, end) as any).n as number;
+
+  return { orders: rows, next_cursor: nextCursor, total_estimate: totalEstimate };
+}
+
+/**
+ * List the order IDs (plus minimal headers) for every order that had at least
+ * one refund processed in [start, end). Critical for cross-month refund
+ * reconciliation: a refund processed in March against a February-created
+ * order belongs in March's Finance Summary, but the parent order is outside
+ * any created_at-based window.
+ *
+ * Returns the parent order rows themselves (not the refunds) so the DevTools
+ * script can loop `/api/recon/orders/:id` to fetch full details with refunds.
+ */
+export function listReconOrdersWithRefundsInRange(opts: {
+  start: string; // inclusive ISO
+  end: string;   // exclusive ISO
+  limit?: number;
+}): { orders: ReconOrderRangeRow[]; total_estimate: number } {
+  const limit = Math.min(2000, Math.max(1, Number(opts.limit) || 1000));
+  const { start, end } = opts;
+  const rows = sqlite
+    .prepare(`
+      SELECT o.id, o.name, o.created_at, o.updated_at, o.processed_at, o.source_name,
+             o.location_id, o.financial_status, o.total_price, o.total_tax,
+             o.has_gift_card, o.ingest_version
+      FROM recon_orders o
+      WHERE o.id IN (
+        SELECT DISTINCT order_id FROM recon_refunds
+        WHERE processed_at IS NOT NULL
+          AND processed_at >= ?
+          AND processed_at < ?
+      )
+      ORDER BY o.created_at ASC, o.id ASC
+      LIMIT ?
+    `)
+    .all(start, end, limit) as ReconOrderRangeRow[];
+  const totalEstimate = (sqlite
+    .prepare(`
+      SELECT COUNT(DISTINCT order_id) AS n FROM recon_refunds
+      WHERE processed_at IS NOT NULL AND processed_at >= ? AND processed_at < ?
+    `)
+    .get(start, end) as any).n as number;
+  return { orders: rows, total_estimate: totalEstimate };
+}
+
 /**
  * Aggregated orders summary for the Test Console "Orders summary" card.
  * Returns total count, date range, per-month, per-channel, and per-location

@@ -94,6 +94,9 @@ import {
   getReconOrderWithLines,
   getReconOrdersWatermark,
   getReconOrdersSummary,
+  // Reconciler (PR #R5a-pre) — paginated date-range pulls
+  listReconOrdersByDateRange,
+  listReconOrdersWithRefundsInRange,
   // Reconciler (PR #R3)
   listReconPayoutsSample,
   getReconPayoutWithTransactions,
@@ -1502,6 +1505,53 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // breakdowns. Read-only (PR #R2f).
   app.get("/api/recon/shopify/orders-summary", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
     res.json(getReconOrdersSummary());
+  });
+
+  // --------------------------------------------------------------------------
+  // PR #R5a-pre — paginated, date-range order listing for paper-recon pulls.
+  // --------------------------------------------------------------------------
+  // Keyset-paginated. Pass `field=created_at|updated_at|processed_at`, ISO
+  // `start`/`end`, optional `cursor` (echo back next_cursor), and `limit`
+  // (default 200, max 1000). Read-only, same payroll.view permission as the
+  // existing sample endpoint.
+  //
+  // IMPORTANT: this route MUST be registered BEFORE /api/recon/orders/:id so
+  // Express doesn't match "range" as the :id parameter.
+  app.get("/api/recon/orders/range", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    if (!start || !end) {
+      return res.status(400).json({ message: "start and end (ISO timestamps) are required" });
+    }
+    if (start >= end) {
+      return res.status(400).json({ message: "start must be < end" });
+    }
+    const fieldRaw = String(req.query.field || "created_at");
+    const field = (fieldRaw === "updated_at" || fieldRaw === "processed_at")
+      ? (fieldRaw as "updated_at" | "processed_at")
+      : "created_at";
+    const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
+    const limit = Number(req.query.limit) || 200;
+    const page = listReconOrdersByDateRange({ field, start, end, cursor, limit });
+    res.json(page);
+  });
+
+  // Companion endpoint: list every order whose refund.processed_at falls in
+  // [start, end). Cross-month refund parents are invisible to a created_at
+  // window so this is the only way to pull them for paper-recon. Returns just
+  // the order rows; callers loop /api/recon/orders/:id for full detail.
+  app.get("/api/recon/refunds/orders-in-range", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const start = String(req.query.start || "").trim();
+    const end = String(req.query.end || "").trim();
+    if (!start || !end) {
+      return res.status(400).json({ message: "start and end (ISO timestamps) are required" });
+    }
+    if (start >= end) {
+      return res.status(400).json({ message: "start must be < end" });
+    }
+    const limit = Number(req.query.limit) || 1000;
+    const result = listReconOrdersWithRefundsInRange({ start, end, limit });
+    res.json(result);
   });
 
   // Single order detail (order + line items) for spot-checking tax_channel_liable.
