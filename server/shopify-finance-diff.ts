@@ -309,6 +309,49 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
       unverified_return_tax: number;
     };
 
+  // 5. Rule #9 — return shipping fees retained.
+  //    When a customer returns merchandise via mail, Sno-Haus deducts a $10
+  //    return shipping fee from the cash refund (e.g. #35232: returned $230
+  //    merchandise, customer received $220 cash, $10 retained as fee revenue).
+  //
+  //    Shopify encodes this with TWO patterns simultaneously:
+  //      (a) a pair of offsetting `refund_discrepancy` order_adjustments on
+  //          the refund (e.g. +$220 / -$220) — these net to $0 in the refunds
+  //          table, so they don't show up in our 'returns' aggregate, AND
+  //      (b) a positive `current_total_price` on the order equal to the fee.
+  //
+  //    Shopify's Finance Summary books the retained fee in `total_sales`
+  //    on the refund's processed_at month (not the original order's month).
+  //    To match, we sum `current_total_price` for orders whose refunds this
+  //    month contain a `refund_discrepancy` adjustment.
+  //
+  //    Detection rationale: refund_discrepancy is Shopify's specific marker
+  //    for "this refund's cash amount didn't match the merchandise value";
+  //    we cross-check current_total_price > 0 so we only book actual retained
+  //    revenue (zero on full returns where the discrepancy was a Shopify-side
+  //    payout rounding artifact, like #37402 and #35100).
+  //
+  //    Validated against March 2026 dump: 3 orders have refund_discrepancy
+  //    adjustments in March. Only #35232 has current_total_price > 0 ($10.00).
+  //    Sum = $10.00, matches the residual exactly. April 2026: 0 matches.
+  const retainedFees = sqlite
+    .prepare(`
+      SELECT COALESCE(SUM(o.current_total_price), 0) AS retained_total
+      FROM recon_orders o
+      WHERE o.current_total_price IS NOT NULL
+        AND o.current_total_price > 0
+        AND EXISTS (
+          SELECT 1
+          FROM recon_refunds r
+          JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+          WHERE r.order_id = o.id
+            AND rli.kind = 'adjustment'
+            AND rli.adjustment_kind = 'refund_discrepancy'
+            AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        )
+    `)
+    .get(monthKey) as { retained_total: number };
+
   // Plug into Shopify's formulas. Returns are stored positive and subtracted
   // in Net sales. Discounts use the non-GC line aggregate (Rule #7a).
   const gross_sales = grossRow.gross;
@@ -321,7 +364,11 @@ export function computeLocalFinanceSummary(monthKey: string): FinanceSummaryLoca
   // can be negative (Shopify writes -$2.15 in current_total_tax), so the
   // subtraction effectively re-adds the customer's reversed tax to refunds.
   const taxes = perLineTax + shippingTax - refundTotals.returns_tax - unverifiedReturns.unverified_return_tax;
-  const total_sales = net_sales + shipping + taxes;
+  // Rule #9: retained return-shipping fees hit `total_sales` only (Shopify
+  // does NOT include them in shipping, net_sales, or taxes — verified on
+  // March 2026: shipping/net/tax all matched without fee, total_sales off
+  // by exactly the fee amount).
+  const total_sales = net_sales + shipping + taxes + retainedFees.retained_total;
 
   return {
     month: monthKey,
