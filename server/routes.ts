@@ -1783,6 +1783,96 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // Debug: per-order date-mismatch report for a month.
+  // For every order whose line.recognized_at month = :month, report:
+  //   - created_at month, processed_at month, line.recognized_at month
+  //   - whether they disagree (draft order / paid-later / exchange)
+  //   - per-order gross + discount + tax + refund totals
+  // Sort by absolute gross contribution descending so the biggest outliers
+  // bubble to the top. Read-only.
+  app.get("/api/recon/finance/debug/date-mismatches/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const tz = "'-5 hours'";
+    // Pull every order that has at least one line recognized in :month.
+    const rows = sqlite.prepare(`
+      WITH lines_in_month AS (
+        SELECT
+          li.order_id,
+          SUM(CASE WHEN li.is_gift_card = 0 THEN li.price * li.quantity ELSE 0 END) AS gross_in_month,
+          SUM(CASE WHEN li.is_gift_card = 0 THEN MAX(li.total_discount, COALESCE(li.discount_allocations_total, 0)) ELSE 0 END) AS disc_in_month,
+          SUM(CASE WHEN li.is_gift_card = 0 THEN li.line_tax_total ELSE 0 END) AS tax_in_month,
+          COUNT(*) AS lines_in_month_count,
+          SUM(CASE WHEN li.added_via_exchange_refund_id IS NOT NULL THEN 1 ELSE 0 END) AS exchange_line_count
+        FROM recon_line_items li
+        WHERE substr(datetime(
+          COALESCE(li.recognized_at, (SELECT o.processed_at FROM recon_orders o WHERE o.id = li.order_id), (SELECT o.created_at FROM recon_orders o WHERE o.id = li.order_id)),
+          ${tz}), 1, 7) = ?
+        GROUP BY li.order_id
+      )
+      SELECT
+        o.id, o.order_number, o.name,
+        o.created_at, o.processed_at, o.cancelled_at,
+        substr(datetime(o.created_at,                              ${tz}), 1, 7) AS month_created,
+        substr(datetime(COALESCE(o.processed_at, o.created_at),    ${tz}), 1, 7) AS month_processed,
+        o.financial_status, o.fulfillment_status, o.source_name,
+        o.total_price, o.total_discounts, o.total_tax, o.total_refunded,
+        l.gross_in_month, l.disc_in_month, l.tax_in_month,
+        l.lines_in_month_count, l.exchange_line_count,
+        (SELECT COUNT(*) FROM recon_line_items li2 WHERE li2.order_id = o.id) AS total_lines_on_order
+      FROM lines_in_month l
+      JOIN recon_orders o ON o.id = l.order_id
+      ORDER BY ABS(l.gross_in_month) DESC
+    `).all(month);
+
+    // Bucket rows by date-mismatch pattern.
+    const buckets: Record<string, any[]> = {
+      cross_month_created_vs_recognized: [], // order created in different month than recognized
+      processed_vs_created_mismatch: [],     // processed_at month ≠ created_at month (draft/layaway)
+      exchange_lines: [],                    // exchange replacement lines (added_via_exchange_refund_id)
+      cancelled: [],
+      same_month: [],                        // all dates agree on :month
+    };
+    const totals = {
+      gross_in_month: 0, disc_in_month: 0, tax_in_month: 0,
+      gross_by_bucket: {} as Record<string, number>,
+      disc_by_bucket: {} as Record<string, number>,
+    };
+    for (const r of rows as any[]) {
+      totals.gross_in_month += Number(r.gross_in_month) || 0;
+      totals.disc_in_month += Number(r.disc_in_month) || 0;
+      totals.tax_in_month += Number(r.tax_in_month) || 0;
+      const sameCreated = r.month_created === month;
+      const sameProcessed = r.month_processed === month;
+      const hasExchange = (Number(r.exchange_line_count) || 0) > 0;
+      const isCancelled = !!r.cancelled_at;
+      let bucket: keyof typeof buckets;
+      if (isCancelled) bucket = "cancelled";
+      else if (hasExchange) bucket = "exchange_lines";
+      else if (!sameCreated) bucket = "cross_month_created_vs_recognized";
+      else if (!sameProcessed) bucket = "processed_vs_created_mismatch";
+      else bucket = "same_month";
+      buckets[bucket].push(r);
+      totals.gross_by_bucket[bucket] = (totals.gross_by_bucket[bucket] || 0) + (Number(r.gross_in_month) || 0);
+      totals.disc_by_bucket[bucket] = (totals.disc_by_bucket[bucket] || 0) + (Number(r.disc_in_month) || 0);
+    }
+
+    res.json({
+      month,
+      order_count: (rows as any[]).length,
+      totals,
+      bucket_counts: Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])),
+      bucket_top_10: Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, (v as any[]).slice(0, 10)])),
+      note:
+        "Buckets are evaluated in priority order: cancelled → exchange_lines → cross_month_created_vs_recognized → processed_vs_created_mismatch → same_month. " +
+        "`cross_month_created_vs_recognized` means the line was fulfilled (recognized) in :month but the order was placed in a different month — these are the exchange / late-fulfillment / deferred lines. " +
+        "`processed_vs_created_mismatch` means the order was placed AND recognized in :month but payment was processed in a different month — draft / layaway / paid-later orders.",
+    });
+  });
+
   // Debug: list every order our recon bucketed into this month, so we can diff
   // against Shopify's ShopifyQL `FROM sales` order_name list and identify the
   // exact orders that disagree. Returns per-order gross/discounts/refund flags
