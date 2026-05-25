@@ -2830,9 +2830,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const round2 = (n: number | null | undefined) =>
       n == null || !Number.isFinite(n) ? null : Math.round(n * 100) / 100;
 
-    // Page through Shopify orders by updatedAt. For each, pull totals + check
-    // for an edited event. We can't filter directly by "has edited event" in
-    // the orders connection, so we post-filter in code.
+    // Page through Shopify orders by updatedAt.
+    //
+    // NOTE (PR #85d fix): we previously included an `events(query: "verb:edited")`
+    // sub-selection here. That works fine when querying ONE order at a time
+    // (PR #85/#85b), but inside the orders connection Shopify silently
+    // returns 0 events for every order — appears to be a nested-connection
+    // cost-limit truncation. As a result PR #85c (with that subselection)
+    // scanned 10,000 orders and returned 0 edits even though #22338 and
+    // #21840 demonstrably have verb=edited events.
+    //
+    // Fix: drop the events sub-selection. Detect candidates purely by
+    // originalTotalPriceSet != currentTotalPriceSet. This catches order
+    // edits AND refunds — we distinguish them client-side or in a follow-up
+    // per-order call against PR #85b.
     const query = `
       query EditedOrdersPage($first: Int!, $after: String, $q: String!) {
         orders(first: $first, after: $after, query: $q, sortKey: UPDATED_AT) {
@@ -2851,9 +2862,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               currentTotalDiscountsSet{ shopMoney { amount } }
               currentTotalTaxSet     { shopMoney { amount } }
               currentShippingPriceSet{ shopMoney { amount } }
-              events(first: 5, query: "verb:edited OR action:order_edited", sortKey: CREATED_AT, reverse: true) {
-                edges { node { id createdAt message } }
-              }
             }
           }
         }
@@ -2883,9 +2891,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       for (const e of edges) {
         const o = e.node;
-        const eventEdges = (o.events?.edges || []) as any[];
-        const hasEditedEvent = eventEdges.length > 0;
-        if (!hasEditedEvent) continue;
 
         const original_total_price = num(o.originalTotalPriceSet);
         const current_total_price  = num(o.currentTotalPriceSet);
@@ -2895,6 +2900,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const current_shipping     = num(o.currentShippingPriceSet);
 
         if (original_total_price == null || current_total_price == null) continue;
+        // Detection: any order where original_total_price != current_total_price.
+        // This catches both true edits (Bug 3) and refunds. Refunds get
+        // filtered out client-side by checking against the refund table,
+        // or in a follow-up per-order PR #85b call to inspect events.
         if (Math.abs(original_total_price - current_total_price) < 0.01) continue;
 
         editedCount++;
@@ -2909,18 +2918,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           subtotal_delta_est = current_subtotal - original_subtotal_est;
         }
 
-        const editTs = eventEdges[eventEdges.length - 1]?.node?.createdAt || null;
-        const lastEditTs = eventEdges[0]?.node?.createdAt || null;
-
         results.push({
           order_id: String(o.id).replace("gid://shopify/Order/", ""),
           name: o.name,
           created_at: o.createdAt,
           updated_at: o.updatedAt,
           closed_at: o.closedAt,
-          first_edit_at: editTs,
-          last_edit_at: lastEditTs,
-          edit_event_count: eventEdges.length,
+          // edit_at proxy: when there's no events subselection, we use
+          // updatedAt (the most recent modification timestamp) as the
+          // attribution timestamp. For most edits this is == the edit time.
+          // For refunds it's the refund time. Client-side reconciliation
+          // step should validate against the actual event verb via PR #85b
+          // before booking.
+          edit_at_proxy: o.updatedAt,
           shopify: {
             original_total_price: round2(original_total_price),
             current_total_price:  round2(current_total_price),
@@ -2947,7 +2957,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           end_cursor: conn.pageInfo?.endCursor || null,
         },
         query_args: { updated_at_min: updatedMin, updated_at_max: updatedMax, page_size: pageSize, cursor },
-        note: "PR #85c: enumerates GraphQL orders by updatedAt, post-filters to those with at least one verb=edited event AND originalTotalPrice!=currentTotalPrice. Re-call with cursor=page_info.end_cursor until has_next_page=false to walk all of history.",
+        note: "PR #85d (fix): events sub-selection inside the orders connection silently returned 0 events due to a nested-connection cost limit. Detection now relies solely on originalTotalPriceSet != currentTotalPriceSet. Catches edits AND refunds; the caller should distinguish them via PR #85b (verb=edited check per order).",
       });
     } catch (e: any) {
       res.status(502).json({ message: "enumerate-edited failed", error: String(e?.message || e) });
