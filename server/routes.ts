@@ -2899,8 +2899,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // PR #96 schema-health (read-only). Materializes the new
   // recon_shopify_agreements + recon_shopify_sales tables on first hit
-  // and returns current row counts. PR #96 is schema-only — no rows are
-  // ingested here (ingest lands in PR #97). Counts will be 0/0 until then.
+  // and returns current row counts.
   app.get("/api/recon/finance/debug/agreements-ledger/health", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
     try {
       const {
@@ -2911,14 +2910,178 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const counts = getShopifyAgreementsCounts();
       res.json({
         ok: true,
-        build_id: "pr96",
+        build_id: "pr97",
         schema_ready: true,
         counts,
-        note: "PR #96 schema-only. Tables are materialized but empty until PR #97 ingest lands.",
+        note: "Agreements ledger ready. Ingest via /agreements-ledger/ingest (single order) or /agreements-ledger/backfill (batch).",
       });
     } catch (e: any) {
       res.status(500).json({ message: "agreements-ledger schema check failed", error: String(e?.message || e) });
     }
+  });
+
+  // PR #97 single-order ingest. Pulls Order.agreements -> sales from
+  // Shopify GraphQL and upserts into recon_shopify_agreements +
+  // recon_shopify_sales. Idempotent (re-runs bump ingest_version).
+  // Read-only against Shopify.
+  // Body: { name: string } e.g. "22338" or "#22338"
+  app.post("/api/recon/finance/debug/agreements-ledger/ingest", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    const { sqlite } = require("./storage");
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const raw = String(req.body?.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "body.name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT id, name FROM recon_orders
+      WHERE name = ? OR name = ? OR order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+    try {
+      const {
+        ingestAgreementsForOrder,
+        getOrderAgreementsCounts,
+      } = require("./shopify-recon-agreements");
+      const result = await ingestAgreementsForOrder(cfg, row.id);
+      const counts_after = getOrderAgreementsCounts(row.id);
+      res.json({
+        ok: true,
+        order_id: row.id,
+        order_name: row.name,
+        result,
+        counts_after,
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "ingestAgreementsForOrder failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #97 batch backfill. Kicks off a background loop and returns a
+  // job id immediately. Poll progress via
+  // GET /agreements-ledger/backfill/:job_id.
+  // Body shapes:
+  //   { scope: "all" }
+  //   { scope: "edited" }                        // Bug 3 blast radius
+  //   { scope: "month", month: "2025-11" }
+  //   { scope: "names", names: ["22338", "21840"] }
+  //   { scope: "orders", ids: ["123456789", ...] }
+  app.post("/api/recon/finance/debug/agreements-ledger/backfill", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const body = req.body || {};
+    const kind = String(body.scope || "").trim();
+    let scope: any;
+    if (kind === "all") {
+      scope = { kind: "all" };
+    } else if (kind === "edited") {
+      scope = { kind: "edited" };
+    } else if (kind === "month") {
+      if (!body.month || !/^\d{4}-\d{2}$/.test(String(body.month))) {
+        return res.status(400).json({ message: "body.month required as 'YYYY-MM'" });
+      }
+      scope = { kind: "month", month: String(body.month) };
+    } else if (kind === "names") {
+      if (!Array.isArray(body.names) || body.names.length === 0) {
+        return res.status(400).json({ message: "body.names: string[] required" });
+      }
+      scope = { kind: "names", names: body.names.map((n: any) => String(n)) };
+    } else if (kind === "orders") {
+      if (!Array.isArray(body.ids) || body.ids.length === 0) {
+        return res.status(400).json({ message: "body.ids: string[] required" });
+      }
+      scope = { kind: "orders", ids: body.ids.map((n: any) => String(n)) };
+    } else {
+      return res.status(400).json({ message: "body.scope must be one of: all | edited | month | names | orders" });
+    }
+
+    try {
+      const { startAgreementsBackfill } = require("./shopify-recon-agreements");
+      const progress = startAgreementsBackfill(cfg, scope);
+      res.json({ ok: true, job_id: progress.job_id, total_orders: progress.total_orders, status: progress.status });
+    } catch (e: any) {
+      res.status(500).json({ message: "startAgreementsBackfill failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #97 backfill progress polling.
+  app.get("/api/recon/finance/debug/agreements-ledger/backfill/:job_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const { getBackfillProgress } = require("./shopify-recon-agreements");
+      const p = getBackfillProgress(String(req.params.job_id));
+      if (!p) return res.status(404).json({ message: "job not found (in-process registry only)" });
+      // Trim errors[] in the response so big jobs stay readable.
+      res.json({
+        ...p,
+        errors_count: p.errors.length,
+        errors_sample: p.errors.slice(0, 10),
+        errors: undefined,
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "getBackfillProgress failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #97 read-back. Returns the agreements + sales we have stored
+  // locally for one order, for comparison against the live-GraphQL
+  // endpoint at /agreements (which fetches from Shopify in real time).
+  app.get("/api/recon/finance/debug/orders/by-name/:name/agreements-ledger", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const { sqlite } = require("./storage");
+    const raw = String(req.params.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT id, name FROM recon_orders
+      WHERE name = ? OR name = ? OR order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+    const {
+      ensureShopifyAgreementsSchema,
+    } = require("./shopify-recon-agreements");
+    ensureShopifyAgreementsSchema();
+
+    const agreements: any[] = sqlite.prepare(`
+      SELECT id, happened_at, happened_month, reason, agreement_type,
+             app_handle, refund_id, return_id, ingested_at, ingest_version
+      FROM recon_shopify_agreements
+      WHERE order_id = ?
+      ORDER BY happened_at ASC, id ASC
+    `).all(row.id) as any[];
+    const sales: any[] = sqlite.prepare(`
+      SELECT id, agreement_id, happened_at, happened_month, sale_type,
+             action_type, line_type, quantity, total_amount,
+             total_discount_after_taxes, total_discount_before_taxes,
+             total_tax, ref_id, ref_name, ref_sku, tax_breakdown_json,
+             ingested_at, ingest_version
+      FROM recon_shopify_sales
+      WHERE order_id = ?
+      ORDER BY happened_at ASC, id ASC
+    `).all(row.id) as any[];
+
+    // Attach sales to their parent agreement for readability.
+    const byAgreement = new Map<string, any[]>();
+    for (const s of sales) {
+      const arr = byAgreement.get(s.agreement_id) || [];
+      const taxBreakdown = (() => {
+        try { return JSON.parse(s.tax_breakdown_json || "[]"); } catch { return []; }
+      })();
+      arr.push({ ...s, tax_breakdown: taxBreakdown, tax_breakdown_json: undefined });
+      byAgreement.set(s.agreement_id, arr);
+    }
+    const enriched = agreements.map((a) => ({ ...a, sales: byAgreement.get(a.id) || [] }));
+
+    res.json({
+      order_id: row.id,
+      order_name: row.name,
+      agreements: enriched,
+      counts: { agreements: agreements.length, sales: sales.length },
+      note: "Local DB copy of agreements ledger. Compare with /agreements (live GraphQL) to validate ingest.",
+    });
   });
 
   // PR #85b diagnostic. Batch version of /graphql-totals.
