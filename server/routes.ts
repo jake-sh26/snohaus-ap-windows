@@ -1783,6 +1783,55 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // Debug: audit how many lines actually have a recognized_at ≠ their order's
+  // created_at. If our recognized_at logic only overrides for exchange lines
+  // (added_via_exchange_refund_id), the count of non-equal lines should equal
+  // the count of exchange lines. If it's much larger, the override is firing
+  // on more cases than intended.
+  app.get("/api/recon/finance/debug/recognized-vs-created-audit", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    const { sqlite } = require("./storage");
+    const tz = "'-5 hours'";
+    const overall = sqlite.prepare(`
+      SELECT
+        COUNT(*)                                                                    AS total_lines,
+        SUM(CASE WHEN li.recognized_at IS NULL                            THEN 1 ELSE 0 END) AS recognized_at_null,
+        SUM(CASE WHEN li.added_via_exchange_refund_id IS NOT NULL         THEN 1 ELSE 0 END) AS exchange_lines,
+        SUM(CASE WHEN li.recognized_at <> o.created_at                    THEN 1 ELSE 0 END) AS recognized_ne_created_raw,
+        SUM(CASE WHEN li.recognized_at <> o.created_at
+                  AND li.added_via_exchange_refund_id IS NULL              THEN 1 ELSE 0 END) AS recognized_ne_created_nonexchange,
+        SUM(CASE WHEN substr(datetime(li.recognized_at, ${tz}), 1, 7) <>
+                       substr(datetime(o.created_at,     ${tz}), 1, 7)
+                  AND li.added_via_exchange_refund_id IS NULL              THEN 1 ELSE 0 END) AS recognized_month_ne_created_month_nonexchange,
+        SUM(CASE WHEN substr(datetime(COALESCE(o.processed_at, o.created_at), ${tz}), 1, 7) <>
+                       substr(datetime(o.created_at,                          ${tz}), 1, 7)
+                                                                            THEN 1 ELSE 0 END) AS processed_month_ne_created_month
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+    `).get() as Record<string, number>;
+
+    // Sample 20 non-exchange lines where recognized_at month ≠ created_at month
+    const sample = sqlite.prepare(`
+      SELECT
+        o.name,
+        o.created_at, o.processed_at, o.cancelled_at,
+        li.id AS line_id, li.title,
+        li.recognized_at, li.added_via_exchange_refund_id,
+        li.price, li.quantity, li.is_gift_card,
+        substr(datetime(li.recognized_at, ${tz}), 1, 7) AS month_recognized,
+        substr(datetime(o.created_at,     ${tz}), 1, 7) AS month_created,
+        substr(datetime(o.processed_at,   ${tz}), 1, 7) AS month_processed
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+      WHERE li.added_via_exchange_refund_id IS NULL
+        AND substr(datetime(li.recognized_at, ${tz}), 1, 7) <>
+            substr(datetime(o.created_at,     ${tz}), 1, 7)
+      ORDER BY o.created_at DESC
+      LIMIT 20
+    `).all();
+
+    res.json({ overall, sample });
+  });
+
   // Debug: per-order date-mismatch report for a month.
   // For every order whose line.recognized_at month = :month, report:
   //   - created_at month, processed_at month, line.recognized_at month
