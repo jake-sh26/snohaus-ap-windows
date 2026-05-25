@@ -1783,6 +1783,89 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // Debug: distribution of exchange-line pairings by (fulfillment - order_created) gap.
+  // Plus per-month breakdown of recognition-vs-creation drift. Helps answer:
+  //   - is the Oct/Nov over-recognition unique, or systemic?
+  //   - what gap threshold (7d, 14d, 30d, 90d) would have caught the bug?
+  app.get("/api/recon/finance/debug/exchange-gap-audit", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    const { sqlite } = require("./storage");
+    const tz = "'-5 hours'";
+
+    // Per exchange-flagged line: how many days between order.created_at and line.recognized_at?
+    const lines = sqlite.prepare(`
+      SELECT
+        o.name,
+        substr(datetime(o.created_at,    ${tz}), 1, 7) AS month_order_created,
+        substr(datetime(li.recognized_at, ${tz}), 1, 7) AS month_recognized,
+        o.created_at AS order_created_at,
+        li.recognized_at,
+        li.title,
+        li.price, li.quantity,
+        (li.price * li.quantity) AS gross,
+        MAX(li.total_discount, COALESCE(li.discount_allocations_total, 0)) AS effective_discount,
+        CAST(round((julianday(li.recognized_at) - julianday(o.created_at)), 0) AS INT) AS gap_days
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+      WHERE li.added_via_exchange_refund_id IS NOT NULL
+        AND li.is_gift_card = 0
+      ORDER BY gap_days DESC, gross DESC
+    `).all() as any[];
+
+    // Bucket by gap window.
+    const buckets = {
+      "0-7d":   { count: 0, gross: 0, disc: 0 },
+      "8-14d":  { count: 0, gross: 0, disc: 0 },
+      "15-30d": { count: 0, gross: 0, disc: 0 },
+      "31-90d": { count: 0, gross: 0, disc: 0 },
+      "91-180d":{ count: 0, gross: 0, disc: 0 },
+      "180d+":  { count: 0, gross: 0, disc: 0 },
+    };
+    for (const l of lines) {
+      const g = Number(l.gap_days) || 0;
+      const gr = Number(l.gross) || 0;
+      const ds = Number(l.effective_discount) || 0;
+      let k: keyof typeof buckets;
+      if (g <= 7) k = "0-7d";
+      else if (g <= 14) k = "8-14d";
+      else if (g <= 30) k = "15-30d";
+      else if (g <= 90) k = "31-90d";
+      else if (g <= 180) k = "91-180d";
+      else k = "180d+";
+      buckets[k].count += 1;
+      buckets[k].gross += gr;
+      buckets[k].disc += ds;
+    }
+
+    // Per-month: how much exchange gross is recognized into each month, separated
+    // by short-gap (<=14d, likely legit) vs long-gap (>14d, likely bug)?
+    const monthly: Record<string, { legit_gross: number; legit_disc: number; suspect_gross: number; suspect_disc: number; legit_count: number; suspect_count: number }> = {};
+    for (const l of lines) {
+      const m = l.month_recognized as string;
+      if (!m) continue;
+      monthly[m] = monthly[m] || { legit_gross: 0, legit_disc: 0, suspect_gross: 0, suspect_disc: 0, legit_count: 0, suspect_count: 0 };
+      const g = Number(l.gap_days) || 0;
+      const gr = Number(l.gross) || 0;
+      const ds = Number(l.effective_discount) || 0;
+      if (g <= 14) {
+        monthly[m].legit_gross += gr;
+        monthly[m].legit_disc += ds;
+        monthly[m].legit_count += 1;
+      } else {
+        monthly[m].suspect_gross += gr;
+        monthly[m].suspect_disc += ds;
+        monthly[m].suspect_count += 1;
+      }
+    }
+
+    res.json({
+      total_exchange_lines: lines.length,
+      gap_buckets: buckets,
+      monthly_recognition: monthly,
+      top_20_widest_gaps: lines.slice(0, 20),
+      note: "gap_days = days between o.created_at and li.recognized_at. Real exchanges should land in 0-14d. Anything >30d is almost certainly a false-positive pairing (the bug).",
+    });
+  });
+
   // Debug: audit how many lines actually have a recognized_at ≠ their order's
   // created_at. If our recognized_at logic only overrides for exchange lines
   // (added_via_exchange_refund_id), the count of non-equal lines should equal
