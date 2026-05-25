@@ -1672,14 +1672,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       "total_sales",
     ] as const;
 
+    // Test multiple bucketing variants in one shot.
+    //   A: current default (line_recognized_at) — baseline
+    //   B: order_processed_at for gross/line_tax (other knobs unchanged)
+    //   C: order_created_at for gross/line_tax (matches Shopify Help docs verbatim)
+    //   D: order_created_at for EVERYTHING on the sale side
+    //      (gross/line_tax/shipping/unverified). Discounts inside grossRow follow gross.
+    const VARIANTS: Record<string, Parameters<typeof computeLocalFinanceSummary>[1]> = {
+      A_current: { bucketBy: "line_recognized_at" },
+      B_proc_lines: { bucketBy: "order_processed_at" },
+      C_created_lines: { bucketBy: "order_created_at" },
+      D_created_all: {
+        bucketBy: "order_created_at",
+        shippingBucketBy: "order_created_at",
+        unverifiedBucketBy: "order_created_at",
+      },
+    };
+    const VARIANT_KEYS = Object.keys(VARIANTS);
+
     const results = snaps.map((snap: any) => {
       const month = snap.month;
-      const current = computeLocalFinanceSummary(month, {
-        bucketBy: "line_recognized_at",
-      });
-      const proposed = computeLocalFinanceSummary(month, {
-        bucketBy: "order_processed_at",
-      });
       const shopify = {
         gross_sales: snap.gross_sales,
         discounts: absDisc(snap.discounts),
@@ -1689,49 +1701,85 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         taxes: snap.taxes,
         total_sales: snap.total_sales,
       };
-      const row: any = { month };
-      for (const f of FIELDS) {
-        const cur = (current as any)[f];
-        const prop = (proposed as any)[f];
-        const shop = (shopify as any)[f];
-        row[f] = {
-          shopify: shop,
-          current_ours: cur,
-          proposed_ours: prop,
-          current_diff: shop == null ? null : Math.round((cur - shop) * 100) / 100,
-          proposed_diff: shop == null ? null : Math.round((prop - shop) * 100) / 100,
-        };
+      const variantSummaries: Record<string, any> = {};
+      for (const v of VARIANT_KEYS) {
+        variantSummaries[v] = computeLocalFinanceSummary(month, VARIANTS[v]);
       }
-      // Per-month verdicts.
-      const currentAllOk = FIELDS.every(f => {
-        const d = row[f].current_diff;
-        return d == null || Math.abs(d) <= tolerance;
-      });
-      const proposedAllOk = FIELDS.every(f => {
-        const d = row[f].proposed_diff;
-        return d == null || Math.abs(d) <= tolerance;
-      });
+      const fieldRows: any = {};
+      for (const f of FIELDS) {
+        const shop = (shopify as any)[f];
+        const perVariant: Record<string, any> = {};
+        for (const v of VARIANT_KEYS) {
+          const val = (variantSummaries[v] as any)[f];
+          perVariant[v] = {
+            ours: val,
+            diff: shop == null ? null : Math.round((val - shop) * 100) / 100,
+          };
+        }
+        fieldRows[f] = { shopify: shop, ...perVariant };
+      }
+      const okFor = (v: string) =>
+        FIELDS.every(f => {
+          const d = fieldRows[f][v].diff;
+          return d == null || Math.abs(d) <= tolerance;
+        });
+      const verdicts: Record<string, boolean> = {};
+      for (const v of VARIANT_KEYS) verdicts[v] = okFor(v);
+
+      // Per-field totals across variants for easy console.table scanning.
+      const compact: any = { month };
+      for (const f of FIELDS) {
+        for (const v of VARIANT_KEYS) {
+          compact[`${f}__${v}`] = fieldRows[f][v].diff;
+        }
+      }
+
       return {
         month,
-        current_all_ok: currentAllOk,
-        proposed_all_ok: proposedAllOk,
-        regressed: currentAllOk && !proposedAllOk, // clean before, broken after
-        fixed: !currentAllOk && proposedAllOk,     // broken before, clean after
-        fields: row,
+        verdicts,
+        fields: fieldRows,
+        compact,
       };
     });
+
+    const cleanCount: Record<string, number> = {};
+    const cleanMonths: Record<string, string[]> = {};
+    for (const v of VARIANT_KEYS) {
+      cleanMonths[v] = results.filter((r: any) => r.verdicts[v]).map((r: any) => r.month);
+      cleanCount[v] = cleanMonths[v].length;
+    }
+
+    // Helper: months that go from broken → clean / clean → broken vs baseline A.
+    const transitions: Record<string, { fixed: string[]; regressed: string[] }> = {};
+    for (const v of VARIANT_KEYS) {
+      if (v === "A_current") continue;
+      const fixed: string[] = [];
+      const regressed: string[] = [];
+      for (const r of results as any[]) {
+        if (!r.verdicts.A_current && r.verdicts[v]) fixed.push(r.month);
+        if (r.verdicts.A_current && !r.verdicts[v]) regressed.push(r.month);
+      }
+      transitions[v] = { fixed, regressed };
+    }
 
     res.json({
       tolerance,
       months_examined: results.length,
-      months_currently_clean: results.filter((r: any) => r.current_all_ok).length,
-      months_proposed_clean: results.filter((r: any) => r.proposed_all_ok).length,
-      months_fixed_by_proposal: results.filter((r: any) => r.fixed).map((r: any) => r.month),
-      months_regressed_by_proposal: results.filter((r: any) => r.regressed).map((r: any) => r.month),
+      variants: VARIANT_KEYS,
+      variants_legend: {
+        A_current: "baseline — line.recognized_at (fulfillment) for sales",
+        B_proc_lines: "order.processed_at for gross/line_tax (other buckets unchanged)",
+        C_created_lines: "order.created_at for gross/line_tax (other buckets unchanged)",
+        D_created_all: "order.created_at for gross/line_tax/shipping/unverified",
+      },
+      months_clean_count: cleanCount,
+      months_clean: cleanMonths,
+      transitions_vs_current: transitions,
       results,
       note:
-        "Dry run only. Compares computeLocalFinanceSummary with bucketBy='line_recognized_at' " +
-        "vs 'order_processed_at' against each month's Shopify snapshot. No live code path changed.",
+        "Dry run only. Tests 4 bucketing variants against each month's Shopify snapshot. " +
+        "Returns are ALWAYS bucketed on refund.processed_at (matches Shopify exactly — " +
+        "per Shopify Help: 'reversals display on the day they were processed').",
     });
   });
 
