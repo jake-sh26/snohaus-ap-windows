@@ -105,15 +105,29 @@ function ensure(): void {
 
 // ----- Detector -----
 // Asks Shopify GraphQL for a single order's totals + edit events. Returns
-// null when the order has no edit (originalTotalPriceSet ==
-// currentTotalPriceSet AND no verb=edited event) so callers can skip the
-// upsert. Returns a row-shaped object when an edit IS detected.
+// null when the order is NOT an order edit (callers should skip writing
+// the ledger). Returns a row-shaped object when an edit IS confirmed.
 //
-// We treat "edited" as: original_total_price != current_total_price
-// REGARDLESS of whether the events array contains a verb=edited node.
-// In practice every true edit in the 1566-candidate scan had both, but
-// the price-delta check is the authoritative one — Shopify occasionally
-// trims old events from the events feed for very old orders.
+// PR #86a-fix1 — Tightened detection rule:
+//   An order is treated as a true edit ONLY when ALL of these hold:
+//     1. original_total_price != current_total_price (totals moved), AND
+//     2. at least one event with verb=edited / action=order_edited exists
+//        in the order's events feed (giving us a real edited_at_iso).
+//
+// Why both:
+//   - Connection-level candidate sweep (route handler) flags every order
+//     whose totals moved. That sweep catches refunds too — a refund
+//     reduces current_total_price without producing an edit event.
+//   - Refunds belong in recon_refunds, not recon_order_edits. Without
+//     an edited_at_iso the reconciler can't attribute to an edit month
+//     anyway, so a refund row in this table is dead weight at best and
+//     double-counts at worst (refund already reduces current totals).
+//   - The events check rejects refunds cleanly because Shopify only emits
+//     verb=edited on Admin > Edit order, not on Refund.
+//
+// Cost of being strict: if Shopify trims edit events from a very old
+// order's feed we'd miss it. Acceptable — all 9 known true edits are
+// 2025-era and have events present (verified in PR #88).
 //
 // IMPORTANT: this is the same query used by PR #86's
 // graphql-totals-batch endpoint — reusing keeps Path B math identical to
@@ -182,8 +196,10 @@ export async function detectOrderEdit(
   const current_tax = moneyNum(o.currentTotalTaxSet);
   const current_shipping = moneyNum(o.currentShippingPriceSet);
 
-  // Authoritative edit check: total price differs from original. Falls back
-  // to event-presence check only if totals are nullable (legacy orders).
+  // PR #86a-fix1: BOTH conditions must hold to count as an order edit.
+  // Either alone is ambiguous (refunds move totals but emit no edit
+  // event; some edit events have no money impact and shouldn't be
+  // attributed by Path B).
   const totalsDiffer =
     original_total_price != null &&
     current_total_price != null &&
@@ -192,7 +208,7 @@ export async function detectOrderEdit(
   const editEdges = (o.events?.edges || []) as any[];
   const hasEditEvent = editEdges.length > 0;
 
-  if (!totalsDiffer && !hasEditEvent) return null;
+  if (!totalsDiffer || !hasEditEvent) return null;
 
   // Path B
   let implied_tax_rate: number | null = null;
