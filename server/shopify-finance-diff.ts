@@ -118,7 +118,20 @@ export type FinanceSummaryLocal = {
   };
 };
 
-export function computeLocalFinanceSummary(monthKey: string, opts?: { includeComponents?: boolean }): FinanceSummaryLocal {
+// `bucketBy` controls how lines are time-bucketed:
+//   - 'line_recognized_at' (default, current behavior): bucket each line on
+//     COALESCE(li.recognized_at, o.processed_at, o.created_at). This handles
+//     deferred fulfillment (e.g. ski boots ordered Oct, picked up Nov) by
+//     recognizing revenue when goods are delivered.
+//   - 'order_processed_at': bucket each line on COALESCE(o.processed_at,
+//     o.created_at). This matches Shopify's Finance Summary, which books
+//     gross/discount/tax on the date the order was placed regardless of
+//     fulfillment timing. Per Shopify Help docs: "Sales display in your sales
+//     reports as a positive value for the day that they were made."
+export function computeLocalFinanceSummary(
+  monthKey: string,
+  opts?: { includeComponents?: boolean; bucketBy?: 'line_recognized_at' | 'order_processed_at' },
+): FinanceSummaryLocal {
   ensureSchemaOnce();
   // Match Shopify's store-local month bucketing. SQLite stores ISO UTC; we
   // shift by -5h (EST) as a coarse approximation. The shoulder days in
@@ -163,7 +176,15 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
   // tax. Order-level total_tax can drift a few dollars from per-line per-
   // jurisdiction rounding; the line aggregate matches Shopify exactly.
 
-  // 1. Gross sales + GC tracking + order count, bucketed on LINE recognized_at.
+  // 1. Gross sales + GC tracking + order count.
+  // Bucket expression depends on opts.bucketBy. Default = line.recognized_at
+  // (deferred fulfillment recognition). 'order_processed_at' matches Shopify
+  // Finance Summary's behavior.
+  const bucketBy = opts?.bucketBy ?? 'line_recognized_at';
+  const grossBucketExpr =
+    bucketBy === 'order_processed_at'
+      ? `COALESCE(o.processed_at, o.created_at)`
+      : `COALESCE(li.recognized_at, o.processed_at, o.created_at)`;
   const grossRow = sqlite
     .prepare(`
       SELECT
@@ -180,7 +201,7 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
       FROM recon_line_items li
       JOIN recon_orders o ON o.id = li.order_id
       WHERE substr(datetime(
-        COALESCE(li.recognized_at, o.processed_at, o.created_at),
+        ${grossBucketExpr},
         '-5 hours'), 1, 7) = ?
     `)
     .get(monthKey) as {
@@ -190,15 +211,16 @@ export function computeLocalFinanceSummary(monthKey: string, opts?: { includeCom
       order_count: number;
     };
 
-  // 2. Per-line tax from tax_lines_json (Rule #7b). Bucket on LINE recognized_at,
-  //    exclude gift-card lines (they're non-taxable anyway, but defensive).
+  // 2. Per-line tax from tax_lines_json (Rule #7b). Use the same bucketBy
+  //    as gross so tax stays consistent with the lines it's collected on.
+  //    Exclude gift-card lines (they're non-taxable anyway, but defensive).
   const lineTaxRows = sqlite
     .prepare(`
       SELECT li.tax_lines_json
       FROM recon_line_items li
       JOIN recon_orders o ON o.id = li.order_id
       WHERE substr(datetime(
-        COALESCE(li.recognized_at, o.processed_at, o.created_at),
+        ${grossBucketExpr},
         '-5 hours'), 1, 7) = ?
         AND li.is_gift_card = 0
         AND li.tax_lines_json IS NOT NULL
