@@ -3084,6 +3084,243 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // ===================================================================
+  // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
+  // ===================================================================
+  // 4 endpoints behind the USE_AGREEMENTS_PROJECTOR feature flag. The V2
+  // projector writes to recon_revenue_events_v2 (a separate table) so
+  // legacy and V2 coexist for diff-compare validation.
+  // -------------------------------------------------------------------
+
+  // POST /api/recon/finance/debug/projector-v2/project
+  // Body: { scope: 'all' } | { scope: 'order', orderId: string }
+  // Synchronously runs the V2 projector. Wipes target scope, re-emits
+  // from recon_shopify_sales. Returns counts + by_type + by_reason.
+  app.post("/api/recon/finance/debug/projector-v2/project", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+    try {
+      const {
+        projectRevenueEventsV2,
+        ensureRevenueEventsV2Schema,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      const body = req.body || {};
+      const scope = String(body.scope || "all");
+      if (scope === "all") {
+        const summary = projectRevenueEventsV2({ scope: "all" });
+        return res.json({ build_id: "pr102", ...summary });
+      }
+      if (scope === "order") {
+        const orderId = String(body.orderId || body.order_id || "").trim();
+        if (!orderId) {
+          return res.status(400).json({ message: "orderId required when scope='order'" });
+        }
+        const summary = projectRevenueEventsV2({ scope: "order", orderId });
+        return res.json({ build_id: "pr102", ...summary });
+      }
+      return res.status(400).json({ message: "scope must be 'all' or 'order'" });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-v2 failed", error: String(e?.message || e) });
+    }
+  });
+
+  // GET /api/recon/finance/debug/projector-compare/:month
+  // Diffs legacy recon_revenue_events vs V2 recon_revenue_events_v2 for
+  // a single month (YYYY-MM, ET). Returns:
+  //   - legacy totals (from aggregateRevenueEventsByMonth)
+  //   - v2 totals (from aggregateRevenueEventsV2ByMonth)
+  //   - delta = v2 - legacy for each column
+  //   - per-order discrepancies where the two projectors disagree
+  app.get("/api/recon/finance/debug/projector-compare/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const month = String(req.params.month || "").trim();
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      const {
+        aggregateRevenueEventsByMonth,
+      } = require("./shopify-recon-revenue-events");
+      const {
+        aggregateRevenueEventsV2ByMonth,
+        ensureRevenueEventsV2Schema,
+        isV2ProjectorActive,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+      const { sqlite } = require("./storage");
+
+      const legacy = aggregateRevenueEventsByMonth(month);
+      const v2 = aggregateRevenueEventsV2ByMonth(month);
+
+      const cols = ["gross_sales", "discounts", "returns", "taxes", "return_fees", "net_sales_gift_cards", "net_sales"];
+      const delta: Record<string, number> = {};
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      for (const c of cols) {
+        delta[c] = round2(Number((v2 as any)[c]) - Number((legacy as any)[c]));
+      }
+
+      // Per-order discrepancies — orders where legacy and v2 totals diverge
+      // by more than $0.01 on net_sales. Limit to 200 worst offenders so
+      // the response stays manageable.
+      const orderDiffs: any[] = sqlite.prepare(`
+        SELECT
+          o.id AS order_id,
+          o.name AS order_name,
+          COALESCE(L.gross,0) - COALESCE(V.gross,0)   AS d_gross,
+          COALESCE(L.disc,0)  - COALESCE(V.disc,0)    AS d_discount,
+          COALESCE(L.ret,0)   - COALESCE(V.ret,0)     AS d_returns,
+          COALESCE(L.tax,0)   - COALESCE(V.tax,0)     AS d_tax,
+          COALESCE(L.rfee,0)  - COALESCE(V.rfee,0)    AS d_return_fees,
+          COALESCE(L.gc,0)    - COALESCE(V.gc,0)      AS d_gc,
+          (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
+            - (COALESCE(V.gross,0)-COALESCE(V.disc,0)-COALESCE(V.ret,0)) AS d_net_sales
+        FROM recon_orders o
+        LEFT JOIN (
+          SELECT order_id,
+                 SUM(gross) AS gross, SUM(discount) AS disc,
+                 SUM(returns) AS ret, SUM(tax) AS tax,
+                 SUM(return_fees) AS rfee, SUM(net_sales_gift_cards) AS gc
+          FROM recon_revenue_events
+          WHERE event_month = ?
+          GROUP BY order_id
+        ) L ON L.order_id = o.id
+        LEFT JOIN (
+          SELECT order_id,
+                 SUM(gross) AS gross, SUM(discount) AS disc,
+                 SUM(returns) AS ret, SUM(tax) AS tax,
+                 SUM(return_fees) AS rfee, SUM(net_sales_gift_cards) AS gc
+          FROM recon_revenue_events_v2
+          WHERE event_month = ?
+          GROUP BY order_id
+        ) V ON V.order_id = o.id
+        WHERE (L.order_id IS NOT NULL OR V.order_id IS NOT NULL)
+          AND ABS(
+            (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
+            - (COALESCE(V.gross,0)-COALESCE(V.disc,0)-COALESCE(V.ret,0))
+          ) > 0.01
+        ORDER BY ABS(
+          (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
+          - (COALESCE(V.gross,0)-COALESCE(V.disc,0)-COALESCE(V.ret,0))
+        ) DESC
+        LIMIT 200
+      `).all(month, month) as any[];
+
+      res.json({
+        build_id: "pr102",
+        month,
+        active_projector: isV2ProjectorActive() ? "v2" : "legacy",
+        flag_env: process.env.USE_AGREEMENTS_PROJECTOR || "(unset)",
+        legacy,
+        v2,
+        delta,
+        is_clean: cols.every((c) => Math.abs(delta[c]) < 0.01),
+        order_diffs: orderDiffs.map((d) => ({
+          ...d,
+          d_gross: round2(d.d_gross),
+          d_discount: round2(d.d_discount),
+          d_returns: round2(d.d_returns),
+          d_tax: round2(d.d_tax),
+          d_return_fees: round2(d.d_return_fees),
+          d_gc: round2(d.d_gc),
+          d_net_sales: round2(d.d_net_sales),
+        })),
+        order_diff_count: orderDiffs.length,
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-compare failed", error: String(e?.message || e) });
+    }
+  });
+
+  // GET /api/recon/finance/debug/projector-compare/order/:name
+  // Side-by-side diff of legacy and V2 events for a single order. Useful
+  // when projector-compare/:month surfaces a discrepant order and you
+  // want to drill into which specific events differ.
+  app.get("/api/recon/finance/debug/projector-compare/order/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const raw = String(req.params.name || "").trim();
+      if (!raw) return res.status(400).json({ message: "name required" });
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+      const row: any = sqlite.prepare(`
+        SELECT id, name FROM recon_orders
+        WHERE name = ? OR name = ? OR order_number = ?
+        LIMIT 1
+      `).get(withHash, noHash, noHash);
+      if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+      const {
+        listEventsForOrder,
+      } = require("./shopify-recon-revenue-events");
+      const {
+        listEventsV2ForOrder,
+        ensureRevenueEventsV2Schema,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      const legacy = listEventsForOrder(row.id);
+      const v2 = listEventsV2ForOrder(row.id);
+
+      const sumCols = (rows: any[]) => {
+        const t = { gross: 0, discount: 0, tax: 0, returns: 0, return_fees: 0, net_sales_gift_cards: 0 };
+        for (const r of rows) {
+          t.gross += Number(r.gross || 0);
+          t.discount += Number(r.discount || 0);
+          t.tax += Number(r.tax || 0);
+          t.returns += Number(r.returns || 0);
+          t.return_fees += Number(r.return_fees || 0);
+          t.net_sales_gift_cards += Number(r.net_sales_gift_cards || 0);
+        }
+        return t;
+      };
+
+      res.json({
+        build_id: "pr102",
+        order_id: row.id,
+        order_name: row.name,
+        legacy: { events: legacy, totals: sumCols(legacy) },
+        v2: { events: v2, totals: sumCols(v2) },
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-compare/order failed", error: String(e?.message || e) });
+    }
+  });
+
+  // GET /api/recon/finance/debug/projector-v2/orders/by-name/:name
+  // List V2 events for a single order. Mirrors the legacy /events endpoint
+  // for direct inspection of the V2 projector output.
+  app.get("/api/recon/finance/debug/projector-v2/orders/by-name/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const raw = String(req.params.name || "").trim();
+      if (!raw) return res.status(400).json({ message: "name required" });
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+      const row: any = sqlite.prepare(`
+        SELECT id, name FROM recon_orders
+        WHERE name = ? OR name = ? OR order_number = ?
+        LIMIT 1
+      `).get(withHash, noHash, noHash);
+      if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+      const {
+        listEventsV2ForOrder,
+        ensureRevenueEventsV2Schema,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      const events = listEventsV2ForOrder(row.id);
+      res.json({
+        build_id: "pr102",
+        order_id: row.id,
+        order_name: row.name,
+        count: events.length,
+        events,
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-v2/orders failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #85b diagnostic. Batch version of /graphql-totals.
   // POST body: { names: string[] } (with or without leading '#'; max 25)
   // For each order: runs the same GraphQL query, computes the
