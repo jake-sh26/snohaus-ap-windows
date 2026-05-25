@@ -192,6 +192,7 @@ type FinanceSummaryLocal = {
   returns: number;
   net_sales: number;
   shipping: number;
+  return_fees: number;
   taxes: number;
   total_sales: number;
   net_sales_gift_cards: number;
@@ -420,6 +421,7 @@ const FINANCE_FIELDS: Array<{ key: string; label: string }> = [
   { key: "returns", label: "Returns" },
   { key: "net_sales", label: "Net sales" },
   { key: "shipping", label: "Shipping" },
+  { key: "return_fees", label: "Return fees" },
   { key: "taxes", label: "Taxes" },
   { key: "total_sales", label: "Total sales" },
   { key: "net_sales_gift_cards", label: "Net sales (gift cards)" },
@@ -819,6 +821,7 @@ export default function ReconcilerTest() {
     returns: "",
     net_sales: "",
     shipping: "",
+    return_fees: "",
     taxes: "",
     total_sales: "",
     net_sales_gift_cards: "",
@@ -835,7 +838,7 @@ export default function ReconcilerTest() {
     if (!snap) {
       setShopifyDraft({
         gross_sales: "", discounts: "", returns: "", net_sales: "",
-        shipping: "", taxes: "", total_sales: "", net_sales_gift_cards: "",
+        shipping: "", return_fees: "", taxes: "", total_sales: "", net_sales_gift_cards: "",
       });
       return;
     }
@@ -845,6 +848,7 @@ export default function ReconcilerTest() {
       returns: snap.returns == null ? "" : String(snap.returns),
       net_sales: snap.net_sales == null ? "" : String(snap.net_sales),
       shipping: snap.shipping == null ? "" : String(snap.shipping),
+      return_fees: snap.return_fees == null ? "" : String(snap.return_fees),
       taxes: snap.taxes == null ? "" : String(snap.taxes),
       total_sales: snap.total_sales == null ? "" : String(snap.total_sales),
       net_sales_gift_cards: snap.net_sales_gift_cards == null ? "" : String(snap.net_sales_gift_cards),
