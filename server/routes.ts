@@ -3334,6 +3334,136 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // =====================================================================
+  // PR #94 — Revenue events ledger (data layer only).
+  //
+  // These endpoints expose the new recon_revenue_events projection without
+  // touching the production reconciler math. They exist so we can build,
+  // backfill, and inspect the ledger in parallel with the legacy path,
+  // then compare in PR #95 before switching over in PR #97.
+  //
+  //   POST /api/recon/finance/debug/events/backfill
+  //     Body: { scope: "all" } | { scope: "order", order_id }
+  //     Wipes (in scope) and re-projects events from recon_line_items +
+  //     recon_refunds + recon_refund_line_items.
+  //
+  //   GET  /api/recon/finance/debug/events/monthly/:month
+  //     Returns the new path's monthly aggregate for inspection.
+  //
+  //   GET  /api/recon/finance/debug/events/order/:order_id
+  //     Returns every event row for one order. Useful for verifying that
+  //     an edited order generated the right sale/refund/return_fee rows.
+  //
+  //   GET  /api/recon/finance/debug/events/warnings
+  //     Returns recent rows from recon_event_warnings.
+  //
+  //   GET  /api/recon/finance/debug/events/health
+  //     Quick counts: total events, by type, distinct months, latest detected_at.
+  // =====================================================================
+  app.post("/api/recon/finance/debug/events/backfill", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    try {
+      const {
+        projectRevenueEvents,
+      } = require("./shopify-recon-revenue-events");
+      const scope = req.body?.scope === "order" ? "order" : "all";
+      if (scope === "order") {
+        const orderId = String(req.body?.order_id || "").trim();
+        if (!orderId) {
+          return res.status(400).json({ message: "order_id required for scope=order" });
+        }
+        const summary = projectRevenueEvents({ scope, orderId });
+        return res.json({ ok: true, build_id: "pr94", summary });
+      }
+      const summary = projectRevenueEvents({ scope: "all" });
+      res.json({ ok: true, build_id: "pr94", summary });
+    } catch (e: any) {
+      res.status(502).json({ message: "projectRevenueEvents failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/monthly/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const {
+        aggregateRevenueEventsByMonth,
+      } = require("./shopify-recon-revenue-events");
+      const monthKey = String(req.params.month || "").trim();
+      if (!/^\d{4}-\d{2}$/.test(monthKey)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      const row = aggregateRevenueEventsByMonth(monthKey);
+      res.json({ ok: true, build_id: "pr94", month: monthKey, row });
+    } catch (e: any) {
+      res.status(502).json({ message: "aggregateRevenueEventsByMonth failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/order/:order_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const {
+        listEventsForOrder,
+      } = require("./shopify-recon-revenue-events");
+      const orderId = String(req.params.order_id || "").trim();
+      if (!orderId) {
+        return res.status(400).json({ message: "order_id required" });
+      }
+      const events = listEventsForOrder(orderId);
+      res.json({ ok: true, build_id: "pr94", order_id: orderId, count: events.length, events });
+    } catch (e: any) {
+      res.status(502).json({ message: "listEventsForOrder failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/warnings", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+    try {
+      const {
+        listRecentEventWarnings,
+      } = require("./shopify-recon-revenue-events");
+      const limit = Math.min(Math.max(Number(req.query?.limit) || 100, 1), 1000);
+      const rows = listRecentEventWarnings(limit);
+      res.json({ ok: true, build_id: "pr94", count: rows.length, warnings: rows });
+    } catch (e: any) {
+      res.status(502).json({ message: "listRecentEventWarnings failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/health", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const {
+        ensureRevenueEventsSchema,
+      } = require("./shopify-recon-revenue-events");
+      ensureRevenueEventsSchema();
+      const total = (sqlite.prepare(`SELECT COUNT(*) AS n FROM recon_revenue_events`).get() as any).n;
+      const byType = sqlite.prepare(`
+        SELECT event_type, COUNT(*) AS n
+        FROM recon_revenue_events
+        GROUP BY event_type
+        ORDER BY event_type
+      `).all();
+      const months = sqlite.prepare(`
+        SELECT event_month, COUNT(*) AS n
+        FROM recon_revenue_events
+        GROUP BY event_month
+        ORDER BY event_month ASC
+      `).all();
+      const latest = (sqlite.prepare(`
+        SELECT MAX(detected_at) AS d FROM recon_revenue_events
+      `).get() as any).d;
+      const warnings = (sqlite.prepare(`SELECT COUNT(*) AS n FROM recon_event_warnings`).get() as any).n;
+      res.json({
+        ok: true,
+        build_id: "pr94",
+        total_events: total,
+        by_type: byType,
+        by_month: months,
+        latest_detected_at: latest,
+        warnings_total: warnings,
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "events health failed", error: String(e?.message || e) });
+    }
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
