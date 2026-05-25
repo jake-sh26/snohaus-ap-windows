@@ -3108,6 +3108,95 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #86a-fix3 diagnostic. Side-by-side view of one order: local
+  // recon_orders + line-item subtotal aggregate, vs Shopify Admin's
+  // current totals. Built for the edited-to-zero investigation — lets us
+  // verify whether the local line-item rollup reflects the post-edit
+  // state ($0) or still carries the pre-edit lines. Read-only.
+  //
+  // POST body: { order_id?: string, order_name?: string }   // one or other
+  app.post("/api/recon/finance/debug/orders/local-vs-shopify", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const { sqlite } = require("./storage");
+
+    const orderId = String(req.body?.order_id || "").trim();
+    const orderName = String(req.body?.order_name || "").trim();
+    if (!orderId && !orderName) return res.status(400).json({ message: "body.order_id or body.order_name required" });
+
+    // Resolve to recon_orders row.
+    const row: any = orderId
+      ? sqlite.prepare(`SELECT id, name, created_at, updated_at, total_price, subtotal, total_tax, total_discounts, total_shipping, ingest_version, ingested_at FROM recon_orders WHERE id = ?`).get(orderId)
+      : sqlite.prepare(`SELECT id, name, created_at, updated_at, total_price, subtotal, total_tax, total_discounts, total_shipping, ingest_version, ingested_at FROM recon_orders WHERE name = ? OR name = ?`).get(orderName.startsWith("#") ? orderName : `#${orderName}`, orderName.startsWith("#") ? orderName.slice(1) : orderName);
+    if (!row) return res.status(404).json({ message: "not found in recon_orders", looked_up: { orderId, orderName } });
+
+    // Local line-item rollup.
+    const lineAgg: any = sqlite.prepare(`
+      SELECT
+        COUNT(*) AS line_count,
+        COALESCE(SUM(price * quantity), 0)               AS gross_pre_discount,
+        COALESCE(SUM(MAX(total_discount, COALESCE(discount_allocations_total, 0))), 0) AS line_discounts,
+        COALESCE(SUM(price * quantity)
+               - SUM(MAX(total_discount, COALESCE(discount_allocations_total, 0))), 0) AS net_subtotal,
+        SUM(CASE WHEN is_gift_card = 1 THEN 1 ELSE 0 END) AS gift_card_lines
+      FROM recon_line_items
+      WHERE order_id = ?
+    `).get(row.id);
+
+    // Ask Shopify for the live totals.
+    const probeQuery = `
+      query OrderTotalsForDiag($id: ID!) {
+        order(id: $id) {
+          id
+          name
+          createdAt
+          updatedAt
+          originalTotalPriceSet   { shopMoney { amount } }
+          currentTotalPriceSet    { shopMoney { amount } }
+          currentSubtotalPriceSet { shopMoney { amount } }
+          currentTotalTaxSet      { shopMoney { amount } }
+          currentShippingPriceSet { shopMoney { amount } }
+        }
+      }
+    `;
+    let shopifyTotals: any = null;
+    let shopifyError: string | null = null;
+    try {
+      const r = await shopifyGraphqlCall(cfg, probeQuery, { id: `gid://shopify/Order/${row.id}` });
+      if (r.errors) shopifyError = JSON.stringify(r.errors);
+      else {
+        const o: any = (r.data as any)?.order;
+        const num = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
+        shopifyTotals = {
+          original_total_price: num(o?.originalTotalPriceSet),
+          current_total_price:  num(o?.currentTotalPriceSet),
+          current_subtotal:     num(o?.currentSubtotalPriceSet),
+          current_tax:          num(o?.currentTotalTaxSet),
+          current_shipping:     num(o?.currentShippingPriceSet),
+        };
+      }
+    } catch (e: any) {
+      shopifyError = String(e?.message || e);
+    }
+
+    res.json({
+      build_id: "86a-fix3",
+      recon_orders_row: row,
+      local_line_aggregate: lineAgg,
+      shopify_totals: shopifyTotals,
+      shopify_error: shopifyError,
+      diagnosis: {
+        local_reflects_post_edit:
+          shopifyTotals?.current_subtotal != null &&
+          Math.abs((lineAgg.net_subtotal || 0) - (shopifyTotals.current_subtotal || 0)) < 0.01,
+        local_minus_shopify_subtotal:
+          shopifyTotals?.current_subtotal != null
+            ? Math.round(((lineAgg.net_subtotal || 0) - (shopifyTotals.current_subtotal || 0)) * 100) / 100
+            : null,
+      },
+    });
+  });
+
   // PR #86a — read-only listing of recon_order_edits for operator inspection.
   // GET so it's easy to spot-check from the browser.
   app.get("/api/recon/finance/debug/orders/list-edits", authMiddleware, requirePermission("payroll.view"), async (_req: any, res) => {
