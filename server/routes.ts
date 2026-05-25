@@ -2897,6 +2897,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #96 schema-health (read-only). Materializes the new
+  // recon_shopify_agreements + recon_shopify_sales tables on first hit
+  // and returns current row counts. PR #96 is schema-only — no rows are
+  // ingested here (ingest lands in PR #97). Counts will be 0/0 until then.
+  app.get("/api/recon/finance/debug/agreements-ledger/health", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    try {
+      const {
+        ensureShopifyAgreementsSchema,
+        getShopifyAgreementsCounts,
+      } = require("./shopify-recon-agreements");
+      ensureShopifyAgreementsSchema();
+      const counts = getShopifyAgreementsCounts();
+      res.json({
+        ok: true,
+        build_id: "pr96",
+        schema_ready: true,
+        counts,
+        note: "PR #96 schema-only. Tables are materialized but empty until PR #97 ingest lands.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "agreements-ledger schema check failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #85b diagnostic. Batch version of /graphql-totals.
   // POST body: { names: string[] } (with or without leading '#'; max 25)
   // For each order: runs the same GraphQL query, computes the
