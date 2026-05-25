@@ -1618,6 +1618,123 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // DRY RUN: order-date bucketing across ALL months. For each month with a
+  // Shopify snapshot, run computeLocalFinanceSummary twice — once with the
+  // current line.recognized_at bucketing, once with order.processed_at
+  // bucketing — and show the diff against the Shopify snapshot for both.
+  //
+  // This lets us confirm in one call whether switching to order-date bucketing
+  // closes Oct + Nov gaps WITHOUT regressing any of the 7 currently-clean
+  // months. Pure read — no code path changed. If all months land within
+  // tolerance, the next step is a tiny PR making 'order_processed_at' the
+  // default in computeLocalFinanceSummary.
+  app.get("/api/recon/finance/debug/dryrun-order-bucket", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const { sqlite } = require("./storage");
+    const { computeLocalFinanceSummary } = require("./shopify-finance-diff");
+    const tolerance = Number.isFinite(Number(req.query.tolerance))
+      ? Number(req.query.tolerance)
+      : 0.01;
+
+    // Pull every month that has a snapshot to compare against.
+    const snaps = sqlite
+      .prepare(
+        `SELECT month, snapshot_kind, gross_sales, discounts, returns, net_sales,
+                shipping, taxes, total_sales, net_sales_gift_cards
+           FROM recon_shopify_finance_snapshots
+          WHERE snapshot_kind = 'all_channels'
+          ORDER BY month`,
+      )
+      .all() as Array<{
+        month: string;
+        snapshot_kind: string;
+        gross_sales: number | null;
+        discounts: number | null;
+        returns: number | null;
+        net_sales: number | null;
+        shipping: number | null;
+        taxes: number | null;
+        total_sales: number | null;
+        net_sales_gift_cards: number | null;
+      }>;
+
+    // Shopify stores discounts/returns as negative; flip to positive for the
+    // ours-side comparison (which is stored positive).
+    const absDisc = (n: number | null) => (n == null ? null : Math.abs(n));
+    const absRet = (n: number | null) => (n == null ? null : Math.abs(n));
+
+    const FIELDS = [
+      "gross_sales",
+      "discounts",
+      "returns",
+      "net_sales",
+      "shipping",
+      "taxes",
+      "total_sales",
+    ] as const;
+
+    const results = snaps.map((snap: any) => {
+      const month = snap.month;
+      const current = computeLocalFinanceSummary(month, {
+        bucketBy: "line_recognized_at",
+      });
+      const proposed = computeLocalFinanceSummary(month, {
+        bucketBy: "order_processed_at",
+      });
+      const shopify = {
+        gross_sales: snap.gross_sales,
+        discounts: absDisc(snap.discounts),
+        returns: absRet(snap.returns),
+        net_sales: snap.net_sales,
+        shipping: snap.shipping,
+        taxes: snap.taxes,
+        total_sales: snap.total_sales,
+      };
+      const row: any = { month };
+      for (const f of FIELDS) {
+        const cur = (current as any)[f];
+        const prop = (proposed as any)[f];
+        const shop = (shopify as any)[f];
+        row[f] = {
+          shopify: shop,
+          current_ours: cur,
+          proposed_ours: prop,
+          current_diff: shop == null ? null : Math.round((cur - shop) * 100) / 100,
+          proposed_diff: shop == null ? null : Math.round((prop - shop) * 100) / 100,
+        };
+      }
+      // Per-month verdicts.
+      const currentAllOk = FIELDS.every(f => {
+        const d = row[f].current_diff;
+        return d == null || Math.abs(d) <= tolerance;
+      });
+      const proposedAllOk = FIELDS.every(f => {
+        const d = row[f].proposed_diff;
+        return d == null || Math.abs(d) <= tolerance;
+      });
+      return {
+        month,
+        current_all_ok: currentAllOk,
+        proposed_all_ok: proposedAllOk,
+        regressed: currentAllOk && !proposedAllOk, // clean before, broken after
+        fixed: !currentAllOk && proposedAllOk,     // broken before, clean after
+        fields: row,
+      };
+    });
+
+    res.json({
+      tolerance,
+      months_examined: results.length,
+      months_currently_clean: results.filter((r: any) => r.current_all_ok).length,
+      months_proposed_clean: results.filter((r: any) => r.proposed_all_ok).length,
+      months_fixed_by_proposal: results.filter((r: any) => r.fixed).map((r: any) => r.month),
+      months_regressed_by_proposal: results.filter((r: any) => r.regressed).map((r: any) => r.month),
+      results,
+      note:
+        "Dry run only. Compares computeLocalFinanceSummary with bucketBy='line_recognized_at' " +
+        "vs 'order_processed_at' against each month's Shopify snapshot. No live code path changed.",
+    });
+  });
+
   // Debug: list every order our recon bucketed into this month, so we can diff
   // against Shopify's ShopifyQL `FROM sales` order_name list and identify the
   // exact orders that disagree. Returns per-order gross/discounts/refund flags
