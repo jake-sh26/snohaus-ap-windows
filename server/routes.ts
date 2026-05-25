@@ -125,6 +125,7 @@ import {
   getShopifyAccessToken,
   clearShopifyTokenCache,
   shopifyRestCall,
+  shopifyGraphqlCall,
 } from "./shopify-recon";
 import {
   syncOrdersIncremental,
@@ -2522,6 +2523,137 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     } catch (e: any) {
       res.status(502).json({ message: "Shopify events fetch failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #85 diagnostic — Bug 3 GraphQL pre-edit totals.
+  //
+  // The Shopify Admin GraphQL Order object exposes
+  //   originalTotalPriceSet           = total price at order CREATION (pre-edit)
+  //   currentTotalPriceSet            = total price NOW (post-edit)
+  //   currentTotalDiscountsSet        = discount NOW
+  //   currentSubtotalPriceSet         = subtotal NOW (post-returns/refunds)
+  //   currentTotalTaxSet              = tax NOW
+  //   originalTotalAdditionalFeesSet  = fees at creation
+  //   originalTotalDutiesSet          = duties at creation
+  // The pre-edit DISCOUNT is NOT directly exposed but is derivable from the
+  // line items' original prices vs the order's originalTotalPrice.
+  //
+  // This endpoint runs a single GraphQL query for one order (by name) and
+  // returns the structured Original-vs-Current totals plus the most recent
+  // `verb=edited` event with its timestamp. If `originalTotalPriceSet` for
+  // #22338 is the pre-edit price ($741.99 = $699.99 + $42 tax) and
+  // `currentTotalPriceSet` is the post-edit price ($521.99), we know
+  // GraphQL has what we need to model Bug 3 attribution.
+  //
+  // Read-only. payroll.view. No DB writes.
+  app.get("/api/recon/finance/debug/orders/by-name/:name/graphql-totals", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const { sqlite } = require("./storage");
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const raw = String(req.params.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash   = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT id, name, order_number, created_at, processed_at, updated_at, closed_at,
+             total_price, subtotal, total_discounts, total_tax, total_shipping
+      FROM recon_orders
+      WHERE name = ? OR name = ? OR order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+    const orderGid = `gid://shopify/Order/${row.id}`;
+    const query = `
+      query OrderTotals($id: ID!) {
+        order(id: $id) {
+          id
+          name
+          createdAt
+          updatedAt
+          closedAt
+          originalTotalPriceSet           { shopMoney { amount currencyCode } }
+          originalTotalAdditionalFeesSet  { shopMoney { amount currencyCode } }
+          originalTotalDutiesSet          { shopMoney { amount currencyCode } }
+          currentTotalPriceSet            { shopMoney { amount currencyCode } }
+          currentSubtotalPriceSet         { shopMoney { amount currencyCode } }
+          currentTotalDiscountsSet        { shopMoney { amount currencyCode } }
+          currentCartDiscountAmountSet    { shopMoney { amount currencyCode } }
+          currentTotalTaxSet              { shopMoney { amount currencyCode } }
+          currentShippingPriceSet         { shopMoney { amount currencyCode } }
+          currentSubtotalLineItemsQuantity
+          events(first: 50, query: "verb:edited OR action:order_edited", sortKey: CREATED_AT, reverse: true) {
+            edges { node { id createdAt message } }
+          }
+        }
+      }
+    `;
+    try {
+      const r = await shopifyGraphqlCall(cfg, query, { id: orderGid });
+      if (r.errors) {
+        return res.status(502).json({ message: "GraphQL errors", errors: r.errors, data: r.data });
+      }
+      const o: any = (r.data as any)?.order;
+      if (!o) return res.status(404).json({ message: "GraphQL order returned null" });
+
+      const num = (mb: any) => mb?.shopMoney?.amount ? Number(mb.shopMoney.amount) : null;
+      const original_total_price = num(o.originalTotalPriceSet);
+      const original_total_additional_fees = num(o.originalTotalAdditionalFeesSet);
+      const original_total_duties = num(o.originalTotalDutiesSet);
+      const current_total_price = num(o.currentTotalPriceSet);
+      const current_subtotal_price = num(o.currentSubtotalPriceSet);
+      const current_total_discounts = num(o.currentTotalDiscountsSet);
+      const current_cart_discount_amount = num(o.currentCartDiscountAmountSet);
+      const current_total_tax = num(o.currentTotalTaxSet);
+      const current_shipping_price = num(o.currentShippingPriceSet);
+
+      const deltas = {
+        gross_delta: (current_total_price ?? 0) - (original_total_price ?? 0),
+        // We can't compute discount_delta directly without originalTotalDiscountsSet.
+        // But: current_total_price = current_subtotal - current_discount + tax + shipping.
+        // And: original_total_price = original_subtotal - original_discount + original_tax + original_shipping.
+        // The Bug 3 hypothesis is that gross_delta + tax_delta + shipping_delta == -discount_delta.
+        note: "originalTotalDiscountsSet is not exposed by GraphQL. To recover the pre-edit discount, the gross_delta should equal -(post-edit discount additions). For #22338 we expect originalTotalPriceSet=$741.99 (=$699.99+$42 tax, pre-discount) and currentTotalPriceSet=$521.99, giving gross_delta=-$220, which IS the discount applied at edit.",
+      };
+
+      const edits = (o.events?.edges || []).map((e: any) => ({
+        id: e.node.id,
+        created_at: e.node.createdAt,
+        message: e.node.message,
+      }));
+
+      res.json({
+        order_id: row.id,
+        order_name: row.name,
+        our_db: {
+          total_price: row.total_price,
+          subtotal: row.subtotal,
+          total_discounts: row.total_discounts,
+          total_tax: row.total_tax,
+          total_shipping: row.total_shipping,
+        },
+        shopify_graphql: {
+          original_total_price,
+          original_total_additional_fees,
+          original_total_duties,
+          current_total_price,
+          current_subtotal_price,
+          current_total_discounts,
+          current_cart_discount_amount,
+          current_total_tax,
+          current_shipping_price,
+          current_subtotal_line_items_quantity: o.currentSubtotalLineItemsQuantity,
+          created_at: o.createdAt,
+          updated_at: o.updatedAt,
+          closed_at: o.closedAt,
+        },
+        deltas,
+        edit_events: edits,
+        note: "PR #85 diagnostic. If shopify_graphql.original_total_price differs from shopify_graphql.current_total_price, the order was edited post-creation and the delta is what Shopify books in the edit month. Compare against edit_events[0].created_at for the edit-month timestamp.",
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "shopifyGraphqlCall failed", error: String(e?.message || e) });
     }
   });
 

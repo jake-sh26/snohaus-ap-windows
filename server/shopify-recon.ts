@@ -342,6 +342,68 @@ export async function shopifyRestCall(
 }
 
 /**
+ * Generic Shopify Admin GraphQL caller. Mirrors the auth/retry/error behavior
+ * of `shopifyRestCall` and `runShopifyql` but accepts any GraphQL query and
+ * variables.
+ *
+ * Used by PR #85+ for the order-edit attribution work (Bug 3) where we need
+ * `originalTotalPriceSet` / `currentTotalPriceSet` etc. that aren't exposed
+ * by REST.
+ */
+export async function shopifyGraphqlCall<T = any>(
+  cfg: ShopifyReconConfig,
+  query: string,
+  variables?: Record<string, any>,
+): Promise<{ status: number; data: T | null; errors: any[] | null }> {
+  const url = `https://${cfg.shopDomain}/admin/api/${cfg.apiVersion}/graphql.json`;
+  const gqlBody = { query, variables: variables || {} };
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    let res: Response;
+    try {
+      const token = await getShopifyAccessToken(cfg);
+      const authHeaders: Record<string, string> = token.startsWith("atkn_")
+        ? { Authorization: `Bearer ${token}` }
+        : { "X-Shopify-Access-Token": token };
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(gqlBody),
+      });
+    } catch (e: any) {
+      if (attempt >= 3) throw e;
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+      continue;
+    }
+    if (res.status === 429 && attempt < 5) {
+      const retryAfter = Number(res.headers.get("Retry-After") || "2");
+      await new Promise((r) => setTimeout(r, retryAfter * 1000));
+      continue;
+    }
+    if (res.status >= 500 && res.status < 600 && attempt < 3) {
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+      continue;
+    }
+    const text = await res.text();
+    let body: any = null;
+    try { body = text ? JSON.parse(text) : null; } catch { /* below */ }
+    if (!res.ok) {
+      throw new Error(`shopifyGraphqlCall failed: ${res.status} ${text.slice(0, 400)}`);
+    }
+    if (!body) {
+      throw new Error(`shopifyGraphqlCall returned non-JSON (status ${res.status})`);
+    }
+    const errors = Array.isArray(body?.errors) && body.errors.length > 0 ? body.errors : null;
+    return { status: res.status, data: (body?.data ?? null) as T | null, errors };
+  }
+}
+
+/**
  * Extracts the `rel="next"` URL from a Shopify Link header. Returns null when
  * there are no more pages. Format: `<...page_info=xyz>; rel="next", <...>; rel="previous"`.
  */
