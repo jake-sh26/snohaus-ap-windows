@@ -2758,20 +2758,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                       totalDiscountAmountAfterTaxes { shopMoney { amount } }
                       totalDiscountAmountBeforeTaxes { shopMoney { amount } }
                       totalTaxAmount      { shopMoney { amount } }
+                      taxes {
+                        amount { shopMoney { amount } }
+                        taxLine { title rate priceSet { shopMoney { amount } } }
+                      }
                       ... on ProductSale {
                         lineItem { id name sku quantity originalUnitPriceSet { shopMoney { amount } } }
                       }
-                      ... on AdjustmentSale {
+                      ... on GiftCardSale {
+                        lineItem { id name sku }
+                      }
+                      ... on TipSale {
                         lineItem { id name }
                       }
                       ... on ShippingLineSale {
-                        lineItem { id title }
+                        shippingLine { id title code originalPriceSet { shopMoney { amount } } }
                       }
                       ... on FeeSale {
-                        lineItem { id name }
+                        fee { id }
                       }
-                      ... on TipSale {
-                        lineItem { id title }
+                      ... on AdditionalFeeSale {
+                        additionalFee { id name }
+                      }
+                      ... on DutySale {
+                        duty { id }
                       }
                     }
                   }
@@ -2796,6 +2806,44 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const a = ae.node;
         const sales = (a.sales?.edges || []).map((se: any) => {
           const s = se.node;
+          // Subtype-aware back-reference extraction.
+          // AdjustmentSale + UnknownSale have no back-ref (ref_id stays null).
+          let ref_id: string | null = null;
+          let ref_name: string | null = null;
+          let ref_sku:  string | null = null;
+          switch (s.__typename) {
+            case "ProductSale":
+            case "GiftCardSale":
+              ref_id   = s.lineItem?.id   || null;
+              ref_name = s.lineItem?.name || null;
+              ref_sku  = s.lineItem?.sku  || null;
+              break;
+            case "TipSale":
+              ref_id   = s.lineItem?.id   || null;
+              ref_name = s.lineItem?.name || null;
+              break;
+            case "ShippingLineSale":
+              ref_id   = s.shippingLine?.id    || null;
+              ref_name = s.shippingLine?.title || s.shippingLine?.code || null;
+              break;
+            case "FeeSale":
+              ref_id = s.fee?.id || null;
+              break;
+            case "AdditionalFeeSale":
+              ref_id   = s.additionalFee?.id   || null;
+              ref_name = s.additionalFee?.name || null;
+              break;
+            case "DutySale":
+              ref_id = s.duty?.id || null;
+              break;
+            // AdjustmentSale, UnknownSale: no back-ref
+          }
+          const tax_breakdown = (s.taxes || []).map((t: any) => ({
+            amount: num(t.amount),
+            title:  t.taxLine?.title || null,
+            rate:   t.taxLine?.rate ?? null,
+            price:  num(t.taxLine?.priceSet),
+          }));
           return {
             id: s.id,
             type: s.__typename,
@@ -2806,9 +2854,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             total_discount_after_taxes: num(s.totalDiscountAmountAfterTaxes),
             total_discount_before_taxes: num(s.totalDiscountAmountBeforeTaxes),
             total_tax: num(s.totalTaxAmount),
-            line_item_id: s.lineItem?.id || null,
-            line_item_name: s.lineItem?.name || s.lineItem?.title || null,
-            line_item_sku: s.lineItem?.sku || null,
+            ref_id,
+            ref_name,
+            ref_sku,
+            tax_breakdown,
           };
         });
         return {
