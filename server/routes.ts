@@ -124,6 +124,7 @@ import {
   clearShopifyReconErrorLog,
   getShopifyAccessToken,
   clearShopifyTokenCache,
+  shopifyRestCall,
 } from "./shopify-recon";
 import {
   syncOrdersIncremental,
@@ -2460,6 +2461,68 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       orders: rows,
       note: "All orders whose recognized_month (COALESCE(processed_at,created_at) -5h) differs from close_month (closed_at -5h). If we shift attribution to close_month, each pair represents -disc/+disc mirror between the two months. Compare against Bug-3 known months (2025-05/06, 2025-10/11) and any additional months not yet caught by the reconciler.",
     });
+  });
+
+  // PR #84 diagnostic — Bug 3. Proxies Shopify's REST GET /orders/:id/events.json
+  // for a single order (looked up by name), returning the timeline events.
+  //
+  // This is the cleanest data source for post-sale order edits: Shopify's
+  // /orders/:id snapshot only ever returns the current state of the order,
+  // but /orders/:id/events.json returns the audit log including
+  // "Order edited", item add/remove, discount applied, and refund events
+  // — each with the timestamp at which it happened.
+  //
+  // Used to confirm the Bug 3 mechanism for #22338 (Nov 4 discount-added)
+  // and #21840 (Jun 22 backend item add) before designing the attribution fix.
+  //
+  // Read-only. payroll.view permission. No DB writes.
+  app.get("/api/recon/finance/debug/orders/by-name/:name/events", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const { sqlite } = require("./storage");
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const raw = String(req.params.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash   = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT id, name, order_number, created_at, processed_at, updated_at, closed_at
+      FROM recon_orders
+      WHERE name = ? OR name = ? OR order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found in recon_orders` });
+    try {
+      const r = await shopifyRestCall(cfg, `/orders/${row.id}/events.json`, {
+        query: { limit: 250 },
+      });
+      const body: any = r.json || {};
+      const events: any[] = Array.isArray(body.events) ? body.events : [];
+      // Surface the most relevant fields plus the raw event — we don't yet
+      // know which subset of fields Shopify populates for order edits, so
+      // returning the full event is the safest call.
+      const summary = events.map((e: any) => ({
+        id: e.id,
+        created_at: e.created_at,
+        verb: e.verb,
+        subject_type: e.subject_type,
+        subject_id: e.subject_id,
+        message: e.message,
+        author: e.author,
+        description: e.description,
+        arguments: e.arguments,
+        path: e.path,
+      }));
+      res.json({
+        order: row,
+        event_count: events.length,
+        events_summary: summary,
+        events_raw: events,
+        shopify_status: r.status,
+        note: "Shopify /orders/:id/events.json output. Look for verb='order_edited' or 'discount_applied' or 'order_line_added' — the created_at on those events is when the edit actually happened, which is what Bug 3 needs to attribute deltas by.",
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "Shopify events fetch failed", error: String(e?.message || e) });
+    }
   });
 
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
