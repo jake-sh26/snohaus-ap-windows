@@ -2800,6 +2800,160 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // PR #85c diagnostic. Full-history enumeration of orders that have at
+  // least one Shopify Admin GraphQL 'edited' event AND whose
+  // originalTotalPriceSet != currentTotalPriceSet. Returns Path B
+  // subtotal_delta_est for every match so we can validate the formula
+  // exhaustively before PR #86.
+  //
+  // POST body: {
+  //   updated_at_min?: string   // ISO; default "2024-01-01T00:00:00Z"
+  //   updated_at_max?: string   // ISO; default now
+  //   page_size?: number        // default 50, max 100 (GraphQL bulk safety)
+  //   cursor?: string           // GraphQL endCursor from previous page
+  // }
+  //
+  // Returns:
+  //   { page_count, has_next_page, end_cursor, results: [{name, deltas, ...}],
+  //     scanned_count, edited_count }
+  //
+  // Read-only. payroll.view permission.
+  app.post("/api/recon/finance/debug/orders/enumerate-edited", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+
+    const updatedMin = String(req.body?.updated_at_min || "2024-01-01T00:00:00Z");
+    const updatedMax = String(req.body?.updated_at_max || new Date().toISOString());
+    const pageSize = Math.min(Math.max(Number(req.body?.page_size) || 50, 1), 100);
+    const cursor: string | null = req.body?.cursor || null;
+
+    const round2 = (n: number | null | undefined) =>
+      n == null || !Number.isFinite(n) ? null : Math.round(n * 100) / 100;
+
+    // Page through Shopify orders by updatedAt. For each, pull totals + check
+    // for an edited event. We can't filter directly by "has edited event" in
+    // the orders connection, so we post-filter in code.
+    const query = `
+      query EditedOrdersPage($first: Int!, $after: String, $q: String!) {
+        orders(first: $first, after: $after, query: $q, sortKey: UPDATED_AT) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            cursor
+            node {
+              id
+              name
+              createdAt
+              updatedAt
+              closedAt
+              originalTotalPriceSet  { shopMoney { amount } }
+              currentTotalPriceSet   { shopMoney { amount } }
+              currentSubtotalPriceSet{ shopMoney { amount } }
+              currentTotalDiscountsSet{ shopMoney { amount } }
+              currentTotalTaxSet     { shopMoney { amount } }
+              currentShippingPriceSet{ shopMoney { amount } }
+              events(first: 5, query: "verb:edited OR action:order_edited", sortKey: CREATED_AT, reverse: true) {
+                edges { node { id createdAt message } }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    // Shopify orders search query string: updated_at range
+    const qStr = `updated_at:>='${updatedMin}' AND updated_at:<='${updatedMax}'`;
+
+    try {
+      const r = await shopifyGraphqlCall(cfg, query, {
+        first: pageSize,
+        after: cursor,
+        q: qStr,
+      });
+      if (r.errors) {
+        return res.status(502).json({ message: "GraphQL errors", errors: r.errors });
+      }
+      const conn: any = (r.data as any)?.orders;
+      if (!conn) return res.status(502).json({ message: "GraphQL orders connection null" });
+
+      const edges: any[] = conn.edges || [];
+      const num = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
+
+      const results: any[] = [];
+      let editedCount = 0;
+
+      for (const e of edges) {
+        const o = e.node;
+        const eventEdges = (o.events?.edges || []) as any[];
+        const hasEditedEvent = eventEdges.length > 0;
+        if (!hasEditedEvent) continue;
+
+        const original_total_price = num(o.originalTotalPriceSet);
+        const current_total_price  = num(o.currentTotalPriceSet);
+        const current_subtotal     = num(o.currentSubtotalPriceSet);
+        const current_discounts    = num(o.currentTotalDiscountsSet);
+        const current_tax          = num(o.currentTotalTaxSet);
+        const current_shipping     = num(o.currentShippingPriceSet);
+
+        if (original_total_price == null || current_total_price == null) continue;
+        if (Math.abs(original_total_price - current_total_price) < 0.01) continue;
+
+        editedCount++;
+
+        let implied_tax_rate: number | null = null;
+        let original_subtotal_est: number | null = null;
+        let subtotal_delta_est: number | null = null;
+        if (current_subtotal != null && current_subtotal > 0 && current_tax != null) {
+          implied_tax_rate = current_tax / current_subtotal;
+          const pre_tax_pre_shipping = original_total_price - (current_shipping || 0);
+          original_subtotal_est = pre_tax_pre_shipping / (1 + implied_tax_rate);
+          subtotal_delta_est = current_subtotal - original_subtotal_est;
+        }
+
+        const editTs = eventEdges[eventEdges.length - 1]?.node?.createdAt || null;
+        const lastEditTs = eventEdges[0]?.node?.createdAt || null;
+
+        results.push({
+          order_id: String(o.id).replace("gid://shopify/Order/", ""),
+          name: o.name,
+          created_at: o.createdAt,
+          updated_at: o.updatedAt,
+          closed_at: o.closedAt,
+          first_edit_at: editTs,
+          last_edit_at: lastEditTs,
+          edit_event_count: eventEdges.length,
+          shopify: {
+            original_total_price: round2(original_total_price),
+            current_total_price:  round2(current_total_price),
+            current_subtotal:     round2(current_subtotal),
+            current_discounts:    round2(current_discounts),
+            current_tax:          round2(current_tax),
+            current_shipping:     round2(current_shipping),
+          },
+          path_b: {
+            implied_tax_rate: implied_tax_rate == null ? null : Math.round(implied_tax_rate * 100000) / 100000,
+            original_subtotal_est: round2(original_subtotal_est),
+            subtotal_delta_est:    round2(subtotal_delta_est),
+            gross_delta:           round2(current_total_price - original_total_price),
+          },
+        });
+      }
+
+      res.json({
+        scanned_count: edges.length,
+        edited_count: editedCount,
+        results,
+        page_info: {
+          has_next_page: conn.pageInfo?.hasNextPage || false,
+          end_cursor: conn.pageInfo?.endCursor || null,
+        },
+        query_args: { updated_at_min: updatedMin, updated_at_max: updatedMax, page_size: pageSize, cursor },
+        note: "PR #85c: enumerates GraphQL orders by updatedAt, post-filters to those with at least one verb=edited event AND originalTotalPrice!=currentTotalPrice. Re-call with cursor=page_info.end_cursor until has_next_page=false to walk all of history.",
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "enumerate-edited failed", error: String(e?.message || e) });
+    }
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
