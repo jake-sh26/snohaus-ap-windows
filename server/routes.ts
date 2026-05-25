@@ -2207,6 +2207,136 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // PR #81 — Bug 3 forensic endpoint.
+  //
+  // For a given month, produce a per-order pivot of where our recon books the
+  // order's gross/discount/tax vs where Shopify (presumably) books it. Shopify
+  // Finance Summary books an order's gross + discount + tax in the month of
+  // o.created_at (origin month). Our recon books each LINE in the month of
+  // li.recognized_at (which can differ from o.created_at when a line was added
+  // via exchange/refund).
+  //
+  // For each order whose lines touch :month OR whose origin month is :month,
+  // we return:
+  //   - origin_month                       — month_of(o.created_at)
+  //   - our_lines[month] = { gross, disc, tax, line_count }
+  //   - shopify_attribution_month          — origin_month (the convention)
+  //   - our_attribution_in_target          — our_lines[:month]
+  //   - shopify_attribution_in_target      — origin_month==month ? order totals : 0
+  //   - diff                               — ours - shopify, per field
+  //
+  // Orders are sorted by ABS(net diff) so the operator can see the biggest
+  // mirror contributors first. No truncation — ALL orders affecting the diff.
+  app.get("/api/recon/finance/debug/bug3-forensics/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const tz = "'-5 hours'";
+
+    // Per-order, per-line-month pivot. Sums gross/disc/tax by the month each
+    // line was recognized in. Excludes gift cards and cancelled orders to
+    // match Shopify's Finance Summary exclusions.
+    const rows = sqlite.prepare(`
+      WITH per_line AS (
+        SELECT
+          li.order_id,
+          o.name AS order_name,
+          o.order_number,
+          substr(datetime(o.created_at, ${tz}), 1, 7) AS origin_month,
+          substr(datetime(
+            COALESCE(li.recognized_at, o.processed_at, o.created_at), ${tz}
+          ), 1, 7) AS line_month,
+          li.is_gift_card,
+          li.added_via_exchange_refund_id IS NOT NULL AS is_exchange_line,
+          (li.price * li.quantity) AS line_gross,
+          MAX(li.total_discount, COALESCE(li.discount_allocations_total, 0)) AS line_disc,
+          li.line_tax_total AS line_tax,
+          o.total_price AS order_total_price,
+          o.total_discounts AS order_total_discounts,
+          o.total_tax AS order_total_tax,
+          o.cancelled_at,
+          o.financial_status
+        FROM recon_line_items li
+        JOIN recon_orders o ON o.id = li.order_id
+        WHERE li.is_gift_card = 0
+          AND o.cancelled_at IS NULL
+      ),
+      pivot AS (
+        SELECT
+          order_id, order_name, order_number, origin_month,
+          order_total_price, order_total_discounts, order_total_tax,
+          financial_status,
+          SUM(CASE WHEN line_month = ?     THEN line_gross ELSE 0 END) AS gross_in_target,
+          SUM(CASE WHEN line_month = ?     THEN line_disc  ELSE 0 END) AS disc_in_target,
+          SUM(CASE WHEN line_month = ?     THEN line_tax   ELSE 0 END) AS tax_in_target,
+          SUM(CASE WHEN line_month = ?     THEN 1 ELSE 0 END) AS lines_in_target,
+          SUM(CASE WHEN line_month != ?    THEN line_gross ELSE 0 END) AS gross_other,
+          SUM(CASE WHEN line_month != ?    THEN line_disc  ELSE 0 END) AS disc_other,
+          SUM(CASE WHEN line_month != ?    THEN line_tax   ELSE 0 END) AS tax_other,
+          SUM(CASE WHEN line_month != ?    THEN 1 ELSE 0 END) AS lines_other,
+          SUM(CASE WHEN is_exchange_line=1 THEN 1 ELSE 0 END) AS exchange_line_count,
+          MIN(line_month) AS first_line_month,
+          MAX(line_month) AS last_line_month,
+          GROUP_CONCAT(DISTINCT line_month) AS line_months
+        FROM per_line
+        GROUP BY order_id
+      )
+      SELECT * FROM pivot
+       WHERE origin_month = ?
+          OR lines_in_target > 0
+    `).all(month, month, month, month, month, month, month, month, month) as any[];
+
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const enriched = rows.map((r: any) => {
+      // Where Shopify presumably books this order (origin month convention)
+      const shopifyAttributesToTarget = r.origin_month === month;
+      const shopify_gross = shopifyAttributesToTarget ? Number(r.order_total_price) - Number(r.order_total_tax) + Number(r.order_total_discounts) : 0;
+      const shopify_disc = shopifyAttributesToTarget ? Number(r.order_total_discounts) : 0;
+      const shopify_tax = shopifyAttributesToTarget ? Number(r.order_total_tax) : 0;
+      // Our attribution to target month
+      const our_gross = Number(r.gross_in_target);
+      const our_disc = Number(r.disc_in_target);
+      const our_tax = Number(r.tax_in_target);
+
+      return {
+        order_name: r.order_name,
+        origin_month: r.origin_month,
+        line_months: r.line_months,
+        exchange_line_count: Number(r.exchange_line_count),
+        ours_in_target:   { gross: round2(our_gross), disc: round2(our_disc), tax: round2(our_tax), lines: Number(r.lines_in_target) },
+        shopify_in_target:{ gross: round2(shopify_gross), disc: round2(shopify_disc), tax: round2(shopify_tax) },
+        diff:             { gross: round2(our_gross - shopify_gross), disc: round2(our_disc - shopify_disc), tax: round2(our_tax - shopify_tax) },
+        order_totals:     { gross: round2(Number(r.order_total_price) - Number(r.order_total_tax) + Number(r.order_total_discounts)), disc: round2(Number(r.order_total_discounts)), tax: round2(Number(r.order_total_tax)) },
+      };
+    }).filter((r: any) => {
+      // Only return rows where there's an attribution difference. Same-month
+      // orders with no exchange lines wash out and aren't interesting.
+      return Math.abs(r.diff.gross) > 0.005 || Math.abs(r.diff.disc) > 0.005 || Math.abs(r.diff.tax) > 0.005;
+    });
+
+    enriched.sort((a: any, b: any) =>
+      (Math.abs(b.diff.gross) + Math.abs(b.diff.disc) + Math.abs(b.diff.tax))
+      - (Math.abs(a.diff.gross) + Math.abs(a.diff.disc) + Math.abs(a.diff.tax))
+    );
+
+    const sumDiff = enriched.reduce((acc: any, r: any) => {
+      acc.gross += r.diff.gross;
+      acc.disc += r.diff.disc;
+      acc.tax += r.diff.tax;
+      return acc;
+    }, { gross: 0, disc: 0, tax: 0 });
+
+    res.json({
+      month,
+      orders_with_attribution_mismatch: enriched.length,
+      sum_of_diffs: { gross: round2(sumDiff.gross), disc: round2(sumDiff.disc), tax: round2(sumDiff.tax) },
+      note: "diff.gross = our_gross_in_target - shopify_gross_in_target (Shopify books by o.created_at month). Sum_of_diffs SHOULD equal the gross/disc/tax diff in the finance reconciler for this month, ignoring refund/return effects.",
+      orders: enriched,
+    });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
