@@ -2657,6 +2657,149 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #85b diagnostic. Batch version of /graphql-totals.
+  // POST body: { names: string[] } (with or without leading '#'; max 25)
+  // For each order: runs the same GraphQL query, computes the
+  // tax-rate-back-out estimate of original_subtotal and subtotal_delta
+  // (the value Shopify's net-sales-by-order CSV books to the edit month).
+  // Read-only. Used to validate the Path B attribution formula on 5-10
+  // Bug 3 candidates from the 522-order blast radius before committing
+  // it to the real fix in PR #86.
+  app.post("/api/recon/finance/debug/orders/graphql-totals-batch", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    const { sqlite } = require("./storage");
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const inNames: any = req.body?.names;
+    if (!Array.isArray(inNames) || inNames.length === 0) {
+      return res.status(400).json({ message: "body.names: string[] required" });
+    }
+    if (inNames.length > 25) {
+      return res.status(400).json({ message: "max 25 names per batch" });
+    }
+
+    const round2 = (n: number | null | undefined) =>
+      n == null || !Number.isFinite(n) ? null : Math.round(n * 100) / 100;
+
+    const query = `
+      query OrderTotals($id: ID!) {
+        order(id: $id) {
+          id
+          name
+          createdAt
+          updatedAt
+          closedAt
+          originalTotalPriceSet           { shopMoney { amount currencyCode } }
+          currentTotalPriceSet            { shopMoney { amount currencyCode } }
+          currentSubtotalPriceSet         { shopMoney { amount currencyCode } }
+          currentTotalDiscountsSet        { shopMoney { amount currencyCode } }
+          currentTotalTaxSet              { shopMoney { amount currencyCode } }
+          currentShippingPriceSet         { shopMoney { amount currencyCode } }
+          events(first: 10, query: "verb:edited OR action:order_edited", sortKey: CREATED_AT, reverse: true) {
+            edges { node { id createdAt message } }
+          }
+        }
+      }
+    `;
+
+    const results: any[] = [];
+    for (const raw0 of inNames) {
+      const raw = String(raw0 || "").trim();
+      if (!raw) { results.push({ input: raw0, error: "empty name" }); continue; }
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const noHash   = raw.startsWith("#") ? raw.slice(1) : raw;
+      const row: any = sqlite.prepare(`
+        SELECT id, name, order_number, created_at, updated_at, closed_at,
+               total_price, subtotal, total_discounts, total_tax, total_shipping
+        FROM recon_orders
+        WHERE name = ? OR name = ? OR order_number = ?
+        LIMIT 1
+      `).get(withHash, noHash, noHash);
+      if (!row) { results.push({ input: raw, error: "not found in recon_orders" }); continue; }
+
+      const orderGid = `gid://shopify/Order/${row.id}`;
+      try {
+        const r = await shopifyGraphqlCall(cfg, query, { id: orderGid });
+        if (r.errors) {
+          results.push({ input: raw, order_id: row.id, error: "graphql errors", errors: r.errors });
+          continue;
+        }
+        const o: any = (r.data as any)?.order;
+        if (!o) { results.push({ input: raw, order_id: row.id, error: "graphql order null" }); continue; }
+
+        const num = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
+        const original_total_price = num(o.originalTotalPriceSet);
+        const current_total_price  = num(o.currentTotalPriceSet);
+        const current_subtotal     = num(o.currentSubtotalPriceSet);
+        const current_discounts    = num(o.currentTotalDiscountsSet);
+        const current_tax          = num(o.currentTotalTaxSet);
+        const current_shipping     = num(o.currentShippingPriceSet);
+
+        // Path B: back out the original subtotal using current tax rate.
+        //   implied_tax_rate = current_tax / current_subtotal
+        //   original_subtotal_est = (original_total_price - current_shipping) / (1 + implied_tax_rate)
+        // Notes:
+        //   - We assume shipping was not changed during the edit (best effort).
+        //   - We assume tax rate is stable per order (no mixed-rate items).
+        //   - Validated against #22338 (-$220) and #21840 (+$588) to the penny.
+        let implied_tax_rate: number | null = null;
+        let original_subtotal_est: number | null = null;
+        let subtotal_delta_est: number | null = null;
+        if (
+          current_subtotal != null && current_subtotal > 0 &&
+          current_tax != null && original_total_price != null
+        ) {
+          implied_tax_rate = current_tax / current_subtotal;
+          const pre_tax_pre_shipping = original_total_price - (current_shipping || 0);
+          original_subtotal_est = pre_tax_pre_shipping / (1 + implied_tax_rate);
+          subtotal_delta_est = current_subtotal - original_subtotal_est;
+        }
+
+        const gross_delta =
+          current_total_price != null && original_total_price != null
+            ? current_total_price - original_total_price
+            : null;
+
+        const editEdges = (o.events?.edges || []) as any[];
+        const firstEdit = editEdges[editEdges.length - 1]?.node; // oldest first edit
+        const lastEdit  = editEdges[0]?.node;                    // newest edit
+
+        results.push({
+          input: raw,
+          order_id: row.id,
+          order_name: row.name,
+          created_at: o.createdAt,
+          updated_at: o.updatedAt,
+          closed_at: o.closedAt,
+          first_edit_at: firstEdit?.createdAt || null,
+          last_edit_at: lastEdit?.createdAt || null,
+          edit_event_count: editEdges.length,
+          shopify: {
+            original_total_price: round2(original_total_price),
+            current_total_price:  round2(current_total_price),
+            current_subtotal:     round2(current_subtotal),
+            current_discounts:    round2(current_discounts),
+            current_tax:          round2(current_tax),
+            current_shipping:     round2(current_shipping),
+          },
+          path_b: {
+            implied_tax_rate: implied_tax_rate == null ? null : Math.round(implied_tax_rate * 100000) / 100000,
+            original_subtotal_est: round2(original_subtotal_est),
+            subtotal_delta_est: round2(subtotal_delta_est),
+            gross_delta: round2(gross_delta),
+          },
+        });
+      } catch (e: any) {
+        results.push({ input: raw, order_id: row.id, error: String(e?.message || e) });
+      }
+    }
+
+    res.json({
+      count: results.length,
+      results,
+      note: "PR #85b: Path B = tax-rate-back-out formula. original_subtotal_est = (originalTotalPrice - currentShipping) / (1 + currentTax/currentSubtotal). subtotal_delta_est is the predicted edit-month attribution amount (should match Shopify net-sales-by-order CSV).",
+    });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
