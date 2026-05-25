@@ -121,8 +121,181 @@
  */
 
 import { sqlite } from "./storage";
+import { shopifyGraphqlCall, type ShopifyReconConfig } from "./shopify-recon";
 
 let schemaEnsured = false;
+
+// ---------------------------------------------------------------------------
+// PR #97 — GraphQL query (mirrors the PR #96 probe v2 endpoint shape).
+// ---------------------------------------------------------------------------
+
+const AGREEMENTS_QUERY = `
+  query OrderAgreementsIngest($id: ID!, $agreementsCursor: String, $salesFirst: Int!) {
+    order(id: $id) {
+      id
+      agreements(first: 50, after: $agreementsCursor) {
+        edges {
+          cursor
+          node {
+            id
+            happenedAt
+            reason
+            __typename
+            ... on OrderAgreement      { app { handle } }
+            ... on OrderEditAgreement  { app { handle } }
+            ... on RefundAgreement     { app { handle } refund { id processedAt createdAt } }
+            ... on ReturnAgreement     { app { handle } return { id name status } }
+            sales(first: $salesFirst) {
+              edges {
+                cursor
+                node {
+                  id
+                  __typename
+                  actionType
+                  lineType
+                  quantity
+                  totalAmount         { shopMoney { amount currencyCode } }
+                  totalDiscountAmountAfterTaxes { shopMoney { amount } }
+                  totalDiscountAmountBeforeTaxes { shopMoney { amount } }
+                  totalTaxAmount      { shopMoney { amount } }
+                  taxes {
+                    amount { shopMoney { amount } }
+                    taxLine { title rate priceSet { shopMoney { amount } } }
+                  }
+                  ... on ProductSale       { lineItem { id name sku quantity originalUnitPriceSet { shopMoney { amount } } } }
+                  ... on GiftCardSale      { lineItem { id name sku } }
+                  ... on TipSale           { lineItem { id name } }
+                  ... on ShippingLineSale  { shippingLine { id title code originalPriceSet { shopMoney { amount } } } }
+                  ... on FeeSale           { fee { id } }
+                  ... on AdditionalFeeSale { additionalFee { id name } }
+                  ... on DutySale          { duty { id } }
+                }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+// Inner-only query for paginating a single agreement's sales when it has
+// more than `salesFirst` entries. Cheaper than re-running the outer query.
+const AGREEMENT_SALES_PAGE_QUERY = `
+  query OneAgreementSalesPage($id: ID!, $cursor: String!) {
+    node(id: $id) {
+      ... on SalesAgreement {
+        id
+        sales(first: 250, after: $cursor) {
+          edges {
+            cursor
+            node {
+              id
+              __typename
+              actionType
+              lineType
+              quantity
+              totalAmount         { shopMoney { amount currencyCode } }
+              totalDiscountAmountAfterTaxes { shopMoney { amount } }
+              totalDiscountAmountBeforeTaxes { shopMoney { amount } }
+              totalTaxAmount      { shopMoney { amount } }
+              taxes {
+                amount { shopMoney { amount } }
+                taxLine { title rate priceSet { shopMoney { amount } } }
+              }
+              ... on ProductSale       { lineItem { id name sku quantity originalUnitPriceSet { shopMoney { amount } } } }
+              ... on GiftCardSale      { lineItem { id name sku } }
+              ... on TipSale           { lineItem { id name } }
+              ... on ShippingLineSale  { shippingLine { id title code originalPriceSet { shopMoney { amount } } } }
+              ... on FeeSale           { fee { id } }
+              ... on AdditionalFeeSale { additionalFee { id name } }
+              ... on DutySale          { duty { id } }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  }
+`;
+
+// ---------------------------------------------------------------------------
+// Helpers — money parsing, subtype-aware back-ref extraction.
+// ---------------------------------------------------------------------------
+
+const num = (mb: any): number | null =>
+  mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
+
+function extractRef(s: any): {
+  ref_id: string | null;
+  ref_name: string | null;
+  ref_sku: string | null;
+} {
+  let ref_id: string | null = null;
+  let ref_name: string | null = null;
+  let ref_sku: string | null = null;
+  switch (s.__typename) {
+    case "ProductSale":
+    case "GiftCardSale":
+      ref_id = s.lineItem?.id || null;
+      ref_name = s.lineItem?.name || null;
+      ref_sku = s.lineItem?.sku || null;
+      break;
+    case "TipSale":
+      ref_id = s.lineItem?.id || null;
+      ref_name = s.lineItem?.name || null;
+      break;
+    case "ShippingLineSale":
+      ref_id = s.shippingLine?.id || null;
+      ref_name = s.shippingLine?.title || s.shippingLine?.code || null;
+      break;
+    case "FeeSale":
+      ref_id = s.fee?.id || null;
+      break;
+    case "AdditionalFeeSale":
+      ref_id = s.additionalFee?.id || null;
+      ref_name = s.additionalFee?.name || null;
+      break;
+    case "DutySale":
+      ref_id = s.duty?.id || null;
+      break;
+    // AdjustmentSale, UnknownSale: no back-ref
+  }
+  return { ref_id, ref_name, ref_sku };
+}
+
+function buildTaxBreakdown(
+  taxes: any[] | null | undefined,
+): { amount: number | null; title: string | null; rate: number | null; price: number | null }[] {
+  return (taxes || []).map((t: any) => ({
+    amount: num(t.amount),
+    title: t.taxLine?.title || null,
+    rate: t.taxLine?.rate ?? null,
+    price: num(t.taxLine?.priceSet),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Warnings logging — reuses recon_event_warnings table from PR #94.
+// ---------------------------------------------------------------------------
+
+function logWarning(
+  order_id: string,
+  reason: string,
+  detail: any,
+): void {
+  try {
+    sqlite.prepare(`
+      INSERT INTO recon_event_warnings
+        (order_id, refund_id, line_item_id, event_type, reason, detail_json, logged_at)
+      VALUES (?, NULL, NULL, 'agreements_ingest', ?, ?, ?)
+    `).run(order_id, reason, JSON.stringify(detail), new Date().toISOString());
+  } catch {
+    // Warnings are best-effort; never throw from inside the ingest path.
+  }
+}
 
 /**
  * Idempotent schema migration for the Shopify agreements/sales ledger.
@@ -216,4 +389,385 @@ export function getShopifyAgreementsCounts(): {
     .prepare(`SELECT COUNT(*) AS n FROM recon_shopify_sales`)
     .get() as any;
   return { agreements: a?.n ?? 0, sales: s?.n ?? 0 };
+}
+
+export function getOrderAgreementsCounts(order_id: string): {
+  agreements: number;
+  sales: number;
+} {
+  ensureShopifyAgreementsSchema();
+  const a = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM recon_shopify_agreements WHERE order_id = ?`)
+    .get(order_id) as any;
+  const s = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM recon_shopify_sales WHERE order_id = ?`)
+    .get(order_id) as any;
+  return { agreements: a?.n ?? 0, sales: s?.n ?? 0 };
+}
+
+// ---------------------------------------------------------------------------
+// PR #97 — Per-order ingest.
+// ---------------------------------------------------------------------------
+
+export interface IngestOrderResult {
+  order_id: string;
+  agreements_upserted: number;
+  sales_upserted: number;
+  graphql_calls: number;
+  warnings: number;
+  duration_ms: number;
+}
+
+/**
+ * Fetches Order.agreements -> sales from Shopify and upserts into
+ * recon_shopify_agreements + recon_shopify_sales. Read-only against
+ * Shopify. Idempotent: re-running yields the same rows but bumps
+ * ingest_version. Pagination is handled on both the outer (agreements)
+ * and inner (sales) connections.
+ */
+export async function ingestAgreementsForOrder(
+  cfg: ShopifyReconConfig,
+  order_id: string,
+): Promise<IngestOrderResult> {
+  ensureShopifyAgreementsSchema();
+  const started = Date.now();
+  const orderGid = `gid://shopify/Order/${order_id}`;
+  const now = new Date().toISOString();
+
+  let graphqlCalls = 0;
+  let warnings = 0;
+  const agreementNodes: any[] = [];
+
+  // ---- Outer pagination: agreements ----
+  let agreementsCursor: string | null = null;
+  for (let safetyPage = 0; safetyPage < 50; safetyPage++) {
+    graphqlCalls++;
+    const r = await shopifyGraphqlCall(cfg, AGREEMENTS_QUERY, {
+      id: orderGid,
+      agreementsCursor,
+      salesFirst: 250,
+    });
+    if (r.errors) {
+      logWarning(order_id, "graphql_errors", { errors: r.errors });
+      warnings++;
+      throw new Error(`agreements graphql errors: ${JSON.stringify(r.errors).slice(0, 500)}`);
+    }
+    const order: any = (r.data as any)?.order;
+    if (!order) {
+      logWarning(order_id, "order_null", { orderGid });
+      warnings++;
+      return {
+        order_id,
+        agreements_upserted: 0,
+        sales_upserted: 0,
+        graphql_calls: graphqlCalls,
+        warnings,
+        duration_ms: Date.now() - started,
+      };
+    }
+    const edges = order.agreements?.edges || [];
+    for (const e of edges) agreementNodes.push(e.node);
+    const pi = order.agreements?.pageInfo;
+    if (!pi?.hasNextPage) break;
+    agreementsCursor = pi.endCursor || null;
+    if (!agreementsCursor) break;
+  }
+
+  // ---- Inner pagination: per-agreement sales (rare; most have <250) ----
+  for (const a of agreementNodes) {
+    let salesCursor: string | null = a.sales?.pageInfo?.hasNextPage
+      ? a.sales?.pageInfo?.endCursor || null
+      : null;
+    while (salesCursor) {
+      graphqlCalls++;
+      const r = await shopifyGraphqlCall(cfg, AGREEMENT_SALES_PAGE_QUERY, {
+        id: a.id,
+        cursor: salesCursor,
+      });
+      if (r.errors) {
+        logWarning(order_id, "sales_page_graphql_errors", {
+          agreement_id: a.id,
+          errors: r.errors,
+        });
+        warnings++;
+        break;
+      }
+      const node: any = (r.data as any)?.node;
+      const moreEdges = node?.sales?.edges || [];
+      a.sales.edges.push(...moreEdges);
+      const pi = node?.sales?.pageInfo;
+      if (!pi?.hasNextPage) break;
+      salesCursor = pi.endCursor || null;
+    }
+  }
+
+  // ---- Upsert in a single transaction ----
+  const upsertAgreement = sqlite.prepare(`
+    INSERT INTO recon_shopify_agreements
+      (id, order_id, happened_at, reason, agreement_type, app_handle,
+       refund_id, return_id, raw_json, ingested_at, ingest_version)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(id) DO UPDATE SET
+      happened_at    = excluded.happened_at,
+      reason         = excluded.reason,
+      agreement_type = excluded.agreement_type,
+      app_handle     = excluded.app_handle,
+      refund_id      = excluded.refund_id,
+      return_id      = excluded.return_id,
+      raw_json       = excluded.raw_json,
+      ingested_at    = excluded.ingested_at,
+      ingest_version = ingest_version + 1
+  `);
+  const upsertSale = sqlite.prepare(`
+    INSERT INTO recon_shopify_sales
+      (id, agreement_id, order_id, happened_at, sale_type, action_type,
+       line_type, quantity, total_amount, total_discount_after_taxes,
+       total_discount_before_taxes, total_tax, ref_id, ref_name, ref_sku,
+       tax_breakdown_json, raw_json, ingested_at, ingest_version)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(id) DO UPDATE SET
+      agreement_id                = excluded.agreement_id,
+      order_id                    = excluded.order_id,
+      happened_at                 = excluded.happened_at,
+      sale_type                   = excluded.sale_type,
+      action_type                 = excluded.action_type,
+      line_type                   = excluded.line_type,
+      quantity                    = excluded.quantity,
+      total_amount                = excluded.total_amount,
+      total_discount_after_taxes  = excluded.total_discount_after_taxes,
+      total_discount_before_taxes = excluded.total_discount_before_taxes,
+      total_tax                   = excluded.total_tax,
+      ref_id                      = excluded.ref_id,
+      ref_name                    = excluded.ref_name,
+      ref_sku                     = excluded.ref_sku,
+      tax_breakdown_json          = excluded.tax_breakdown_json,
+      raw_json                    = excluded.raw_json,
+      ingested_at                 = excluded.ingested_at,
+      ingest_version              = ingest_version + 1
+  `);
+
+  let agreementsUpserted = 0;
+  let salesUpserted = 0;
+
+  const tx = sqlite.transaction(() => {
+    for (const a of agreementNodes) {
+      if (!a?.id || !a?.happenedAt || !a?.reason) {
+        logWarning(order_id, "agreement_missing_required", {
+          agreement_id: a?.id,
+          happened_at: a?.happenedAt,
+          reason: a?.reason,
+        });
+        warnings++;
+        continue;
+      }
+      upsertAgreement.run(
+        a.id,
+        order_id,
+        a.happenedAt,
+        a.reason,
+        a.__typename || "Unknown",
+        a.app?.handle || null,
+        a.refund?.id || null,
+        a.return?.id || null,
+        JSON.stringify(a),
+        now,
+      );
+      agreementsUpserted++;
+
+      for (const se of a.sales?.edges || []) {
+        const s = se.node;
+        if (!s?.id || !s?.__typename) {
+          logWarning(order_id, "sale_missing_required", {
+            agreement_id: a.id,
+            sale_id: s?.id,
+            typename: s?.__typename,
+          });
+          warnings++;
+          continue;
+        }
+        const ref = extractRef(s);
+        const taxBreakdown = buildTaxBreakdown(s.taxes);
+        upsertSale.run(
+          s.id,
+          a.id,
+          order_id,
+          a.happenedAt,            // denormalized so projector reads sales alone
+          s.__typename,
+          s.actionType || null,
+          s.lineType || null,
+          s.quantity ?? null,
+          num(s.totalAmount),
+          num(s.totalDiscountAmountAfterTaxes),
+          num(s.totalDiscountAmountBeforeTaxes),
+          num(s.totalTaxAmount),
+          ref.ref_id,
+          ref.ref_name,
+          ref.ref_sku,
+          JSON.stringify(taxBreakdown),
+          JSON.stringify(s),
+          now,
+        );
+        salesUpserted++;
+      }
+    }
+  });
+  tx();
+
+  return {
+    order_id,
+    agreements_upserted: agreementsUpserted,
+    sales_upserted: salesUpserted,
+    graphql_calls: graphqlCalls,
+    warnings,
+    duration_ms: Date.now() - started,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PR #97 — Backfill across many orders.
+// ---------------------------------------------------------------------------
+
+export type BackfillScope =
+  | { kind: "orders"; ids: string[] }    // explicit list of order ids
+  | { kind: "names"; names: string[] }   // explicit list of order names (#22338, 21840)
+  | { kind: "edited" }                   // orders where updated_at > processed_at (Bug 3 blast radius)
+  | { kind: "month"; month: string }     // 'YYYY-MM' (created_at OR updated_at)
+  | { kind: "all" };                     // every order in recon_orders
+
+export interface BackfillProgress {
+  job_id: string;
+  scope: BackfillScope;
+  started_at: string;
+  finished_at: string | null;
+  total_orders: number;
+  processed: number;
+  agreements_upserted: number;
+  sales_upserted: number;
+  graphql_calls: number;
+  warnings: number;
+  errors: { order_id: string; message: string }[];
+  status: "running" | "completed" | "failed";
+}
+
+// In-process job registry. Backfills run inside this Node process; a
+// crash loses progress (re-run picks up where it left off because
+// upserts are idempotent and we can skip orders that already have rows).
+const backfillJobs = new Map<string, BackfillProgress>();
+
+export function getBackfillProgress(job_id: string): BackfillProgress | null {
+  return backfillJobs.get(job_id) || null;
+}
+
+function resolveBackfillTargets(scope: BackfillScope): { id: string; name: string }[] {
+  switch (scope.kind) {
+    case "orders":
+      return sqlite
+        .prepare(
+          `SELECT id, name FROM recon_orders WHERE id IN (${scope.ids.map(() => "?").join(",")})`,
+        )
+        .all(...scope.ids) as any[];
+    case "names": {
+      const withHash = scope.names.map((n) => (n.startsWith("#") ? n : `#${n}`));
+      const noHash = scope.names.map((n) => (n.startsWith("#") ? n.slice(1) : n));
+      const placeholders = withHash.map(() => "?").join(",");
+      return sqlite
+        .prepare(
+          `SELECT id, name FROM recon_orders
+             WHERE name IN (${placeholders})
+                OR name IN (${placeholders})
+                OR order_number IN (${placeholders})`,
+        )
+        .all(...withHash, ...noHash, ...noHash) as any[];
+    }
+    case "edited":
+      return sqlite
+        .prepare(
+          `SELECT id, name FROM recon_orders
+             WHERE updated_at IS NOT NULL
+               AND processed_at IS NOT NULL
+               AND datetime(updated_at) > datetime(processed_at)
+             ORDER BY processed_at ASC`,
+        )
+        .all() as any[];
+    case "month":
+      return sqlite
+        .prepare(
+          `SELECT id, name FROM recon_orders
+             WHERE substr(datetime(created_at, '-5 hours'), 1, 7) = ?
+                OR substr(datetime(updated_at, '-5 hours'), 1, 7) = ?
+             ORDER BY created_at ASC`,
+        )
+        .all(scope.month, scope.month) as any[];
+    case "all":
+      return sqlite
+        .prepare(`SELECT id, name FROM recon_orders ORDER BY created_at ASC`)
+        .all() as any[];
+  }
+}
+
+/**
+ * Kicks off a background backfill. Returns the job id immediately; poll
+ * via getBackfillProgress(jobId). Safe to call repeatedly — ingest is
+ * idempotent and re-runs bump ingest_version.
+ *
+ * Throttling: a 100 ms delay between orders keeps us well under
+ * Shopify's GraphQL cost budget (each order costs ~12 cost units; at 10
+ * orders/sec we burn ~120/sec while the bucket refills at ~50/sec
+ * sustained, so we'll naturally back off via the 429 retry inside
+ * shopifyGraphqlCall when needed).
+ */
+export function startAgreementsBackfill(
+  cfg: ShopifyReconConfig,
+  scope: BackfillScope,
+): BackfillProgress {
+  ensureShopifyAgreementsSchema();
+  const targets = resolveBackfillTargets(scope);
+  const job_id = `bf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const progress: BackfillProgress = {
+    job_id,
+    scope,
+    started_at: new Date().toISOString(),
+    finished_at: null,
+    total_orders: targets.length,
+    processed: 0,
+    agreements_upserted: 0,
+    sales_upserted: 0,
+    graphql_calls: 0,
+    warnings: 0,
+    errors: [],
+    status: "running",
+  };
+  backfillJobs.set(job_id, progress);
+
+  // Fire-and-forget background loop.
+  (async () => {
+    try {
+      for (const t of targets) {
+        try {
+          const r = await ingestAgreementsForOrder(cfg, t.id);
+          progress.agreements_upserted += r.agreements_upserted;
+          progress.sales_upserted += r.sales_upserted;
+          progress.graphql_calls += r.graphql_calls;
+          progress.warnings += r.warnings;
+        } catch (e: any) {
+          progress.errors.push({
+            order_id: t.id,
+            message: String(e?.message || e).slice(0, 300),
+          });
+        }
+        progress.processed++;
+        // Light throttle. 100 ms = max 10 orders/sec. Cooperative with
+        // shopifyGraphqlCall's 429 retry; never starves the event loop.
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      progress.status = "completed";
+    } catch (e: any) {
+      progress.status = "failed";
+      progress.errors.push({ order_id: "(loop)", message: String(e?.message || e).slice(0, 300) });
+    } finally {
+      progress.finished_at = new Date().toISOString();
+    }
+  })();
+
+  return progress;
 }
