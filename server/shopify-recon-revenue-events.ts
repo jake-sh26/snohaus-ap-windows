@@ -32,11 +32,27 @@
  * a single GROUP BY.
  *
  * PR SEQUENCE (DO NOT skip ahead)
- *   PR #94 — schema + projection + debug endpoints (THIS PR, behavior unchanged)
- *   PR #95 — parallel-validation endpoint comparing old vs new path
- *   PR #96 — edit_adjustment events from detectOrderEdit
- *   PR #97 — switch computeLocalFinanceSummary to events-ledger path
- *   PR #98 — delete legacy rules code
+ *   PR #94  — schema + projection + debug endpoints (behavior unchanged)
+ *   PR #95  — parallel-validation endpoint comparing old vs new path
+ *   PR #95c — projector fixes (THIS PR): shipping_tax, adjustment_tax, Rule #8
+ *   PR #96  — edit_adjustment events from detectOrderEdit
+ *   PR #97  — switch computeLocalFinanceSummary to events-ledger path
+ *   PR #98  — delete legacy rules code
+ *
+ * PR #95c additions (validated against June 2025 diff-compare $77.64 gap):
+ *   1. sale_shipping_tax events — one per order with non-zero shipping tax.
+ *      Closes the missing shipping_tax piece on the sale side (Rule #7b
+ *      shipping-line tax_lines) that legacy adds via order raw_json.
+ *      June 2025: +$108.26.
+ *   2. refund_adjustment_tax events — one per adjustment-kind refund line
+ *      with non-zero total_tax. Stored negative (Rule #10 sign convention).
+ *      Closes the missing adjustment-row tax subtraction that legacy does
+ *      via the returns_tax CASE WHEN. June 2025: −$30.62 of refund tax.
+ *      Shipping-refund adjustments use ABS(total_tax) to mirror legacy.
+ *   3. unverified_return events — for orders matching Rule #8 (subtotal >
+ *      current_subtotal, no refund row). Stores the subtotal delta as a
+ *      return and the tax delta with legacy's sign convention. Validated
+ *      against March 2026 #37901 ($24.99 leash → $27.14 GC).
  *
  * DATA MODEL
  * ----------
@@ -285,7 +301,7 @@ export function projectRevenueEvents(
 ): ProjectionSummary {
   ensure();
   const startedAt = Date.now();
-  const detector_source = "projectRevenueEvents-pr94";
+  const detector_source = "projectRevenueEvents-pr95c";
   const detected_at = new Date().toISOString();
 
   const summary: ProjectionSummary = {
@@ -404,6 +420,76 @@ export function projectRevenueEvents(
       summary.events_inserted += 1;
     }
 
+    // 2b. SALE_SHIPPING_TAX events (PR #95c, addition #1).
+    //     One per order with non-zero shipping_lines[].tax_lines[].price sum.
+    //     Legacy adds this via order raw_json → shippingTax → taxes (Rule
+    //     #7b shipping piece). Bucket on the order's recognized date —
+    //     shipping is paid at order time, not at line-recognition time —
+    //     mirroring legacy's shippingBucketBy = 'order_processed_at'.
+    //     Emitted as event_type='sale' (not a refund or fee) so SUM(tax)
+    //     over sale events still equals "tax collected on sale-side".
+    const shippingOrderRows = sqlite
+      .prepare(`
+        SELECT o.id, o.raw_json,
+               COALESCE(o.processed_at, o.created_at) AS event_date
+        FROM recon_orders o
+        ${opts.scope === "order" ? "WHERE o.id = ?" : ""}
+      `)
+      .all(...orderFilterParams) as Array<{
+        id: string;
+        raw_json: string | null;
+        event_date: string | null;
+      }>;
+
+    for (const row of shippingOrderRows) {
+      if (!row.event_date) continue;
+      if (!row.raw_json) continue;
+      let shipTax = 0;
+      try {
+        const rj = typeof row.raw_json === "string"
+          ? JSON.parse(row.raw_json)
+          : row.raw_json;
+        const shippingLines = Array.isArray(rj?.shipping_lines)
+          ? rj.shipping_lines
+          : [];
+        for (const s of shippingLines) {
+          const tls = Array.isArray(s?.tax_lines) ? s.tax_lines : [];
+          for (const tl of tls) {
+            const p = Number(tl?.price);
+            if (Number.isFinite(p)) shipTax += p;
+          }
+        }
+      } catch {
+        logWarning("order raw_json parse failed for shipping tax", {
+          order_id: row.id,
+          event_type: "sale",
+          detail: { snippet: String(row.raw_json).slice(0, 200) },
+        });
+        continue;
+      }
+      if (Math.abs(shipTax) < 0.005) continue;
+      insertStmt.run({
+        event_id: `sale_shipping_tax:${row.id}`,
+        event_type: "sale",
+        event_date: row.event_date,
+        order_id: row.id,
+        line_item_id: null,
+        refund_id: null,
+        refund_line_item_id: null,
+        is_gift_card: 0,
+        gross: 0,
+        discount: 0,
+        tax: round2(shipTax),
+        returns: 0,
+        return_fees: 0,
+        net_sales_gift_cards: 0,
+        detector_source,
+        detected_at,
+      });
+      summary.by_type.sale += 1;
+      summary.events_inserted += 1;
+    }
+
     // 3. REFUND events: one per recon_refund_line_items row of kind='item'.
     //    Bucket date: refund.processed_at.
     //    Rule #11 carry-forward: refund lines that point at a gift-card line
@@ -478,9 +564,46 @@ export function projectRevenueEvents(
         // Shipping refunds are handled via order shipping math, not here.
         const amount = Number(rli.subtotal ?? 0);  // adjustment subtotal
         const adjKind = (rli.adjustment_kind || "").toLowerCase();
+
+        // PR #95c addition #2: emit a tax-only refund event for ANY
+        // adjustment row carrying non-zero total_tax (independent of the
+        // subtotal branch below). Legacy's returns_tax SUM includes:
+        //   shipping_refund        → ABS(total_tax)
+        //   other adjustment kinds → total_tax (signed)
+        // We mirror both with a single negative refund-tax row so the
+        // events SUM(tax) matches legacy's `taxes − returns_tax` math.
+        // Rule #10 sign convention: refund tax stored negative.
+        const adjTaxRaw = Number(rli.total_tax ?? 0);
+        if (Number.isFinite(adjTaxRaw) && Math.abs(adjTaxRaw) > 0.005) {
+          const taxMagnitude = adjKind === "shipping_refund"
+            ? Math.abs(adjTaxRaw)
+            : adjTaxRaw;
+          insertStmt.run({
+            event_id: `refund_adjustment_tax:${rli.id}`,
+            event_type: "refund",
+            event_date: eventDate,
+            order_id: rli.order_id,
+            line_item_id: null,
+            refund_id: rli.refund_id,
+            refund_line_item_id: rli.id,
+            is_gift_card: 0,
+            gross: 0,
+            discount: 0,
+            tax: round2(-taxMagnitude),
+            returns: 0,
+            return_fees: 0,
+            net_sales_gift_cards: 0,
+            detector_source,
+            detected_at,
+          });
+          summary.by_type.refund += 1;
+          summary.events_inserted += 1;
+        }
+
         if (adjKind === "shipping_refund") {
-          // Skip: shipping refunds reduce shipping in PR #97's
-          // shipping query, not the events ledger.
+          // Skip subtotal: shipping refunds reduce shipping in PR #97's
+          // shipping query, not the events ledger. Tax already handled
+          // above via the adjustment-tax event.
           continue;
         }
         if (amount > 0.005) {
@@ -532,6 +655,77 @@ export function projectRevenueEvents(
         // amount ≈ 0 → no event (e.g. zero-adjustment refunds)
       }
       // Other refund line kinds — currently none expected; would warn if seen.
+    }
+
+    // 4. UNVERIFIED_RETURN events (PR #95c, addition #3 — Rule #8).
+    //    Same-order exchanges for store credit don't emit a refund row;
+    //    Shopify encodes them via current_subtotal_price / current_total_tax
+    //    deltas on the order itself. Legacy adds:
+    //      Returns      += (o.subtotal − o.current_subtotal_price)
+    //      Taxes delta  -= (o.total_tax − o.current_total_tax)
+    //    on orders where the delta is non-zero AND no refund row exists.
+    //    See shopify-finance-diff.ts Rule #8 block. Validated against
+    //    Mar 2026 #37901 ($24.99 leash → $27.14 GC, pre-rule diff was
+    //    +$17.14 / 0.007%, post-rule $0.00).
+    //
+    //    Bucket date: order recognized date (processed_at|created_at) —
+    //    same as legacy's unverifiedBucketExpr default.
+    const unverifiedRows = sqlite
+      .prepare(`
+        SELECT
+          o.id, o.subtotal, o.current_subtotal_price,
+          o.total_tax, o.current_total_tax,
+          COALESCE(o.processed_at, o.created_at) AS event_date
+        FROM recon_orders o
+        WHERE NOT EXISTS (SELECT 1 FROM recon_refunds r WHERE r.order_id = o.id)
+          AND o.current_subtotal_price IS NOT NULL
+          AND o.subtotal IS NOT NULL
+          AND (o.subtotal - o.current_subtotal_price) > 0
+          ${opts.scope === "order" ? "AND o.id = ?" : ""}
+      `)
+      .all(...orderFilterParams) as Array<{
+        id: string;
+        subtotal: number | null;
+        current_subtotal_price: number | null;
+        total_tax: number | null;
+        current_total_tax: number | null;
+        event_date: string | null;
+      }>;
+
+    for (const row of unverifiedRows) {
+      if (!row.event_date) continue;
+      const subtotalDelta = Number(row.subtotal ?? 0) - Number(row.current_subtotal_price ?? 0);
+      if (!(subtotalDelta > 0.005)) continue;
+      // Tax delta uses legacy's exact predicate: include only when both
+      // sides present and non-equal. Stored negative (Rule #10) so the
+      // monthly SUM(tax) over events matches legacy's `taxes -= delta`.
+      let taxDelta = 0;
+      if (
+        row.total_tax != null && row.current_total_tax != null &&
+        Number(row.total_tax) !== Number(row.current_total_tax)
+      ) {
+        taxDelta = Number(row.total_tax) - Number(row.current_total_tax);
+      }
+      insertStmt.run({
+        event_id: `unverified_return:${row.id}`,
+        event_type: "refund",
+        event_date: row.event_date,
+        order_id: row.id,
+        line_item_id: null,
+        refund_id: null,
+        refund_line_item_id: null,
+        is_gift_card: 0,
+        gross: 0,
+        discount: 0,
+        tax: round2(-taxDelta),
+        returns: round2(subtotalDelta),
+        return_fees: 0,
+        net_sales_gift_cards: 0,
+        detector_source,
+        detected_at,
+      });
+      summary.by_type.refund += 1;
+      summary.events_inserted += 1;
     }
   });
 
