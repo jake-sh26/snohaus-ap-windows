@@ -1517,6 +1517,49 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
   });
 
+  // PR #95 — Parallel-validation endpoint: legacy vs events vs Shopify in
+  // one shot. Pure read; touches no production reconciler state. Lets
+  // operators monitor the events-ledger path across the historical
+  // backfill before PR #97 switches the production reconciler over.
+  //
+  //   GET /api/recon/finance/diff-compare/:month
+  //   GET /api/recon/finance/diff-compare/:month?tolerance=0.01
+  //
+  // Response shape (FinanceDiffCompareResult):
+  //   {
+  //     month, tolerance,
+  //     legacy:  { gross_sales, discounts, returns, net_sales, taxes, ... },
+  //     events:  { gross_sales, discounts, returns, net_sales, taxes, return_fees, net_sales_gift_cards, event_count },
+  //     shopify: <recon_shopify_finance_snapshots row>,
+  //     lines: [{ field, legacy, events, shopify, shopify_raw,
+  //               legacy_vs_events, events_vs_shopify, legacy_vs_shopify,
+  //               ok_legacy_events, ok_events_shopify }, ...],
+  //     summary: {
+  //       legacy_vs_events_all_ok,
+  //       events_vs_shopify_all_ok,
+  //       legacy_vs_events_total_abs,
+  //       events_vs_shopify_total_abs,
+  //       events_count,
+  //     }
+  //   }
+  app.get("/api/recon/finance/diff-compare/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const tolerance = Number(req.query.tolerance);
+    try {
+      const { computeFinanceDiffCompare } = require("./shopify-finance-diff");
+      res.json(
+        computeFinanceDiffCompare(month, {
+          tolerance: Number.isFinite(tolerance) ? tolerance : undefined,
+        }),
+      );
+    } catch (e: any) {
+      res.status(502).json({ message: "diff-compare failed", error: String(e?.message || e) });
+    }
+  });
+
   // Debug: dump the internal components of computeLocalFinanceSummary so we
   // can see exactly which sub-total contributes to each line. Read-only.
   app.get("/api/recon/finance/debug/components/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
