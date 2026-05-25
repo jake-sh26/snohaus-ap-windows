@@ -2337,6 +2337,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // PR #82 diagnostic — Look up a single recon_orders row + parsed raw_json
+  // by Shopify order name (e.g. "22338" or "#22338"). Read-only. Used to
+  // investigate Bug 3 (cross-boundary order edits). The raw_json carries the
+  // full Shopify order payload including `transactions[]`, `order_adjustments[]`,
+  // `current_*` vs `original_*` totals, and `updated_at` — which is where the
+  // edit-month deltas live.
+  app.get("/api/recon/finance/debug/orders/by-name/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const { sqlite } = require("./storage");
+    const raw = String(req.params.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash   = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT
+        o.id, o.order_number, o.name,
+        o.created_at, o.processed_at, o.updated_at, o.cancelled_at, o.closed_at,
+        substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS recognized_month,
+        o.financial_status, o.fulfillment_status, o.source_name,
+        o.total_price, o.subtotal, o.total_discounts, o.total_shipping, o.total_tax, o.total_refunded,
+        o.has_gift_card,
+        o.raw_json
+      FROM recon_orders o
+      WHERE o.name = ? OR o.name = ? OR o.order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found in recon_orders` });
+    let parsed: any = null;
+    let parse_error: string | null = null;
+    try {
+      parsed = row.raw_json ? JSON.parse(row.raw_json) : null;
+    } catch (e: any) {
+      parse_error = String(e?.message || e);
+    }
+    delete row.raw_json;
+    const refunds = sqlite.prepare(`
+      SELECT * FROM recon_refunds WHERE order_id = ? ORDER BY processed_at, created_at
+    `).all(row.id);
+    const lineItems = sqlite.prepare(`
+      SELECT * FROM recon_line_items WHERE order_id = ? ORDER BY id
+    `).all(row.id);
+    // Strip raw_json from nested rows to keep payload focused
+    for (const li of lineItems) delete (li as any).raw_json;
+    for (const rf of refunds) delete (rf as any).raw_json;
+    res.json({
+      order: row,
+      refunds,
+      line_items: lineItems,
+      raw_json: parsed,
+      parse_error,
+      note: "PR #82 diagnostic. raw_json is the full Shopify payload as stored at last sync. Look at raw_json.updated_at, raw_json.order_adjustments[], raw_json.transactions[] (timestamps), and current_* vs original_* totals to find order-edit deltas.",
+    });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
