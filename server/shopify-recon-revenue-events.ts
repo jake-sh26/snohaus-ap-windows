@@ -34,7 +34,8 @@
  * PR SEQUENCE (DO NOT skip ahead)
  *   PR #94  — schema + projection + debug endpoints (behavior unchanged)
  *   PR #95  — parallel-validation endpoint comparing old vs new path
- *   PR #95c — projector fixes (THIS PR): shipping_tax, adjustment_tax, Rule #8
+ *   PR #95c — projector fixes: shipping_tax, adjustment_tax, Rule #8
+ *   PR #95d — Rule #9 + Rule #12 alignment (THIS PR)
  *   PR #96  — edit_adjustment events from detectOrderEdit
  *   PR #97  — switch computeLocalFinanceSummary to events-ledger path
  *   PR #98  — delete legacy rules code
@@ -53,6 +54,29 @@
  *      current_subtotal, no refund row). Stores the subtotal delta as a
  *      return and the tax delta with legacy's sign convention. Validated
  *      against March 2026 #37901 ($24.99 leash → $27.14 GC).
+ *
+ * PR #95d alignment fix (validated against 9 months — Jan/Feb/Mar/Apr/Nov/
+ * Dec 2025 + Jan/Feb/Mar 2026 — showing returns over-reporting vs Shopify):
+ *   - The previous per-row return_fee / refund_discrepancy detector fired
+ *     on every kind='adjustment' row with subtotal sign, with no Rule #9
+ *     or Rule #12 discriminator. This produced false positives in 9 of 16
+ *     historical months (total over-count: ~$8,000+ of phantom returns/
+ *     fees Shopify doesn't book).
+ *   - PR #95d replaces the per-row branch with a per-order pass that
+ *     mirrors legacy's Rule #9 + Rule #12 logic exactly:
+ *       Rule #9 (retained fee) fires iff:
+ *         current_subtotal_price = 0
+ *         AND current_total_tax  = 0
+ *         AND current_total_price > 0
+ *         AND order has ≥ 1 refund_discrepancy adjustment in any refund
+ *       Rule #12 (price-error discrepancy as additional Return) fires iff:
+ *         order does NOT match Rule #9
+ *         AND per-refund SUM(refund_discrepancy subtotals) ABS > 0.005
+ *         AND adjustment_kind = 'refund_discrepancy' (paired-+/− cancel)
+ *     Other adjustment kinds (restocking_fee, etc.) have their tax handled
+ *     by PR #95c's refund_adjustment_tax event and contribute nothing to
+ *     returns/return_fees. shipping_refund subtotals still skipped
+ *     (handled by shipping query, not events).
  *
  * DATA MODEL
  * ----------
@@ -301,7 +325,7 @@ export function projectRevenueEvents(
 ): ProjectionSummary {
   ensure();
   const startedAt = Date.now();
-  const detector_source = "projectRevenueEvents-pr95c";
+  const detector_source = "projectRevenueEvents-pr95d";
   const detected_at = new Date().toISOString();
 
   const summary: ProjectionSummary = {
@@ -558,21 +582,19 @@ export function projectRevenueEvents(
         continue;
       }
       if (rli.kind === "adjustment") {
-        // Rule #9 carry-forward: positive adjustment_amount on an
-        // adjustment row = retained fee (Shopify's "Return fees" line).
-        // Negative = refund discrepancy treated as additional return.
-        // Shipping refunds are handled via order shipping math, not here.
-        const amount = Number(rli.subtotal ?? 0);  // adjustment subtotal
-        const adjKind = (rli.adjustment_kind || "").toLowerCase();
-
         // PR #95c addition #2: emit a tax-only refund event for ANY
-        // adjustment row carrying non-zero total_tax (independent of the
-        // subtotal branch below). Legacy's returns_tax SUM includes:
+        // adjustment row carrying non-zero total_tax. Legacy's returns_tax
+        // SUM includes:
         //   shipping_refund        → ABS(total_tax)
         //   other adjustment kinds → total_tax (signed)
-        // We mirror both with a single negative refund-tax row so the
-        // events SUM(tax) matches legacy's `taxes − returns_tax` math.
         // Rule #10 sign convention: refund tax stored negative.
+        //
+        // PR #95d note: subtotal-side handling (retained_fee / discrepancy)
+        // moved out of the per-row loop into the per-order pass below so
+        // we can apply Rule #9 / Rule #12 discriminators. Tax handling stays
+        // here because legacy applies it row-by-row regardless of order-
+        // level state.
+        const adjKind = (rli.adjustment_kind || "").toLowerCase();
         const adjTaxRaw = Number(rli.total_tax ?? 0);
         if (Number.isFinite(adjTaxRaw) && Math.abs(adjTaxRaw) > 0.005) {
           const taxMagnitude = adjKind === "shipping_refund"
@@ -599,62 +621,142 @@ export function projectRevenueEvents(
           summary.by_type.refund += 1;
           summary.events_inserted += 1;
         }
-
-        if (adjKind === "shipping_refund") {
-          // Skip subtotal: shipping refunds reduce shipping in PR #97's
-          // shipping query, not the events ledger. Tax already handled
-          // above via the adjustment-tax event.
-          continue;
-        }
-        if (amount > 0.005) {
-          // Retained fee — appears on Shopify Finance Summary "Return fees"
-          insertStmt.run({
-            event_id: `return_fee:${rli.id}`,
-            event_type: "return_fee",
-            event_date: eventDate,
-            order_id: rli.order_id,
-            line_item_id: null,
-            refund_id: rli.refund_id,
-            refund_line_item_id: rli.id,
-            is_gift_card: 0,
-            gross: 0,
-            discount: 0,
-            tax: 0,
-            returns: 0,
-            return_fees: round2(amount),
-            net_sales_gift_cards: 0,
-            detector_source,
-            detected_at,
-          });
-          summary.by_type.return_fee += 1;
-          summary.events_inserted += 1;
-        } else if (amount < -0.005) {
-          // Discrepancy adjustment — Shopify books this as additional
-          // Returns (Rule #12). Stored positive on the returns column.
-          insertStmt.run({
-            event_id: `refund_discrepancy:${rli.id}`,
-            event_type: "refund",
-            event_date: eventDate,
-            order_id: rli.order_id,
-            line_item_id: null,
-            refund_id: rli.refund_id,
-            refund_line_item_id: rli.id,
-            is_gift_card: 0,
-            gross: 0,
-            discount: 0,
-            tax: 0,
-            returns: round2(Math.abs(amount)),
-            return_fees: 0,
-            net_sales_gift_cards: 0,
-            detector_source,
-            detected_at,
-          });
-          summary.by_type.refund += 1;
-          summary.events_inserted += 1;
-        }
-        // amount ≈ 0 → no event (e.g. zero-adjustment refunds)
+        // Subtotal-side handling is in the per-order pass below.
+        continue;
       }
       // Other refund line kinds — currently none expected; would warn if seen.
+    }
+
+    // 3b. PR #95d — Per-ORDER Rule #9 (retained fee) + Rule #12 (price-error
+    //     discrepancy as Return) pass. Mirrors legacy's two SQL blocks in
+    //     shopify-finance-diff.ts:
+    //       Rule #9  (retainedFees query, lines 476-497):
+    //         SUM(o.current_total_price) where Rule #9 discriminator fires
+    //       Rule #12 (discrepancyReturnsRow query, lines 586-616):
+    //         SUM(ABS(per-refund refund_discrepancy net)) where Rule #9
+    //         doesn't fire AND ABS(net) > 0.005
+    //     The two rules are mutually exclusive by construction — if Rule #9
+    //     fires on an order, Rule #12 is skipped for that order. Validated
+    //     against #21526 (Apr 25 — Rule #9 fires, Rule #12 skipped) and
+    //     #19670 / #20368 / #21876 (Rule #9 skipped, Rule #12 fires).
+    //
+    //     Implementation detail: legacy uses two separate SQL queries with
+    //     month-key WHERE clauses. The events projector is whole-history,
+    //     so we compute the per-refund discrepancy nets across all refunds
+    //     in scope, then attribute each result to its own refund's
+    //     processed_at (becomes the event_date → event_month rolls up).
+    const retainedFeeRows = sqlite
+      .prepare(`
+        SELECT
+          o.id AS order_id,
+          o.current_total_price AS retained_amount,
+          rf.first_refund_id AS refund_id,
+          rf.processed_at AS event_date
+        FROM recon_orders o
+        JOIN (
+          SELECT
+            r.order_id,
+            MIN(r.id) AS first_refund_id,
+            MIN(COALESCE(r.processed_at, r.created_at)) AS processed_at
+          FROM recon_refunds r
+          WHERE EXISTS (
+            SELECT 1 FROM recon_refund_line_items rli
+             WHERE rli.refund_id = r.id
+               AND rli.kind = 'adjustment'
+               AND rli.adjustment_kind = 'refund_discrepancy'
+          )
+          GROUP BY r.order_id
+        ) rf ON rf.order_id = o.id
+        WHERE o.current_total_price IS NOT NULL
+          AND o.current_total_price > 0
+          AND COALESCE(o.current_subtotal_price, 0) = 0
+          AND COALESCE(o.current_total_tax, 0) = 0
+          ${opts.scope === "order" ? "AND o.id = ?" : ""}
+      `)
+      .all(...orderFilterParams) as Array<{
+        order_id: string;
+        retained_amount: number;
+        refund_id: string;
+        event_date: string | null;
+      }>;
+
+    const retainedFeeOrderIds = new Set<string>();
+    for (const row of retainedFeeRows) {
+      if (!row.event_date) continue;
+      if (!(Number(row.retained_amount) > 0.005)) continue;
+      retainedFeeOrderIds.add(row.order_id);
+      insertStmt.run({
+        event_id: `return_fee:${row.order_id}`,
+        event_type: "return_fee",
+        event_date: row.event_date,
+        order_id: row.order_id,
+        line_item_id: null,
+        refund_id: row.refund_id,
+        refund_line_item_id: null,
+        is_gift_card: 0,
+        gross: 0,
+        discount: 0,
+        tax: 0,
+        returns: 0,
+        return_fees: round2(Number(row.retained_amount)),
+        net_sales_gift_cards: 0,
+        detector_source,
+        detected_at,
+      });
+      summary.by_type.return_fee += 1;
+      summary.events_inserted += 1;
+    }
+
+    // Rule #12 — per-refund discrepancy nets, ABS, emit on refund's
+    // processed_at, EXCLUDING orders that fired Rule #9 above.
+    // Mirrors legacy's refund_discrepancy_nets CTE + the NOT (Rule #9)
+    // discriminator.
+    const discrepancyRows = sqlite
+      .prepare(`
+        SELECT
+          r.id AS refund_id,
+          r.order_id,
+          COALESCE(r.processed_at, r.created_at) AS event_date,
+          COALESCE(SUM(rli.subtotal), 0) AS discrepancy_net
+        FROM recon_refunds r
+        JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+        WHERE rli.kind = 'adjustment'
+          AND rli.adjustment_kind = 'refund_discrepancy'
+          ${opts.scope === "order" ? "AND r.order_id = ?" : ""}
+        GROUP BY r.id, r.order_id, r.processed_at, r.created_at
+      `)
+      .all(...orderFilterParams) as Array<{
+        refund_id: string;
+        order_id: string;
+        event_date: string | null;
+        discrepancy_net: number;
+      }>;
+
+    for (const row of discrepancyRows) {
+      if (!row.event_date) continue;
+      if (retainedFeeOrderIds.has(row.order_id)) continue; // Rule #9 wins
+      const absNet = Math.abs(Number(row.discrepancy_net));
+      if (!(absNet > 0.005)) continue;
+      insertStmt.run({
+        event_id: `refund_discrepancy:${row.refund_id}`,
+        event_type: "refund",
+        event_date: row.event_date,
+        order_id: row.order_id,
+        line_item_id: null,
+        refund_id: row.refund_id,
+        refund_line_item_id: null,
+        is_gift_card: 0,
+        gross: 0,
+        discount: 0,
+        tax: 0,
+        returns: round2(absNet),
+        return_fees: 0,
+        net_sales_gift_cards: 0,
+        detector_source,
+        detected_at,
+      });
+      summary.by_type.refund += 1;
+      summary.events_inserted += 1;
     }
 
     // 4. UNVERIFIED_RETURN events (PR #95c, addition #3 — Rule #8).
