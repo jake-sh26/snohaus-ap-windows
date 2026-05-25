@@ -3108,11 +3108,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  // PR #86a-fix3 diagnostic. Side-by-side view of one order: local
-  // recon_orders + line-item subtotal aggregate, vs Shopify Admin's
-  // current totals. Built for the edited-to-zero investigation — lets us
-  // verify whether the local line-item rollup reflects the post-edit
-  // state ($0) or still carries the pre-edit lines. Read-only.
+  // PR #86a-fix4 diagnostic. Side-by-side view of one order: local
+  // recon_orders + line-item subtotal aggregate + refund aggregate,
+  // vs Shopify Admin's current totals + refund state. Built for the
+  // edited-to-zero investigation — lets us verify whether the local
+  // line-item rollup reflects the post-edit state ($0), and whether
+  // a refund row already books the negative attribution.
+  //
+  // pattern classifier values:
+  //   refund_via_edit_fully_refunded — total_refunded == original, edit
+  //     just cosmetic; recon_refunds already corrects local books.
+  //   edited_to_zero_no_refund — no refund row; pure write-off; we
+  //     need to book -local_net_subtotal in edit-month.
+  //   edited_to_zero_partial_refund — needs manual review.
+  //   other — not zeroed; normal edit.
+  // Read-only.
   //
   // POST body: { order_id?: string, order_name?: string }   // one or other
   app.post("/api/recon/finance/debug/orders/local-vs-shopify", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
@@ -3143,7 +3153,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       WHERE order_id = ?
     `).get(row.id);
 
-    // Ask Shopify for the live totals.
+    // Local refund rollup (recon_refunds is denormalized by order_id).
+    const refundAgg: any = sqlite.prepare(`
+      SELECT
+        COUNT(*)                              AS refund_count,
+        COALESCE(SUM(subtotal), 0)            AS refund_subtotal_sum,
+        COALESCE(SUM(total_tax), 0)           AS refund_tax_sum,
+        COALESCE(SUM(total_refunded), 0)      AS refund_total_sum,
+        COALESCE(SUM(adjustment_amount), 0)   AS refund_adjustment_sum,
+        MAX(processed_at)                     AS last_processed_at
+      FROM recon_refunds
+      WHERE order_id = ?
+    `).get(row.id);
+
+    // Ask Shopify for the live totals + refund state.
     const probeQuery = `
       query OrderTotalsForDiag($id: ID!) {
         order(id: $id) {
@@ -3151,15 +3174,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           name
           createdAt
           updatedAt
-          originalTotalPriceSet   { shopMoney { amount } }
-          currentTotalPriceSet    { shopMoney { amount } }
-          currentSubtotalPriceSet { shopMoney { amount } }
-          currentTotalTaxSet      { shopMoney { amount } }
-          currentShippingPriceSet { shopMoney { amount } }
+          displayFinancialStatus
+          originalTotalPriceSet     { shopMoney { amount } }
+          currentTotalPriceSet      { shopMoney { amount } }
+          currentSubtotalPriceSet   { shopMoney { amount } }
+          currentTotalTaxSet        { shopMoney { amount } }
+          currentShippingPriceSet   { shopMoney { amount } }
+          totalRefundedSet          { shopMoney { amount } }
+          refunds {
+            id
+            createdAt
+            totalRefundedSet        { shopMoney { amount } }
+          }
         }
       }
     `;
     let shopifyTotals: any = null;
+    let shopifyRefunds: any = null;
     let shopifyError: string | null = null;
     try {
       const r = await shopifyGraphqlCall(cfg, probeQuery, { id: `gid://shopify/Order/${row.id}` });
@@ -3168,22 +3199,53 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const o: any = (r.data as any)?.order;
         const num = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
         shopifyTotals = {
-          original_total_price: num(o?.originalTotalPriceSet),
-          current_total_price:  num(o?.currentTotalPriceSet),
-          current_subtotal:     num(o?.currentSubtotalPriceSet),
-          current_tax:          num(o?.currentTotalTaxSet),
-          current_shipping:     num(o?.currentShippingPriceSet),
+          display_financial_status: o?.displayFinancialStatus ?? null,
+          original_total_price:     num(o?.originalTotalPriceSet),
+          current_total_price:      num(o?.currentTotalPriceSet),
+          current_subtotal:         num(o?.currentSubtotalPriceSet),
+          current_tax:              num(o?.currentTotalTaxSet),
+          current_shipping:         num(o?.currentShippingPriceSet),
+          total_refunded:           num(o?.totalRefundedSet),
+        };
+        const refunds = Array.isArray(o?.refunds) ? o.refunds : [];
+        shopifyRefunds = {
+          count: refunds.length,
+          items: refunds.map((rf: any) => ({
+            id: rf?.id,
+            created_at: rf?.createdAt,
+            total_refunded: num(rf?.totalRefundedSet),
+          })),
         };
       }
     } catch (e: any) {
       shopifyError = String(e?.message || e);
     }
 
+    // Pattern classifier — only meaningful when shopify_totals returned.
+    let pattern: string | null = null;
+    if (shopifyTotals) {
+      const original = shopifyTotals.original_total_price ?? 0;
+      const refunded = shopifyTotals.total_refunded ?? 0;
+      const current  = shopifyTotals.current_total_price ?? 0;
+      const eps = 0.01;
+      if (current === 0 && Math.abs(refunded - original) < eps) {
+        pattern = "refund_via_edit_fully_refunded";       // refund row already books -original
+      } else if (current === 0 && refunded < eps) {
+        pattern = "edited_to_zero_no_refund";              // pure write-off, no refund row
+      } else if (current === 0 && refunded > eps && Math.abs(refunded - original) > eps) {
+        pattern = "edited_to_zero_partial_refund";         // mixed — needs manual review
+      } else {
+        pattern = "other";
+      }
+    }
+
     res.json({
-      build_id: "86a-fix3",
+      build_id: "86a-fix4",
       recon_orders_row: row,
       local_line_aggregate: lineAgg,
+      local_refund_aggregate: refundAgg,
       shopify_totals: shopifyTotals,
+      shopify_refunds: shopifyRefunds,
       shopify_error: shopifyError,
       diagnosis: {
         local_reflects_post_edit:
@@ -3193,6 +3255,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           shopifyTotals?.current_subtotal != null
             ? Math.round(((lineAgg.net_subtotal || 0) - (shopifyTotals.current_subtotal || 0)) * 100) / 100
             : null,
+        local_refund_total_matches_shopify:
+          shopifyTotals?.total_refunded != null
+            ? Math.abs((refundAgg.refund_total_sum || 0) - (shopifyTotals.total_refunded || 0)) < 0.01
+            : null,
+        pattern,
       },
     });
   });
