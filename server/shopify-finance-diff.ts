@@ -80,6 +80,16 @@ export function ensureFinanceDiffSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_recon_shopify_finance_snap_month
       ON recon_shopify_finance_snapshots(month);
   `);
+  // Idempotent column add for return_fees (Shopify's Finance Summary added
+  // "Return fees" as a separate line between Shipping and Taxes — e.g. Apr
+  // 2025 +$10, Mar 2026 +$10). Older deployments don't have the column; this
+  // backfills it on first import after the upgrade.
+  try {
+    sqlite.exec(`ALTER TABLE recon_shopify_finance_snapshots ADD COLUMN return_fees REAL`);
+  } catch (e) {
+    const msg = String((e as any)?.message ?? e);
+    if (!/duplicate column name|already exists/i.test(msg)) throw e;
+  }
 }
 
 // ----- Local rollup compute -----
@@ -97,6 +107,7 @@ export type FinanceSummaryLocal = {
   returns: number;
   net_sales: number;
   shipping: number;
+  return_fees: number;
   taxes: number;
   total_sales: number;
   net_sales_gift_cards: number;
@@ -115,6 +126,8 @@ export type FinanceSummaryLocal = {
     shipping_refunded: number;
     returns_subtotal: number;
     unverified_return_subtotal: number;
+    discrepancy_returns: number;
+    gc_refund_subtotal: number;
   };
 };
 
@@ -483,11 +496,124 @@ export function computeLocalFinanceSummary(
     `)
     .get(monthKey) as { retained_total: number };
 
+  // 6. Rule #11b — gift-card liability symmetry on net_sales_gift_cards.
+  //
+  //    Rule #6 builds net_sales_gift_cards from the SALE side only
+  //    (Σ li.price × li.quantity − line discounts WHERE is_gift_card=1).
+  //    Shopify ALSO nets gift-card REFUNDS out of net_sales_gift_cards in
+  //    its Finance Summary — same way it nets merchandise refunds out of
+  //    Returns. Without this rule, any month with a refund of a
+  //    previously-sold gift card has our net_sales_gift_cards over-stated
+  //    by the refund amount.
+  //
+  //    Bucketing: on refund.processed_at (mirrors Returns bucketing), not
+  //    on the original sale's recognized_at.
+  //
+  //    Detection: refund_line_item.kind='item' AND li.is_gift_card=1 (the
+  //    same join+filter Rule #11 uses to EXCLUDE these from main Returns).
+  //    Rule #11 keeps them out of Returns; Rule #11b nets them out of GC.
+  //
+  //    Validated against Feb 2025 (#20790: $32.59 GC refund, Feb 20):
+  //      pre-fix gc_diff = +$32.59 (ours over)
+  //      post-fix gc_diff = $0.00
+  //    Also predicts Jan 25 +$50, Mar 25 +$488.80, May 25 +$195.54 close.
+  const gcRefundRow = sqlite
+    .prepare(`
+      SELECT COALESCE(SUM(rli.subtotal), 0) AS gc_refund_subtotal
+      FROM recon_refunds r
+      JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+      JOIN recon_line_items li ON li.id = rli.line_item_id
+      WHERE rli.kind = 'item'
+        AND li.is_gift_card = 1
+        AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+    `)
+    .get(monthKey) as { gc_refund_subtotal: number };
+
+  // 7. Rule #12 — pure refund_discrepancy as Return.
+  //
+  //    The remaining unmodeled refund pattern is the "price error" /
+  //    discount-match cash refund: customer keeps the merchandise, but we
+  //    issue a cash refund anyway because we overcharged. Shopify encodes
+  //    this as a refund with:
+  //      • refund_line_items: ONE adjustment line, kind='refund_discrepancy'
+  //      • refund.adjustment_amount = -X  (negative = money leaving us)
+  //      • refund.total_refunded = X      (the cash that moved)
+  //      • refund.subtotal = 0, total_tax = 0  (no item rows)
+  //    Shopify books this in Returns (reduces Net sales by X).
+  //
+  //    Discriminator — Rule #12 fires only on orders where Rule #9 retained-
+  //    fees does NOT fire. The two patterns are mutually exclusive in
+  //    practice:
+  //      • Rule #9 (retained fee) fires iff current_subtotal_price=0 AND
+  //        current_total_tax=0 AND current_total_price>0 — i.e. customer
+  //        returned all merch and we kept the $10 return-shipping fee.
+  //      • Rule #12 (price error) fires when customer KEEPS merch — i.e.
+  //        current_subtotal_price > 0 — and gets a cash discrepancy back.
+  //    So we filter Rule #12 to orders NOT matching Rule #9's discriminator.
+  //
+  //    Using refund.adjustment_amount (the per-refund net) instead of
+  //    SUM(rli.subtotal WHERE adjustment_kind='refund_discrepancy') means
+  //    Shopify's own per-refund pairing nets WITHIN the refund row. The
+  //    #21526 case has refund A with rli=[-24.99, +244.99, -244.99] all
+  //    inside one refund — adjustment_amount nets those to -24.99
+  //    automatically. We don't need to re-derive pair detection here.
+  //
+  //    Why not just use adjustment_amount unconditionally? Because Rule #9
+  //    orders ALSO have a non-zero adjustment_amount per refund (#21526
+  //    refund A: -24.99, refund B: +9.99 = ±$15 net). Booking either as
+  //    a Return would double-count on top of the item lines that ARE
+  //    captured by Rule #11's returns_subtotal.
+  //
+  //    Validated against:
+  //      • Jan 25 #19670 (Oakley discount match, $129.92, kept merch)
+  //          → Rule #9 doesn't fire (current_sub=$333.99) → +$129.92 Return
+  //      • Feb 25 #20368 (Price error, $5.43, kept merch)
+  //          → Rule #9 doesn't fire (current_sub=$89.95) → +$5.43 Return
+  //      • Jun 25 #21876 ($500, kept merch)
+  //          → Rule #9 doesn't fire (current_sub=$3185) → +$500 Return
+  //      • Apr 25 #21526 (real return + retained fee)
+  //          → Rule #9 FIRES (current_sub=0, current_total=$10)
+  //          → Rule #12 skipped, no double-count
+  //
+  //    We use ABS(adjustment_amount) because the sign convention is
+  //    "negative = money leaving us" (which is exactly a Return). Storing
+  //    Returns as positive magnitudes matches our other Returns sources.
+  const discrepancyReturnsRow = sqlite
+    .prepare(`
+      SELECT COALESCE(SUM(ABS(r.adjustment_amount)), 0) AS discrepancy_returns
+      FROM recon_refunds r
+      JOIN recon_orders o ON o.id = r.order_id
+      WHERE r.adjustment_amount IS NOT NULL
+        AND ABS(r.adjustment_amount) > 0.005
+        AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        AND EXISTS (
+          SELECT 1 FROM recon_refund_line_items rli
+           WHERE rli.refund_id = r.id
+             AND rli.kind = 'adjustment'
+             AND rli.adjustment_kind = 'refund_discrepancy'
+        )
+        -- Rule #9 retained-fee discriminator (inverted): fires only when
+        -- the order is NOT a retained-fee scenario. A retained-fee order
+        -- has current_subtotal_price=0 AND current_total_tax=0 AND
+        -- current_total_price>0. We exclude those orders so Rule #9 stays
+        -- the source of truth for retained fees.
+        AND NOT (
+              o.current_total_price IS NOT NULL
+          AND o.current_total_price > 0
+          AND COALESCE(o.current_subtotal_price, 0) = 0
+          AND COALESCE(o.current_total_tax, 0) = 0
+        )
+    `)
+    .get(monthKey) as { discrepancy_returns: number };
+
   // Plug into Shopify's formulas. Returns are stored positive and subtracted
   // in Net sales. Discounts use the non-GC line aggregate (Rule #7a).
   const gross_sales = grossRow.gross;
   const discounts = grossRow.line_discounts_nongc;
-  const returns = refundTotals.returns_subtotal + unverifiedReturns.unverified_return_subtotal;
+  const returns =
+    refundTotals.returns_subtotal
+    + unverifiedReturns.unverified_return_subtotal
+    + discrepancyReturnsRow.discrepancy_returns;  // Rule #12
   const net_sales = gross_sales - discounts - returns;
   const shipping = orderTotals.total_shipping - refundTotals.shipping_refunded;
   // Taxes (Rule #7b): per-line tax + shipping-line tax − refund tax this month.
@@ -495,11 +621,15 @@ export function computeLocalFinanceSummary(
   // can be negative (Shopify writes -$2.15 in current_total_tax), so the
   // subtraction effectively re-adds the customer's reversed tax to refunds.
   const taxes = perLineTax + shippingTax - refundTotals.returns_tax - unverifiedReturns.unverified_return_tax;
-  // Rule #9: retained return-shipping fees hit `total_sales` only (Shopify
-  // does NOT include them in shipping, net_sales, or taxes — verified on
-  // March 2026: shipping/net/tax all matched without fee, total_sales off
-  // by exactly the fee amount).
-  const total_sales = net_sales + shipping + taxes + retainedFees.retained_total;
+  // Rule #9 surfaced as its own line (matches Shopify Finance Summary's
+  // "Return fees" row — Apr 2025 +$10, Mar 2026 +$10). Total_sales math is
+  // unchanged: net + shipping + taxes + return_fees (Shopify adds it to
+  // total_sales but not to net/shipping/taxes individually).
+  const return_fees = retainedFees.retained_total;
+  const total_sales = net_sales + shipping + taxes + return_fees;
+  // Rule #11b — net GC refunds out of net_sales_gift_cards. Bucketed on
+  // refund.processed_at, mirroring main Returns bucketing.
+  const net_sales_gift_cards = grossRow.gc_net_sales - gcRefundRow.gc_refund_subtotal;
 
   const result: FinanceSummaryLocal = {
     month: monthKey,
@@ -508,9 +638,10 @@ export function computeLocalFinanceSummary(
     returns: round2(returns),
     net_sales: round2(net_sales),
     shipping: round2(shipping),
+    return_fees: round2(return_fees),
     taxes: round2(taxes),
     total_sales: round2(total_sales),
-    net_sales_gift_cards: round2(grossRow.gc_net_sales),
+    net_sales_gift_cards: round2(net_sales_gift_cards),
     order_count: grossRow.order_count,
     refund_count: refundTotals.refund_count,
   };
@@ -525,6 +656,8 @@ export function computeLocalFinanceSummary(
       shipping_refunded: round2(refundTotals.shipping_refunded),
       returns_subtotal: round2(refundTotals.returns_subtotal),
       unverified_return_subtotal: round2(unverifiedReturns.unverified_return_subtotal),
+      discrepancy_returns: round2(discrepancyReturnsRow.discrepancy_returns),
+      gc_refund_subtotal: round2(gcRefundRow.gc_refund_subtotal),
     };
   }
   return result;
@@ -545,6 +678,7 @@ export type ShopifySnapshotInput = {
   returns?: number | null;
   net_sales?: number | null;
   shipping?: number | null;
+  return_fees?: number | null;
   taxes?: number | null;
   total_sales?: number | null;
   net_sales_gift_cards?: number | null;
@@ -561,15 +695,16 @@ export function upsertShopifySnapshot(p: ShopifySnapshotInput): void {
     .prepare(`
       INSERT INTO recon_shopify_finance_snapshots
         (month, snapshot_kind, gross_sales, discounts, returns, net_sales,
-         shipping, taxes, total_sales, net_sales_gift_cards,
+         shipping, return_fees, taxes, total_sales, net_sales_gift_cards,
          source_label, raw_input, captured_at, captured_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(month, snapshot_kind) DO UPDATE SET
         gross_sales = excluded.gross_sales,
         discounts   = excluded.discounts,
         returns     = excluded.returns,
         net_sales   = excluded.net_sales,
         shipping    = excluded.shipping,
+        return_fees = excluded.return_fees,
         taxes       = excluded.taxes,
         total_sales = excluded.total_sales,
         net_sales_gift_cards = excluded.net_sales_gift_cards,
@@ -586,6 +721,7 @@ export function upsertShopifySnapshot(p: ShopifySnapshotInput): void {
       p.returns ?? null,
       p.net_sales ?? null,
       p.shipping ?? null,
+      p.return_fees ?? null,
       p.taxes ?? null,
       p.total_sales ?? null,
       p.net_sales_gift_cards ?? null,
@@ -651,12 +787,15 @@ export type FinanceDiffResult = {
   tolerance: number;
 };
 
+// Order matches Shopify Admin's Finance Summary line order (Apr 2025 onward).
+// `return_fees` lives between Shipping and Taxes — same as the Shopify UI.
 const DIFF_FIELDS = [
   "gross_sales",
   "discounts",
   "returns",
   "net_sales",
   "shipping",
+  "return_fees",
   "taxes",
   "total_sales",
   "net_sales_gift_cards",
