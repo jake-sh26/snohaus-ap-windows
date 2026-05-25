@@ -2700,6 +2700,154 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #96 probe (read-only) — pulls Shopify's per-line transaction
+  // ledger via the Order.agreements -> sales GraphQL connection.
+  // This is what powers Shopify's finance reports. Each SalesAgreement
+  // has happenedAt + reason (ORDER, ORDER_EDIT, REFUND, RETURN, etc.);
+  // each Sale within has actionType + lineType + totalAmount and
+  // tax/discount breakdowns. We use this to validate that we can mirror
+  // Shopify's ledger directly instead of synthesizing edit-deltas
+  // ourselves.
+  app.get("/api/recon/finance/debug/orders/by-name/:name/agreements", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const { sqlite } = require("./storage");
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const raw = String(req.params.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash   = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT id, name, order_number, created_at, processed_at, updated_at
+      FROM recon_orders
+      WHERE name = ? OR name = ? OR order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+    const orderGid = `gid://shopify/Order/${row.id}`;
+    const query = `
+      query OrderAgreements($id: ID!) {
+        order(id: $id) {
+          id
+          name
+          createdAt
+          processedAt
+          updatedAt
+          originalTotalPriceSet { shopMoney { amount } }
+          currentTotalPriceSet  { shopMoney { amount } }
+          agreements(first: 50) {
+            edges {
+              node {
+                id
+                happenedAt
+                reason
+                __typename
+                ... on OrderAgreement      { app { handle } }
+                ... on OrderEditAgreement  { app { handle } }
+                ... on RefundAgreement     { app { handle } refund { id processedAt createdAt } }
+                ... on ReturnAgreement     { app { handle } return { id name status } }
+                sales(first: 50) {
+                  edges {
+                    node {
+                      id
+                      __typename
+                      actionType
+                      lineType
+                      quantity
+                      totalAmount         { shopMoney { amount currencyCode } }
+                      totalDiscountAmountAfterTaxes { shopMoney { amount } }
+                      totalDiscountAmountBeforeTaxes { shopMoney { amount } }
+                      totalTaxAmount      { shopMoney { amount } }
+                      ... on ProductSale {
+                        lineItem { id name sku quantity originalUnitPriceSet { shopMoney { amount } } }
+                      }
+                      ... on AdjustmentSale {
+                        lineItem { id name }
+                      }
+                      ... on ShippingLineSale {
+                        lineItem { id title }
+                      }
+                      ... on FeeSale {
+                        lineItem { id name }
+                      }
+                      ... on TipSale {
+                        lineItem { id title }
+                      }
+                    }
+                  }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    `;
+    try {
+      const r = await shopifyGraphqlCall(cfg, query, { id: orderGid });
+      if (r.errors) {
+        return res.status(502).json({ message: "GraphQL errors", errors: r.errors, data: r.data });
+      }
+      const o: any = (r.data as any)?.order;
+      if (!o) return res.status(404).json({ message: "GraphQL order returned null" });
+      const num = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
+      const agreements = (o.agreements?.edges || []).map((ae: any) => {
+        const a = ae.node;
+        const sales = (a.sales?.edges || []).map((se: any) => {
+          const s = se.node;
+          return {
+            id: s.id,
+            type: s.__typename,
+            action_type: s.actionType,
+            line_type: s.lineType,
+            quantity: s.quantity,
+            total_amount: num(s.totalAmount),
+            total_discount_after_taxes: num(s.totalDiscountAmountAfterTaxes),
+            total_discount_before_taxes: num(s.totalDiscountAmountBeforeTaxes),
+            total_tax: num(s.totalTaxAmount),
+            line_item_id: s.lineItem?.id || null,
+            line_item_name: s.lineItem?.name || s.lineItem?.title || null,
+            line_item_sku: s.lineItem?.sku || null,
+          };
+        });
+        return {
+          id: a.id,
+          type: a.__typename,
+          happened_at: a.happenedAt,
+          reason: a.reason,
+          app_handle: a.app?.handle || null,
+          refund_id: a.refund?.id || null,
+          refund_processed_at: a.refund?.processedAt || null,
+          return_id: a.return?.id || null,
+          sales,
+          sales_page_info: a.sales?.pageInfo || null,
+        };
+      });
+      res.json({
+        order_id: row.id,
+        order_name: row.name,
+        our_db: {
+          created_at: row.created_at,
+          processed_at: row.processed_at,
+          updated_at: row.updated_at,
+        },
+        shopify_graphql: {
+          original_total_price: num(o.originalTotalPriceSet),
+          current_total_price:  num(o.currentTotalPriceSet),
+          created_at: o.createdAt,
+          processed_at: o.processedAt,
+          updated_at: o.updatedAt,
+        },
+        agreements,
+        agreements_page_info: o.agreements?.pageInfo || null,
+        note: "PR #96 probe. Each agreement.happenedAt is the date Shopify books the contained sales to. Each sale carries line_item_id + amounts, so we can rebuild the events ledger one-to-one against Shopify's view.",
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "shopifyGraphqlCall failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #85b diagnostic. Batch version of /graphql-totals.
   // POST body: { names: string[] } (with or without leading '#'; max 25)
   // For each order: runs the same GraphQL query, computes the
