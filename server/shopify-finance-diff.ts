@@ -118,19 +118,37 @@ export type FinanceSummaryLocal = {
   };
 };
 
-// `bucketBy` controls how lines are time-bucketed:
-//   - 'line_recognized_at' (default, current behavior): bucket each line on
-//     COALESCE(li.recognized_at, o.processed_at, o.created_at). This handles
-//     deferred fulfillment (e.g. ski boots ordered Oct, picked up Nov) by
-//     recognizing revenue when goods are delivered.
-//   - 'order_processed_at': bucket each line on COALESCE(o.processed_at,
-//     o.created_at). This matches Shopify's Finance Summary, which books
-//     gross/discount/tax on the date the order was placed regardless of
-//     fulfillment timing. Per Shopify Help docs: "Sales display in your sales
-//     reports as a positive value for the day that they were made."
+// `bucketBy` controls how lines are time-bucketed for the SALE side
+// (gross, line_tax). Returns are ALWAYS bucketed on refund.processed_at
+// (matches Shopify exactly).
+//
+// Per Shopify Help docs (Total Sales Reports), verbatim:
+//   "Sales display in your sales reports as a positive value for the day
+//    that they were made, and reversals display as a negative value for
+//    the day that they were processed."
+//
+// Options:
+//   - 'line_recognized_at' (current default): bucket each line on
+//     COALESCE(li.recognized_at, o.processed_at, o.created_at). GAAP-correct
+//     deferred revenue recognition (line recognized when fulfilled). Reused
+//     by Phase 2 for QBO JE posting. DOES NOT MATCH Shopify Finance Summary.
+//   - 'order_processed_at': bucket on COALESCE(o.processed_at, o.created_at).
+//     Matches "the day money moved."
+//   - 'order_created_at': bucket on o.created_at exactly. Matches Shopify
+//     Help docs verbatim — "the day the order was placed."
+//
+// `discountBucketBy` and `unverifiedBucketBy` control the OTHER sale-side
+// buckets independently so we can test which knob actually closes Oct/Nov.
+// Defaults preserve current behavior exactly.
 export function computeLocalFinanceSummary(
   monthKey: string,
-  opts?: { includeComponents?: boolean; bucketBy?: 'line_recognized_at' | 'order_processed_at' },
+  opts?: {
+    includeComponents?: boolean;
+    bucketBy?: 'line_recognized_at' | 'order_processed_at' | 'order_created_at';
+    discountBucketBy?: 'order_processed_at' | 'order_created_at';
+    shippingBucketBy?: 'order_processed_at' | 'order_created_at';
+    unverifiedBucketBy?: 'order_processed_at' | 'order_created_at';
+  },
 ): FinanceSummaryLocal {
   ensureSchemaOnce();
   // Match Shopify's store-local month bucketing. SQLite stores ISO UTC; we
@@ -181,10 +199,19 @@ export function computeLocalFinanceSummary(
   // (deferred fulfillment recognition). 'order_processed_at' matches Shopify
   // Finance Summary's behavior.
   const bucketBy = opts?.bucketBy ?? 'line_recognized_at';
+  const discountBucketBy = opts?.discountBucketBy ?? 'order_processed_at';
+  const shippingBucketBy = opts?.shippingBucketBy ?? 'order_processed_at';
+  const unverifiedBucketBy = opts?.unverifiedBucketBy ?? 'order_processed_at';
   const grossBucketExpr =
-    bucketBy === 'order_processed_at'
+    bucketBy === 'order_created_at'
+      ? `o.created_at`
+      : bucketBy === 'order_processed_at'
       ? `COALESCE(o.processed_at, o.created_at)`
       : `COALESCE(li.recognized_at, o.processed_at, o.created_at)`;
+  const orderDateExprFor = (mode: 'order_processed_at' | 'order_created_at') =>
+    mode === 'order_created_at' ? `o.created_at` : `COALESCE(o.processed_at, o.created_at)`;
+  const shippingBucketExpr = orderDateExprFor(shippingBucketBy);
+  const unverifiedBucketExpr = orderDateExprFor(unverifiedBucketBy);
   const grossRow = sqlite
     .prepare(`
       SELECT
@@ -248,7 +275,7 @@ export function computeLocalFinanceSummary(
     .prepare(`
       SELECT o.total_shipping, o.raw_json
       FROM recon_orders o
-      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+      WHERE substr(datetime(${shippingBucketExpr}, '-5 hours'), 1, 7) = ?
     `)
     .all(monthKey) as { total_shipping: number | null; raw_json: string | null }[];
   let totalShipping = 0;
@@ -374,7 +401,7 @@ export function computeLocalFinanceSummary(
                THEN (o.total_tax - o.current_total_tax)
                ELSE 0 END), 0) AS unverified_return_tax
       FROM recon_orders o
-      WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+      WHERE substr(datetime(${unverifiedBucketExpr}, '-5 hours'), 1, 7) = ?
         AND NOT EXISTS (SELECT 1 FROM recon_refunds r WHERE r.order_id = o.id)
     `)
     .get(monthKey) as {
