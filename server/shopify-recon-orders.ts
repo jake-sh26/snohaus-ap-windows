@@ -131,13 +131,65 @@ export function transformShopifyOrder(o: any): {
         if (!pairedRefund) continue;
         const refundId = String(pairedRefund.id);
         const fLineItems = Array.isArray(f.line_items) ? f.line_items : [];
+        // R5a-fix2 (line-ID monotonicity guard):
+        // A fulfillment created after a refund only contains EXCHANGE
+        // REPLACEMENTS if its line IDs are HIGHER than the highest refunded
+        // line ID. Shopify line item IDs are monotonically increasing within
+        // an order (snowflake-style), so any line whose ID is <= the highest
+        // refunded line ID existed on the ORIGINAL order — it's an original
+        // line being legitimately late-fulfilled (patio preorder shipped
+        // months later, layaway paid off in a future month, etc.), NOT an
+        // exchange replacement.
+        //
+        // Without this guard, order #21862 (June 2025 patio order with a
+        // June 7 chair exchange AND an October 4 fulfillment of the original
+        // Dash Top + Delivery lines) incorrectly bucketed $2,894 + $150 of
+        // June revenue into October. The guard preserves correct
+        // cross-month exchange accounting (new lines added in a later month
+        // still get higher IDs than the returned originals) while preventing
+        // misattribution of legitimately-delayed original-order fulfillments.
+        // We compare via BigInt() calls (not literal syntax) so this works
+        // under the project's current TS target without needing ES2020.
+        const ZERO = BigInt("0");
+        const refundedLineItemIds = Array.isArray(pairedRefund.refund_line_items)
+          ? pairedRefund.refund_line_items.map((rli: any) => {
+              try { return BigInt(String(rli?.line_item_id ?? "0")); }
+              catch { return ZERO; }
+            })
+          : [];
+        const maxRefundedLineId = refundedLineItemIds.length > 0
+          ? refundedLineItemIds.reduce((a: bigint, b: bigint) => a > b ? a : b, ZERO)
+          : ZERO;
         for (const fli of fLineItems) {
           const liId = fli?.id != null ? String(fli.id) : null;
           if (!liId) continue;
+          // Skip lines that pre-date the refund — they are original-order
+          // lines, not exchange replacements.
+          let liIdBig: bigint;
+          try { liIdBig = BigInt(liId); }
+          catch { continue; }
+          if (maxRefundedLineId > ZERO && liIdBig <= maxRefundedLineId) continue;
+          // R5a-fix3 (refund-date recognition):
+          // Recognize the exchange replacement on the REFUND DATE (the day the
+          // exchange transaction actually happened), NOT the fulfillment date.
+          // Per the matching principle: an exchange on June 7 swapping $X of
+          // returned items for $Y of replacements creates a $Y-$X delta on
+          // June 7. Whether the new items physically ship on June 8 or
+          // October 4 is irrelevant to revenue/COGS recognition.
+          //
+          // We prefer refund.processed_at; fall back to refund.created_at;
+          // finally fall back to the fulfillment date if neither is present
+          // (defensive — these refund fields are reliably populated by Shopify).
+          const refundRecognizedAt = String(
+            pairedRefund.processed_at
+            ?? pairedRefund.created_at
+            ?? fCreatedAt
+            ?? ""
+          );
           // First write wins — if a line item somehow appears in multiple
           // exchange fulfillments, the earliest exchange owns it.
           if (!exchangeLineMap.has(liId)) {
-            exchangeLineMap.set(liId, { recognized_at: fCreatedAt, refund_id: refundId });
+            exchangeLineMap.set(liId, { recognized_at: refundRecognizedAt, refund_id: refundId });
           }
         }
       }
