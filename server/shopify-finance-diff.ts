@@ -551,12 +551,19 @@ export function computeLocalFinanceSummary(
   //        current_subtotal_price > 0 — and gets a cash discrepancy back.
   //    So we filter Rule #12 to orders NOT matching Rule #9's discriminator.
   //
-  //    Using refund.adjustment_amount (the per-refund net) instead of
-  //    SUM(rli.subtotal WHERE adjustment_kind='refund_discrepancy') means
-  //    Shopify's own per-refund pairing nets WITHIN the refund row. The
-  //    #21526 case has refund A with rli=[-24.99, +244.99, -244.99] all
-  //    inside one refund — adjustment_amount nets those to -24.99
-  //    automatically. We don't need to re-derive pair detection here.
+  //    PR #81 fix — sum refund_discrepancy LINE subtotals, not
+  //    refund.adjustment_amount. Pre-#81 we summed r.adjustment_amount, which
+  //    is Shopify's per-refund net across ALL adjustment kinds. That includes
+  //    shipping_refund adjustments, which leaked into Returns:
+  //      Feb 25 #20786 — refund_discrepancy pair (+244 / -244) nets to 0,
+  //        BUT the same refund has shipping_refund=-14.99, so
+  //        r.adjustment_amount = -14.99 — and Rule #12 booked $14.99 as
+  //        a Return when it shouldn't have.
+  //
+  //    Fix: sum SUM(rli.subtotal) WHERE rli.adjustment_kind='refund_discrepancy'
+  //    per refund (one subquery per refund), then ABS that per-refund net.
+  //    This automatically handles the #21526 inside-one-refund
+  //    [+244.99, -244.99] cancellation, AND ignores shipping_refund leakage.
   //
   //    Why not just use adjustment_amount unconditionally? Because Rule #9
   //    orders ALSO have a non-zero adjustment_amount per refund (#21526
@@ -569,29 +576,31 @@ export function computeLocalFinanceSummary(
   //          → Rule #9 doesn't fire (current_sub=$333.99) → +$129.92 Return
   //      • Feb 25 #20368 (Price error, $5.43, kept merch)
   //          → Rule #9 doesn't fire (current_sub=$89.95) → +$5.43 Return
+  //      • Feb 25 #20786 (PR #81 — shipping_refund leak)
+  //          → refund_discrepancy lines net to 0 → SKIP (no leak)
   //      • Jun 25 #21876 ($500, kept merch)
   //          → Rule #9 doesn't fire (current_sub=$3185) → +$500 Return
   //      • Apr 25 #21526 (real return + retained fee)
   //          → Rule #9 FIRES (current_sub=0, current_total=$10)
   //          → Rule #12 skipped, no double-count
-  //
-  //    We use ABS(adjustment_amount) because the sign convention is
-  //    "negative = money leaving us" (which is exactly a Return). Storing
-  //    Returns as positive magnitudes matches our other Returns sources.
   const discrepancyReturnsRow = sqlite
     .prepare(`
-      SELECT COALESCE(SUM(ABS(r.adjustment_amount)), 0) AS discrepancy_returns
-      FROM recon_refunds r
-      JOIN recon_orders o ON o.id = r.order_id
-      WHERE r.adjustment_amount IS NOT NULL
-        AND ABS(r.adjustment_amount) > 0.005
-        AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
-        AND EXISTS (
-          SELECT 1 FROM recon_refund_line_items rli
-           WHERE rli.refund_id = r.id
-             AND rli.kind = 'adjustment'
-             AND rli.adjustment_kind = 'refund_discrepancy'
-        )
+      WITH refund_discrepancy_nets AS (
+        SELECT
+          r.id AS refund_id,
+          r.order_id,
+          COALESCE(SUM(rli.subtotal), 0) AS discrepancy_net
+        FROM recon_refunds r
+        JOIN recon_refund_line_items rli ON rli.refund_id = r.id
+        WHERE rli.kind = 'adjustment'
+          AND rli.adjustment_kind = 'refund_discrepancy'
+          AND substr(datetime(COALESCE(r.processed_at, r.created_at), '-5 hours'), 1, 7) = ?
+        GROUP BY r.id, r.order_id
+      )
+      SELECT COALESCE(SUM(ABS(rdn.discrepancy_net)), 0) AS discrepancy_returns
+      FROM refund_discrepancy_nets rdn
+      JOIN recon_orders o ON o.id = rdn.order_id
+      WHERE ABS(rdn.discrepancy_net) > 0.005
         -- Rule #9 retained-fee discriminator (inverted): fires only when
         -- the order is NOT a retained-fee scenario. A retained-fee order
         -- has current_subtotal_price=0 AND current_total_tax=0 AND
