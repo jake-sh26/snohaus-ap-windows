@@ -2964,6 +2964,156 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #86a — populate recon_order_edits ledger.
+  //
+  // DATA-LAYER ONLY. This endpoint reads from Shopify and writes to the new
+  // recon_order_edits table. It DOES NOT touch the reconciler math —
+  // computeLocalFinanceSummary() ignores the table for now. The attribution
+  // change ships in PR #86b after we visually verify the rows here match
+  // the 9 true edits enumerated via PR #88 (only #21840 and #22338 should
+  // affect cross-month buckets).
+  //
+  // Strategy: page through the Shopify Admin GraphQL orders connection by
+  // updatedAt (same query as PR #88), filter to orders whose original total
+  // != current total, then per matching order call detectOrderEdit() which
+  // runs the single-order query that DOES include the events sub-selection
+  // (works at single-order scope; only fails at the connection level — see
+  // PR #88 commit note). For each detection we upsert into recon_order_edits.
+  //
+  // Body: {
+  //   updated_at_min?: string   // ISO; default "2024-01-01T00:00:00Z"
+  //   updated_at_max?: string   // ISO; default now
+  //   page_size?: number        // default 50, max 100
+  //   cursor?: string           // GraphQL endCursor from previous page
+  //   dry_run?: boolean         // when true, returns detections but does
+  //                             // NOT write to the table. Default false.
+  // }
+  //
+  // Returns: { scanned_count, edited_count, written_count, results: [...],
+  //            page_info: {has_next_page, end_cursor}, ledger_total }
+  //
+  // Read-only impact on the reconciler. payroll.view permission.
+  app.post("/api/recon/finance/debug/orders/populate-edits", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+
+    const { sqlite } = require("./storage");
+    const {
+      detectOrderEdit,
+      upsertOrderEdit,
+      ensureOrderEditsSchema,
+    } = require("./shopify-recon-order-edits");
+    ensureOrderEditsSchema();
+
+    const updatedMin = String(req.body?.updated_at_min || "2024-01-01T00:00:00Z");
+    const updatedMax = String(req.body?.updated_at_max || new Date().toISOString());
+    const pageSize = Math.min(Math.max(Number(req.body?.page_size) || 50, 1), 100);
+    const cursor: string | null = req.body?.cursor || null;
+    const dryRun: boolean = req.body?.dry_run === true;
+
+    // First pass: enumerate candidates via the connection-level query.
+    // Same query and detection rule as PR #88 — original_total_price !=
+    // current_total_price. We intentionally do NOT filter by event verb
+    // here because the nested events sub-selection is unreliable at the
+    // connection level (PR #85d finding).
+    const pageQuery = `
+      query EditedOrdersPage($first: Int!, $after: String, $q: String!) {
+        orders(first: $first, after: $after, query: $q, sortKey: UPDATED_AT) {
+          pageInfo { hasNextPage endCursor }
+          edges {
+            node {
+              id
+              originalTotalPriceSet  { shopMoney { amount } }
+              currentTotalPriceSet   { shopMoney { amount } }
+            }
+          }
+        }
+      }
+    `;
+    const qStr = `updated_at:>='${updatedMin}' AND updated_at:<='${updatedMax}'`;
+
+    try {
+      const r = await shopifyGraphqlCall(cfg, pageQuery, {
+        first: pageSize,
+        after: cursor,
+        q: qStr,
+      });
+      if (r.errors) {
+        return res.status(502).json({ message: "GraphQL errors", errors: r.errors });
+      }
+      const conn: any = (r.data as any)?.orders;
+      if (!conn) return res.status(502).json({ message: "GraphQL orders connection null" });
+
+      const edges: any[] = conn.edges || [];
+      const numAmt = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
+
+      // Build the candidate list — orders whose total moved.
+      const candidateOrderIds: string[] = [];
+      for (const e of edges) {
+        const o = e.node;
+        const orig = numAmt(o.originalTotalPriceSet);
+        const curr = numAmt(o.currentTotalPriceSet);
+        if (orig == null || curr == null) continue;
+        if (Math.abs(orig - curr) < 0.01) continue;
+        candidateOrderIds.push(String(o.id).replace("gid://shopify/Order/", ""));
+      }
+
+      // Second pass: per-candidate single-order GraphQL via detectOrderEdit().
+      // This is the query that DOES include events — it works because we
+      // ask for one order at a time. The per-order call cost is cheap
+      // (~1 cost unit each); doing it serially keeps us under any burst
+      // limits even on a 100-candidate page.
+      const results: any[] = [];
+      let writtenCount = 0;
+      for (const orderId of candidateOrderIds) {
+        try {
+          const detection = await detectOrderEdit(cfg, orderId);
+          if (!detection) {
+            results.push({ order_id: orderId, skipped: "no edit detected" });
+            continue;
+          }
+          if (!dryRun) {
+            upsertOrderEdit(detection, "populate-edits-endpoint");
+            writtenCount++;
+          }
+          results.push(detection);
+        } catch (err: any) {
+          results.push({ order_id: orderId, error: String(err?.message || err) });
+        }
+      }
+
+      const ledgerTotal: number = (sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM recon_order_edits`)
+        .get() as any)?.n ?? 0;
+
+      res.json({
+        scanned_count: edges.length,
+        candidate_count: candidateOrderIds.length,
+        written_count: writtenCount,
+        dry_run: dryRun,
+        results,
+        page_info: {
+          has_next_page: conn.pageInfo?.hasNextPage || false,
+          end_cursor: conn.pageInfo?.endCursor || null,
+        },
+        ledger_total: ledgerTotal,
+        query_args: { updated_at_min: updatedMin, updated_at_max: updatedMax, page_size: pageSize, cursor, dry_run: dryRun },
+        note: "PR #86a: data layer only. Rows written to recon_order_edits do NOT affect the reconciler — computeLocalFinanceSummary() ignores the table until PR #86b. Run with dry_run=true first to preview detections.",
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "populate-edits failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #86a — read-only listing of recon_order_edits for operator inspection.
+  // GET so it's easy to spot-check from the browser.
+  app.get("/api/recon/finance/debug/orders/list-edits", authMiddleware, requirePermission("payroll.view"), async (_req: any, res) => {
+    const { ensureOrderEditsSchema, listAllOrderEdits } = require("./shopify-recon-order-edits");
+    ensureOrderEditsSchema();
+    const rows = listAllOrderEdits();
+    res.json({ count: rows.length, rows });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
