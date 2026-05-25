@@ -2390,6 +2390,78 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // PR #82 diagnostic — Bug 3 blast radius. Lists every order where the
+  // closed_at month (NY local) differs from the recognized month
+  // (COALESCE(processed_at, created_at) -5h), with the dollars at stake.
+  // Rationale: Shopify's Net Sales by Order CSV attributes discount/balance
+  // to the close month for partially-paid orders that finalize later.
+  // Our reconciler books everything in the created_at month, producing the
+  // cross-boundary mirror seen in May/Jun and Oct/Nov. This endpoint quantifies
+  // how many orders/dollars are affected across the entire history before we
+  // decide on an attribution fix.
+  //
+  // Read-only. Returns: per-month buckets keyed by close_month, with the
+  // sum of total_discounts moving (the most common delta), plus a flat list
+  // of every cross-month order.
+  app.get("/api/recon/finance/debug/cross-month-close", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const { sqlite } = require("./storage");
+    const rows: any[] = sqlite.prepare(`
+      SELECT
+        o.id, o.name, o.order_number,
+        o.created_at, o.processed_at, o.closed_at, o.updated_at,
+        o.financial_status, o.fulfillment_status, o.source_name,
+        o.total_price, o.subtotal, o.total_discounts, o.total_tax, o.total_shipping, o.total_refunded,
+        substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS recognized_month,
+        substr(datetime(o.closed_at, '-5 hours'), 1, 7) AS close_month
+      FROM recon_orders o
+      WHERE o.closed_at IS NOT NULL
+        AND substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7)
+            != substr(datetime(o.closed_at, '-5 hours'), 1, 7)
+      ORDER BY o.closed_at
+    `).all();
+
+    // Bucket by (recognized_month -> close_month) pair so we can see the
+    // mirror clearly: each pair will produce a +X in close_month, -X in
+    // recognized_month if we shift attribution.
+    const byPair = new Map<string, any>();
+    let total_discount_at_stake = 0;
+    let total_gross_at_stake = 0;
+    for (const r of rows) {
+      const key = `${r.recognized_month} -> ${r.close_month}`;
+      const disc = Number(r.total_discounts || 0);
+      const gross = Number(r.subtotal || 0);
+      total_discount_at_stake += disc;
+      total_gross_at_stake += gross;
+      if (!byPair.has(key)) byPair.set(key, {
+        recognized_month: r.recognized_month,
+        close_month: r.close_month,
+        order_count: 0,
+        sum_total_discounts: 0,
+        sum_subtotal: 0,
+        sum_total_price: 0,
+        sample_orders: [] as string[],
+      });
+      const b = byPair.get(key);
+      b.order_count += 1;
+      b.sum_total_discounts = +(b.sum_total_discounts + disc).toFixed(2);
+      b.sum_subtotal = +(b.sum_subtotal + gross).toFixed(2);
+      b.sum_total_price = +(b.sum_total_price + Number(r.total_price || 0)).toFixed(2);
+      if (b.sample_orders.length < 5) b.sample_orders.push(r.name);
+    }
+
+    const pairs = Array.from(byPair.values()).sort((a: any, b: any) =>
+      Math.abs(b.sum_total_discounts) - Math.abs(a.sum_total_discounts));
+
+    res.json({
+      total_cross_month_orders: rows.length,
+      total_discount_at_stake: +total_discount_at_stake.toFixed(2),
+      total_gross_at_stake: +total_gross_at_stake.toFixed(2),
+      pairs,
+      orders: rows,
+      note: "All orders whose recognized_month (COALESCE(processed_at,created_at) -5h) differs from close_month (closed_at -5h). If we shift attribution to close_month, each pair represents -disc/+disc mirror between the two months. Compare against Bug-3 known months (2025-05/06, 2025-10/11) and any additional months not yet caught by the reconciler.",
+    });
+  });
+
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
   // through the (now broadened) exchange detection logic in
   // shopify-recon-orders.ts and rewrites recon_line_items including
