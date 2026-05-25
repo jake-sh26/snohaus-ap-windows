@@ -3098,6 +3098,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         ledger_total: ledgerTotal,
         query_args: { updated_at_min: updatedMin, updated_at_max: updatedMax, page_size: pageSize, cursor, dry_run: dryRun },
+        // PR #86a-fix2: build sentinel so we can confirm which code is live.
+        // Bump whenever detector logic changes so dry-run output is unambiguous.
+        build_id: "86a-fix2",
         note: "PR #86a: data layer only. Rows written to recon_order_edits do NOT affect the reconciler — computeLocalFinanceSummary() ignores the table until PR #86b. Run with dry_run=true first to preview detections.",
       });
     } catch (e: any) {
@@ -3111,7 +3114,68 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const { ensureOrderEditsSchema, listAllOrderEdits } = require("./shopify-recon-order-edits");
     ensureOrderEditsSchema();
     const rows = listAllOrderEdits();
-    res.json({ count: rows.length, rows });
+    res.json({ count: rows.length, rows, build_id: "86a-fix2" });
+  });
+
+  // PR #86a-fix2 diagnostic. Calls the SAME query that detectOrderEdit() runs
+  // for a single order, then returns the raw events.edges + the detector
+  // decision. Lets us verify whether the events sub-selection is actually
+  // returning edges in the deployed environment, vs the detector returning
+  // null for some other reason. Read-only.
+  //
+  // POST body: { order_id: string }   // numeric Shopify order id
+  app.post("/api/recon/finance/debug/orders/probe-edit-detector", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    const cfg = getShopifyReconConfig();
+    if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+    const orderId = String(req.body?.order_id || "").trim();
+    if (!orderId) return res.status(400).json({ message: "body.order_id required" });
+
+    const probeQuery = `
+      query ProbeOrderForDetect($id: ID!) {
+        order(id: $id) {
+          id
+          name
+          createdAt
+          originalTotalPriceSet     { shopMoney { amount } }
+          currentTotalPriceSet      { shopMoney { amount } }
+          events(first: 10, query: "verb:edited OR action:order_edited", sortKey: CREATED_AT, reverse: true) {
+            edges { node { id createdAt message } }
+          }
+        }
+      }
+    `;
+    try {
+      const r = await shopifyGraphqlCall(cfg, probeQuery, { id: `gid://shopify/Order/${orderId}` });
+      const o: any = (r.data as any)?.order;
+      const editEdges: any[] = (o?.events?.edges || []) as any[];
+
+      // Also call the actual detector so we can compare what it returns.
+      const { detectOrderEdit } = require("./shopify-recon-order-edits");
+      let detector_result: any = null;
+      let detector_error: string | null = null;
+      try {
+        detector_result = await detectOrderEdit(cfg, orderId);
+      } catch (err: any) {
+        detector_error = String(err?.message || err);
+      }
+
+      res.json({
+        build_id: "86a-fix2",
+        order_id: orderId,
+        raw_graphql: {
+          errors: r.errors || null,
+          order_name: o?.name || null,
+          original_total_price: o?.originalTotalPriceSet?.shopMoney?.amount ?? null,
+          current_total_price:  o?.currentTotalPriceSet?.shopMoney?.amount ?? null,
+          events_edges_count: editEdges.length,
+          events_edges: editEdges,
+        },
+        detector_result,
+        detector_error,
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "probe failed", error: String(e?.message || e), build_id: "86a-fix2" });
+    }
   });
 
   // R5a-fix1 one-shot backfill. Re-transforms every recon_orders.raw_json
