@@ -3554,6 +3554,197 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ===================================================================
+  // PR #104 — Per-order diagnose endpoint
+  // ===================================================================
+  // GET /api/recon/finance/debug/diagnose-order/:name
+  // Single-call investigation for one Shopify order. Returns everything
+  // needed to figure out why an order is over/under-booked:
+  //   - Shopify live truth (currentTotalPriceSet etc. + refunds)
+  //   - Legacy projector view (recon_revenue_events rows)
+  //   - V2 shadow view (recon_shopify_agreements + recon_shopify_sales
+  //     + recon_revenue_events_v2 rows)
+  //   - recon_orders row (lifecycle / refund_variance_flag / etc.)
+  //
+  // Designed as the standard tool when month totals show a gap: run
+  // /shopify-ground-truth/:month, pick the worst order, run this. No
+  // need for a separate DevTools script per drill-down.
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/diagnose-order/:name", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const raw = String(req.params.name || "").trim();
+      if (!raw) return res.status(400).json({ message: "name required" });
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+
+      // Find the order in our DB
+      const orderRow: any = sqlite.prepare(`
+        SELECT id, name, created_at, updated_at, processed_at, cancelled_at,
+               financial_status, fulfillment_status,
+               subtotal, total_tax, total_discounts, total_price,
+               current_total_price, total_refunded
+        FROM recon_orders
+        WHERE name = ? OR name = ?
+        LIMIT 1
+      `).get(withHash, noHash);
+      if (!orderRow) {
+        return res.status(404).json({ message: `Order ${withHash} not found in recon_orders` });
+      }
+      const orderId = orderRow.id;
+
+      // Legacy projector events
+      const legacyEvents: any[] = sqlite.prepare(`
+        SELECT event_id, event_date, event_month, event_type,
+               gross, discount, returns, tax, return_fees, net_sales_gift_cards,
+               detector_source, detected_at, line_item_id, refund_id
+        FROM recon_revenue_events
+        WHERE order_id = ?
+        ORDER BY event_date ASC, event_id ASC
+      `).all(orderId);
+
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      const sumCol = (rows: any[], col: string) =>
+        round2(rows.reduce((s, r) => s + Number(r[col] || 0), 0));
+      const legacyTotals = {
+        event_count: legacyEvents.length,
+        gross: sumCol(legacyEvents, "gross"),
+        discount: sumCol(legacyEvents, "discount"),
+        returns: sumCol(legacyEvents, "returns"),
+        tax: sumCol(legacyEvents, "tax"),
+        return_fees: sumCol(legacyEvents, "return_fees"),
+        net_sales_gift_cards: sumCol(legacyEvents, "net_sales_gift_cards"),
+      };
+
+      // V2 shadow: agreements + sales + v2 events
+      let v2Block: any = { available: false };
+      try {
+        const { ensureRevenueEventsV2Schema } = require("./shopify-recon-events-projector-v2");
+        ensureRevenueEventsV2Schema();
+
+        const agreements: any[] = sqlite.prepare(`
+          SELECT id, happened_at, reason, agreement_type, app_handle,
+                 refund_id, return_id, ingest_version
+          FROM recon_shopify_agreements
+          WHERE order_id = ?
+          ORDER BY happened_at ASC
+        `).all(orderId);
+
+        const sales: any[] = sqlite.prepare(`
+          SELECT id, agreement_id, happened_at, sale_type, action_type,
+                 line_type, quantity,
+                 total_amount, total_discount_after_taxes,
+                 total_discount_before_taxes, total_tax,
+                 ref_id, ref_name, ref_sku
+          FROM recon_shopify_sales
+          WHERE order_id = ?
+          ORDER BY happened_at ASC, id ASC
+        `).all(orderId);
+
+        const v2Events: any[] = sqlite.prepare(`
+          SELECT event_id, event_date, event_month, event_type,
+                 gross, discount, returns, tax, return_fees, net_sales_gift_cards,
+                 sale_id, agreement_id, detector_source
+          FROM recon_revenue_events_v2
+          WHERE order_id = ?
+          ORDER BY event_date ASC, event_id ASC
+        `).all(orderId);
+
+        v2Block = {
+          available: true,
+          agreement_count: agreements.length,
+          sales_count: sales.length,
+          event_count: v2Events.length,
+          agreements,
+          sales,
+          events: v2Events,
+          sales_totals: {
+            total_amount: sumCol(sales, "total_amount"),
+            total_tax: sumCol(sales, "total_tax"),
+            total_discount_after_taxes: sumCol(sales, "total_discount_after_taxes"),
+            total_discount_before_taxes: sumCol(sales, "total_discount_before_taxes"),
+          },
+          event_totals: {
+            gross: sumCol(v2Events, "gross"),
+            discount: sumCol(v2Events, "discount"),
+            returns: sumCol(v2Events, "returns"),
+            tax: sumCol(v2Events, "tax"),
+            return_fees: sumCol(v2Events, "return_fees"),
+            net_sales_gift_cards: sumCol(v2Events, "net_sales_gift_cards"),
+          },
+        };
+      } catch (e: any) {
+        v2Block = { available: false, error: String(e?.message || e) };
+      }
+
+      // Optionally: live Shopify GraphQL look-up for this order (current totals)
+      let shopifyLive: any = { available: false };
+      try {
+        const cfg = getShopifyReconConfig();
+        if (cfg) {
+          const { shopifyGraphqlCall } = require("./shopify-recon");
+          const Q = `
+            query DiagOrder($id: ID!) {
+              order(id: $id) {
+                id name createdAt cancelledAt displayFinancialStatus
+                currentTotalPriceSet     { shopMoney { amount } }
+                currentSubtotalPriceSet  { shopMoney { amount } }
+                currentTotalTaxSet       { shopMoney { amount } }
+                currentTotalDiscountsSet { shopMoney { amount } }
+                totalRefundedSet         { shopMoney { amount } }
+                subtotalPriceSet         { shopMoney { amount } }
+                totalPriceSet            { shopMoney { amount } }
+                totalTaxSet              { shopMoney { amount } }
+                totalDiscountsSet        { shopMoney { amount } }
+              }
+            }`;
+          const gid = `gid://shopify/Order/${orderId}`;
+          const r: any = await shopifyGraphqlCall(cfg, Q, { id: gid });
+          if (r.data?.order) {
+            const num = (x: any) => round2(Number(x?.shopMoney?.amount || 0));
+            const o = r.data.order;
+            shopifyLive = {
+              available: true,
+              name: o.name,
+              financial_status: o.displayFinancialStatus,
+              cancelled_at: o.cancelledAt,
+              current_total: num(o.currentTotalPriceSet),
+              current_subtotal: num(o.currentSubtotalPriceSet),
+              current_tax: num(o.currentTotalTaxSet),
+              current_discounts: num(o.currentTotalDiscountsSet),
+              total_refunded: num(o.totalRefundedSet),
+              original_total: num(o.totalPriceSet),
+              original_subtotal: num(o.subtotalPriceSet),
+              original_tax: num(o.totalTaxSet),
+              original_discounts: num(o.totalDiscountsSet),
+            };
+          } else if (r.errors) {
+            shopifyLive = { available: false, errors: r.errors };
+          }
+        }
+      } catch (e: any) {
+        shopifyLive = { available: false, error: String(e?.message || e) };
+      }
+
+      res.json({
+        build_id: "pr104-diagnose-order",
+        order: orderRow,
+        shopify_live: shopifyLive,
+        legacy_projector: {
+          source_of_truth: true,
+          totals: legacyTotals,
+          events: legacyEvents,
+        },
+        v2_shadow: {
+          source_of_truth: false,
+          ...v2Block,
+        },
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "diagnose-order failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #85b diagnostic. Batch version of /graphql-totals.
   // POST body: { names: string[] } (with or without leading '#'; max 25)
   // For each order: runs the same GraphQL query, computes the

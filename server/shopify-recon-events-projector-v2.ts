@@ -235,14 +235,50 @@ function logWarning(
 // ---------------------------------------------------------------------------
 
 /**
- * Is the V2 projector the primary projector right now?
- * Read at projector call sites (and the compare endpoint) to decide which
- * table the read code should hit.
+ * PR #104 status:
+ *
+ *   The V2 projector is DIAGNOSTIC-ONLY. The legacy projector
+ *   (recon_revenue_events) remains the source of truth for the books.
+ *
+ *   Why: PR #102 ground-truth validation (PR #103 endpoint) found that
+ *   the V2 pipeline as of 8c15bb2 has known unresolved issues:
+ *     - Ingest layer drops orders that have ReturnAgreement edges
+ *       (~1,778 of 19,175 / ~9% missing entirely; 6 of 77 April 2025
+ *       orders missing $33,316 of gross)
+ *     - Projector layer inflates gross by ~$14,700 in April 2025
+ *       (V2 gross $87,488 vs Shopify subtotal $97,693, but V2 > ingest
+ *       total_amount $72,781 — i.e. projector double-counts something)
+ *     - return_fees comes out $0 across all months (real value ~$10+)
+ *     - returns comes out near $0 (legacy correctly books $26,947 in
+ *       April 2025)
+ *
+ *   The V2 tables (recon_shopify_agreements, recon_shopify_sales,
+ *   recon_revenue_events_v2) remain populated and are useful as a
+ *   shadow ledger for ad-hoc per-order investigation via:
+ *     - GET /api/recon/finance/debug/shopify-ground-truth/:month
+ *     - GET /api/recon/finance/debug/diagnose-order/:name (PR #104)
+ *     - GET /api/recon/finance/debug/projector-compare/order/:name
+ *
+ *   Do NOT set USE_AGREEMENTS_PROJECTOR=true in production until the
+ *   issues above are resolved. The boot-time check below will log a
+ *   loud warning if the flag is enabled.
  */
 export function isV2ProjectorActive(): boolean {
   const v = (process.env.USE_AGREEMENTS_PROJECTOR || "").toLowerCase();
-  return v === "true" || v === "1" || v === "yes";
+  const active = v === "true" || v === "1" || v === "yes";
+  if (active && !warnedAboutV2Active) {
+    warnedAboutV2Active = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      "\n[V2-PROJECTOR-WARN] USE_AGREEMENTS_PROJECTOR is enabled. " +
+      "V2 is diagnostic-only as of PR #104 and is known to drop ~9% of " +
+      "orders and inflate gross by ~15%. Unset this flag unless you know " +
+      "exactly what you're doing.\n"
+    );
+  }
+  return active;
 }
+let warnedAboutV2Active = false;
 
 // ---------------------------------------------------------------------------
 // Projection
