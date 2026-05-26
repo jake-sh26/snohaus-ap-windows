@@ -1016,3 +1016,177 @@ export function computeFinanceDiffCompare(
     },
   };
 }
+
+// =====================================================================
+// PR #122 — V2 finance summary, the new source of truth for the UI.
+//
+// Replaces computeLocalFinanceSummary as the `ours` side of the Finance
+// Summary diff. Sources its numbers from recon_shopify_sales using the
+// same V2 formulas validated against ShopifyQL in /v2-vs-shopifyql.
+// All 17 months of 2025–2026 reconcile to the penny under these rules
+// (acceptance run after PR #121).
+//
+// Formulas (identical to /api/recon/finance/debug/v2-vs-shopifyql/:month):
+//   gross_sales:  action_type IN (ORDER,UPDATE), line_type=PRODUCT
+//                 sum of (total_amount + total_discount_before_taxes - total_tax)
+//   discounts:    action_type IN (ORDER,UPDATE), line_type=PRODUCT
+//                 sum of -total_discount_before_taxes  (returns as POSITIVE
+//                 magnitude for FinanceSummaryLocal contract)
+//   returns:      action_type=RETURN, line_type IN (PRODUCT, ADJUSTMENT)
+//                 abs(sum of (total_amount - total_tax))  (POSITIVE magnitude)
+//   return_fees:  action_type=ORDER, line_type=FEE
+//                 sum of (total_amount - total_tax)
+//   net_sales_gift_cards: line_type=GIFT_CARD
+//                 sum of (total_amount - total_tax)  signed by action_type
+//   shipping:     line_type=SHIPPING, sum of (total_amount - total_tax)
+//   taxes:        line_type != GIFT_CARD, sum of total_tax
+//   net_sales:    gross_sales - discounts - returns  (positive magnitudes
+//                 are SUBTRACTED here so the result matches Shopify)
+//   total_sales:  net_sales + shipping + return_fees + taxes  (PR #118)
+//
+// order_count: PR #114 placement-in-month + non-zero PRODUCT/ADJUSTMENT
+//              activity. PR #117 dropped the != 0 ex-tax predicate.
+//
+// refund_count: distinct order_ids with any RETURN row in :month.
+// =====================================================================
+export function computeV2FinanceSummary(monthKey: string): FinanceSummaryLocal {
+  ensureSchemaOnce();
+
+  const row: any = sqlite.prepare(`
+    SELECT
+      COALESCE(SUM(
+        CASE WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
+             THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
+             ELSE 0 END
+      ), 0) AS gross_sales,
+      COALESCE(SUM(
+        CASE WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
+             THEN s.total_discount_before_taxes
+             ELSE 0 END
+      ), 0) AS discounts_pos,
+      COALESCE(SUM(
+        CASE WHEN s.action_type = 'RETURN'
+              AND s.line_type IN ('PRODUCT','ADJUSTMENT')
+             THEN (s.total_amount - s.total_tax)
+             ELSE 0 END
+      ), 0) AS returns_neg,
+      COALESCE(SUM(
+        CASE WHEN s.action_type = 'ORDER' AND s.line_type = 'FEE'
+             THEN s.total_amount - s.total_tax
+             ELSE 0 END
+      ), 0) AS return_fees,
+      COALESCE(SUM(
+        CASE WHEN s.line_type = 'GIFT_CARD'
+             THEN s.total_amount - s.total_tax
+             ELSE 0 END
+      ), 0) AS net_sales_gift_cards,
+      COALESCE(SUM(
+        CASE WHEN s.line_type = 'SHIPPING'
+             THEN s.total_amount - s.total_tax
+             ELSE 0 END
+      ), 0) AS shipping,
+      COALESCE(SUM(
+        CASE WHEN s.line_type != 'GIFT_CARD'
+             THEN s.total_tax
+             ELSE 0 END
+      ), 0) AS taxes,
+      (
+        SELECT COUNT(*)
+          FROM recon_orders o
+         WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+           AND EXISTS (
+             SELECT 1 FROM recon_shopify_sales ss
+              WHERE ss.order_id = o.id
+                AND ss.happened_month = ?
+                AND (
+                  (ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
+                  OR (ss.action_type = 'RETURN'
+                      AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
+                )
+           )
+      ) AS order_count,
+      (
+        SELECT COUNT(DISTINCT s2.order_id)
+          FROM recon_shopify_sales s2
+         WHERE s2.happened_month = ?
+           AND s2.action_type = 'RETURN'
+           AND s2.line_type IN ('PRODUCT','ADJUSTMENT')
+      ) AS refund_count
+    FROM recon_shopify_sales s
+    WHERE s.happened_month = ?
+  `).get(monthKey, monthKey, monthKey, monthKey) as any;
+
+  const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
+
+  const gross_sales = r2(row.gross_sales);
+  // Surface discounts & returns as POSITIVE magnitudes (FinanceSummaryLocal
+  // contract — matches legacy computeLocalFinanceSummary and the UI's diff
+  // table which renders contra-revenue magnitudes for comparison).
+  const discounts = r2(row.discounts_pos);
+  const returns = r2(Math.abs(Number(row.returns_neg) || 0));
+  const return_fees = r2(row.return_fees);
+  const net_sales_gift_cards = r2(row.net_sales_gift_cards);
+  const shipping = r2(row.shipping);
+  const taxes = r2(row.taxes);
+
+  // Net sales = gross - discounts - returns (positive magnitudes subtracted)
+  const net_sales = r2(gross_sales - discounts - returns);
+  // Total sales includes return_fees (PR #118).
+  const total_sales = r2(net_sales + shipping + return_fees + taxes);
+
+  return {
+    month: monthKey,
+    gross_sales,
+    discounts,
+    returns,
+    net_sales,
+    shipping,
+    return_fees,
+    taxes,
+    total_sales,
+    net_sales_gift_cards,
+    order_count: Number(row.order_count) || 0,
+    refund_count: Number(row.refund_count) || 0,
+  };
+}
+
+// V2 version of computeFinanceDiff. Identical shape to FinanceDiffResult
+// so the UI works unchanged. Sources `ours` from V2 SQL instead of legacy
+// computeLocalFinanceSummary.
+export function computeFinanceDiffV2(
+  monthKey: string,
+  opts: { tolerance?: number; snapshotKind?: string } = {},
+): FinanceDiffResult {
+  ensureSchemaOnce();
+  const tolerance = opts.tolerance ?? 0.01;
+  const ours = computeV2FinanceSummary(monthKey);
+  const shopify = getShopifySnapshot(monthKey, opts.snapshotKind ?? "all_channels");
+
+  const CONTRA_REVENUE_FIELDS = new Set(["discounts", "returns"]);
+
+  const lines: FinanceDiffLine[] = DIFF_FIELDS.map((f) => {
+    const o = (ours as any)[f] as number;
+    if (!shopify || shopify[f] == null) {
+      return { field: f, ours: o, shopify: null, shopify_raw: null, diff: null, ok: null };
+    }
+    const rawS = Number(shopify[f]);
+    const s = CONTRA_REVENUE_FIELDS.has(f) ? Math.abs(rawS) : rawS;
+    const diff = round2(o - s);
+    return {
+      field: f,
+      ours: o,
+      shopify: s,
+      shopify_raw: rawS,
+      diff,
+      ok: Math.abs(diff) <= tolerance,
+    };
+  });
+
+  const linesWithSnapshot = lines.filter((l) => l.shopify != null);
+  const all_ok =
+    linesWithSnapshot.length === 0
+      ? null
+      : linesWithSnapshot.every((l) => l.ok === true);
+
+  return { month: monthKey, ours, shopify, lines, all_ok, tolerance };
+}

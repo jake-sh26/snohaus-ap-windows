@@ -1507,15 +1507,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // PR #122 — swap the UI's Finance Summary diff source from legacy
+  // (computeLocalFinanceSummary, refunds-derived) to V2 (computeFinanceDiffV2,
+  // recon_shopify_sales-derived with the same formulas as /v2-vs-shopifyql).
+  // V2 reconciles to the penny across all 17 months of 2025–2026 (acceptance
+  // run after PR #121). Response shape is identical so the UI is unchanged.
   app.get("/api/recon/finance/diff/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
     }
     const tolerance = Number(req.query.tolerance);
-    const { computeFinanceDiff } = require("./shopify-finance-diff");
+    const { computeFinanceDiffV2 } = require("./shopify-finance-diff");
     res.json(
-      computeFinanceDiff(month, {
+      computeFinanceDiffV2(month, {
         tolerance: Number.isFinite(tolerance) ? tolerance : undefined,
       }),
     );
