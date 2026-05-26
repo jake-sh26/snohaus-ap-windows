@@ -10,11 +10,13 @@
  * sync trigger (which is also automated on boot + every 6h).
  */
 import { useState, useEffect, useRef } from "react";
+import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { apiRequest } from "@/lib/queryClient";
 import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check, BookOpen, Upload, Calculator, Layers } from "lucide-react";
 
@@ -1185,17 +1187,93 @@ export default function ReconcilerTest() {
   const cfg = statusQ.data;
   const configured = !!cfg?.configured;
 
+  // ---------------------------------------------------------------------------
+  // PR #128 — page layout: 5-tab shell with URL persistence (?tab=...).
+  //
+  // The 16 stacked cards on this page got unmanageable. We group them into:
+  //   reconcile  — Finance Summary diff · Orders summary · Gift card activity
+  //   bystore    — (reserved — per-store breakdown lands in the next PR)
+  //   sync       — Orders sync · Payouts sync/summary · Recent orders · Sync log · Webhooks
+  //   mapping    — Shopify locations · Entity↔location · CoA · Allocation engine
+  //   setup      — Connection · App install · Integration errors
+  //
+  // Active tab persists in the URL so refresh / bookmark / share works. App
+  // uses wouter+useHashLocation so this reads/writes the query portion of the
+  // hash route (e.g. #/recon?tab=sync).
+  // ---------------------------------------------------------------------------
+  const VALID_TABS = ["reconcile", "bystore", "sync", "mapping", "setup"] as const;
+  type TabKey = (typeof VALID_TABS)[number];
+
+  const [location, setLocation] = useLocation();
+  const readTab = (): TabKey => {
+    const qIdx = location.indexOf("?");
+    if (qIdx < 0) return "reconcile";
+    const params = new URLSearchParams(location.slice(qIdx + 1));
+    const t = params.get("tab") as TabKey | null;
+    return t && (VALID_TABS as readonly string[]).includes(t) ? t : "reconcile";
+  };
+  const [activeTab, setActiveTab] = useState<TabKey>(readTab);
+
+  // Keep state in sync if the user uses back/forward or edits the URL directly.
+  useEffect(() => {
+    const t = readTab();
+    if (t !== activeTab) setActiveTab(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location]);
+
+  const onTabChange = (next: string) => {
+    const t = (VALID_TABS as readonly string[]).includes(next) ? (next as TabKey) : "reconcile";
+    setActiveTab(t);
+    const qIdx = location.indexOf("?");
+    const base = qIdx < 0 ? location : location.slice(0, qIdx);
+    const params = qIdx < 0 ? new URLSearchParams() : new URLSearchParams(location.slice(qIdx + 1));
+    params.set("tab", t);
+    setLocation(`${base}?${params.toString()}`, { replace: true });
+  };
+
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Reconciler — Phase 1 Test Console</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Finance Reconciliation</h1>
           <p className="text-sm text-muted-foreground mt-1">
             Read-only validation for the multi-entity Shopify reconciler. No QBO posting, no allocation — that lands in Phase 2.
           </p>
         </div>
         <Badge variant="outline" className="gap-1.5">Read-only</Badge>
       </div>
+
+      <Tabs value={activeTab} onValueChange={onTabChange} className="space-y-6">
+        <TabsList className="sticky top-0 z-10 h-auto flex-wrap">
+          <TabsTrigger value="reconcile">Reconcile</TabsTrigger>
+          <TabsTrigger value="bystore">By store</TabsTrigger>
+          <TabsTrigger value="sync">Sync</TabsTrigger>
+          <TabsTrigger value="mapping">Mapping</TabsTrigger>
+          <TabsTrigger value="setup">Setup</TabsTrigger>
+        </TabsList>
+
+        {/* =================== BY STORE TAB =================== */}
+        <TabsContent value="bystore" className="space-y-6 mt-0">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2"><Store className="size-4" /> Per-store breakdown</CardTitle>
+              <CardDescription>
+                Greenvale · Huntington · Hempstead. Per-line POS attribution from
+                ShopifyQL (PR #125–#127). Validated penny-perfect across all 17
+                months × 3 stores. Detailed UI lands in PR #129.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground">
+                Coming next. Use the <button type="button" className="underline" onClick={() => onTabChange("reconcile")}>Reconcile</button> tab for the
+                current Finance Summary diff.
+              </p>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* =================== SETUP TAB =================== */}
+        <TabsContent value="setup" className="space-y-6 mt-0">
 
       {/* ===== 1. Connection status ===== */}
       <Card>
@@ -1296,6 +1374,7 @@ export default function ReconcilerTest() {
       </Card>
 
       {/* ===== 1b. App install (OAuth) — PR #R2e ===== */}
+      {/* (Integration errors card moves below, closes the Setup tab.) */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2"><ShieldCheck className="size-4" /> App install (Admin API token)</CardTitle>
@@ -1376,6 +1455,11 @@ export default function ReconcilerTest() {
           )}
         </CardContent>
       </Card>
+
+        </TabsContent>
+
+        {/* =================== SYNC TAB (part 1) =================== */}
+        <TabsContent value="sync" className="space-y-6 mt-0">
 
       {/* ===== 2. Orders sync ===== */}
       <Card>
@@ -1801,6 +1885,11 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
+        </TabsContent>
+
+        {/* =================== RECONCILE TAB (part 1) =================== */}
+        <TabsContent value="reconcile" className="space-y-6 mt-0">
+
       {/* ===== 2a. Shopify Finance Summary diff — PR #R5a ===== */}
       {/* User-driven reconciliation: paste Shopify Admin's Finance Summary values
           for a month and confirm our computed numbers match exactly. The whole
@@ -2175,6 +2264,11 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
+        </TabsContent>
+
+        {/* =================== SYNC TAB (part 2) =================== */}
+        <TabsContent value="sync" className="space-y-6 mt-0">
+
       {/* ===== 2c. Payouts sync — PR #R3 ===== */}
       <Card>
         <CardHeader>
@@ -2432,6 +2526,11 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
+        </TabsContent>
+
+        {/* =================== MAPPING TAB (part 1) =================== */}
+        <TabsContent value="mapping" className="space-y-6 mt-0">
+
       {/* ===== 4. Shopify locations ===== */}
       <Card>
         <CardHeader>
@@ -2465,6 +2564,11 @@ export default function ReconcilerTest() {
           )}
         </CardContent>
       </Card>
+
+        </TabsContent>
+
+        {/* =================== SYNC TAB (part 3) =================== */}
+        <TabsContent value="sync" className="space-y-6 mt-0">
 
       {/* ===== 5. Recent orders sample ===== */}
       <Card>
@@ -2564,6 +2668,11 @@ export default function ReconcilerTest() {
           )}
         </CardContent>
       </Card>
+
+        </TabsContent>
+
+        {/* =================== MAPPING TAB (part 2) =================== */}
+        <TabsContent value="mapping" className="space-y-6 mt-0">
 
       {/* ===== 6.5. Suggested entity ↔ Shopify location mapping (PR #R3b) ===== */}
       <Card>
@@ -3308,8 +3417,18 @@ export default function ReconcilerTest() {
         </CardContent>
       </Card>
 
+        </TabsContent>
+
+        {/* =================== RECONCILE TAB (part 2) =================== */}
+        <TabsContent value="reconcile" className="space-y-6 mt-0">
+
       {/* ===== 8b. Gift card activity (PR #R4e) ===== */}
       <GiftCardActivityCard month={allocMonth} />
+
+        </TabsContent>
+
+        {/* =================== SETUP TAB (part 2 — errors) =================== */}
+        <TabsContent value="setup" className="space-y-6 mt-0">
 
       {/* ===== 9. Error log ===== */}
       {(() => {
@@ -3356,6 +3475,9 @@ export default function ReconcilerTest() {
           </Card>
         );
       })()}
+
+        </TabsContent>
+      </Tabs>
 
       {/* Tiny status line at the bottom */}
       {lastAction && (
