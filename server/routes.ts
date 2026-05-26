@@ -219,6 +219,7 @@ const uploadHandler = multer({
 import { ALLOWED_EMAILS, STORES } from "@shared/schema";
 import { getQboStatus, getAuthUrl, exchangeCode, disconnectQbo, searchBills, searchPayments, createBill, createVendorCredit, syncQboVendorsFromApi, lastVendorSyncAge, getQboErrorLog, clearQboErrorLog } from "./qbo";
 import { getGmailStatus, pollNow, pollWithRetry, testGmailConnection, clearGmailErrorLog, reingestEmails } from "./gmail";
+import { registerReconStagingRoutes } from "./recon-staging/routes";
 
 declare global {
   namespace Express {
@@ -568,6 +569,9 @@ function buildPasswordRecords(): Record<string, { salt: string; hash: string }> 
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  // Mount recon staging harness (isolated data-staging.db; read-only Shopify pulls)
+  registerReconStagingRoutes(app, authMiddleware);
+
   // ---- Auth ----
   // Simple in-memory rate limit: 5 attempts per email per 15min
   const authAttempts = new Map<string, number[]>();
