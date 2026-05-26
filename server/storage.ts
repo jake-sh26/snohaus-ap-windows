@@ -909,6 +909,18 @@ function bootstrapSchema() {
       ON recon_orders(financial_status);
     CREATE INDEX IF NOT EXISTS idx_recon_orders_has_gift_card
       ON recon_orders(has_gift_card) WHERE has_gift_card = 1;
+    -- PR #134 — speed up GC customer_affinity (tryCustomerAffinity)
+    -- which filters recon_orders by customer_id then created_at. Without
+    -- this the GROUP BY scanned all rows for every GC line item.
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_customer_created
+      ON recon_orders(customer_id, created_at)
+      WHERE customer_id IS NOT NULL;
+    -- PR #134 — speed up email_affinity (PR #123 guest-checkout fallback)
+    -- which filters recon_orders by LOWER(TRIM(customer_email)). Sqlite
+    -- can use a functional index for this exact expression.
+    CREATE INDEX IF NOT EXISTS idx_recon_orders_email_lower_created
+      ON recon_orders(LOWER(TRIM(customer_email)), created_at)
+      WHERE customer_email IS NOT NULL;
   `);
 
   // ----- Shopify line items -----
@@ -1535,6 +1547,14 @@ function bootstrapSchema() {
       ON recon_allocations(method);
     CREATE INDEX IF NOT EXISTS idx_recon_allocations_overridden
       ON recon_allocations(overridden_at) WHERE overridden_at IS NOT NULL;
+    -- PR #134 — speed up the GC customer/email-affinity GROUP BY.
+    -- Query in shopify-recon-gc-issuance.ts (tryAffinityForFilter) joins
+    -- recon_allocations × recon_orders with WHERE method IN ('pos_location',
+    -- 'fulfillment_location', 'manual_override') GROUP BY entity_id. The
+    -- composite (method, order_id) lets sqlite restrict by method first,
+    -- then look up matching order rows, instead of full-scanning.
+    CREATE INDEX IF NOT EXISTS idx_recon_allocations_method_order
+      ON recon_allocations(method, order_id);
   `);
 
   // ----- Gift cards issued -----

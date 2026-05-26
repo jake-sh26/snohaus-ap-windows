@@ -143,14 +143,20 @@ type FulfillmentRow = {
   line_item_ids: string[];
 };
 
+// PR #134 — cache prepared statements so we don't recompile SQL per order.
+// Lazy init lets the schema run() bootstrap before the first prepare().
+let _fulfillmentsStmt: ReturnType<typeof sqlite.prepare> | null = null;
+let _fulfillmentOrdersStmt: ReturnType<typeof sqlite.prepare> | null = null;
 function listSuccessfulFulfillments(orderId: string): FulfillmentRow[] {
-  const rows = sqlite
-    .prepare(
+  if (!_fulfillmentsStmt) {
+    _fulfillmentsStmt = sqlite.prepare(
       `SELECT id, location_id, status, line_item_ids_json
        FROM recon_order_fulfillments
        WHERE order_id = ? AND status = 'success'
        ORDER BY (created_at IS NULL), created_at ASC, id ASC`
-    )
+    );
+  }
+  const rows = _fulfillmentsStmt
     .all(orderId) as Array<{
       id: string;
       location_id: string | null;
@@ -201,14 +207,16 @@ function listFulfillmentOrders(orderId: string): FulfillmentOrderRow[] {
   // We accept open|in_progress|scheduled FOs as routing signals. Cancelled
   // / incomplete / closed-without-ship leave the assigned_location_id behind
   // but it no longer represents intent, so we skip them.
-  const rows = sqlite
-    .prepare(
+  if (!_fulfillmentOrdersStmt) {
+    _fulfillmentOrdersStmt = sqlite.prepare(
       `SELECT id, assigned_location_id, status, line_item_ids_json
        FROM recon_fulfillment_orders
        WHERE order_id = ?
          AND status IN ('open', 'in_progress', 'scheduled', 'closed')
        ORDER BY (status = 'closed'), id ASC`
-    )
+    );
+  }
+  const rows = _fulfillmentOrdersStmt
     .all(orderId) as Array<{
       id: string;
       assigned_location_id: string | null;
@@ -593,6 +601,18 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
          method, reason, auto_method, auto_entity_id, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    // PR #134 — hoist per-order lookups out of the loop. better-sqlite3
+    // .prepare() compiles the SQL each call, which adds up over thousands
+    // of orders. Reusing the prepared handle is ~3–10× cheaper per call.
+    const linesStmt = sqlite.prepare(
+      `SELECT id, order_id, sku, title, quantity, price, total_discount,
+              line_subtotal, line_tax_total, is_gift_card, requires_shipping
+       FROM recon_line_items WHERE order_id = ?`
+    );
+    const overridesStmt = sqlite.prepare(
+      `SELECT line_item_id FROM recon_allocations
+       WHERE order_id = ? AND method = 'manual_override'`
+    );
 
     for (const o of orders) {
       summary.orders_processed++;
@@ -601,21 +621,10 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
         // share=0 so they don't roll into revenue.
         continue;
       }
-      const lines = sqlite
-        .prepare(
-          `SELECT id, order_id, sku, title, quantity, price, total_discount,
-                  line_subtotal, line_tax_total, is_gift_card, requires_shipping
-           FROM recon_line_items WHERE order_id = ?`
-        )
-        .all(o.id) as LineItemRow[];
+      const lines = linesStmt.all(o.id) as LineItemRow[];
 
       // Check if any allocation for this order was overridden manually.
-      const overrides = sqlite
-        .prepare(
-          `SELECT line_item_id FROM recon_allocations
-           WHERE order_id = ? AND method = 'manual_override'`
-        )
-        .all(o.id) as Array<{ line_item_id: string | null }>;
+      const overrides = overridesStmt.all(o.id) as Array<{ line_item_id: string | null }>;
       const overriddenLineIds = new Set(overrides.map(r => r.line_item_id));
 
       // PR #R4b — pre-load successful fulfillments for this order so the
