@@ -3480,9 +3480,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // + line_type filters (matches ShopifyQL Finance Summary aggregation).
       //
       // Filter formulas (locked from Retail-Q + empirical April 2025 match):
-      //   gross_sales:  action_type=ORDER,  line_type=PRODUCT
+      //   gross_sales:  action_type IN (ORDER, UPDATE), line_type=PRODUCT
       //                 sum of (total_amount + discount_before_taxes - total_tax)
-      //   discounts:    action_type=ORDER,  line_type=PRODUCT
+      //   discounts:    action_type IN (ORDER, UPDATE), line_type=PRODUCT
       //                 sum of -discount_before_taxes
       //   returns:      action_type=RETURN, line_type=PRODUCT
       //                 sum of (total_amount - total_tax)  [already negative]
@@ -3491,18 +3491,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       //   net_sales_gift_cards: line_type=GIFT_CARD (signed by action_type)
       //   shipping_charges:     line_type=SHIPPING
       //   taxes:                all rows except line_type=GIFT_CARD
+      //
+      // PR #121: include action_type=UPDATE for gross & discounts.
+      // OrderEdit events emit a pair of rows: (1) a UPDATE/PRODUCT row that
+      // REVERSES the original ORDER/PRODUCT (negative qty/amount/tax), then
+      // (2) a new ORDER/PRODUCT row at the post-edit state. ShopifyQL's
+      // `gross_sales` reflects the net effect of all three rows. The
+      // per-Sale v2_gross precomputed column already nets UPDATE in, but
+      // this aggregation query was filtering UPDATE out, causing V2 to
+      // double-count the gross on edited orders. Example: order #35763
+      // (Feb 2026) — original $315, price-match edit added $120 discount,
+      // V2 was reporting $630 instead of $315.
       const v2Row: any = sqlite.prepare(`
         SELECT
           COALESCE(SUM(
             CASE
-              WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT'
+              WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
                 THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
               ELSE 0
             END
           ), 0) AS gross_sales,
           COALESCE(SUM(
             CASE
-              WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT'
+              WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
                 THEN -s.total_discount_before_taxes
               ELSE 0
             END
@@ -3644,8 +3655,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. PR #117 dropped the !=0 ex-tax check (ShopifyQL counts zero-sum orders too — 100% disc/comp/gift orders). PR #118 added return_fees into total_sales (it's a real component of ShopifyQL's total_sales column — was producing a flat $10 diff in months with return fees). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
-        build_id: "pr118",
+        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. PR #117 dropped the !=0 ex-tax check (ShopifyQL counts zero-sum orders too — 100% disc/comp/gift orders). PR #118 added return_fees into total_sales (it's a real component of ShopifyQL's total_sales column — was producing a flat $10 diff in months with return fees). PR #121 widened gross & discounts to include action_type=UPDATE/PRODUCT to net in OrderEdit reversal rows (was double-counting edited orders' gross). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
+        build_id: "pr121",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
@@ -3983,8 +3994,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       // 2) V2: one GROUP BY query. Use the same gross_sales formula as
-      //    /v2-vs-shopifyql: action_type=ORDER, line_type=PRODUCT,
+      //    /v2-vs-shopifyql: action_type IN (ORDER,UPDATE), line_type=PRODUCT,
       //    sum of (total_amount + total_discount_before_taxes - total_tax).
+      //    PR #121: UPDATE/PRODUCT rows are edit reversals that must net in.
       //    Only include orders whose created_month_et = this month, to
       //    match the placement filter PR #114/#117 uses on the total.
       const v2Rows: any[] = sqlite
@@ -3994,7 +4006,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                  o.created_at, o.processed_at, o.cancelled_at,
                  o.financial_status, o.source_name,
                  COALESCE(SUM(
-                   CASE WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT'
+                   CASE WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
                         THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
                         ELSE 0 END
                  ), 0) AS v2_gross
@@ -4079,8 +4091,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         window_stats: windowStats,
         diffs: diffs.slice(0, limit),
-        note: "PR #120 — per-order gross_sales diff. ShopifyQL pulled in weekly windows; capped windows auto-split down to 1-day. Values summed across windows per order_name. V2 gross uses action_type=ORDER+line_type=PRODUCT, restricted to orders whose ET-shifted placement falls in :month. For ShopifyQL-only orders, metadata is loaded from recon_orders so v2_placement_month reveals which month V2 thinks the order belongs to. diff_v2_minus_ql > 0 means V2 attributes more gross to this order than ShopifyQL.",
-        build_id: "pr120",
+        note: "PR #121 — per-order gross_sales diff. V2 gross now uses action_type IN (ORDER,UPDATE) + line_type=PRODUCT to net in OrderEdit reversal rows. ShopifyQL pulled in weekly windows; capped windows auto-split down to 1-day. For ShopifyQL-only orders, metadata is loaded from recon_orders so v2_placement_month reveals which month V2 thinks the order belongs to. diff_v2_minus_ql > 0 means V2 attributes more gross to this order than ShopifyQL.",
+        build_id: "pr121",
       });
     } catch (e: any) {
       res.status(500).json({ message: "per-order-gross-diff failed", error: String(e?.message || e) });
