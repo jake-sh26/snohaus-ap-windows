@@ -172,19 +172,32 @@ function diffDays(a: string, b: string): number {
  * even if its money totals are zero) by SHOWing gross_sales — a value of
  * 0 is still a valid row, ShopifyQL only suppresses NULL groupings.
  */
-function buildQuery(start: string, end: string): string {
+function buildQuery(
+  start: string,
+  end: string,
+  posLocationId?: string,
+): string {
   // ShopifyQL SINCE is inclusive, UNTIL is inclusive — to express [start, end)
   // we shift end back by one day. Caller passes half-open intervals.
   const untilInclusive = addDays(end, -1);
-  return [
+  const parts = [
     "FROM sales",
     "SHOW gross_sales",
     "GROUP BY sale_id, line_item_id, line_type, pos_location_id, pos_location_name, order_id, order_name",
-    `SINCE ${start}`,
-    `UNTIL ${untilInclusive}`,
-    "LIMIT 1000",
-  ].join(" ");
+  ];
+  if (posLocationId) {
+    // pos_location_id is unquoted numeric in ShopifyQL WHERE clauses.
+    parts.push(`WHERE pos_location_id = ${posLocationId}`);
+  }
+  parts.push(`SINCE ${start}`, `UNTIL ${untilInclusive}`, "LIMIT 1000");
+  return parts.join(" ");
 }
+
+// PR #127 — Sno-Haus store IDs. When a single-day window hits the 1000-row
+// cap, we re-run it once per store with WHERE pos_location_id = X to recover
+// the truncated rows. Three stores × ≤1000 rows = 3000-row effective ceiling
+// per day, well above Sno-Haus's busiest Christmas-week day (~1700/day).
+const SNOHAUS_POS_LOCATIONS = ["63208882365", "82273140978", "82273206514"];
 
 /**
  * Extract the bare numeric tail from a Sale GID:
@@ -210,7 +223,9 @@ async function runWindow(
   warnings: string[],
 ): Promise<{ rows: QlSaleRow[]; windowsRan: number }> {
   if (diffDays(start, end) <= 1) {
-    // Cannot subdivide further — accept truncation if it happens.
+    // Single-day window. Try the unfiltered query first — fast path for
+    // ordinary days. If it hits the 1000-row cap, fan out per store
+    // (PR #127) to multiply the effective ceiling by the store count.
     const q = buildQuery(start, end);
     const result = await runShopifyql(q);
     if (result.parseErrors && result.parseErrors.length > 0) {
@@ -221,12 +236,58 @@ async function runWindow(
       );
     }
     const rows = (result.rows || []).map(coerceRow);
-    if (rows.length === 1000) {
-      warnings.push(
-        `Single-day window ${start} hit 1000-row cap — possible truncation.`,
-      );
+    if (rows.length < 1000) {
+      return { rows, windowsRan: 1 };
     }
-    return { rows, windowsRan: 1 };
+
+    // Cap hit. Fan out per pos_location_id. Each store's day-volume is
+    // well under 1000 rows even on the busiest days, so the union of the
+    // three per-store queries reliably covers the day without truncation.
+    //
+    // We union the per-store results with the original unfiltered result
+    // (de-duped by sale_id) so that any rows with NULL pos_location_id
+    // — e.g., online gift card purchases that never touched a POS register
+    // — are still preserved. Those would be excluded by the WHERE clause
+    // in the per-store queries.
+    const perStoreResults = await Promise.all(
+      SNOHAUS_POS_LOCATIONS.map(async (locId) => {
+        const sq = buildQuery(start, end, locId);
+        const sr = await runShopifyql(sq);
+        if (sr.parseErrors && sr.parseErrors.length > 0) {
+          warnings.push(
+            `ShopifyQL parseErrors for ${start}..${end} loc=${locId}: ${sr.parseErrors
+              .map((e) => e.message || JSON.stringify(e))
+              .join("; ")}`,
+          );
+        }
+        const sRows = (sr.rows || []).map(coerceRow);
+        if (sRows.length === 1000) {
+          warnings.push(
+            `Single-day window ${start} loc=${locId} STILL hit 1000-row cap after per-store fan-out — truncation possible.`,
+          );
+        }
+        return sRows;
+      }),
+    );
+
+    const dedupe = new Map<string, QlSaleRow>();
+    // Seed with unfiltered rows to keep any NULL-pos_location entries
+    // that the per-store queries would exclude.
+    for (const r of rows) {
+      if (r.sale_id != null) dedupe.set(String(r.sale_id), r);
+    }
+    // Per-store rows overwrite the unfiltered ones for the same sale_id
+    // — they're the authoritative, non-truncated source for sales that
+    // do have a pos_location_id.
+    for (const sRows of perStoreResults) {
+      for (const r of sRows) {
+        if (r.sale_id != null) dedupe.set(String(r.sale_id), r);
+      }
+    }
+    return {
+      rows: Array.from(dedupe.values()),
+      windowsRan: 1 + SNOHAUS_POS_LOCATIONS.length,
+    };
   }
 
   const q = buildQuery(start, end);
