@@ -223,6 +223,50 @@ app.use((req, res, next) => {
         } catch (e: any) {
           console.error(`[shopify-recon] orders sync failed: ${e?.message ?? e}`);
         }
+
+        // PR #129 — keep per-line pos_location_id attribution fresh.
+        //
+        // The orders sync (webhook + 6h polling) lands new sale rows with
+        // pos_location_id = NULL. We backfill that column from ShopifyQL
+        // immediately afterward so /api/recon/finance/by-store-pos and the
+        // By-Store UI stay current.
+        //
+        // Window: rolling 14 days. ShopifyQL analytics has up to ~1h lag
+        // landing attribution, so 14d is generous — it also catches any late
+        // edits that reclassify a sale to a different register.
+        //
+        // Wrapped in its own try/catch: a ShopifyQL hiccup must NOT fail the
+        // orders sync (orders are source of truth; pos_location_id is
+        // downstream enrichment).
+        try {
+          const { getShopifyReconConfig } = await import("./shopify-recon");
+          if (!getShopifyReconConfig()) return;
+          const { ingestPosLocationsFromQL } = await import(
+            "./shopify-recon-pos-locations"
+          );
+          const now = new Date();
+          const endExclusive = new Date(now);
+          endExclusive.setUTCDate(endExclusive.getUTCDate() + 1);
+          const start = new Date(now);
+          start.setUTCDate(start.getUTCDate() - 14);
+          const fmt = (d: Date) => d.toISOString().slice(0, 10);
+          const r = await ingestPosLocationsFromQL(fmt(start), fmt(endExclusive));
+          log(
+            `Shopify pos-locations sync: ${r.sales_updated} updated, ${r.sales_unchanged} unchanged, ${r.ql_rows_fetched} QL rows across ${r.windows_ran} windows (${r.duration_ms}ms)` +
+              (r.warnings && r.warnings.length
+                ? ` — ${r.warnings.length} warning(s)`
+                : ""),
+          );
+          if (r.warnings && r.warnings.length) {
+            for (const w of r.warnings) {
+              console.warn(`[shopify-recon] pos-locations warning: ${w}`);
+            }
+          }
+        } catch (e: any) {
+          console.error(
+            `[shopify-recon] pos-locations sync failed: ${e?.message ?? e}`,
+          );
+        }
       };
       // PR #R3 — payouts polling. No webhooks for payouts (Shopify doesn't offer
       // a payout webhook for app-level installs), so this poller is the only
