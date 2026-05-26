@@ -3889,6 +3889,153 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #119 — per-order gross_sales diff between ShopifyQL and V2.
+  //
+  // Use case: when /v2-vs-shopifyql/:month shows a non-zero gross diff with
+  // matching order counts (e.g. Nov 2025: v2_gross 841941.01, ql_gross
+  // 841241.02, diff -699.99, orders 1732 == 1732), the offending dollars
+  // are inside existing orders — not extra orders. This endpoint shows
+  // which orders' v2_gross differs from ShopifyQL's per-order gross_sales,
+  // sorted by absolute diff so the single-line offenders surface first.
+  //
+  // Why server-side:
+  //   - ShopifyQL GROUP BY caps at 1000 rows per call (Nov 2025 has
+  //     ~1732+ orders, so a single-call browser script truncates).
+  //     We chunk by weekly windows and merge.
+  //   - V2 per-order gross via orders-v2 enumerates every order with
+  //     6 correlated subqueries each — multi-second on high-volume
+  //     months. Here we do it as one GROUP BY order_id query.
+  //
+  // GET /api/recon/finance/debug/per-order-gross-diff/:month?limit=N
+  //   limit: max rows in `diffs` array (default 50, cap 500)
+  //
+  // Returns:
+  //   counts: shopifyql_orders, v2_orders, diff_count, sum_diff, any_window_capped
+  //   diffs: [{ name, v2_gross, ql_gross, diff_v2_minus_ql,
+  //              created_at, processed_at, cancelled_at,
+  //              financial_status, source_name }]
+  app.get("/api/recon/finance/debug/per-order-gross-diff/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
+    try {
+      const { sqlite } = require("./storage");
+      const { runShopifyql } = require("./shopify-shopifyql");
+
+      const [yy, mm] = month.split("-").map(Number);
+      const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+
+      // Chunk into ~7-day windows so each ShopifyQL call stays well under
+      // the 1000-row cap. For a 30-day month: 1-7, 8-14, 15-21, 22-28, 29-30.
+      const windows: Array<{ start: string; end: string }> = [];
+      for (let d = 1; d <= lastDay; d += 7) {
+        const we = Math.min(d + 6, lastDay);
+        windows.push({
+          start: `${month}-${String(d).padStart(2, "0")}`,
+          end: `${month}-${String(we).padStart(2, "0")}`,
+        });
+      }
+
+      // 1) ShopifyQL: pull gross_sales per order_name per window, merge.
+      //    Same order_name can appear in multiple windows (e.g. if Shopify
+      //    attributes activity across windows). Sum across windows.
+      const qlMap = new Map<string, number>();
+      let anyWindowCapped = false;
+      const windowStats: Array<{ start: string; end: string; rows: number; capped: boolean }> = [];
+      for (const w of windows) {
+        const r: any = await runShopifyql(
+          `FROM sales\nSHOW gross_sales\nGROUP BY order_name\nSINCE ${w.start} UNTIL ${w.end}`,
+        );
+        const rows: any[] = r?.rows || [];
+        const capped = rows.length === 1000;
+        if (capped) anyWindowCapped = true;
+        windowStats.push({ start: w.start, end: w.end, rows: rows.length, capped });
+        for (const row of rows) {
+          const name = String(row.order_name);
+          const gs = Number(row.gross_sales) || 0;
+          qlMap.set(name, (qlMap.get(name) || 0) + gs);
+        }
+      }
+
+      // 2) V2: one GROUP BY query. Use the same gross_sales formula as
+      //    /v2-vs-shopifyql: action_type=ORDER, line_type=PRODUCT,
+      //    sum of (total_amount + total_discount_before_taxes - total_tax).
+      //    Only include orders whose created_month_et = this month, to
+      //    match the placement filter PR #114/#117 uses on the total.
+      const v2Rows: any[] = sqlite
+        .prepare(
+          `
+          SELECT o.name AS name,
+                 o.created_at, o.processed_at, o.cancelled_at,
+                 o.financial_status, o.source_name,
+                 COALESCE(SUM(
+                   CASE WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT'
+                        THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
+                        ELSE 0 END
+                 ), 0) AS v2_gross
+            FROM recon_orders o
+            LEFT JOIN recon_shopify_sales s
+              ON s.order_id = o.id
+             AND s.happened_month = ?
+           WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+           GROUP BY o.id
+           HAVING v2_gross != 0
+        `,
+        )
+        .all(month, month);
+      const v2Map = new Map<string, any>();
+      for (const r of v2Rows) v2Map.set(String(r.name), r);
+
+      // 3) Diff. Walk union of names.
+      const allNames = new Set<string>();
+      qlMap.forEach((_v, k) => allNames.add(k));
+      v2Map.forEach((_v, k) => allNames.add(k));
+      const diffs: any[] = [];
+      let sumDiff = 0;
+      const namesArr = Array.from(allNames);
+      for (const name of namesArr) {
+        const ql = qlMap.get(name) || 0;
+        const v2row = v2Map.get(name);
+        const v2 = v2row ? Number(v2row.v2_gross) || 0 : 0;
+        const d = Math.round((v2 - ql) * 100) / 100;
+        if (Math.abs(d) >= 0.01) {
+          diffs.push({
+            name,
+            v2_gross: Math.round(v2 * 100) / 100,
+            ql_gross: Math.round(ql * 100) / 100,
+            diff_v2_minus_ql: d,
+            created_at: v2row?.created_at || null,
+            processed_at: v2row?.processed_at || null,
+            cancelled_at: v2row?.cancelled_at || null,
+            financial_status: v2row?.financial_status || null,
+            source_name: v2row?.source_name || null,
+          });
+          sumDiff += d;
+        }
+      }
+      diffs.sort((a, b) => Math.abs(b.diff_v2_minus_ql) - Math.abs(a.diff_v2_minus_ql));
+
+      res.json({
+        month,
+        counts: {
+          shopifyql_orders: qlMap.size,
+          v2_orders: v2Map.size,
+          diff_count: diffs.length,
+          sum_diff: Math.round(sumDiff * 100) / 100,
+          any_window_capped: anyWindowCapped,
+        },
+        window_stats: windowStats,
+        diffs: diffs.slice(0, limit),
+        note: "PR #119 — per-order gross_sales diff. ShopifyQL pulled in weekly windows to stay under the 1000-row cap; values summed across windows per order_name. V2 gross uses the same action_type=ORDER+line_type=PRODUCT formula as /v2-vs-shopifyql, restricted to orders whose ET-shifted placement falls in :month. diff_v2_minus_ql > 0 means V2 attributes more gross to this order than ShopifyQL.",
+        build_id: "pr119",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "per-order-gross-diff failed", error: String(e?.message || e) });
+    }
+  });
+
   // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
