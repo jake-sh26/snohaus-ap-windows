@@ -69,6 +69,27 @@ export type AllocationRunSummary = {
   gc_je_legs_emitted: number;
   warnings: string[];
   ran_at: string;
+  // PR #136 — per-phase timing. Used to find the real bottleneck after two
+  // perf PRs (#134 indexes, #135 GC-shortcircuit) missed. All values in ms.
+  // total_ms is the wall-clock end-to-end runAllocationEngine duration.
+  // The phase fields sum to ~total_ms (small overhead for orchestration).
+  // Inside txn_total_ms we also track per-statement aggregates so we can
+  // see if it's the SELECTs (linesStmt/overridesStmt/fulfillments/FOs),
+  // the in-memory allocateLineItem, the row INSERTs, or the GC-issuance
+  // side-writes (assignGcIssuance/recordPosGcIssuance) that eats the time.
+  timing_ms: {
+    total_ms: number;
+    fetch_orders_ms: number;
+    delete_existing_ms: number;
+    txn_total_ms: number;
+    lines_query_ms: number;
+    overrides_query_ms: number;
+    fulfillments_query_ms: number;
+    fulfillment_orders_query_ms: number;
+    allocate_line_ms: number;
+    insert_alloc_ms: number;
+    gc_redemption_pass_ms: number;
+  };
 };
 
 type OrderRow = {
@@ -530,6 +551,20 @@ function allocateLineItem(
  * (method='manual_override') are preserved.
  */
 export function runAllocationEngine(month: string): AllocationRunSummary {
+  // PR #136 — instrumentation. All Date.now() checkpoints accumulate into
+  // these locals and get folded into summary.timing_ms at the end.
+  const t_start = Date.now();
+  let t_fetch_orders = 0;
+  let t_delete_existing = 0;
+  let t_txn_total = 0;
+  let t_lines_query = 0;
+  let t_overrides_query = 0;
+  let t_fulfillments_query = 0;
+  let t_fulfillment_orders_query = 0;
+  let t_allocate_line = 0;
+  let t_insert_alloc = 0;
+  let t_gc_redemption_pass = 0;
+
   const summary: AllocationRunSummary = {
     month,
     orders_processed: 0,
@@ -550,12 +585,26 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
     gc_je_legs_emitted: 0,
     warnings: [],
     ran_at: new Date().toISOString(),
+    timing_ms: {
+      total_ms: 0,
+      fetch_orders_ms: 0,
+      delete_existing_ms: 0,
+      txn_total_ms: 0,
+      lines_query_ms: 0,
+      overrides_query_ms: 0,
+      fulfillments_query_ms: 0,
+      fulfillment_orders_query_ms: 0,
+      allocate_line_ms: 0,
+      insert_alloc_ms: 0,
+      gc_redemption_pass_ms: 0,
+    },
   };
 
   const monthStart = `${month}-01T00:00:00Z`;
   const [y, m] = month.split("-").map(Number);
   const nextMonth = m === 12 ? `${y + 1}-01-01T00:00:00Z` : `${y}-${String(m + 1).padStart(2, "0")}-01T00:00:00Z`;
 
+  const t0_fetch = Date.now();
   const orders = sqlite
     .prepare(
       `SELECT id, created_at, source_name, location_id, customer_id, customer_email,
@@ -566,9 +615,12 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
        ORDER BY created_at ASC`
     )
     .all(monthStart, nextMonth) as OrderRow[];
+  t_fetch_orders = Date.now() - t0_fetch;
 
   if (orders.length === 0) {
     summary.warnings.push(`No orders found for ${month}`);
+    summary.timing_ms.total_ms = Date.now() - t_start;
+    summary.timing_ms.fetch_orders_ms = t_fetch_orders;
     return summary;
   }
 
@@ -585,6 +637,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
     // Preserve manual overrides — delete only auto allocations for these orders.
     const orderIds = orders.map(o => o.id);
     if (orderIds.length > 0) {
+      const t0_del = Date.now();
       const placeholders = orderIds.map(() => "?").join(",");
       sqlite
         .prepare(
@@ -593,6 +646,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
              AND method != 'manual_override'`
         )
         .run(...orderIds);
+      t_delete_existing = Date.now() - t0_del;
     }
 
     const insertStmt = sqlite.prepare(`
@@ -621,27 +675,38 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
         // share=0 so they don't roll into revenue.
         continue;
       }
+      const t0_lines = Date.now();
       const lines = linesStmt.all(o.id) as LineItemRow[];
+      t_lines_query += Date.now() - t0_lines;
 
       // Check if any allocation for this order was overridden manually.
+      const t0_ovr = Date.now();
       const overrides = overridesStmt.all(o.id) as Array<{ line_item_id: string | null }>;
+      t_overrides_query += Date.now() - t0_ovr;
       const overriddenLineIds = new Set(overrides.map(r => r.line_item_id));
 
       // PR #R4b — pre-load successful fulfillments for this order so the
       // online-physical branch can route each line by its actual ship-from
       // location instead of the (often null) order-level location_id.
+      const t0_ff = Date.now();
       const fulfillments = listSuccessfulFulfillments(o.id);
+      t_fulfillments_query += Date.now() - t0_ff;
       // PR #R4d — pre-load fulfillment_orders too, for unshipped + Locally
       // orders that have no fulfillments yet but DO have FO routing intent.
+      const t0_fo = Date.now();
       const fulfillmentOrders = listFulfillmentOrders(o.id);
+      t_fulfillment_orders_query += Date.now() - t0_fo;
       const lineCtx = { ...ctx, fulfillments, fulfillmentOrders };
 
       let orderHasReview = false;
       for (const line of lines) {
         summary.line_items_processed++;
         if (overriddenLineIds.has(line.id)) continue; // keep manual override
+        const t0_alloc = Date.now();
         const slices = allocateLineItem(o, line, lineCtx);
+        t_allocate_line += Date.now() - t0_alloc;
         for (const a of slices) {
+          const t0_ins = Date.now();
           insertStmt.run(
             a.order_id,
             a.line_item_id,
@@ -655,6 +720,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
             a.auto_entity_id,
             now,
           );
+          t_insert_alloc += Date.now() - t0_ins;
           summary.by_method[a.method]++;
           summary.allocations_written++;
           if (a.method === "needs_review") orderHasReview = true;
@@ -664,12 +730,14 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
     }
   });
 
+  const t0_txn = Date.now();
   try {
     txn();
   } catch (e: any) {
     summary.failed_orders = summary.orders_processed - summary.needs_review_orders;
     summary.warnings.push(`Transaction failed: ${e?.message ?? String(e)}`);
   }
+  t_txn_total = Date.now() - t0_txn;
 
   // PR #R4e — Post-allocation: record GC redemptions + generate inter-company
   // JE legs. Runs AFTER the allocation transaction commits so the redemption
@@ -697,6 +765,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
   // transactions[] looking for gateway === 'gift_card'). Anything that would
   // have produced a redemption row still does; anything filtered out would
   // have returned skipped_reason='no_gc_transactions' anyway.
+  const t0_gc = Date.now();
   const liveOrderIds = orders.filter(o => !o.cancelled_at).map(o => o.id);
   if (liveOrderIds.length > 0) {
     const placeholders = liveOrderIds.map(() => "?").join(",");
@@ -719,7 +788,21 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
       }
     }
   }
+  t_gc_redemption_pass = Date.now() - t0_gc;
 
+  summary.timing_ms = {
+    total_ms: Date.now() - t_start,
+    fetch_orders_ms: t_fetch_orders,
+    delete_existing_ms: t_delete_existing,
+    txn_total_ms: t_txn_total,
+    lines_query_ms: t_lines_query,
+    overrides_query_ms: t_overrides_query,
+    fulfillments_query_ms: t_fulfillments_query,
+    fulfillment_orders_query_ms: t_fulfillment_orders_query,
+    allocate_line_ms: t_allocate_line,
+    insert_alloc_ms: t_insert_alloc,
+    gc_redemption_pass_ms: t_gc_redemption_pass,
+  };
   return summary;
 }
 
