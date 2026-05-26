@@ -3335,6 +3335,121 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // tax-exclusive PR #108 formulas — deliberately NOT from
   // recon_revenue_events_v2, so this is a check on the underlying fact table
   // and is robust against future projector changes.
+  // PR #112: Single-query diagnostic for residual reconciliation gaps.
+  // Returns:
+  //   (a) full action_type x line_type x sale_type matrix for :month with
+  //       row counts, sum_amt_ex_tax, sum_tax, and the gross-formula sum.
+  //   (b) orders-count breakdown (5 different rules) for orders-diff diagnosis.
+  //   (c) RETURN rows where line_type != PRODUCT — the smoking-gun list for
+  //       a returns-column gap (matches PR #109's smoking-gun pattern, this
+  //       time on the RETURN side instead of the ORDER side).
+  app.get("/api/recon/finance/debug/sales-combo-matrix/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const { sqlite } = require("./storage");
+
+      const matrix = sqlite.prepare(`
+        SELECT
+          s.action_type,
+          s.line_type,
+          s.sale_type,
+          COUNT(*) AS rows_n,
+          ROUND(SUM(s.total_amount - s.total_tax), 2) AS sum_amt_ex_tax,
+          ROUND(SUM(s.total_tax), 2) AS sum_tax,
+          ROUND(SUM(s.total_amount + s.total_discount_before_taxes - s.total_tax), 2) AS sum_gross_formula
+        FROM recon_shopify_sales s
+        WHERE s.happened_month = ?
+        GROUP BY s.action_type, s.line_type, s.sale_type
+        ORDER BY s.action_type, s.line_type, s.sale_type
+      `).all(month);
+
+      // Five different DISTINCT order_id rules so we can find ShopifyQL's.
+      const orderRules: any = sqlite.prepare(`
+        SELECT
+          COUNT(DISTINCT s.order_id) AS all_any_row,
+          COUNT(DISTINCT CASE WHEN s.line_type != 'GIFT_CARD' THEN s.order_id END) AS exclude_gc,
+          COUNT(DISTINCT CASE WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT' THEN s.order_id END) AS order_product_only,
+          COUNT(DISTINCT CASE WHEN s.action_type = 'ORDER' THEN s.order_id END) AS any_order_action,
+          COUNT(DISTINCT CASE WHEN s.line_type = 'PRODUCT' THEN s.order_id END) AS product_any_action,
+          COUNT(DISTINCT CASE WHEN s.line_type != 'GIFT_CARD' AND s.line_type != 'SHIPPING' THEN s.order_id END) AS exclude_gc_and_shipping
+        FROM recon_shopify_sales s
+        WHERE s.happened_month = ?
+      `).get(month);
+
+      // RETURN rows that are NOT line_type=PRODUCT — these would be missed
+      // by V2's current returns filter but might be in ShopifyQL's returns.
+      const returnNonProduct = sqlite.prepare(`
+        SELECT
+          s.id AS sale_id,
+          s.order_id,
+          o.name AS order_name,
+          s.happened_at,
+          s.action_type,
+          s.line_type,
+          s.sale_type,
+          a.reason,
+          s.total_amount,
+          s.total_tax,
+          ROUND(s.total_amount - s.total_tax, 2) AS amt_ex_tax,
+          s.ref_name
+        FROM recon_shopify_sales s
+        LEFT JOIN recon_orders o ON o.id = s.order_id
+        LEFT JOIN recon_shopify_agreements a ON a.id = s.agreement_id
+        WHERE s.happened_month = ?
+          AND s.action_type = 'RETURN'
+          AND s.line_type != 'PRODUCT'
+        ORDER BY ABS(s.total_amount) DESC
+      `).all(month);
+
+      const returnNonProductSum = (returnNonProduct as any[]).reduce(
+        (a: number, r: any) => a + Number(r.amt_ex_tax || 0), 0,
+      );
+      const returnNonProductTaxSum = (returnNonProduct as any[]).reduce(
+        (a: number, r: any) => a + Number(r.total_tax || 0), 0,
+      );
+
+      // Order rows with ONLY line_type=PRODUCT under action_type=ORDER, vs
+      // orders with line_type=FEE under action_type=ORDER (return_fee).
+      // Useful for the orders-count breakdown.
+      const grossFormulaCheck: any = sqlite.prepare(`
+        SELECT
+          ROUND(SUM(CASE WHEN s.action_type='ORDER' AND s.line_type='PRODUCT'
+            THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
+            ELSE 0 END), 2) AS v2_gross_sales,
+          ROUND(SUM(CASE WHEN s.action_type='RETURN' AND s.line_type='PRODUCT'
+            THEN s.total_amount - s.total_tax
+            ELSE 0 END), 2) AS v2_returns,
+          ROUND(SUM(CASE WHEN s.action_type='ORDER' AND s.line_type='FEE'
+            THEN s.total_amount - s.total_tax
+            ELSE 0 END), 2) AS v2_return_fees,
+          ROUND(SUM(CASE WHEN s.line_type != 'GIFT_CARD'
+            THEN s.total_tax ELSE 0 END), 2) AS v2_taxes
+        FROM recon_shopify_sales s
+        WHERE s.happened_month = ?
+      `).get(month);
+
+      res.json({
+        month,
+        build_id: "pr112",
+        matrix,
+        order_counts_by_rule: orderRules,
+        return_non_product: {
+          rows: returnNonProduct,
+          row_count: (returnNonProduct as any[]).length,
+          sum_amt_ex_tax: Math.round(returnNonProductSum * 100) / 100,
+          sum_tax: Math.round(returnNonProductTaxSum * 100) / 100,
+        },
+        v2_sums: grossFormulaCheck,
+        note: "Matrix lists every (action_type x line_type x sale_type) combo with sums. Order_counts_by_rule shows 6 different DISTINCT order_id rules so we can match ShopifyQL's count. return_non_product lists every RETURN row where line_type != PRODUCT — likely the source of returns-column gaps.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "sales-combo-matrix failed", error: String(e?.message || e) });
+    }
+  });
+
   app.get("/api/recon/finance/debug/v2-vs-shopifyql/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
