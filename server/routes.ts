@@ -3321,6 +3321,239 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ===================================================================
+  // PR #103 GROUND TRUTH — Shopify vs Our Ingest vs Our Projection
+  // ===================================================================
+  // GET /api/recon/finance/debug/shopify-ground-truth/:month
+  // Calls live Shopify GraphQL orders() for ALL orders created in the
+  // month (ET window), paginated, and compares Shopify's own totals to:
+  //   - what's in recon_shopify_sales (our ingest layer)
+  //   - what's in recon_revenue_events_v2 (our projection layer)
+  //
+  // Returns three side-by-side total objects plus per-order detail so
+  // we can see exactly which orders our ingest dropped vs. which our
+  // projector miscalculated.
+  //
+  // This is the check that should have gated PR #97. Running it now to
+  // diagnose why the V2 projector totals are short.
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/shopify-ground-truth/:month", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+    try {
+      const month = String(req.params.month || "").trim();
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      const cfg = getShopifyReconConfig();
+      if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+
+      const { shopifyGraphqlCall } = require("./shopify-recon");
+      const { sqlite } = require("./storage");
+      const { ensureRevenueEventsV2Schema } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      // ET window for the month. We use created_at:>=START created_at:<END
+      // in Shopify's query DSL, where START/END are ET local boundaries
+      // expressed as ISO (UTC offset -05:00).
+      const [yStr, mStr] = month.split("-");
+      const y = Number(yStr), m = Number(mStr);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const startET = `${y}-${pad(m)}-01T00:00:00-05:00`;
+      const nextY = m === 12 ? y + 1 : y;
+      const nextM = m === 12 ? 1 : m + 1;
+      const endET = `${nextY}-${pad(nextM)}-01T00:00:00-05:00`;
+      const qStr = `created_at:>='${startET}' AND created_at:<'${endET}'`;
+
+      const ORDERS_QUERY = `
+        query MonthGroundTruth($cursor: String, $q: String!) {
+          orders(first: 100, after: $cursor, query: $q, sortKey: CREATED_AT) {
+            pageInfo { hasNextPage endCursor }
+            edges {
+              node {
+                id
+                name
+                createdAt
+                cancelledAt
+                displayFinancialStatus
+                currentTotalPriceSet     { shopMoney { amount } }
+                currentSubtotalPriceSet  { shopMoney { amount } }
+                currentTotalTaxSet       { shopMoney { amount } }
+                currentTotalDiscountsSet { shopMoney { amount } }
+                totalRefundedSet         { shopMoney { amount } }
+                subtotalPriceSet         { shopMoney { amount } }
+                totalPriceSet            { shopMoney { amount } }
+                totalTaxSet              { shopMoney { amount } }
+                totalDiscountsSet        { shopMoney { amount } }
+              }
+            }
+          }
+        }
+      `;
+
+      const shopifyOrders: any[] = [];
+      let cursor: string | null = null;
+      let pages = 0;
+      const maxPages = 200; // 20,000 orders ceiling per month — plenty
+      while (true) {
+        pages++;
+        if (pages > maxPages) break;
+        const r: any = await shopifyGraphqlCall(cfg, ORDERS_QUERY, { cursor, q: qStr });
+        if (r.errors) {
+          // Log but don't abort if data is still present (PR #103 lesson)
+          if (!r.data) {
+            return res.status(502).json({ message: "Shopify GraphQL failed", errors: r.errors });
+          }
+        }
+        const ords = r.data?.orders;
+        if (!ords) break;
+        for (const e of (ords.edges || [])) shopifyOrders.push(e.node);
+        if (!ords.pageInfo?.hasNextPage) break;
+        cursor = ords.pageInfo.endCursor;
+      }
+
+      // Sum Shopify totals (current = post-refund/edit; "total" = original-at-creation)
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      const num = (x: any) => Number(x?.shopMoney?.amount || 0);
+      const shopifyTotals = {
+        order_count: shopifyOrders.length,
+        current_subtotal: 0,
+        current_total: 0,
+        current_tax: 0,
+        current_discounts: 0,
+        total_refunded: 0,
+        original_subtotal: 0,
+        original_total: 0,
+        original_tax: 0,
+        original_discounts: 0,
+      };
+      for (const o of shopifyOrders) {
+        shopifyTotals.current_subtotal  += num(o.currentSubtotalPriceSet);
+        shopifyTotals.current_total     += num(o.currentTotalPriceSet);
+        shopifyTotals.current_tax       += num(o.currentTotalTaxSet);
+        shopifyTotals.current_discounts += num(o.currentTotalDiscountsSet);
+        shopifyTotals.total_refunded    += num(o.totalRefundedSet);
+        shopifyTotals.original_subtotal += num(o.subtotalPriceSet);
+        shopifyTotals.original_total    += num(o.totalPriceSet);
+        shopifyTotals.original_tax      += num(o.totalTaxSet);
+        shopifyTotals.original_discounts+= num(o.totalDiscountsSet);
+      }
+      for (const k of Object.keys(shopifyTotals)) {
+        if (k !== "order_count") (shopifyTotals as any)[k] = round2((shopifyTotals as any)[k]);
+      }
+
+      // Our ingest layer: aggregate recon_shopify_sales for the same month
+      const ingest: any = sqlite.prepare(`
+        SELECT
+          COUNT(DISTINCT order_id) AS order_count,
+          COUNT(*)                  AS sales_count,
+          COALESCE(SUM(total_amount), 0)                     AS total_amount,
+          COALESCE(SUM(total_tax), 0)                        AS total_tax,
+          COALESCE(SUM(total_discount_after_taxes), 0)       AS total_discount_after_taxes,
+          COALESCE(SUM(total_discount_before_taxes), 0)      AS total_discount_before_taxes
+        FROM recon_shopify_sales
+        WHERE happened_month = ?
+      `).get(month) as any;
+      for (const k of ["total_amount","total_tax","total_discount_after_taxes","total_discount_before_taxes"]) {
+        ingest[k] = round2(Number(ingest[k] || 0));
+      }
+
+      // Our projection layer: aggregate recon_revenue_events_v2 for same month
+      const v2: any = sqlite.prepare(`
+        SELECT
+          COUNT(DISTINCT order_id) AS order_count,
+          COUNT(*)                  AS event_count,
+          COALESCE(SUM(gross), 0)                  AS gross,
+          COALESCE(SUM(discount), 0)               AS discount,
+          COALESCE(SUM(returns), 0)                AS returns,
+          COALESCE(SUM(tax), 0)                    AS tax,
+          COALESCE(SUM(return_fees), 0)            AS return_fees,
+          COALESCE(SUM(net_sales_gift_cards), 0)   AS net_sales_gift_cards
+        FROM recon_revenue_events_v2
+        WHERE event_month = ?
+      `).get(month) as any;
+      for (const k of ["gross","discount","returns","tax","return_fees","net_sales_gift_cards"]) {
+        v2[k] = round2(Number(v2[k] || 0));
+      }
+
+      // Per-order: for each Shopify order in the month, look up our ingest
+      // + v2 counts. Anything where Shopify > 0 but we have 0 is a dropped
+      // order. Anything where amounts differ by >$0.01 is a calculation gap.
+      const lookupSales = sqlite.prepare(`
+        SELECT COUNT(*) AS sales_count, COALESCE(SUM(total_amount), 0) AS total_amount
+        FROM recon_shopify_sales
+        WHERE order_id = ? AND happened_month = ?
+      `);
+      const lookupAgreements = sqlite.prepare(`
+        SELECT COUNT(*) AS agreement_count
+        FROM recon_shopify_agreements
+        WHERE order_id = ?
+      `);
+      const lookupV2 = sqlite.prepare(`
+        SELECT COUNT(*) AS event_count, COALESCE(SUM(gross), 0) AS gross
+        FROM recon_revenue_events_v2
+        WHERE order_id = ? AND event_month = ?
+      `);
+      const perOrder: any[] = [];
+      let droppedCount = 0;
+      let droppedGross = 0;
+      for (const o of shopifyOrders) {
+        const orderId = String(o.id).replace("gid://shopify/Order/", "");
+        const s: any = lookupSales.get(orderId, month) || {};
+        const a: any = lookupAgreements.get(orderId) || {};
+        const ve: any = lookupV2.get(orderId, month) || {};
+        const shopifyTotal = num(o.currentTotalPriceSet);
+        const ingested = Number(s.sales_count || 0) > 0;
+        if (!ingested && shopifyTotal > 0) {
+          droppedCount++;
+          droppedGross += shopifyTotal;
+        }
+        perOrder.push({
+          order_id: orderId,
+          name: o.name,
+          createdAt: o.createdAt,
+          cancelledAt: o.cancelledAt,
+          financial_status: o.displayFinancialStatus,
+          shopify_current_total: round2(num(o.currentTotalPriceSet)),
+          shopify_current_subtotal: round2(num(o.currentSubtotalPriceSet)),
+          shopify_refunded: round2(num(o.totalRefundedSet)),
+          ingest_sales_count: Number(s.sales_count || 0),
+          ingest_total_amount: round2(Number(s.total_amount || 0)),
+          ingest_agreement_count: Number(a.agreement_count || 0),
+          v2_event_count: Number(ve.event_count || 0),
+          v2_gross: round2(Number(ve.gross || 0)),
+          dropped_by_ingest: !ingested && shopifyTotal > 0,
+        });
+      }
+      // Sort: dropped orders first (largest first), then by amount
+      perOrder.sort((a, b) => {
+        if (a.dropped_by_ingest && !b.dropped_by_ingest) return -1;
+        if (!a.dropped_by_ingest && b.dropped_by_ingest) return 1;
+        return b.shopify_current_total - a.shopify_current_total;
+      });
+
+      res.json({
+        build_id: "pr103-ground-truth",
+        month,
+        window_et: { start: startET, end: endET },
+        shopify: shopifyTotals,
+        our_ingest: ingest,
+        our_projection_v2: v2,
+        gaps: {
+          shopify_current_total_vs_v2_gross: round2(shopifyTotals.current_total - Number(v2.gross || 0)),
+          shopify_current_subtotal_vs_v2_gross: round2(shopifyTotals.current_subtotal - Number(v2.gross || 0)),
+          shopify_orders_vs_v2_orders: shopifyTotals.order_count - Number(v2.order_count || 0),
+          shopify_orders_vs_ingest_orders: shopifyTotals.order_count - Number(ingest.order_count || 0),
+          dropped_by_ingest_count: droppedCount,
+          dropped_by_ingest_gross: round2(droppedGross),
+        },
+        per_order_top_50: perOrder.slice(0, 50),
+        per_order_total: perOrder.length,
+        pages_fetched: pages,
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "shopify-ground-truth failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #85b diagnostic. Batch version of /graphql-totals.
   // POST body: { names: string[] } (with or without leading '#'; max 25)
   // For each order: runs the same GraphQL query, computes the
