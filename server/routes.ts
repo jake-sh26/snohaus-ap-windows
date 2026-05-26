@@ -3672,6 +3672,229 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #124 — POS-only by-store finance summary.
+  //
+  // Goal: prove POS attribution is correct by reconciling our V2 totals,
+  // filtered to a single POS location, against Shopify Admin's Finances
+  // Summary with the POS channel filter set to that same location.
+  //
+  // Schema reality: `recon_shopify_sales` has no location_id column — it's
+  // purely a line ledger keyed off `order_id`. The location signal lives on
+  // `recon_orders` (source_name = 'pos' | 'online_store' | 'shop' | ... and
+  // location_id = numeric Shopify location). So we run the exact same V2
+  // aggregation SQL as /v2-vs-shopifyql but add a JOIN on recon_orders and
+  // two predicates: source_name='pos' AND location_id=:location_id.
+  //
+  // Why source_name='pos' AND not just location_id=?: an online order that
+  // was fulfilled from a store location ALSO carries that store's location_id
+  // on recon_orders, but its source_name is 'online_store'. Shopify's POS
+  // channel filter only includes orders rung through a POS register (i.e.
+  // source_name='pos'), so we mirror that exactly.
+  //
+  // Same line-item rules as /v2-vs-shopifyql (PR #110/113/118/121):
+  //   gross_sales: action_type IN (ORDER, UPDATE) AND line_type=PRODUCT
+  //                sum of (total_amount + total_discount_before_taxes - total_tax)
+  //   discounts:   same filter, sum of -total_discount_before_taxes
+  //   returns:     action_type=RETURN AND line_type IN (PRODUCT, ADJUSTMENT)
+  //                sum of (total_amount - total_tax)
+  //   return_fees: action_type=ORDER AND line_type=FEE, sum of (amount - tax)
+  //   net_sales_gift_cards: line_type=GIFT_CARD, signed by action_type
+  //   shipping:    line_type=SHIPPING, sum of (amount - tax)
+  //   taxes:       line_type != GIFT_CARD, sum of total_tax
+  //
+  // net_sales = gross + discounts + returns
+  // total_sales = net_sales + shipping + return_fees + taxes
+  //
+  // Orders count uses recon_orders.processed_at month (ET) bucketing — but
+  // for POS, processed_at and created_at are the same instant (the ring-up),
+  // so the difference is moot.
+  //
+  // Returns are bucketed by the RETURN row's happened_month, NOT the
+  // original sale's month. This matches ShopifyQL behavior when filtered
+  // to a POS location: a return processed at Huntington in March on a
+  // February sale shows up in Huntington's March returns. (When we add
+  // non-POS later, we'll need to decide whether to follow this same rule
+  // or bucket returns to the original sale's store — current standing
+  // rule: bucket to original sale's store. POS returns inherit the POS
+  // location naturally because the return row's parent order_id has the
+  // store's location_id on it.)
+  app.get("/api/recon/finance/by-store-pos/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const locationId = req.query.location_id ? String(req.query.location_id) : null;
+    try {
+      const { sqlite } = require("./storage");
+
+      // Resolve location_id -> entity_id/name via recon_entity_pos_locations.
+      // If caller passes ?location_id=X, restrict to that single store; else
+      // return one row per mapped store (so the caller can sum to total).
+      // Filter to kind='pos' AND active=1 to skip fulfillment-only or
+      // archived rows.
+      const mappedLocs: Array<{ location_id: string; entity_id: number; entity_location: string }> =
+        sqlite.prepare(`
+          SELECT pl.shopify_location_id AS location_id,
+                 pl.entity_id           AS entity_id,
+                 e.location             AS entity_location
+            FROM recon_entity_pos_locations pl
+            JOIN payroll_entities e ON e.id = pl.entity_id
+           WHERE pl.shopify_location_id IS NOT NULL
+             AND pl.kind = 'pos'
+             AND pl.active = 1
+             ${locationId ? "AND pl.shopify_location_id = ?" : ""}
+           ORDER BY pl.entity_id
+        `).all(...(locationId ? [locationId] : []));
+
+      if (mappedLocs.length === 0) {
+        return res.status(404).json({
+          message: locationId
+            ? `No entity mapping found for location_id ${locationId}`
+            : "No POS location mappings found in recon_entity_pos_locations",
+        });
+      }
+
+      const byStore: any[] = [];
+      for (const loc of mappedLocs) {
+        const row: any = sqlite.prepare(`
+          SELECT
+            COALESCE(SUM(
+              CASE
+                WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
+                  THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
+                ELSE 0
+              END
+            ), 0) AS gross_sales,
+            COALESCE(SUM(
+              CASE
+                WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
+                  THEN -s.total_discount_before_taxes
+                ELSE 0
+              END
+            ), 0) AS discounts,
+            COALESCE(SUM(
+              CASE
+                WHEN s.action_type = 'RETURN'
+                     AND s.line_type IN ('PRODUCT', 'ADJUSTMENT')
+                  THEN (s.total_amount - s.total_tax)
+                ELSE 0
+              END
+            ), 0) AS returns,
+            COALESCE(SUM(
+              CASE
+                WHEN s.action_type = 'ORDER' AND s.line_type = 'FEE'
+                  THEN s.total_amount - s.total_tax
+                ELSE 0
+              END
+            ), 0) AS return_fees,
+            COALESCE(SUM(
+              CASE
+                WHEN s.line_type = 'GIFT_CARD'
+                  THEN s.total_amount - s.total_tax
+                ELSE 0
+              END
+            ), 0) AS net_sales_gift_cards,
+            COALESCE(SUM(
+              CASE
+                WHEN s.line_type = 'SHIPPING'
+                  THEN s.total_amount - s.total_tax
+                ELSE 0
+              END
+            ), 0) AS shipping_charges,
+            COALESCE(SUM(
+              CASE
+                WHEN s.line_type != 'GIFT_CARD'
+                  THEN s.total_tax
+                ELSE 0
+              END
+            ), 0) AS taxes,
+            (
+              SELECT COUNT(*)
+                FROM recon_orders o2
+               WHERE substr(datetime(COALESCE(o2.processed_at, o2.created_at), '-5 hours'), 1, 7) = ?
+                 AND o2.source_name = 'pos'
+                 AND o2.location_id = ?
+                 AND EXISTS (
+                   SELECT 1 FROM recon_shopify_sales ss
+                    WHERE ss.order_id = o2.id
+                      AND ss.happened_month = ?
+                      AND (
+                        (ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
+                        OR (ss.action_type = 'RETURN'
+                            AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
+                      )
+                 )
+            ) AS orders
+          FROM recon_shopify_sales s
+          JOIN recon_orders o ON o.id = s.order_id
+          WHERE s.happened_month = ?
+            AND o.source_name = 'pos'
+            AND o.location_id = ?
+        `).get(month, loc.location_id, month, month, loc.location_id) as any;
+
+        const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
+        const gross = r2(row.gross_sales);
+        const disc = r2(row.discounts);
+        const ret = r2(row.returns);
+        const rf = r2(row.return_fees);
+        const gc = r2(row.net_sales_gift_cards);
+        const ship = r2(row.shipping_charges);
+        const tax = r2(row.taxes);
+        const netSales = r2(gross + disc + ret);
+        const totalSales = r2(netSales + ship + rf + tax);
+        byStore.push({
+          entity_id: loc.entity_id,
+          entity_location: loc.entity_location,
+          location_id: loc.location_id,
+          gross_sales: gross,
+          discounts: disc,
+          returns: ret,
+          return_fees: rf,
+          net_sales: netSales,
+          net_sales_gift_cards: gc,
+          shipping_charges: ship,
+          taxes: tax,
+          total_sales: totalSales,
+          orders: Number(row.orders) || 0,
+        });
+      }
+
+      // POS totals across all stores (for cross-foot vs full Shopify
+      // POS-channel totals — Shopify Admin lets you filter Finance Summary
+      // to channel='pos' with no location filter to get this).
+      const r2sum = (a: number, b: number): number => Math.round((a + b) * 100) / 100;
+      const totals = byStore.reduce(
+        (acc, s) => ({
+          gross_sales: r2sum(acc.gross_sales, s.gross_sales),
+          discounts: r2sum(acc.discounts, s.discounts),
+          returns: r2sum(acc.returns, s.returns),
+          return_fees: r2sum(acc.return_fees, s.return_fees),
+          net_sales: r2sum(acc.net_sales, s.net_sales),
+          net_sales_gift_cards: r2sum(acc.net_sales_gift_cards, s.net_sales_gift_cards),
+          shipping_charges: r2sum(acc.shipping_charges, s.shipping_charges),
+          taxes: r2sum(acc.taxes, s.taxes),
+          total_sales: r2sum(acc.total_sales, s.total_sales),
+          orders: acc.orders + s.orders,
+        }),
+        {
+          gross_sales: 0, discounts: 0, returns: 0, return_fees: 0, net_sales: 0,
+          net_sales_gift_cards: 0, shipping_charges: 0, taxes: 0, total_sales: 0, orders: 0,
+        }
+      );
+
+      res.json({
+        month,
+        scope: "pos_only",
+        by_store: byStore,
+        totals,
+        note: "POS attribution is exact (location_id on recon_orders). Non-POS allocation comes in PR #125. Compare each row to Shopify Admin Finance Summary with POS channel filter set to that store's location.",
+        build_id: "pr124",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "by-store-pos failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #116 — Orders-count gap diagnostic. After PR #114 closed all dollar
   // diffs and matched April orders perfectly, Jan/Feb/Mar/May still showed
   // ShopifyQL counting more orders than V2 (+17/+100/+70/+20). This endpoint
