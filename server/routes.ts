@@ -3546,13 +3546,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               ELSE 0
             END
           ), 0) AS taxes,
-          COUNT(DISTINCT CASE
-            WHEN s.line_type != 'GIFT_CARD' THEN s.order_id
-          END) AS orders
+          -- PR #114: orders column historically used a sales-row-presence
+          -- count, which over- or under-counted relative to ShopifyQL. The
+          -- actual ShopifyQL rule (verified empirically on April 2025 vs
+          -- Sales-by-Order CSV, 8/8 match): orders counts orders whose
+          -- placement (processed_at — ET) falls within the period AND
+          -- which had non-zero financial activity (gross or returns) in
+          -- that period. Orders placed earlier but only returned in this
+          -- period are excluded; orders placed in this period with zero
+          -- activity are also excluded. We compute this in a correlated
+          -- subquery to keep one row out from this aggregate.
+          (
+            SELECT COUNT(*)
+              FROM recon_orders o
+             WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+               AND EXISTS (
+                 SELECT 1 FROM recon_shopify_sales ss
+                  WHERE ss.order_id = o.id
+                    AND ss.happened_month = ?
+                    AND (
+                      (ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
+                      OR (ss.action_type = 'RETURN'
+                          AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
+                    )
+                    AND (ss.total_amount - ss.total_tax) != 0
+               )
+          ) AS orders
         FROM recon_shopify_sales s
         JOIN recon_shopify_agreements a ON a.id = s.agreement_id
         WHERE s.happened_month = ?
-      `).get(month) as any;
+      `).get(month, month, month) as any;
 
       const v2 = {
         gross_sales: Math.round(Number(v2Row.gross_sales) * 100) / 100,
