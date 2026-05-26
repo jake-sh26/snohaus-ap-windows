@@ -3927,36 +3927,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const [yy, mm] = month.split("-").map(Number);
       const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
 
-      // Chunk into ~7-day windows so each ShopifyQL call stays well under
-      // the 1000-row cap. For a 30-day month: 1-7, 8-14, 15-21, 22-28, 29-30.
-      const windows: Array<{ start: string; end: string }> = [];
+      // Chunk into ~7-day windows initially. If any window returns the
+      // 1000-row cap, recursively split that window in half until each
+      // sub-window returns < 1000 rows or hits a 1-day floor.
+      const initialWindows: Array<{ start: string; end: string }> = [];
       for (let d = 1; d <= lastDay; d += 7) {
         const we = Math.min(d + 6, lastDay);
-        windows.push({
+        initialWindows.push({
           start: `${month}-${String(d).padStart(2, "0")}`,
           end: `${month}-${String(we).padStart(2, "0")}`,
         });
       }
 
-      // 1) ShopifyQL: pull gross_sales per order_name per window, merge.
-      //    Same order_name can appear in multiple windows (e.g. if Shopify
-      //    attributes activity across windows). Sum across windows.
+      // 1) ShopifyQL: pull gross_sales per order_name per window. Recurse on
+      //    capped windows down to 1-day granularity. Sum across windows.
       const qlMap = new Map<string, number>();
       let anyWindowCapped = false;
-      const windowStats: Array<{ start: string; end: string; rows: number; capped: boolean }> = [];
-      for (const w of windows) {
+      const windowStats: Array<{ start: string; end: string; rows: number; capped: boolean; split?: boolean }> = [];
+
+      const fetchWindow = async (start: string, end: string): Promise<void> => {
         const r: any = await runShopifyql(
-          `FROM sales\nSHOW gross_sales\nGROUP BY order_name\nSINCE ${w.start} UNTIL ${w.end}`,
+          `FROM sales\nSHOW gross_sales\nGROUP BY order_name\nSINCE ${start} UNTIL ${end}`,
         );
         const rows: any[] = r?.rows || [];
-        const capped = rows.length === 1000;
-        if (capped) anyWindowCapped = true;
-        windowStats.push({ start: w.start, end: w.end, rows: rows.length, capped });
+        const capped = rows.length >= 1000;
+        // If capped and we can split (span > 1 day), split in half and retry.
+        if (capped) {
+          const sd = new Date(start + "T00:00:00Z");
+          const ed = new Date(end + "T00:00:00Z");
+          const dayMs = 86400000;
+          const spanDays = Math.round((ed.getTime() - sd.getTime()) / dayMs) + 1;
+          if (spanDays > 1) {
+            const midDays = Math.floor(spanDays / 2);
+            const midEnd = new Date(sd.getTime() + (midDays - 1) * dayMs);
+            const midStart = new Date(sd.getTime() + midDays * dayMs);
+            const midEndStr = midEnd.toISOString().slice(0, 10);
+            const midStartStr = midStart.toISOString().slice(0, 10);
+            windowStats.push({ start, end, rows: rows.length, capped: true, split: true });
+            await fetchWindow(start, midEndStr);
+            await fetchWindow(midStartStr, end);
+            return;
+          }
+          // Can't split further — record and mark cap (still ingest rows below).
+          anyWindowCapped = true;
+        }
+        windowStats.push({ start, end, rows: rows.length, capped });
         for (const row of rows) {
           const name = String(row.order_name);
           const gs = Number(row.gross_sales) || 0;
           qlMap.set(name, (qlMap.get(name) || 0) + gs);
         }
+      };
+      for (const w of initialWindows) {
+        await fetchWindow(w.start, w.end);
       }
 
       // 2) V2: one GROUP BY query. Use the same gross_sales formula as
@@ -3988,6 +4011,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const v2Map = new Map<string, any>();
       for (const r of v2Rows) v2Map.set(String(r.name), r);
 
+      // 2b) Pre-load metadata for ALL recon_orders whose name appears in ShopifyQL
+      //     but is NOT in v2Map (i.e. V2 attributes them to a different month or
+      //     has $0 gross). This lets us surface placement_month, financial_status,
+      //     and processed/cancelled timestamps for those mystery orders.
+      const qlOnlyNames: string[] = [];
+      qlMap.forEach((_v, k) => { if (!v2Map.has(k)) qlOnlyNames.push(k); });
+      const orderMetaMap = new Map<string, any>();
+      if (qlOnlyNames.length > 0) {
+        // Batch in chunks of 500 to avoid SQLite parameter limits.
+        for (let i = 0; i < qlOnlyNames.length; i += 500) {
+          const batch = qlOnlyNames.slice(i, i + 500);
+          const placeholders = batch.map(() => "?").join(",");
+          const rows: any[] = sqlite
+            .prepare(
+              `SELECT name, created_at, processed_at, cancelled_at,
+                      financial_status, source_name,
+                      substr(datetime(COALESCE(processed_at, created_at), '-5 hours'), 1, 7) AS placement_month_et
+                 FROM recon_orders
+                WHERE name IN (${placeholders})`,
+            )
+            .all(...batch);
+          for (const r of rows) orderMetaMap.set(String(r.name), r);
+        }
+      }
+
       // 3) Diff. Walk union of names.
       const allNames = new Set<string>();
       qlMap.forEach((_v, k) => allNames.add(k));
@@ -4001,16 +4049,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const v2 = v2row ? Number(v2row.v2_gross) || 0 : 0;
         const d = Math.round((v2 - ql) * 100) / 100;
         if (Math.abs(d) >= 0.01) {
+          const meta = v2row || orderMetaMap.get(name) || null;
           diffs.push({
             name,
             v2_gross: Math.round(v2 * 100) / 100,
             ql_gross: Math.round(ql * 100) / 100,
             diff_v2_minus_ql: d,
-            created_at: v2row?.created_at || null,
-            processed_at: v2row?.processed_at || null,
-            cancelled_at: v2row?.cancelled_at || null,
-            financial_status: v2row?.financial_status || null,
-            source_name: v2row?.source_name || null,
+            created_at: meta?.created_at || null,
+            processed_at: meta?.processed_at || null,
+            cancelled_at: meta?.cancelled_at || null,
+            financial_status: meta?.financial_status || null,
+            source_name: meta?.source_name || null,
+            v2_placement_month: meta?.placement_month_et || null,
+            in_v2_this_month: !!v2row,
           });
           sumDiff += d;
         }
@@ -4028,8 +4079,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         window_stats: windowStats,
         diffs: diffs.slice(0, limit),
-        note: "PR #119 — per-order gross_sales diff. ShopifyQL pulled in weekly windows to stay under the 1000-row cap; values summed across windows per order_name. V2 gross uses the same action_type=ORDER+line_type=PRODUCT formula as /v2-vs-shopifyql, restricted to orders whose ET-shifted placement falls in :month. diff_v2_minus_ql > 0 means V2 attributes more gross to this order than ShopifyQL.",
-        build_id: "pr119",
+        note: "PR #120 — per-order gross_sales diff. ShopifyQL pulled in weekly windows; capped windows auto-split down to 1-day. Values summed across windows per order_name. V2 gross uses action_type=ORDER+line_type=PRODUCT, restricted to orders whose ET-shifted placement falls in :month. For ShopifyQL-only orders, metadata is loaded from recon_orders so v2_placement_month reveals which month V2 thinks the order belongs to. diff_v2_minus_ql > 0 means V2 attributes more gross to this order than ShopifyQL.",
+        build_id: "pr120",
       });
     } catch (e: any) {
       res.status(500).json({ message: "per-order-gross-diff failed", error: String(e?.message || e) });
