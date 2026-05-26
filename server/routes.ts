@@ -6696,6 +6696,87 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #132 — Range backfill for the allocator. Walks YYYY-MM → YYYY-MM
+  // inclusive and runs runAllocationEngine for each month sequentially.
+  //
+  // Idempotent: runAllocationEngine deletes only auto allocations for the
+  // target month before re-inserting (preserves manual_override rows), so
+  // re-running the same range is safe. Synchronous — the 17-month backfill
+  // takes ~10s on a warm SQLite, well inside any reasonable HTTP timeout,
+  // and the response includes per-month summary so the operator can spot
+  // anomalies (e.g. a month with elevated needs_review).
+  //
+  // Body: { from: "YYYY-MM", to: "YYYY-MM" }   (both inclusive)
+  // Returns: { ok, months_processed, per_month: AllocationRunSummary[],
+  //            total_orders, total_line_items, total_allocations,
+  //            total_needs_review, total_failed }
+  app.post("/api/recon/allocations/backfill", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const from = String(req.body?.from ?? "").trim();
+    const to = String(req.body?.to ?? "").trim();
+    if (!/^\d{4}-\d{2}$/.test(from) || !/^\d{4}-\d{2}$/.test(to)) {
+      return res.status(400).json({ error: "from and to must be YYYY-MM" });
+    }
+    if (from > to) {
+      return res.status(400).json({ error: "from must be <= to" });
+    }
+
+    // Enumerate months from..to inclusive. Cap at 36 months to prevent
+    // runaway requests against a misconfigured cutover date.
+    const months: string[] = [];
+    let [y, m] = from.split("-").map(Number);
+    const [ty, tm] = to.split("-").map(Number);
+    while (y < ty || (y === ty && m <= tm)) {
+      months.push(`${y}-${String(m).padStart(2, "0")}`);
+      m += 1;
+      if (m === 13) { m = 1; y += 1; }
+      if (months.length > 36) {
+        return res.status(400).json({ error: "range exceeds 36 months" });
+      }
+    }
+
+    const t0 = Date.now();
+    const perMonth: any[] = [];
+    let total_orders = 0, total_line_items = 0, total_allocations = 0;
+    let total_needs_review = 0, total_failed = 0;
+    for (const monthStr of months) {
+      try {
+        const s = runAllocationEngine(monthStr);
+        perMonth.push(s);
+        total_orders += s.orders_processed;
+        total_line_items += s.line_items_processed;
+        total_allocations += s.allocations_written;
+        total_needs_review += s.needs_review_orders;
+        total_failed += s.failed_orders;
+      } catch (e: any) {
+        // One bad month shouldn't abort the rest — record the error and
+        // continue. The operator can re-run the single month manually.
+        perMonth.push({
+          month: monthStr,
+          error: e?.message ?? String(e),
+          orders_processed: 0,
+          line_items_processed: 0,
+          allocations_written: 0,
+          needs_review_orders: 0,
+          failed_orders: 0,
+        });
+      }
+    }
+
+    res.json({
+      ok: true,
+      from,
+      to,
+      months_processed: months.length,
+      duration_ms: Date.now() - t0,
+      total_orders,
+      total_line_items,
+      total_allocations,
+      total_needs_review,
+      total_failed,
+      per_month: perMonth,
+    });
+  });
+
   app.get("/api/recon/allocations/needs-review", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const month = typeof req.query.month === "string" && /^\d{4}-\d{2}$/.test(req.query.month)
       ? req.query.month
