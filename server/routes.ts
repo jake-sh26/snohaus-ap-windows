@@ -3627,8 +3627,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
-        build_id: "pr111",
+        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
+        build_id: "pr114",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
