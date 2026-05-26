@@ -70,30 +70,34 @@
  * already has negative total_amount, a reversal already has negative
  * quantity. This eliminates legacy's Rule #10 sign-convention dance.
  *
+ * VERIFIED EMPIRICALLY (2026-05-26, see PR #108): Shopify's totalAmount on a
+ * Sale is **tax-inclusive** (= line subtotal + tax, post-discount). The
+ * earlier comment block calling it "post-discount, pre-tax" was wrong and
+ * was the source of V2's gross_sales overage vs ShopifyQL Finance Summary.
+ *
+ * ShopifyQL defines:
+ *   gross_sales = pre-discount, pre-tax (product subtotal at original price)
+ *   net_sales   = gross_sales - discount - returns
+ *   total_sales = net_sales + shipping + tax + fees   (= what the customer paid)
+ *
+ * Inverting totalAmount → pre-discount, pre-tax:
+ *   gross = total_amount + total_discount_before_taxes - total_tax
+ *
+ * Per-order verification on April 2025 data:
+ *   #21765:  tax sum    = $614.97   = exact gross overage under old rule
+ *   #21707:  tax        = $4,102.98 = exact overage
+ *   #21758:  tax        ≈ $794.98 vs $781.86 overage (~$13 cents/rounding)
+ *
  * For NON-GIFT-CARD sales (reason=ORDER, ORDER_EDIT positive qty):
- *   gross    = (total_amount + total_discount_before_taxes)  // pre-discount
+ *   gross    = total_amount + total_discount_before_taxes - total_tax
  *   discount = total_discount_before_taxes
  *   tax      = total_tax
  *   returns  = 0
  *
- * Wait — Shopify's totalAmount on a Sale is post-discount, pre-tax. So:
- *   gross = unit_price × quantity (we don't have this directly on every
- *           sale subtype; ProductSale has originalUnitPrice → use that)
- *   discount = total_discount_before_taxes
- *   tax = total_tax
- *
- * Simpler alternative — derive gross from totalAmount + discount, since
- * Shopify Finance Summary defines:
- *   gross_sales = totalAmount + discount   (pre-discount, pre-tax)
- *   net_sales   = gross_sales - discount - returns
- *               = totalAmount - returns
- *
- * So we'll use:
- *   gross    = total_amount + total_discount_before_taxes
- *   discount = total_discount_before_taxes
- *
  * For REFUND/RETURN sales (negative total_amount):
- *   returns = -total_amount  // store positive (legacy convention)
+ *   returns = -(total_amount - total_tax)
+ *             // tax-component of refund moves into the tax column, not returns
+ *             // so the returns line matches ShopifyQL's tax-exclusive returns
  *   tax     = total_tax      // already negative from Shopify
  *   gross   = 0
  *   discount = 0
@@ -469,29 +473,32 @@ export function projectRevenueEventsV2(
         lineItemId = s.ref_id;
       }
 
+      // NOTE (PR #108): Shopify Sale.totalAmount is TAX-INCLUSIVE. To match
+      // ShopifyQL Finance Summary's tax-exclusive gross_sales / returns lines,
+      // subtract total_tax wherever we derive gross or returns from
+      // total_amount. See file-level comment for verification details.
       if (eventType === "sale") {
         if (isGc === 1) {
           // Gift card sales contribute to net_sales_gift_cards only.
-          // totalAmount is post-discount, which is what Shopify reports
-          // as "net sales (gift cards)".
-          netSalesGcCol = totalAmount;
+          // totalAmount is tax-inclusive but gift cards are non-taxable, so
+          // total_tax is 0 for these and the subtraction is a no-op.
+          netSalesGcCol = totalAmount - tax;
         } else {
-          // gross = totalAmount + discount (pre-discount, pre-tax)
-          gross = totalAmount + discount;
+          // gross = totalAmount + discount - tax  (pre-discount, pre-tax)
+          gross = totalAmount + discount - tax;
           discountCol = discount;
           taxCol = tax;
         }
       } else if (eventType === "edit_adjustment") {
         // Reversed line under an OrderEditAgreement. totalAmount is already
-        // negative; we keep legacy's column semantics:
+        // negative; same tax-exclusive adjustment as the sale branch.
         //   - reversals reduce gross (negative gross)
-        //   - reversals reduce discount (negative discount), so net effect
-        //     on (gross - discount) matches what Shopify books
+        //   - reversals reduce discount (negative discount)
         //   - tax reversal is negative tax (already signed correctly)
         if (isGc === 1) {
-          netSalesGcCol = totalAmount; // already negative
+          netSalesGcCol = totalAmount - tax; // tax typically 0 for GC
         } else {
-          gross = totalAmount + discount; // discount may also be negative
+          gross = totalAmount + discount - tax;
           discountCol = discount;
           taxCol = tax;
         }
@@ -499,19 +506,21 @@ export function projectRevenueEventsV2(
         if (isGc === 1) {
           // Gift card refund: nets out net_sales_gift_cards, not returns.
           // totalAmount is negative; flip into netSalesGcCol negative.
-          netSalesGcCol = totalAmount;
+          netSalesGcCol = totalAmount - tax; // tax typically 0 for GC
         } else {
-          // Refund / return item. Shopify gives negative totalAmount; the
-          // events table stores `returns` as a positive reduction.
-          returnsCol = -totalAmount;
-          // Tax on refund is also negative from Shopify, matching legacy's
-          // Rule #10 sign convention (store negative).
+          // Refund / return item. Shopify gives negative totalAmount
+          // (tax-inclusive). Tax-exclusive returns = -(totalAmount - tax).
+          // Since totalAmount and tax are both negative on refunds, this
+          // yields a positive returns figure matching ShopifyQL.
+          returnsCol = -(totalAmount - tax);
+          // Tax on refund stays in the tax column (negative from Shopify).
           taxCol = tax;
         }
       } else if (eventType === "return_fee") {
         // Retained fee — positive totalAmount on a FeeSale under
-        // RefundAgreement. Stored as a positive return_fees amount.
-        returnFeesCol = totalAmount;
+        // RefundAgreement. Stored as a positive return_fees amount
+        // (tax-exclusive, consistent with the other tax-exclusive columns).
+        returnFeesCol = totalAmount - tax;
         // Tax on the fee is collected, not refunded — keep as-is.
         taxCol = tax;
       }
