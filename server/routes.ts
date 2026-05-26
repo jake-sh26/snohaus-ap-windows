@@ -6961,6 +6961,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ status: "ok", version: "1.0.0", app: "snohaus-ap-windows" });
   });
 
+  // PR #135 — build-info endpoint. Returns git SHA + build time so devtools
+  // can verify which revision the Windows service is actually running after
+  // a restart. Reads env vars set at build/start time (GIT_SHA, BUILD_TIME);
+  // falls back to 'unknown' if not provided. Pure read, no auth required
+  // because git SHA isn't sensitive.
+  app.get("/api/build-info", (_req, res) => {
+    res.json({
+      git_sha: process.env.GIT_SHA || "unknown",
+      build_time: process.env.BUILD_TIME || "unknown",
+      node_version: process.version,
+      pid: process.pid,
+      uptime_sec: Math.round(process.uptime()),
+      started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    });
+  });
+
   // ---- Invoices ----
   app.get("/api/invoices", authMiddleware, (req, res) => {
     const filters: any = {};

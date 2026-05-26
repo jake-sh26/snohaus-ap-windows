@@ -677,19 +677,46 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
   // Each call is independently idempotent (UNIQUE constraints on both
   // tables), so partial reruns and re-trigger from the rebuild route both
   // converge to the same state.
-  for (const o of orders) {
-    if (o.cancelled_at) continue;
-    const raw = sqlite
-      .prepare(`SELECT raw_json FROM recon_orders WHERE id = ?`)
-      .get(o.id) as { raw_json: string | null } | undefined;
-    if (!raw?.raw_json) continue;
-    try {
-      const parsed = JSON.parse(raw.raw_json);
-      const r = processOrderForGCRedemption(o.id, parsed);
-      summary.gc_redemptions_recorded += r.redemptions_recorded;
-      summary.gc_je_legs_emitted += r.je_legs_emitted;
-    } catch (e: any) {
-      summary.warnings.push(`GC redemption ${o.id}: ${e?.message ?? String(e)}`);
+  //
+  // PR #135 perf — the previous implementation did a per-order SELECT raw_json
+  // + JSON.parse for ALL orders, even though >99% have no GC redemption. For
+  // Nov 2025 (1825 orders), that's 1825 extra round-trips and 1825 JSON parses
+  // of ~50KB payloads. The fix:
+  //   (1) Restrict the pull to orders whose raw_json actually contains the
+  //       substring '"gateway":"gift_card"'. Sqlite INSTR on a TEXT column is
+  //       a sequential scan of recon_orders for this month's order_ids — still
+  //       O(orders) but the per-row cost is a fast substring check vs full
+  //       JSON.parse + transaction array walk. For 1825 Nov orders we expect
+  //       ≥10 GC redemptions → ≤1% pass rate, so we skip ~99% of JSON.parse
+  //       calls.
+  //   (2) Hoist the SELECT into a single batched query (IN clause) so we make
+  //       one round-trip instead of 1825.
+  //
+  // Correctness is preserved: the substring test is a strict superset of
+  // what processOrderForGCRedemption actually processes (it walks
+  // transactions[] looking for gateway === 'gift_card'). Anything that would
+  // have produced a redemption row still does; anything filtered out would
+  // have returned skipped_reason='no_gc_transactions' anyway.
+  const liveOrderIds = orders.filter(o => !o.cancelled_at).map(o => o.id);
+  if (liveOrderIds.length > 0) {
+    const placeholders = liveOrderIds.map(() => "?").join(",");
+    const candidates = sqlite
+      .prepare(
+        `SELECT id, raw_json FROM recon_orders
+         WHERE id IN (${placeholders})
+           AND raw_json IS NOT NULL
+           AND INSTR(raw_json, '"gateway":"gift_card"') > 0`
+      )
+      .all(...liveOrderIds) as Array<{ id: string; raw_json: string }>;
+    for (const c of candidates) {
+      try {
+        const parsed = JSON.parse(c.raw_json);
+        const r = processOrderForGCRedemption(c.id, parsed);
+        summary.gc_redemptions_recorded += r.redemptions_recorded;
+        summary.gc_je_legs_emitted += r.je_legs_emitted;
+      } catch (e: any) {
+        summary.warnings.push(`GC redemption ${c.id}: ${e?.message ?? String(e)}`);
+      }
     }
   }
 
