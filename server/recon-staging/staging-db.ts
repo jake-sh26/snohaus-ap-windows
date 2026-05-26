@@ -162,7 +162,7 @@ function bootstrapStagingSchema(db: Database.Database): void {
       raw_json              TEXT NOT NULL,
       ingested_at_utc       TEXT NOT NULL DEFAULT (datetime('now')),
       harness_run_id        TEXT NOT NULL,
-      FOREIGN KEY (order_id) REFERENCES staging.shopify_orders(order_id)
+      FOREIGN KEY (order_id) REFERENCES shopify_orders(order_id)
     );
     CREATE INDEX IF NOT EXISTS idx_stg_lines_order
       ON staging.shopify_order_lines (order_id);
@@ -188,7 +188,7 @@ function bootstrapStagingSchema(db: Database.Database): void {
       raw_json              TEXT NOT NULL,
       ingested_at_utc       TEXT NOT NULL DEFAULT (datetime('now')),
       harness_run_id        TEXT NOT NULL,
-      FOREIGN KEY (order_id) REFERENCES staging.shopify_orders(order_id)
+      FOREIGN KEY (order_id) REFERENCES shopify_orders(order_id)
     );
     CREATE INDEX IF NOT EXISTS idx_stg_shipping_order
       ON staging.shopify_order_shipping (order_id);
@@ -214,7 +214,7 @@ function bootstrapStagingSchema(db: Database.Database): void {
       raw_json              TEXT NOT NULL,
       ingested_at_utc       TEXT NOT NULL DEFAULT (datetime('now')),
       harness_run_id        TEXT NOT NULL,
-      FOREIGN KEY (order_id) REFERENCES staging.shopify_orders(order_id)
+      FOREIGN KEY (order_id) REFERENCES shopify_orders(order_id)
     );
     CREATE INDEX IF NOT EXISTS idx_stg_tax_order
       ON staging.shopify_order_tax_lines (order_id);
@@ -241,7 +241,7 @@ function bootstrapStagingSchema(db: Database.Database): void {
       raw_json              TEXT NOT NULL,
       ingested_at_utc       TEXT NOT NULL DEFAULT (datetime('now')),
       harness_run_id        TEXT NOT NULL,
-      FOREIGN KEY (order_id) REFERENCES staging.shopify_orders(order_id)
+      FOREIGN KEY (order_id) REFERENCES shopify_orders(order_id)
     );
     CREATE INDEX IF NOT EXISTS idx_stg_refunds_order
       ON staging.shopify_refunds (order_id);
@@ -271,7 +271,7 @@ function bootstrapStagingSchema(db: Database.Database): void {
       raw_json              TEXT NOT NULL,
       ingested_at_utc       TEXT NOT NULL DEFAULT (datetime('now')),
       harness_run_id        TEXT NOT NULL,
-      FOREIGN KEY (refund_id) REFERENCES staging.shopify_refunds(refund_id)
+      FOREIGN KEY (refund_id) REFERENCES shopify_refunds(refund_id)
     );
     CREATE INDEX IF NOT EXISTS idx_stg_refund_lines_refund
       ON staging.shopify_refund_lines (refund_id);
@@ -303,7 +303,7 @@ function bootstrapStagingSchema(db: Database.Database): void {
       raw_json              TEXT NOT NULL,
       ingested_at_utc       TEXT NOT NULL DEFAULT (datetime('now')),
       harness_run_id        TEXT NOT NULL,
-      FOREIGN KEY (order_id) REFERENCES staging.shopify_orders(order_id)
+      FOREIGN KEY (order_id) REFERENCES shopify_orders(order_id)
     );
     CREATE INDEX IF NOT EXISTS idx_stg_edits_order
       ON staging.shopify_order_edits (order_id);
