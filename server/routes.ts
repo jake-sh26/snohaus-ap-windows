@@ -2098,7 +2098,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              AND a.reason IN ('ORDER', 'ORDER_EDIT')
         ) AS v2_gross_in_month,
         (
-          SELECT COALESCE(SUM(-(s.total_amount - s.total_tax)), 0)
+          -- PR #109: ShopifyQL convention — returns stored NEGATIVE
+          -- (total_amount on refund row is already negative).
+          SELECT COALESCE(SUM(s.total_amount - s.total_tax), 0)
             FROM recon_shopify_sales s
             JOIN recon_shopify_agreements a ON a.id = s.agreement_id
            WHERE s.order_id = o.id
@@ -2139,7 +2141,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         tax: Math.round(totals.tax * 100) / 100,
       },
       orders,
-      note: "V2-aware enumeration. Every order with at least one recon_shopify_sales row whose happened_month matches. Cross-month orders (created in a prior month, edited/refunded in :month) show created_month != :month. v2_gross/returns/tax use the tax-exclusive PR #108 formulas.",
+      note: "V2-aware enumeration. Every order with at least one recon_shopify_sales row whose happened_month matches. Cross-month orders (created in a prior month, edited/refunded in :month) show created_month != :month. v2_gross/returns/tax use PR #109 ShopifyQL-sign formulas (returns NEGATIVE).",
     });
   });
 
@@ -3231,7 +3233,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       ORDER BY s.happened_at ASC, s.id ASC
     `).all(row.id) as any[];
 
-    // Compute the same tax-exclusive V2 columns the projector uses (PR #108).
+    // PR #109: V2 columns now in ShopifyQL sign convention —
+    //   gross    ≥ 0   (pre-discount, pre-tax)
+    //   discount ≤ 0   (negative)
+    //   returns  ≤ 0   (negative, tax-exclusive)
+    //   tax      signed (positive on sale, negative on refund)
     const enriched = rows.map((r) => {
       const total = Number(r.total_amount || 0);
       const disc = Number(r.total_discount_before_taxes || 0);
@@ -3240,16 +3246,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const reason = String(r.reason || "").toUpperCase();
       const isRefundLike = reason === "REFUND" || reason === "RETURN";
       let v2_gross = 0;
+      let v2_discount = 0;
       let v2_returns = 0;
       if (!isGc && (reason === "ORDER" || reason === "ORDER_EDIT")) {
         v2_gross = total + disc - tax;
+        v2_discount = -disc;
       } else if (!isGc && isRefundLike) {
-        v2_returns = -(total - tax);
+        // total is already negative on refund rows; (total - tax) is the
+        // signed-negative tax-exclusive returns.
+        v2_returns = total - tax;
       }
       return {
         ...r,
         v2_gross: Math.round(v2_gross * 100) / 100,
-        v2_discount: Math.round(disc * 100) / 100,
+        v2_discount: Math.round(v2_discount * 100) / 100,
         v2_returns: Math.round(v2_returns * 100) / 100,
         v2_tax: Math.round(tax * 100) / 100,
       };
@@ -3278,7 +3288,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       sales: enriched,
       by_month: byMonth,
       counts: { sales: enriched.length },
-      note: "Flat per-Sale-event ledger with PR #108 tax-exclusive V2 columns. by_month rollup uses happened_month and includes cross-month edit/refund events.",
+      note: "Flat per-Sale-event ledger with PR #109 ShopifyQL-sign V2 columns (discount ≤ 0, returns ≤ 0). by_month rollup uses happened_month and includes cross-month edit/refund events.",
     });
   });
 
@@ -3325,8 +3335,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ), 0) AS discounts,
           COALESCE(SUM(
             CASE
+              -- PR #109: ShopifyQL convention — returns stored NEGATIVE
+              -- (tax-exclusive). total_amount on a refund row is already
+              -- negative from Shopify, so (total_amount - total_tax) is
+              -- already the correct negative number.
               WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('REFUND','RETURN')
-                THEN -(s.total_amount - s.total_tax)
+                THEN (s.total_amount - s.total_tax)
               ELSE 0
             END
           ), 0) AS returns,
@@ -3373,14 +3387,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           discounts: cmp(ql.discounts, v2.discounts),
           returns: cmp(ql.returns, v2.returns),
           net_sales: cmp(ql.net_sales, net_sales),
-          shipping_charges: cmp(ql.shipping_charges, v2.shipping_charges),
+          shipping_charges: cmp(ql.shipping, v2.shipping_charges),
           taxes: cmp(ql.taxes, v2.taxes),
           total_sales: cmp(ql.total_sales, total_sales),
           orders: cmp(ql.orders, v2.orders),
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #108 tax-exclusive formulas. Acceptance: every line.diff = 0.00 (or 0 for orders).",
+        note: "V2 sums come straight from recon_shopify_sales using PR #109 ShopifyQL-sign formulas (discounts ≤ 0, returns ≤ 0, net = gross + disc + ret). Acceptance: every line.diff = 0.00 (or 0 for orders).",
+        build_id: "pr109",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
@@ -3474,8 +3489,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           COALESCE(L.tax,0)   - COALESCE(V.tax,0)     AS d_tax,
           COALESCE(L.rfee,0)  - COALESCE(V.rfee,0)    AS d_return_fees,
           COALESCE(L.gc,0)    - COALESCE(V.gc,0)      AS d_gc,
+          -- PR #109: V2 stores disc/ret NEGATIVE (ShopifyQL convention),
+          -- so V net = gross + disc + ret. Legacy still stores positive,
+          -- so L net = gross - disc - ret. Both expressions below yield
+          -- the correctly-signed net for their respective tables.
           (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
-            - (COALESCE(V.gross,0)-COALESCE(V.disc,0)-COALESCE(V.ret,0)) AS d_net_sales
+            - (COALESCE(V.gross,0)+COALESCE(V.disc,0)+COALESCE(V.ret,0)) AS d_net_sales
         FROM recon_orders o
         LEFT JOIN (
           SELECT order_id,
@@ -3498,11 +3517,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         WHERE (L.order_id IS NOT NULL OR V.order_id IS NOT NULL)
           AND ABS(
             (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
-            - (COALESCE(V.gross,0)-COALESCE(V.disc,0)-COALESCE(V.ret,0))
+            - (COALESCE(V.gross,0)+COALESCE(V.disc,0)+COALESCE(V.ret,0))
           ) > 0.01
         ORDER BY ABS(
           (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
-          - (COALESCE(V.gross,0)-COALESCE(V.disc,0)-COALESCE(V.ret,0))
+          - (COALESCE(V.gross,0)+COALESCE(V.disc,0)+COALESCE(V.ret,0))
         ) DESC
         LIMIT 200
       `).all(month, month) as any[];
