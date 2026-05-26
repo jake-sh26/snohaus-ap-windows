@@ -99,6 +99,8 @@ export type FinanceSummaryShopifyql = {
   // sub-query because the merchant-facing `sales` dataset does not always
   // expose them on the same row — see pullFinanceSummary().
   return_fees: number | null;
+  // PR #111: ShopifyQL's `sales` dataset does NOT expose a gift-card column.
+  // We keep the field for type compatibility but it is ALWAYS null.
   net_sales_gift_cards: number | null;
   // The raw row Shopify returned, for audit.
   raw: ShopifyqlRow | null;
@@ -324,10 +326,14 @@ export async function pullFinanceSummary(
     // (2026-05-24). Note `shipping_charges` — NOT `shipping`, `total_shipping`,
     // or any other variant. The other 7 names match Shopify Admin's CSV
     // export headers verbatim.
-    // PR #110: Added return_fees and net_sales_gift_cards for V2 parity.
-    // These are documented Finance Summary columns; if Shopify returns null
-    // for an account that doesn't track them, we coalesce to 0 downstream.
-    "SHOW gross_sales, discounts, returns, net_sales, shipping_charges, taxes, total_sales, orders, return_fees, net_sales_gift_cards",
+    // PR #110 + #111: return_fees IS a valid column on the `sales` dataset
+    // (probed 2026-05-26 via devtools_pr110_probe_columns: April 2025 = $10).
+    // Gift-card columns are NOT — every candidate name (gift_cards_issued,
+    // gift_card_sales, net_gift_card_sales, etc.) returned "Column Not Found",
+    // and `FROM gift_cards` returns rows=0. Shopify's Finance Summary
+    // "Gift cards" line lives elsewhere; we compute it ourselves from
+    // recon_shopify_sales line_type='GIFT_CARD' and skip the ShopifyQL diff.
+    "SHOW gross_sales, discounts, returns, net_sales, shipping_charges, taxes, total_sales, orders, return_fees",
     // Dates are NOT string-quoted in ShopifyQL — the ANTLR grammar expects a
     // bare DATE_ token (yyyy-MM-dd). Quoting them yields:
     //   "Syntax input mismatch - mismatched input ''2026-03-01''
@@ -369,7 +375,8 @@ export async function pullFinanceSummary(
     total_sales: num(row?.total_sales),
     orders: num(row?.orders),
     return_fees: num(row?.return_fees),
-    net_sales_gift_cards: num(row?.net_sales_gift_cards),
+    // PR #111: not pulled from ShopifyQL (column does not exist on `sales`).
+    net_sales_gift_cards: null,
     raw: row,
     query: q,
   };
