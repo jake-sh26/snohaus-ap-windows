@@ -95,6 +95,11 @@ export type FinanceSummaryShopifyql = {
   taxes: number | null;
   total_sales: number | null;
   orders: number | null;
+  // PR #110: ShopifyQL Finance Summary parity columns. Pulled in a separate
+  // sub-query because the merchant-facing `sales` dataset does not always
+  // expose them on the same row — see pullFinanceSummary().
+  return_fees: number | null;
+  net_sales_gift_cards: number | null;
   // The raw row Shopify returned, for audit.
   raw: ShopifyqlRow | null;
   // The actual ShopifyQL string we executed.
@@ -319,7 +324,10 @@ export async function pullFinanceSummary(
     // (2026-05-24). Note `shipping_charges` — NOT `shipping`, `total_shipping`,
     // or any other variant. The other 7 names match Shopify Admin's CSV
     // export headers verbatim.
-    "SHOW gross_sales, discounts, returns, net_sales, shipping_charges, taxes, total_sales, orders",
+    // PR #110: Added return_fees and net_sales_gift_cards for V2 parity.
+    // These are documented Finance Summary columns; if Shopify returns null
+    // for an account that doesn't track them, we coalesce to 0 downstream.
+    "SHOW gross_sales, discounts, returns, net_sales, shipping_charges, taxes, total_sales, orders, return_fees, net_sales_gift_cards",
     // Dates are NOT string-quoted in ShopifyQL — the ANTLR grammar expects a
     // bare DATE_ token (yyyy-MM-dd). Quoting them yields:
     //   "Syntax input mismatch - mismatched input ''2026-03-01''
@@ -360,6 +368,8 @@ export async function pullFinanceSummary(
     taxes: num(row?.taxes),
     total_sales: num(row?.total_sales),
     orders: num(row?.orders),
+    return_fees: num(row?.return_fees),
+    net_sales_gift_cards: num(row?.net_sales_gift_cards),
     raw: row,
     query: q,
   };
