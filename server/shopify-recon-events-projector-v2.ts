@@ -51,13 +51,30 @@
  *   line_item_id = ref_id when line_type IN (PRODUCT, GIFT_CARD, TIP), else NULL
  *   refund_id   = agreement.refund_id when reason='REFUND', else NULL
  *
- * event_type is derived from agreement.reason × sale.action_type:
+ * event_type is derived from sale.action_type × sale.line_type (PR #110):
  *
- *   reason=ORDER       → sale (new sale being booked)
- *   reason=ORDER_EDIT  → sale  if quantity > 0 (added line)
- *                      → edit_adjustment if quantity < 0 (reversed line)
- *   reason=REFUND      → refund
- *   reason=RETURN      → refund (returns net the same way as refunds)
+ *   action_type=ORDER,  line_type=PRODUCT     → sale
+ *   action_type=ORDER,  line_type=FEE         → return_fee (retained fee
+ *                                                rolled into Sales Revenue
+ *                                                for journal entries)
+ *   action_type=ORDER,  line_type=GIFT_CARD   → sale (GC sold, liability)
+ *   action_type=ORDER,  line_type=SHIPPING    → sale (shipping income)
+ *   action_type=ORDER,  line_type=ADJUSTMENT  → sale (positive adjustment)
+ *   action_type=RETURN, line_type=PRODUCT     → refund
+ *   action_type=RETURN, line_type=FEE         → refund (item-level fee return)
+ *   action_type=RETURN, line_type=GIFT_CARD   → refund (GC refund)
+ *   action_type=RETURN, line_type=SHIPPING    → refund (shipping refund)
+ *   action_type=RETURN, line_type=ADJUSTMENT  → refund (negative adjustment)
+ *   action_type=UPDATE, quantity > 0           → sale (edit added line)
+ *   action_type=UPDATE, quantity < 0           → edit_adjustment (reversal)
+ *
+ * Why action_type instead of reason (the PR #110 breakthrough):
+ *   ShopifyQL Finance Summary's Gross Sales aggregates by Sale.actionType
+ *   (= ORDER vs RETURN), not by the parent SalesAgreement.reason. Empirically,
+ *   17 rows in April 2025 with agreement.reason=RETURN but sale.action_type=ORDER
+ *   contribute $27,270.36 to ShopifyQL gross sales because the Sale itself is
+ *   marked ORDER. Filtering by reason missed those entirely. Filtering by
+ *   action_type matches ShopifyQL exactly.
  *
  * is_gift_card = (sale_type='GiftCardSale') ? 1 : 0
  *   Cleaner than reading recon_line_items.is_gift_card — Shopify tells us
@@ -93,22 +110,36 @@
  *   #21707:  tax        = $4,102.98 = exact overage
  *   #21758:  tax        ≈ $794.98 vs $781.86 overage (~$13 cents/rounding)
  *
- * For NON-GIFT-CARD sales (reason=ORDER, ORDER_EDIT positive qty):
+ * For action_type=ORDER, line_type=PRODUCT (gross sale):
  *   gross    = total_amount + total_discount_before_taxes - total_tax
  *   discount = -total_discount_before_taxes   // NEGATIVE per ShopifyQL
  *   tax      = total_tax
  *   returns  = 0
  *
- * For REFUND/RETURN sales (negative total_amount):
+ * For action_type=RETURN, line_type=PRODUCT (refund):
  *   returns = (total_amount - total_tax)      // NEGATIVE per ShopifyQL
  *             // tax-component of refund stays in the tax column
  *   tax     = total_tax      // already negative from Shopify
  *   gross   = 0
  *   discount = 0
  *
- * For GIFT_CARD lines (sale_type='GiftCardSale'):
- *   net_sales_gift_cards = total_amount  (signed — negative on refund)
- *   gross/discount/tax = 0 (excluded from main net-sales math)
+ * For action_type=ORDER, line_type=FEE (retained return-fee):
+ *   return_fees = total_amount - total_tax    // POSITIVE
+ *   tax         = total_tax
+ *   gross/discount/returns = 0
+ *   NOTE: For journal entries this column rolls into Sales Revenue
+ *         (return fee = revenue retained by the merchant). It is kept
+ *         in a separate column for ShopifyQL Finance Summary parity.
+ *
+ * For line_type=GIFT_CARD (any action_type):
+ *   net_sales_gift_cards = total_amount - tax (signed — negative on return)
+ *   gross/discount/tax/returns = 0 (excluded from main net-sales math)
+ *   NOTE: Gift card sales credit "Gift Card Liability" on the balance
+ *         sheet — they are NOT revenue. Stays separate from JE revenue.
+ *
+ * For line_type=SHIPPING:
+ *   currently not booked in V2 events (legacy ledger handles shipping).
+ *   PR #110 leaves this for a future PR.
  *
  *
  * SHIPPING + SHIPPING_TAX
@@ -427,35 +458,37 @@ export function projectRevenueEventsV2(
       const qty = Number(s.quantity ?? 0);
       const isGc = s.sale_type === "GiftCardSale" ? 1 : 0;
 
-      // Determine event_type from reason + action_type + quantity sign.
+      // PR #110: Determine event_type from action_type + line_type.
+      // This matches ShopifyQL Finance Summary's aggregation logic exactly.
       let eventType: "sale" | "edit_adjustment" | "refund" | "return_fee";
-      const reason = (s.reason || "").toUpperCase();
-      if (reason === "ORDER") {
-        eventType = "sale";
-      } else if (reason === "ORDER_EDIT") {
-        // Positive qty = added line (sale). Negative qty = reversed line
-        // (edit_adjustment). Zero qty rows shouldn't occur but default to
-        // sale so totalAmount sign drives the math.
-        eventType = qty < 0 ? "edit_adjustment" : "sale";
-      } else if (reason === "REFUND" || reason === "RETURN") {
-        // Fee/AdditionalFee sales under a RefundAgreement that net POSITIVE
-        // (retained-fee scenario) become return_fee events. Everything else
-        // refund-ish (item refunds, adjustment refunds, return-item negatives)
-        // is a refund.
-        const isFeeSubtype = s.sale_type === "FeeSale" || s.sale_type === "AdditionalFeeSale";
-        if (isFeeSubtype && totalAmount > 0.005) {
+      const actionType = (s.action_type || "").toUpperCase();
+      const lineType = (s.line_type || "").toUpperCase();
+
+      if (actionType === "ORDER") {
+        if (lineType === "FEE") {
+          // Retained return fee booked as ORDER+FEE — appears in revenue.
           eventType = "return_fee";
         } else {
-          eventType = "refund";
+          eventType = "sale";
         }
+      } else if (actionType === "RETURN") {
+        eventType = "refund";
+      } else if (actionType === "UPDATE") {
+        // OrderEdit reversal/addition. Negative qty = reversed line.
+        eventType = qty < 0 ? "edit_adjustment" : "sale";
       } else {
-        // Unknown reason — bucket as sale and warn so we see new Shopify
-        // agreement reasons in the warnings table.
-        logWarning("unknown agreement reason", {
+        // Unknown action_type — bucket as sale and warn so we surface new
+        // Shopify Sale.actionType values in the warnings table.
+        logWarning("unknown sale action_type", {
           order_id: s.order_id,
           sale_id: s.sale_id,
           agreement_id: s.agreement_id,
-          detail: { reason: s.reason, agreement_type: s.agreement_type },
+          detail: {
+            action_type: s.action_type,
+            line_type: s.line_type,
+            reason: s.reason,
+            agreement_type: s.agreement_type,
+          },
         });
         eventType = "sale";
       }
@@ -477,49 +510,39 @@ export function projectRevenueEventsV2(
         lineItemId = s.ref_id;
       }
 
-      // NOTE (PR #109): Sign convention switched to ShopifyQL. discounts and
-      // returns are stored NEGATIVE so net_sales = gross + disc + ret. tax
-      // remains signed (already correct on refund rows). return_fees and
-      // net_sales_gift_cards stay positive (no ShopifyQL parallel line).
-      if (eventType === "sale") {
-        if (isGc === 1) {
-          // Gift card sales contribute to net_sales_gift_cards only.
-          // GC are non-taxable; tax subtraction is a no-op in practice.
-          netSalesGcCol = totalAmount - tax;
-        } else {
-          // gross is positive (pre-discount, pre-tax); discount is negative.
-          gross = totalAmount + discount - tax;
-          discountCol = -discount;
-          taxCol = tax;
-        }
+      // PR #110 sign convention (matches ShopifyQL Finance Summary):
+      //   gross    ≥ 0    discounts ≤ 0    returns ≤ 0    tax signed
+      //   net_sales = gross + discounts + returns
+      // Routing by line_type so we honor ShopifyQL's per-line classification.
+      if (isGc === 1 || lineType === "GIFT_CARD") {
+        // Gift cards are a separate liability bucket — never in gross/net.
+        // Sign tracks action_type (ORDER => positive, RETURN => negative).
+        netSalesGcCol = totalAmount - tax;
+      } else if (lineType === "SHIPPING") {
+        // Shipping not currently booked in V2 events (legacy handles it).
+        // Leave all columns at 0; this is intentional for PR #110.
+      } else if (eventType === "sale") {
+        // ORDER + (PRODUCT|ADJUSTMENT|...). gross is positive; discount
+        // is stored negative.
+        gross = totalAmount + discount - tax;
+        discountCol = -discount;
+        taxCol = tax;
       } else if (eventType === "edit_adjustment") {
-        // Reversed line under an OrderEditAgreement. totalAmount is already
-        // negative; gross goes negative, discount/tax follow.
-        if (isGc === 1) {
-          netSalesGcCol = totalAmount - tax; // tax typically 0 for GC
-        } else {
-          gross = totalAmount + discount - tax;
-          // discount on a reversal is already negative or zero on the source
-          // row, so flipping sign yields the correct positive-or-zero offset.
-          discountCol = -discount;
-          taxCol = tax;
-        }
+        // UPDATE with negative qty — reversed line. totalAmount already
+        // negative; gross goes negative, discount/tax follow source sign.
+        gross = totalAmount + discount - tax;
+        discountCol = -discount;
+        taxCol = tax;
       } else if (eventType === "refund") {
-        if (isGc === 1) {
-          // Gift card refund: net_sales_gift_cards goes negative.
-          netSalesGcCol = totalAmount - tax; // tax typically 0 for GC
-        } else {
-          // totalAmount is negative on refunds. Tax-exclusive returns =
-          // (totalAmount - tax), which is negative — ShopifyQL convention.
-          returnsCol = totalAmount - tax;
-          // Tax on refund stays in the tax column (negative from Shopify).
-          taxCol = tax;
-        }
+        // RETURN + (PRODUCT|FEE|ADJUSTMENT|...). totalAmount is negative
+        // on returns. Tax-exclusive returns = (totalAmount - tax).
+        returnsCol = totalAmount - tax;
+        taxCol = tax;
       } else if (eventType === "return_fee") {
-        // Retained fee — positive totalAmount on a FeeSale under
-        // RefundAgreement. Stored positive (no ShopifyQL parallel).
+        // ORDER + FEE — retained return fee. Positive contribution; kept
+        // in a separate column for ShopifyQL parity but rolled into Sales
+        // Revenue in QBO journal entries.
         returnFeesCol = totalAmount - tax;
-        // Tax on the fee is collected, not refunded — keep as-is.
         taxCol = tax;
       }
 

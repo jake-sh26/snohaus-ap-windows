@@ -2089,29 +2089,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
            WHERE s.order_id = o.id
         ) AS sales_months_all,
         (
+          -- PR #110: ShopifyQL gross filter — action_type=ORDER, line_type=PRODUCT.
           SELECT COALESCE(SUM(s.total_amount + s.total_discount_before_taxes - s.total_tax), 0)
             FROM recon_shopify_sales s
-            JOIN recon_shopify_agreements a ON a.id = s.agreement_id
            WHERE s.order_id = o.id
              AND s.happened_month = ?
-             AND s.sale_type != 'GiftCardSale'
-             AND a.reason IN ('ORDER', 'ORDER_EDIT')
+             AND s.action_type = 'ORDER'
+             AND s.line_type = 'PRODUCT'
         ) AS v2_gross_in_month,
         (
-          -- PR #109: ShopifyQL convention — returns stored NEGATIVE
-          -- (total_amount on refund row is already negative).
+          -- PR #110: ShopifyQL returns filter — action_type=RETURN, line_type=PRODUCT.
+          -- total_amount on a return row is already negative from Shopify.
           SELECT COALESCE(SUM(s.total_amount - s.total_tax), 0)
             FROM recon_shopify_sales s
-            JOIN recon_shopify_agreements a ON a.id = s.agreement_id
            WHERE s.order_id = o.id
              AND s.happened_month = ?
-             AND s.sale_type != 'GiftCardSale'
-             AND a.reason IN ('REFUND', 'RETURN')
+             AND s.action_type = 'RETURN'
+             AND s.line_type = 'PRODUCT'
         ) AS v2_returns_in_month,
         (
+          -- PR #110: return fees (action_type=ORDER, line_type=FEE).
+          SELECT COALESCE(SUM(s.total_amount - s.total_tax), 0)
+            FROM recon_shopify_sales s
+           WHERE s.order_id = o.id
+             AND s.happened_month = ?
+             AND s.action_type = 'ORDER'
+             AND s.line_type = 'FEE'
+        ) AS v2_return_fees_in_month,
+        (
+          -- Taxes exclude GIFT_CARD lines, matching the acceptance endpoint.
           SELECT COALESCE(SUM(s.total_tax), 0)
             FROM recon_shopify_sales s
-           WHERE s.order_id = o.id AND s.happened_month = ?
+           WHERE s.order_id = o.id
+             AND s.happened_month = ?
+             AND s.line_type != 'GIFT_CARD'
         ) AS v2_tax_in_month,
         o.financial_status, o.fulfillment_status, o.source_name
       FROM recon_orders o
@@ -2120,16 +2131,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
          WHERE s.order_id = o.id AND s.happened_month = ?
       )
       ORDER BY o.processed_at, o.created_at
-    `).all(month, month, month, month, month);
+    `).all(month, month, month, month, month, month);
     const totals = orders.reduce(
       (acc: any, o: any) => {
         acc.gross += Number(o.v2_gross_in_month || 0);
         acc.returns += Number(o.v2_returns_in_month || 0);
+        acc.return_fees += Number(o.v2_return_fees_in_month || 0);
         acc.tax += Number(o.v2_tax_in_month || 0);
         if (o.created_month !== month) acc.cross_month_count += 1;
         return acc;
       },
-      { gross: 0, returns: 0, tax: 0, cross_month_count: 0 },
+      { gross: 0, returns: 0, return_fees: 0, tax: 0, cross_month_count: 0 },
     );
     res.json({
       month,
@@ -2138,10 +2150,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       v2_totals: {
         gross: Math.round(totals.gross * 100) / 100,
         returns: Math.round(totals.returns * 100) / 100,
+        return_fees: Math.round(totals.return_fees * 100) / 100,
         tax: Math.round(totals.tax * 100) / 100,
       },
       orders,
-      note: "V2-aware enumeration. Every order with at least one recon_shopify_sales row whose happened_month matches. Cross-month orders (created in a prior month, edited/refunded in :month) show created_month != :month. v2_gross/returns/tax use PR #109 ShopifyQL-sign formulas (returns NEGATIVE).",
+      note: "V2-aware enumeration (PR #110). Per-order v2_gross/returns/return_fees use action_type+line_type filters matching ShopifyQL Finance Summary aggregation.",
+      build_id: "pr110",
     });
   });
 
@@ -3233,34 +3247,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       ORDER BY s.happened_at ASC, s.id ASC
     `).all(row.id) as any[];
 
-    // PR #109: V2 columns now in ShopifyQL sign convention —
-    //   gross    ≥ 0   (pre-discount, pre-tax)
-    //   discount ≤ 0   (negative)
-    //   returns  ≤ 0   (negative, tax-exclusive)
-    //   tax      signed (positive on sale, negative on refund)
+    // PR #110: V2 columns dispatch by action_type + line_type (matches
+    // ShopifyQL Finance Summary aggregation). Sign convention unchanged
+    // from PR #109:
+    //   gross        ≥ 0   (pre-discount, pre-tax)
+    //   discount     ≤ 0   (negative)
+    //   returns      ≤ 0   (negative, tax-exclusive)
+    //   return_fees  ≥ 0   (positive; rolls into Sales Revenue for JE)
+    //   net_sales_gift_cards signed (positive on issue, negative on refund)
+    //   tax          signed (positive on sale, negative on refund)
     const enriched = rows.map((r) => {
       const total = Number(r.total_amount || 0);
       const disc = Number(r.total_discount_before_taxes || 0);
       const tax = Number(r.total_tax || 0);
-      const isGc = r.sale_type === "GiftCardSale";
-      const reason = String(r.reason || "").toUpperCase();
-      const isRefundLike = reason === "REFUND" || reason === "RETURN";
+      const actionType = String(r.action_type || "").toUpperCase();
+      const lineType = String(r.line_type || "").toUpperCase();
+      const isGc = r.sale_type === "GiftCardSale" || lineType === "GIFT_CARD";
       let v2_gross = 0;
       let v2_discount = 0;
       let v2_returns = 0;
-      if (!isGc && (reason === "ORDER" || reason === "ORDER_EDIT")) {
+      let v2_return_fees = 0;
+      let v2_net_sales_gift_cards = 0;
+      if (isGc) {
+        v2_net_sales_gift_cards = total - tax;
+      } else if (lineType === "SHIPPING") {
+        // Shipping is intentionally not booked into the V2 sales columns.
+      } else if (actionType === "ORDER" && lineType === "PRODUCT") {
         v2_gross = total + disc - tax;
         v2_discount = -disc;
-      } else if (!isGc && isRefundLike) {
-        // total is already negative on refund rows; (total - tax) is the
-        // signed-negative tax-exclusive returns.
+      } else if (actionType === "ORDER" && lineType === "FEE") {
+        v2_return_fees = total - tax;
+      } else if (actionType === "RETURN") {
+        // Item or fee return — totalAmount is negative on these rows.
         v2_returns = total - tax;
+      } else if (actionType === "UPDATE") {
+        // Edit add/reverse — mirrors projector’s edit_adjustment routing.
+        v2_gross = total + disc - tax;
+        v2_discount = -disc;
       }
       return {
         ...r,
         v2_gross: Math.round(v2_gross * 100) / 100,
         v2_discount: Math.round(v2_discount * 100) / 100,
         v2_returns: Math.round(v2_returns * 100) / 100,
+        v2_return_fees: Math.round(v2_return_fees * 100) / 100,
+        v2_net_sales_gift_cards: Math.round(v2_net_sales_gift_cards * 100) / 100,
         v2_tax: Math.round(tax * 100) / 100,
       };
     });
@@ -3269,15 +3300,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const byMonth: Record<string, any> = {};
     for (const r of enriched) {
       const m = r.happened_month || "unknown";
-      const acc = (byMonth[m] = byMonth[m] || { rows: 0, gross: 0, discount: 0, returns: 0, tax: 0 });
+      const acc = (byMonth[m] = byMonth[m] || {
+        rows: 0, gross: 0, discount: 0, returns: 0, return_fees: 0,
+        net_sales_gift_cards: 0, tax: 0,
+      });
       acc.rows += 1;
       acc.gross += r.v2_gross;
       acc.discount += r.v2_discount;
       acc.returns += r.v2_returns;
+      acc.return_fees += r.v2_return_fees;
+      acc.net_sales_gift_cards += r.v2_net_sales_gift_cards;
       acc.tax += r.v2_tax;
     }
     for (const k of Object.keys(byMonth)) {
-      for (const col of ["gross", "discount", "returns", "tax"] as const) {
+      for (const col of ["gross", "discount", "returns", "return_fees", "net_sales_gift_cards", "tax"] as const) {
         byMonth[k][col] = Math.round(byMonth[k][col] * 100) / 100;
       }
     }
@@ -3288,7 +3324,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       sales: enriched,
       by_month: byMonth,
       counts: { sales: enriched.length },
-      note: "Flat per-Sale-event ledger with PR #109 ShopifyQL-sign V2 columns (discount ≤ 0, returns ≤ 0). by_month rollup uses happened_month and includes cross-month edit/refund events.",
+      note: "Flat per-Sale-event ledger with PR #110 action_type+line_type V2 columns. by_month rollup uses happened_month and includes cross-month edit/refund events.",
+      build_id: "pr110",
     });
   });
 
@@ -3316,45 +3353,75 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const ql: any = await pullFinanceSummary(startDate, endDate, "processed_at");
 
-      // V2 sums directly from recon_shopify_sales using PR #108 formulas.
+      // PR #110: V2 sums directly from recon_shopify_sales using action_type
+      // + line_type filters (matches ShopifyQL Finance Summary aggregation).
+      //
+      // Filter formulas (locked from Retail-Q + empirical April 2025 match):
+      //   gross_sales:  action_type=ORDER,  line_type=PRODUCT
+      //                 sum of (total_amount + discount_before_taxes - total_tax)
+      //   discounts:    action_type=ORDER,  line_type=PRODUCT
+      //                 sum of -discount_before_taxes
+      //   returns:      action_type=RETURN, line_type=PRODUCT
+      //                 sum of (total_amount - total_tax)  [already negative]
+      //   return_fees:  action_type=ORDER,  line_type=FEE
+      //                 sum of (total_amount - total_tax)
+      //   net_sales_gift_cards: line_type=GIFT_CARD (signed by action_type)
+      //   shipping_charges:     line_type=SHIPPING
+      //   taxes:                all rows except line_type=GIFT_CARD
       const v2Row: any = sqlite.prepare(`
         SELECT
           COALESCE(SUM(
             CASE
-              WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('ORDER','ORDER_EDIT')
+              WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT'
                 THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
               ELSE 0
             END
           ), 0) AS gross_sales,
           COALESCE(SUM(
             CASE
-              WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('ORDER','ORDER_EDIT')
+              WHEN s.action_type = 'ORDER' AND s.line_type = 'PRODUCT'
                 THEN -s.total_discount_before_taxes
               ELSE 0
             END
           ), 0) AS discounts,
           COALESCE(SUM(
             CASE
-              -- PR #109: ShopifyQL convention — returns stored NEGATIVE
-              -- (tax-exclusive). total_amount on a refund row is already
-              -- negative from Shopify, so (total_amount - total_tax) is
-              -- already the correct negative number.
-              WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('REFUND','RETURN')
+              WHEN s.action_type = 'RETURN' AND s.line_type = 'PRODUCT'
                 THEN (s.total_amount - s.total_tax)
               ELSE 0
             END
           ), 0) AS returns,
           COALESCE(SUM(
             CASE
-              WHEN s.sale_type = 'ShippingLineSale' AND a.reason IN ('ORDER','ORDER_EDIT')
+              WHEN s.action_type = 'ORDER' AND s.line_type = 'FEE'
                 THEN s.total_amount - s.total_tax
-              WHEN s.sale_type = 'ShippingLineSale' AND a.reason IN ('REFUND','RETURN')
+              ELSE 0
+            END
+          ), 0) AS return_fees,
+          COALESCE(SUM(
+            CASE
+              WHEN s.line_type = 'GIFT_CARD'
+                THEN s.total_amount - s.total_tax
+              ELSE 0
+            END
+          ), 0) AS net_sales_gift_cards,
+          COALESCE(SUM(
+            CASE
+              WHEN s.line_type = 'SHIPPING'
                 THEN s.total_amount - s.total_tax
               ELSE 0
             END
           ), 0) AS shipping_charges,
-          COALESCE(SUM(s.total_tax), 0) AS taxes,
-          COUNT(DISTINCT s.order_id) AS orders
+          COALESCE(SUM(
+            CASE
+              WHEN s.line_type != 'GIFT_CARD'
+                THEN s.total_tax
+              ELSE 0
+            END
+          ), 0) AS taxes,
+          COUNT(DISTINCT CASE
+            WHEN s.line_type != 'GIFT_CARD' THEN s.order_id
+          END) AS orders
         FROM recon_shopify_sales s
         JOIN recon_shopify_agreements a ON a.id = s.agreement_id
         WHERE s.happened_month = ?
@@ -3364,10 +3431,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         gross_sales: Math.round(Number(v2Row.gross_sales) * 100) / 100,
         discounts: Math.round(Number(v2Row.discounts) * 100) / 100,
         returns: Math.round(Number(v2Row.returns) * 100) / 100,
+        return_fees: Math.round(Number(v2Row.return_fees) * 100) / 100,
+        net_sales_gift_cards: Math.round(Number(v2Row.net_sales_gift_cards) * 100) / 100,
         shipping_charges: Math.round(Number(v2Row.shipping_charges) * 100) / 100,
         taxes: Math.round(Number(v2Row.taxes) * 100) / 100,
         orders: Number(v2Row.orders) || 0,
       };
+      // net_sales matches ShopifyQL: gross + disc + ret. (return_fees and GC
+      // are tracked separately and don't roll into the net_sales line.)
       const net_sales = Math.round((v2.gross_sales + v2.discounts + v2.returns) * 100) / 100;
       const total_sales = Math.round((net_sales + v2.shipping_charges + v2.taxes) * 100) / 100;
 
@@ -3391,11 +3462,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           taxes: cmp(ql.taxes, v2.taxes),
           total_sales: cmp(ql.total_sales, total_sales),
           orders: cmp(ql.orders, v2.orders),
+          // PR #110 — ShopifyQL Finance Summary parity lines (separate from
+          // sales math but exposed for cell-by-cell diff vs the Shopify UI).
+          return_fees: cmp(ql.return_fees, v2.return_fees),
+          net_sales_gift_cards: cmp(ql.net_sales_gift_cards, v2.net_sales_gift_cards),
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #109 ShopifyQL-sign formulas (discounts ≤ 0, returns ≤ 0, net = gross + disc + ret). Acceptance: every line.diff = 0.00 (or 0 for orders).",
-        build_id: "pr109",
+        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). Acceptance: every line.diff = 0.00 (or 0 for orders).",
+        build_id: "pr110",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
