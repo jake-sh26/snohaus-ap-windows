@@ -377,6 +377,34 @@ export function ensureShopifyAgreementsSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_recon_shopify_sales_happened_at
       ON recon_shopify_sales(happened_at);
   `);
+
+  // PR #125 — Store-attribution columns sourced from ShopifyQL `sales`
+  // dataset (Shopify's analytics layer). Plain GraphQL Sale nodes do NOT
+  // expose pos_location_id (confirmed against the SalesAgreement /
+  // Sale / LineItem schemas on 2026-05-26), but ShopifyQL exposes it as a
+  // first-class column on the `sales` table. We ingest it in a separate
+  // pass keyed by sale_id (which is the same Shopify-issued sale GID we
+  // already store as recon_shopify_sales.id, just the bare numeric).
+  //
+  // pos_location_id is NULL for non-POS rows (online orders, etc.). For
+  // those, the by-store endpoint falls back to a fulfillment cascade per
+  // the locked allocation rule (PR #125 SQL change).
+  //
+  // ALTER TABLE ADD COLUMN is idempotent only via try/catch in SQLite —
+  // there's no IF NOT EXISTS clause. Errors swallowed below indicate the
+  // column already exists, which is the desired state.
+  for (const ddl of [
+    `ALTER TABLE recon_shopify_sales ADD COLUMN pos_location_id TEXT`,
+    `ALTER TABLE recon_shopify_sales ADD COLUMN pos_location_name TEXT`,
+    `ALTER TABLE recon_shopify_sales ADD COLUMN line_item_id TEXT`,
+  ]) {
+    try { sqlite.exec(ddl); } catch { /* column already present */ }
+  }
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_recon_shopify_sales_pos_location
+      ON recon_shopify_sales(pos_location_id);
+  `);
+
   schemaEnsured = true;
 }
 

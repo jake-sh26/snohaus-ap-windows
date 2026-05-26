@@ -3678,20 +3678,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // filtered to a single POS location, against Shopify Admin's Finances
   // Summary with the POS channel filter set to that same location.
   //
-  // Schema reality: `recon_shopify_sales` has no location_id column — it's
-  // purely a line ledger keyed off `order_id`. The location signal lives on
-  // `recon_orders` (source_name = 'pos' | 'online_store' | 'shop' | ... and
-  // location_id = numeric Shopify location). So we run the exact same V2
-  // aggregation SQL as /v2-vs-shopifyql but add a JOIN on recon_orders and
-  // two predicates: source_name='pos' AND location_id=:location_id.
+  // PR #125 rewrite: attribution is now per-line via
+  // recon_shopify_sales.pos_location_id, sourced from ShopifyQL's `sales`
+  // dataset (the same dataset Shopify Admin → Analytics → Finance Summary
+  // reads from). This fixes three classes of bug that the prior
+  // `recon_orders.location_id = ?` filter couldn't handle:
   //
-  // Why source_name='pos' AND not just location_id=?: an online order that
-  // was fulfilled from a store location ALSO carries that store's location_id
-  // on recon_orders, but its source_name is 'online_store'. Shopify's POS
-  // channel filter only includes orders rung through a POS register (i.e.
-  // source_name='pos'), so we mirror that exactly.
+  //   1. Multi-location orders — e.g. #37926 had $329 sold at Huntington
+  //      and $299 sold at Greenvale. Previous SQL attributed all $628 to
+  //      whichever store recon_orders.location_id pointed to.
+  //   2. Cross-month exchanges at a different store — e.g. #37234 sold
+  //      $95 at Huntington in Feb; the March exchange-replacement rang at
+  //      Hempstead. Previous SQL kept the new $95 at Huntington.
+  //   3. Cross-store exchanges with tax-rate differential — e.g. #35471
+  //      sold $35 at Hempstead (8.625%), returned and exchanged to a
+  //      different size at Huntington (8.75%). The $0.04 cash adjustment
+  //      and the differential tax row stayed mis-attributed.
   //
-  // Same line-item rules as /v2-vs-shopifyql (PR #110/113/118/121):
+  // All three are now correct because Shopify reports them correctly in
+  // ShopifyQL's `pos_location_id` column per sale row, and we ingest that
+  // value verbatim via shopify-recon-pos-locations.ts.
+  //
+  // Same line-item formulas as /v2-vs-shopifyql (PR #110/113/118/121),
+  // unchanged:
   //   gross_sales: action_type IN (ORDER, UPDATE) AND line_type=PRODUCT
   //                sum of (total_amount + total_discount_before_taxes - total_tax)
   //   discounts:   same filter, sum of -total_discount_before_taxes
@@ -3705,19 +3714,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // net_sales = gross + discounts + returns
   // total_sales = net_sales + shipping + return_fees + taxes
   //
-  // Orders count uses recon_orders.processed_at month (ET) bucketing — but
-  // for POS, processed_at and created_at are the same instant (the ring-up),
-  // so the difference is moot.
+  // Orders count for a store = number of distinct order_ids that had at
+  // least one PRODUCT or RETURN/(PRODUCT|ADJUSTMENT) line at that
+  // pos_location_id in :month. An order that touched two stores counts
+  // toward BOTH stores' orders columns — matching how Shopify's by-store
+  // Finance Summary counts them.
   //
-  // Returns are bucketed by the RETURN row's happened_month, NOT the
-  // original sale's month. This matches ShopifyQL behavior when filtered
-  // to a POS location: a return processed at Huntington in March on a
-  // February sale shows up in Huntington's March returns. (When we add
-  // non-POS later, we'll need to decide whether to follow this same rule
-  // or bucket returns to the original sale's store — current standing
-  // rule: bucket to original sale's store. POS returns inherit the POS
-  // location naturally because the return row's parent order_id has the
-  // store's location_id on it.)
+  // Returns: bucketed by the RETURN row's happened_month (when the refund
+  // landed), not the original sale's month, and attributed to whichever
+  // pos_location_id the return row carries — which per the locked rule is
+  // the original line's store. Shopify enforces this same convention in
+  // ShopifyQL, so we get it for free.
+  //
+  // Non-POS rows (pos_location_id IS NULL): excluded from this endpoint
+  // entirely. The full fulfillment cascade for those comes in a follow-up
+  // PR — for now non-POS revenue (online orders, etc.) does not appear in
+  // any store's roll-up. Use /v2-vs-shopifyql for the channel-agnostic
+  // grand total.
   app.get("/api/recon/finance/by-store-pos/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
@@ -3756,6 +3769,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const byStore: any[] = [];
       for (const loc of mappedLocs) {
+        // PR #125: per-line attribution. The aggregate scans
+        // recon_shopify_sales filtered by
+        // (happened_month = :month AND pos_location_id = :location_id).
+        // No JOIN on recon_orders needed — pos_location_id IS the
+        // attribution dimension.
+        //
+        // Orders count: distinct order_ids touching this pos_location_id
+        // in :month with at least one PRODUCT or RETURN/(PRODUCT|ADJUSTMENT)
+        // line. A multi-store order counts toward each store it touched.
         const row: any = sqlite.prepare(`
           SELECT
             COALESCE(SUM(
@@ -3809,28 +3831,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               END
             ), 0) AS taxes,
             (
-              SELECT COUNT(*)
-                FROM recon_orders o2
-               WHERE substr(datetime(COALESCE(o2.processed_at, o2.created_at), '-5 hours'), 1, 7) = ?
-                 AND o2.source_name = 'pos'
-                 AND o2.location_id = ?
-                 AND EXISTS (
-                   SELECT 1 FROM recon_shopify_sales ss
-                    WHERE ss.order_id = o2.id
-                      AND ss.happened_month = ?
-                      AND (
-                        (ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
-                        OR (ss.action_type = 'RETURN'
-                            AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
-                      )
+              SELECT COUNT(DISTINCT ss.order_id)
+                FROM recon_shopify_sales ss
+               WHERE ss.happened_month = ?
+                 AND ss.pos_location_id = ?
+                 AND (
+                   (ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
+                   OR (ss.action_type = 'RETURN'
+                       AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
                  )
             ) AS orders
           FROM recon_shopify_sales s
-          JOIN recon_orders o ON o.id = s.order_id
           WHERE s.happened_month = ?
-            AND o.source_name = 'pos'
-            AND o.location_id = ?
-        `).get(month, loc.location_id, month, month, loc.location_id) as any;
+            AND s.pos_location_id = ?
+        `).get(month, loc.location_id, month, loc.location_id) as any;
 
         const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
         const gross = r2(row.gross_sales);
@@ -3887,11 +3901,79 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         scope: "pos_only",
         by_store: byStore,
         totals,
-        note: "POS attribution is exact (location_id on recon_orders). Non-POS allocation comes in PR #125. Compare each row to Shopify Admin Finance Summary with POS channel filter set to that store's location.",
-        build_id: "pr124",
+        note: "PR #125: per-line POS attribution via recon_shopify_sales.pos_location_id (sourced from ShopifyQL `sales` dataset). Multi-store orders, cross-month exchanges, and cross-store exchange tax differentials are all attributed correctly because we mirror Shopify's own analytics layer. Non-POS rows (pos_location_id IS NULL) are excluded from this endpoint — they'll get the fulfillment cascade in a follow-up PR. Compare each row to Shopify Admin Finance Summary with POS channel filter set to that store's location.",
+        build_id: "pr125",
       });
     } catch (e: any) {
       res.status(500).json({ message: "by-store-pos failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #125 — Ingest per-line pos_location_id from ShopifyQL `sales`.
+  //
+  // Body: { start: "YYYY-MM-DD", end: "YYYY-MM-DD" }  (half-open: [start, end))
+  // Returns the PosLocationIngestResult shape:
+  //   { start, end, windows_ran, ql_rows_fetched, sales_updated,
+  //     sales_unchanged, unmatched_ql_rows, duration_ms, warnings }
+  //
+  // Idempotent: re-running for the same window only updates rows whose
+  // pos_location_id changed in Shopify's analytics layer (rare — happens
+  // when a refund is voided and reissued at a different register). The
+  // ingest is a pure UPDATE — no inserts, no deletes, can be re-run as
+  // often as needed without side effects.
+  //
+  // Pre-req: agreements ingest must have run for the window first, so the
+  // local recon_shopify_sales rows exist. Otherwise unmatched_ql_rows will
+  // be elevated. The Shopify-side ShopifyQL pipeline can also lag the
+  // GraphQL Order.agreements feed by ~1 hour; if you ingest agreements then
+  // immediately ingest pos_locations, the very newest rows may show
+  // pos_location_id=NULL until ShopifyQL catches up. Re-running this
+  // endpoint after the lag closes finishes the job.
+  app.post("/api/recon/sales/ingest-pos-locations", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    try {
+      const { ingestPosLocationsFromQL } = require("./shopify-recon-pos-locations");
+      const start = String(req.body?.start || "");
+      const end = String(req.body?.end || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+        return res.status(400).json({
+          message: "start and end must be YYYY-MM-DD strings (half-open window)",
+        });
+      }
+      const result = await ingestPosLocationsFromQL(start, end);
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({
+        message: "ingest-pos-locations failed",
+        error: String(e?.message || e),
+        stack: process.env.NODE_ENV === "development" ? e?.stack : undefined,
+      });
+    }
+  });
+
+  // PR #125 — Coverage diagnostic for pos_location_id ingestion. Returns,
+  // for :month, the fraction of recon_shopify_sales rows with
+  // pos_location_id populated, broken down by source_name. Use this to
+  // validate that the ingest landed for a month before swapping any UI to
+  // read from the per-line column.
+  //
+  // Expected steady-state:
+  //   - source_name='pos' rows  → 100% with_pos_location
+  //   - source_name='online_store' rows → 0% (no POS terminal, the
+  //     fulfillment cascade applies instead — follow-up PR)
+  //   - source_name=other / NULL → varies (manual orders, draft orders)
+  app.get("/api/recon/sales/pos-location-coverage/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const { getPosLocationCoverage } = require("./shopify-recon-pos-locations");
+      res.json(getPosLocationCoverage(month));
+    } catch (e: any) {
+      res.status(500).json({
+        message: "pos-location-coverage failed",
+        error: String(e?.message || e),
+      });
     }
   });
 
