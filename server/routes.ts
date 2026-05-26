@@ -3635,6 +3635,244 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #116 — Orders-count gap diagnostic. After PR #114 closed all dollar
+  // diffs and matched April orders perfectly, Jan/Feb/Mar/May still showed
+  // ShopifyQL counting more orders than V2 (+17/+100/+70/+20). This endpoint
+  // does the symmetric diff server-side in one shot so we don't have to ship
+  // 1000+ row GROUP BY results to the browser (which times out).
+  //
+  // Steps (server-side, fast):
+  //   1) Issue ShopifyQL `FROM sales SHOW orders GROUP BY order_name` for
+  //      :month and collect the set of order_name values where orders=1.
+  //   2) Build the V2-PR#114 set: recon_orders where
+  //        substr(processed_at - 5h) = month AND has a non-zero
+  //        ORDER/PRODUCT or RETURN/(PRODUCT|ADJUSTMENT) row in month.
+  //   3) Compute onlyShopifyQL (the gap we're hunting) and onlyV2 (orders we
+  //      count that ShopifyQL doesn't).
+  //   4) For each name in onlyShopifyQL, look up its recon_orders row and the
+  //      per-month sums so we can pattern-match WHY V2 missed it.
+  //
+  // Returns the diff lists (capped at 200 each to keep response small) plus
+  // a `details` array for the first N (default 25) onlyShopifyQL orders with:
+  //   created_at, processed_at, cancelled_at, financial_status, fulfillment_status,
+  //   created_month, sales_rows_in_month, action_type x line_type breakdown of
+  //   (count, sum(total_amount-total_tax)), and a 'reason' classification.
+  app.get("/api/recon/finance/debug/orders-gap/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const detailLimit = Math.min(200, Math.max(1, Number(req.query.detail_limit) || 25));
+    try {
+      const { sqlite } = require("./storage");
+      const { runShopifyql } = require("./shopify-shopifyql");
+
+      const [yy, mm] = month.split("-").map(Number);
+      const startDate = `${month}-01`;
+      const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+      const endDate = `${month}-${String(lastDay).padStart(2, "0")}`;
+
+      // 1) ShopifyQL GROUP BY order_name set.
+      const ql: any = await runShopifyql(
+        `FROM sales\nSHOW orders\nGROUP BY order_name\nSINCE ${startDate} UNTIL ${endDate}`,
+      );
+      const qlRows: any[] = ql?.rows || [];
+      const shopifyOrdersOne: string[] = qlRows
+        .filter((r) => Number(r.orders) === 1)
+        .map((r) => String(r.order_name));
+      const shopifyOrdersZero: string[] = qlRows
+        .filter((r) => Number(r.orders) === 0)
+        .map((r) => String(r.order_name));
+      const shopifySet = new Set(shopifyOrdersOne);
+
+      // 2) V2-PR#114 set. Same predicate as the orders subquery in
+      //    /v2-vs-shopifyql but enumerated so we can produce names.
+      const v2Rows: any[] = sqlite
+        .prepare(
+          `
+          SELECT o.id, o.name
+            FROM recon_orders o
+           WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+             AND EXISTS (
+               SELECT 1 FROM recon_shopify_sales ss
+                WHERE ss.order_id = o.id
+                  AND ss.happened_month = ?
+                  AND (
+                    (ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
+                    OR (ss.action_type = 'RETURN'
+                        AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
+                  )
+                  AND (ss.total_amount - ss.total_tax) != 0
+             )
+        `,
+        )
+        .all(month, month);
+      const v2Names: string[] = v2Rows.map((r: any) => String(r.name));
+      const v2Set = new Set(v2Names);
+
+      const onlyShopifyql = shopifyOrdersOne.filter((n) => !v2Set.has(n));
+      const onlyV2 = v2Names.filter((n) => !shopifySet.has(n));
+
+      // 3) For first detailLimit onlyShopifyql, look up details.
+      const sampleNames = onlyShopifyql.slice(0, detailLimit);
+      const details: any[] = [];
+      for (const name of sampleNames) {
+        const o: any = sqlite
+          .prepare(
+            `
+            SELECT
+              o.id, o.name, o.order_number,
+              o.created_at, o.processed_at, o.cancelled_at,
+              o.financial_status, o.fulfillment_status, o.source_name,
+              substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS created_month_et,
+              (SELECT COUNT(*) FROM recon_shopify_sales s
+                 WHERE s.order_id = o.id AND s.happened_month = ?) AS sales_rows_in_month,
+              (SELECT GROUP_CONCAT(DISTINCT s.happened_month) FROM recon_shopify_sales s
+                 WHERE s.order_id = o.id) AS happened_months_all
+            FROM recon_orders o
+            WHERE o.name = ?
+            LIMIT 1
+          `,
+          )
+          .get(month, name);
+
+        if (!o) {
+          details.push({ name, reason: "NO_RECON_ORDER", note: "Order name in ShopifyQL but not in recon_orders." });
+          continue;
+        }
+
+        const breakdown: any[] = sqlite
+          .prepare(
+            `
+            SELECT s.action_type, s.line_type,
+                   COUNT(*) AS cnt,
+                   COALESCE(SUM(s.total_amount - s.total_tax), 0) AS amt_ex_tax,
+                   COALESCE(SUM(s.total_amount), 0) AS amt_inc_tax,
+                   COALESCE(SUM(s.total_tax), 0) AS tax
+              FROM recon_shopify_sales s
+             WHERE s.order_id = ? AND s.happened_month = ?
+             GROUP BY s.action_type, s.line_type
+             ORDER BY s.action_type, s.line_type
+          `,
+          )
+          .all(o.id, month);
+
+        // Classify reason for the gap:
+        //   - WRONG_CREATED_MONTH: order has sales rows in this month but its
+        //     ET-shifted placement month falls outside :month.
+        //   - ZERO_ACTIVITY: created_month matches but every PRODUCT/ADJUSTMENT
+        //     row sums to zero ex-tax (so PR #114's != 0 predicate filters it).
+        //   - NO_QUALIFYING_LINES: no PRODUCT or RETURN/(PRODUCT|ADJUSTMENT) rows
+        //     at all in this month (only SHIPPING/TAX/GIFT_CARD/FEE/etc).
+        //   - OTHER: doesn't match the above buckets — needs eyeballs.
+        const hasQualifying = breakdown.some(
+          (b: any) =>
+            (b.action_type === "ORDER" && b.line_type === "PRODUCT") ||
+            (b.action_type === "RETURN" && (b.line_type === "PRODUCT" || b.line_type === "ADJUSTMENT")),
+        );
+        const qualifyingSumExTax = breakdown
+          .filter(
+            (b: any) =>
+              (b.action_type === "ORDER" && b.line_type === "PRODUCT") ||
+              (b.action_type === "RETURN" && (b.line_type === "PRODUCT" || b.line_type === "ADJUSTMENT")),
+          )
+          .reduce((acc: number, b: any) => acc + Number(b.amt_ex_tax || 0), 0);
+
+        let reason: string;
+        if (o.created_month_et !== month) reason = "WRONG_CREATED_MONTH";
+        else if (!hasQualifying) reason = "NO_QUALIFYING_LINES";
+        else if (Math.round(qualifyingSumExTax * 100) === 0) reason = "ZERO_ACTIVITY";
+        else reason = "OTHER";
+
+        details.push({
+          name: o.name,
+          reason,
+          created_at: o.created_at,
+          processed_at: o.processed_at,
+          cancelled_at: o.cancelled_at,
+          financial_status: o.financial_status,
+          fulfillment_status: o.fulfillment_status,
+          source_name: o.source_name,
+          created_month_et: o.created_month_et,
+          sales_rows_in_month: o.sales_rows_in_month,
+          happened_months_all: o.happened_months_all,
+          qualifying_sum_ex_tax: Math.round(qualifyingSumExTax * 100) / 100,
+          breakdown,
+        });
+      }
+
+      // 4) Aggregate the reason histogram across ALL onlyShopifyql, not just
+      //    the detail sample, by running a lightweight classification for
+      //    every missing name. Reuse the same SQL but as a single batch.
+      const reasonHistogram: Record<string, number> = {};
+      for (const name of onlyShopifyql) {
+        const o: any = sqlite
+          .prepare(
+            `
+            SELECT o.id,
+                   substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS cm
+              FROM recon_orders o
+             WHERE o.name = ?
+             LIMIT 1
+          `,
+          )
+          .get(name);
+        if (!o) {
+          reasonHistogram["NO_RECON_ORDER"] = (reasonHistogram["NO_RECON_ORDER"] || 0) + 1;
+          continue;
+        }
+        if (o.cm !== month) {
+          reasonHistogram["WRONG_CREATED_MONTH"] = (reasonHistogram["WRONG_CREATED_MONTH"] || 0) + 1;
+          continue;
+        }
+        const agg: any = sqlite
+          .prepare(
+            `
+            SELECT
+              SUM(CASE WHEN (s.action_type='ORDER' AND s.line_type='PRODUCT')
+                       OR (s.action_type='RETURN' AND s.line_type IN ('PRODUCT','ADJUSTMENT'))
+                   THEN 1 ELSE 0 END) AS qcount,
+              COALESCE(SUM(CASE WHEN (s.action_type='ORDER' AND s.line_type='PRODUCT')
+                       OR (s.action_type='RETURN' AND s.line_type IN ('PRODUCT','ADJUSTMENT'))
+                   THEN (s.total_amount - s.total_tax) ELSE 0 END), 0) AS qsum
+              FROM recon_shopify_sales s
+             WHERE s.order_id = ? AND s.happened_month = ?
+          `,
+          )
+          .get(o.id, month);
+        if (!agg || !agg.qcount) {
+          reasonHistogram["NO_QUALIFYING_LINES"] = (reasonHistogram["NO_QUALIFYING_LINES"] || 0) + 1;
+        } else if (Math.round(Number(agg.qsum) * 100) === 0) {
+          reasonHistogram["ZERO_ACTIVITY"] = (reasonHistogram["ZERO_ACTIVITY"] || 0) + 1;
+        } else {
+          reasonHistogram["OTHER"] = (reasonHistogram["OTHER"] || 0) + 1;
+        }
+      }
+
+      res.json({
+        month,
+        shopifyql_window: { start: startDate, end: endDate },
+        counts: {
+          shopifyql_orders_one: shopifyOrdersOne.length,
+          shopifyql_orders_zero: shopifyOrdersZero.length,
+          v2_pr114_orders: v2Names.length,
+          onlyShopifyql: onlyShopifyql.length,
+          onlyV2: onlyV2.length,
+          shopifyql_rows_total: qlRows.length,
+          shopifyql_rows_hit_1000_cap: qlRows.length === 1000,
+        },
+        reason_histogram: reasonHistogram,
+        onlyShopifyql_sample: onlyShopifyql.slice(0, 200),
+        onlyV2_sample: onlyV2.slice(0, 200),
+        details,
+        note: "PR #116 — moves the orders-gap diff to the server so we don't have to round-trip 1000+ row GROUP BYs through the browser. `reason` classifies each missing order against the PR #114 rule. WRONG_CREATED_MONTH = order's ET-shifted placement is outside :month (PR #114 filtered it out). ZERO_ACTIVITY = qualifying lines all sum to 0 ex-tax. NO_QUALIFYING_LINES = no PRODUCT or RETURN/(PRODUCT|ADJUSTMENT) rows. OTHER = doesn't fit the above — needs eyeballs.",
+        build_id: "pr116",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "orders-gap failed", error: String(e?.message || e) });
+    }
+  });
+
   // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
