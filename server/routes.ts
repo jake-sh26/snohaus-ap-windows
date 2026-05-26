@@ -2098,14 +2098,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              AND s.line_type = 'PRODUCT'
         ) AS v2_gross_in_month,
         (
-          -- PR #110: ShopifyQL returns filter — action_type=RETURN, line_type=PRODUCT.
-          -- total_amount on a return row is already negative from Shopify.
+          -- PR #113: ShopifyQL returns filter — action_type=RETURN,
+          -- line_type IN (PRODUCT, ADJUSTMENT). Empirical match on 6 months
+          -- of 2025 data: unpaired RETURN+ADJUSTMENT rows are
+          -- edit-after-return adjustments that ShopifyQL rolls into
+          -- 'returns'. Paired ADJ rows net to zero so this is harmless.
+          -- Refunded SHIPPING is NOT included by ShopifyQL.
+          -- GIFT_CARD returns stay in the GC liability column.
           SELECT COALESCE(SUM(s.total_amount - s.total_tax), 0)
             FROM recon_shopify_sales s
            WHERE s.order_id = o.id
              AND s.happened_month = ?
              AND s.action_type = 'RETURN'
-             AND s.line_type = 'PRODUCT'
+             AND s.line_type IN ('PRODUCT', 'ADJUSTMENT')
         ) AS v2_returns_in_month,
         (
           -- PR #110: return fees (action_type=ORDER, line_type=FEE).
@@ -3277,8 +3282,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         v2_discount = -disc;
       } else if (actionType === "ORDER" && lineType === "FEE") {
         v2_return_fees = total - tax;
-      } else if (actionType === "RETURN") {
-        // Item or fee return — totalAmount is negative on these rows.
+      } else if (actionType === "RETURN" && (lineType === "PRODUCT" || lineType === "ADJUSTMENT")) {
+        // PR #113: Returns column includes RETURN+PRODUCT and
+        // RETURN+ADJUSTMENT. Paired ADJ rows net to zero; unpaired ones
+        // are edit-after-return adjustments ShopifyQL counts in returns.
+        // RETURN+SHIPPING and RETURN+FEE are intentionally excluded.
         v2_returns = total - tax;
       } else if (actionType === "UPDATE") {
         // Edit add/reverse — mirrors projector’s edit_adjustment routing.
@@ -3501,7 +3509,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ), 0) AS discounts,
           COALESCE(SUM(
             CASE
-              WHEN s.action_type = 'RETURN' AND s.line_type = 'PRODUCT'
+              -- PR #113: include RETURN+ADJUSTMENT (edit-after-return
+              -- adjustments). Paired ADJ rows net to zero; unpaired ones
+              -- are real adjustments that ShopifyQL counts in returns.
+              WHEN s.action_type = 'RETURN'
+                   AND s.line_type IN ('PRODUCT', 'ADJUSTMENT')
                 THEN (s.total_amount - s.total_tax)
               ELSE 0
             END
