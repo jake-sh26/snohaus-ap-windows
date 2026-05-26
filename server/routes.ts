@@ -162,6 +162,10 @@ import {
   rebuildRedemptionsForRange,
 } from "./shopify-recon-gc-redemption";
 import {
+  backfillGcIdentityForRange,
+  getGcIdentityDistribution,
+} from "./shopify-recon-gc-backfill";
+import {
   shopifyInstallHandler,
   shopifyCallbackHandler,
   shopifyInstallUrlHandler,
@@ -6190,6 +6194,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const result = rebuildRedemptionsForRange(parsed.sinceIso, parsed.untilIso);
       res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  // ---- PR #123 — Gift card identity backfill + distribution diagnostic ----
+  // The backfill writes recon_gift_card_issuance rows for every historical
+  // GC sale that doesn't already have one (POS + online, digital + physical),
+  // marking each with backfilled_at=now() so the redemption flow knows to
+  // suppress cross-entity JE generation on those cards. The diagnostic
+  // endpoint returns the current distribution so we can validate before
+  // moving on to the by-store finance endpoint.
+  app.post("/api/recon/giftcards/backfill-identity", authMiddleware, requirePermission("system.manage_config"), (req, res) => {
+    const src = Object.keys(req.body || {}).length > 0 ? req.body : req.query;
+    const parsed = parseRangeOrNull(src);
+    if ("error" in parsed) return res.status(400).json(parsed);
+    try {
+      const result = backfillGcIdentityForRange(parsed.sinceIso, parsed.untilIso);
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? String(e) });
+    }
+  });
+
+  app.get("/api/recon/giftcards/distribution", authMiddleware, requirePermission("system.manage_config"), (_req, res) => {
+    try {
+      res.json(getGcIdentityDistribution());
     } catch (e: any) {
       res.status(500).json({ error: e?.message ?? String(e) });
     }

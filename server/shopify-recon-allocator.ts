@@ -27,7 +27,7 @@
  */
 
 import { sqlite, listPayrollEntities } from "./storage";
-import { assignGcIssuance } from "./shopify-recon-gc-issuance";
+import { assignGcIssuance, recordPosGcIssuance } from "./shopify-recon-gc-issuance";
 import { processOrderForGCRedemption } from "./shopify-recon-gc-redemption";
 
 // ----- types -----
@@ -77,6 +77,7 @@ type OrderRow = {
   source_name: string | null;
   location_id: string | null;
   customer_id: string | null;
+  customer_email: string | null;  // PR #123 — enables email_affinity fallback for guest checkouts
   shipping_zip: string | null;
   billing_zip: string | null;
   has_gift_card: number;
@@ -272,6 +273,22 @@ function allocateLineItem(
     const hit = ctx.locationMap.get(order.location_id);
     if (hit) {
       const method: AllocationMethod = hit.kind === "warehouse" ? "warehouse_rollup" : "pos_location";
+      // PR #123 — POS gift card identity. If this line is a gift card, also
+      // persist a recon_gift_card_issuance row so cross-store redemptions of
+      // this card later can find the issuer entity. The allocator row itself
+      // is unchanged — the issuance row is a parallel ledger.
+      if (line.is_gift_card === 1) {
+        recordPosGcIssuance({
+          order_id: order.id,
+          line_item_id: line.id,
+          face_value: gross,
+          assigned_entity_id: hit.entity_id,
+          customer_id: order.customer_id,
+          billing_zip: order.billing_zip,
+          shipping_zip: order.shipping_zip,
+          order_created_at: order.created_at,
+        });
+      }
       return [{
         order_id: order.id,
         line_item_id: line.id,
@@ -310,6 +327,7 @@ function allocateLineItem(
       line_item_id: line.id,
       face_value: gross,
       customer_id: order.customer_id,
+      customer_email: order.customer_email, // PR #123 — enables email_affinity fallback
       billing_zip: order.billing_zip,
       shipping_zip: order.shipping_zip,
       order_created_at: order.created_at,
@@ -532,7 +550,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
 
   const orders = sqlite
     .prepare(
-      `SELECT id, created_at, source_name, location_id, customer_id,
+      `SELECT id, created_at, source_name, location_id, customer_id, customer_email,
               shipping_zip, billing_zip, has_gift_card, cancelled_at, subtotal,
               total_tax, total_shipping, total_discounts, total_price
        FROM recon_orders
