@@ -307,6 +307,8 @@ export async function ingestPosLocationsFromQL(
 
   // Walk the window in 5-day stripes. Each stripe gets passed to runWindow
   // which will further subdivide if it hits the 1000-row cap.
+  // eslint-disable-next-line no-console
+  console.log(`[pos-locations] starting ingest for ${start}..${end}`);
   const STRIPE_DAYS = 5;
   const allRows: QlSaleRow[] = [];
   let windowsRan = 0;
@@ -314,25 +316,81 @@ export async function ingestPosLocationsFromQL(
   while (cursor < end) {
     const stripeEnd = addDays(cursor, STRIPE_DAYS);
     const cappedEnd = stripeEnd > end ? end : stripeEnd;
+    const tStripe = Date.now();
     const { rows, windowsRan: w } = await runWindow(cursor, cappedEnd, warnings);
     allRows.push(...rows);
     windowsRan += w;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[pos-locations] stripe ${cursor}..${cappedEnd}: ${rows.length} rows in ${w} window(s), ${Date.now() - tStripe}ms (total rows so far: ${allRows.length})`,
+    );
     cursor = cappedEnd;
   }
 
   // ---------------------------------------------------------------------
   // UPSERT pos_location_id back onto recon_shopify_sales.
   //
-  // We use a prepared UPDATE that matches by the numeric tail of the
-  // sale GID. Counting how many rows actually got updated requires the
-  // sqlite3 .changes prop on the run result.
+  // PR #126 PERF REWRITE — the original PR #125 implementation had two
+  // killer bugs that caused the ingest to hang the server:
+  //   1. The UPDATE / SELECT predicates used `substr(id, instr(id,
+  //      'Sale/') + 5) = ?` which is NOT sargable — SQLite has to scan
+  //      every row of recon_shopify_sales (~50k rows) for every probe.
+  //   2. `sqlite.prepare(...)` was called inside the per-row loop —
+  //      re-preparing a fresh statement for every QL row.
+  // Combined cost: ~50k rows × ~1700 QL rows/month × 17 months = ~1.4B
+  // string comparisons. That's why the ingest hung Node.
+  //
+  // The fix:
+  //   - Build an in-memory Map<numericTail, gid> once at the start of
+  //     ingest by streaming `SELECT id FROM recon_shopify_sales` (one
+  //     full-scan, ~50ms for 50k rows). This is the index we need.
+  //   - UPDATE by primary key `id = ?` (recon_shopify_sales.id is the
+  //     PK — already indexed). Single B-tree lookup, microseconds each.
+  //   - Process all rows in chunked transactions (CHUNK_SIZE) so the
+  //     write lock doesn't hold for the entire window.
+  //   - Log progress to server stdout so it's visible during long runs.
   // ---------------------------------------------------------------------
+
+  // Step 1: build numeric-tail -> id Map by streaming all sale IDs once.
+  // We only need rows whose happened_month overlaps [start, end) since
+  // ShopifyQL's window will only return sales from that range. Pull a bit
+  // wider (one calendar month either side) to handle any timezone fuzz on
+  // the boundaries.
+  const t1 = Date.now();
+  const monthStart = start.slice(0, 7);
+  const monthEnd = end.slice(0, 7);
+  // Compute one month wider on each side for safety.
+  const widenMonth = (m: string, delta: number) => {
+    const [y, mm] = m.split("-").map(Number);
+    const d = new Date(Date.UTC(y, mm - 1 + delta, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  };
+  const idIndexRows = sqlite
+    .prepare(
+      `SELECT id FROM recon_shopify_sales
+        WHERE happened_month >= ? AND happened_month <= ?`,
+    )
+    .all(widenMonth(monthStart, -1), widenMonth(monthEnd, 1)) as Array<{
+    id: string;
+  }>;
+  const numericToGid = new Map<string, string>();
+  for (const row of idIndexRows) {
+    const numeric = gidToNumeric(row.id);
+    if (numeric) numericToGid.set(numeric, row.id);
+  }
+  // eslint-disable-next-line no-console
+  console.log(
+    `[pos-locations] ${start}..${end} index built: ${numericToGid.size} sale gids in ${Date.now() - t1}ms`,
+  );
+
+  // Step 2: prepared statements outside the loop. UPDATE by PK —
+  // microseconds per row.
   const update = sqlite.prepare(`
     UPDATE recon_shopify_sales
        SET pos_location_id   = ?,
            pos_location_name = ?,
            line_item_id      = COALESCE(?, line_item_id)
-     WHERE substr(id, instr(id, 'Sale/') + 5) = ?
+     WHERE id = ?
        AND (
               pos_location_id   IS NOT ?
            OR pos_location_name IS NOT ?
@@ -344,30 +402,21 @@ export async function ingestPosLocationsFromQL(
   let unchanged = 0;
   let unmatched = 0;
 
-  // Wrap in a single transaction for atomicity + 50-100x perf on bulk update.
-  const tx = sqlite.transaction((rows: QlSaleRow[]) => {
+  // Step 3: chunked transactions. Each chunk commits its own write so
+  // concurrent readers (e.g., the coverage endpoint, the UI's polling
+  // queries) can interleave between chunks.
+  const CHUNK_SIZE = 500;
+  const totalChunks = Math.ceil(allRows.length / CHUNK_SIZE);
+  const t2 = Date.now();
+
+  const processChunk = sqlite.transaction((rows: QlSaleRow[]) => {
     for (const r of rows) {
       if (!r.sale_id) {
         unmatched++;
         continue;
       }
-      // Probe existence first so we can distinguish unchanged (matched
-      // but values were already current) from unmatched (no local row).
-      const existing = sqlite
-        .prepare(
-          `SELECT pos_location_id, pos_location_name, line_item_id
-             FROM recon_shopify_sales
-            WHERE substr(id, instr(id, 'Sale/') + 5) = ?
-            LIMIT 1`,
-        )
-        .get(r.sale_id) as
-        | {
-            pos_location_id: string | null;
-            pos_location_name: string | null;
-            line_item_id: string | null;
-          }
-        | undefined;
-      if (!existing) {
+      const gid = numericToGid.get(r.sale_id);
+      if (!gid) {
         unmatched++;
         continue;
       }
@@ -375,7 +424,7 @@ export async function ingestPosLocationsFromQL(
         r.pos_location_id,
         r.pos_location_name,
         r.line_item_id,
-        r.sale_id,
+        gid,
         r.pos_location_id,
         r.pos_location_name,
         r.line_item_id,
@@ -387,7 +436,17 @@ export async function ingestPosLocationsFromQL(
       }
     }
   });
-  tx(allRows);
+
+  for (let i = 0; i < allRows.length; i += CHUNK_SIZE) {
+    const chunk = allRows.slice(i, i + CHUNK_SIZE);
+    processChunk(chunk);
+    if (totalChunks > 1) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[pos-locations] ${start}..${end} chunk ${Math.floor(i / CHUNK_SIZE) + 1}/${totalChunks} done (${updated} updated, ${unchanged} unchanged, ${unmatched} unmatched, ${Date.now() - t2}ms total)`,
+      );
+    }
+  }
 
   return {
     start,
