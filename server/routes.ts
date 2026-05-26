@@ -3848,13 +3848,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
         const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
         const gross = r2(row.gross_sales);
-        const disc = r2(row.discounts);
-        const ret = r2(row.returns);
+        // PR #133: surface discounts & returns as POSITIVE magnitudes to
+        // match Shopify Admin Finance Summary + the V2 /finance/diff
+        // contract (server/shopify-finance-diff.ts:1125-1126). The SQL
+        // returns these as negative numbers (math convention: net_sales =
+        // gross + disc_neg + ret_neg). We flip them at the API boundary
+        // and switch net_sales to gross - discounts - returns. Same
+        // numeric result; display contract now matches Shopify.
+        const disc = r2(Math.abs(Number(row.discounts) || 0));
+        const ret = r2(Math.abs(Number(row.returns) || 0));
         const rf = r2(row.return_fees);
         const gc = r2(row.net_sales_gift_cards);
         const ship = r2(row.shipping_charges);
         const tax = r2(row.taxes);
-        const netSales = r2(gross + disc + ret);
+        const netSales = r2(gross - disc - ret);
         const totalSales = r2(netSales + ship + rf + tax);
         byStore.push({
           entity_id: loc.entity_id,
@@ -4090,13 +4097,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
       const finalize = (row: any) => {
         const gross = r2(row.gross_sales);
-        const disc = r2(row.discounts);
-        const ret = r2(row.returns);
+        // PR #133: surface discounts & returns as POSITIVE magnitudes to
+        // match Shopify Admin Finance Summary + the V2 /finance/diff
+        // contract. SQL returns these negative (math convention); we flip
+        // them at the API boundary and switch net_sales to
+        // gross - discounts - returns. Same numeric result, Shopify-style
+        // display contract. Mirrors the /by-store-pos fix in the same PR.
+        const disc = r2(Math.abs(Number(row.discounts) || 0));
+        const ret = r2(Math.abs(Number(row.returns) || 0));
         const rf = r2(row.return_fees);
         const gc = r2(row.net_sales_gift_cards);
         const ship = r2(row.shipping_charges);
         const tax = r2(row.taxes);
-        const netSales = r2(gross + disc + ret);
+        const netSales = r2(gross - disc - ret);
         const totalSales = r2(netSales + ship + rf + tax);
         return {
           gross_sales: gross,
