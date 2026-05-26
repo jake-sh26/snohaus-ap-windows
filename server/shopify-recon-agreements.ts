@@ -144,7 +144,14 @@ const AGREEMENTS_QUERY = `
             ... on OrderAgreement      { app { handle } }
             ... on OrderEditAgreement  { app { handle } }
             ... on RefundAgreement     { app { handle } refund { id processedAt createdAt } }
-            ... on ReturnAgreement     { app { handle } return { id name status } }
+            # NOTE: We intentionally do NOT select return{id name status}
+            # here -- that field requires the read_returns Shopify scope,
+            # which this app does not have. Asking for it returned a partial
+            # GraphQL error on every order that had a ReturnAgreement, and
+            # the old ingest code threw on r.errors, silently dropping
+            # ~1,778 orders. return_id is not used downstream by the V2
+            # projector; leaving it NULL is correct.
+            ... on ReturnAgreement     { app { handle } }
             sales(first: $salesFirst) {
               edges {
                 cursor
@@ -447,12 +454,17 @@ export async function ingestAgreementsForOrder(
       agreementsCursor,
       salesFirst: 250,
     });
+    // Partial GraphQL errors are normal in Shopify — e.g. a missing scope on
+    // one fragment returns an error on that path but still ships the rest of
+    // the data. Only treat r.errors as fatal when no data came back.
+    const order: any = (r.data as any)?.order;
     if (r.errors) {
       logWarning(order_id, "graphql_errors", { errors: r.errors });
       warnings++;
-      throw new Error(`agreements graphql errors: ${JSON.stringify(r.errors).slice(0, 500)}`);
+      if (!order) {
+        throw new Error(`agreements graphql errors (no data): ${JSON.stringify(r.errors).slice(0, 500)}`);
+      }
     }
-    const order: any = (r.data as any)?.order;
     if (!order) {
       logWarning(order_id, "order_null", { orderGid });
       warnings++;
@@ -484,15 +496,17 @@ export async function ingestAgreementsForOrder(
         id: a.id,
         cursor: salesCursor,
       });
+      const node: any = (r.data as any)?.node;
       if (r.errors) {
+        // Same partial-error tolerance as the outer paginator — only bail
+        // when no data came back at all.
         logWarning(order_id, "sales_page_graphql_errors", {
           agreement_id: a.id,
           errors: r.errors,
         });
         warnings++;
-        break;
+        if (!node) break;
       }
-      const node: any = (r.data as any)?.node;
       const moreEdges = node?.sales?.edges || [];
       a.sales.edges.push(...moreEdges);
       const pi = node?.sales?.pageInfo;
@@ -632,6 +646,7 @@ export type BackfillScope =
   | { kind: "names"; names: string[] }   // explicit list of order names (#22338, 21840)
   | { kind: "edited" }                   // orders where updated_at > processed_at (Bug 3 blast radius)
   | { kind: "month"; month: string }     // 'YYYY-MM' (created_at OR updated_at)
+  | { kind: "missing" }                  // orders in recon_orders with ZERO rows in recon_shopify_agreements (used to recover the ~1,778 orders the pre-fix ingest dropped)
   | { kind: "all" };                     // every order in recon_orders
 
 export interface BackfillProgress {
@@ -698,6 +713,18 @@ function resolveBackfillTargets(scope: BackfillScope): { id: string; name: strin
              ORDER BY created_at ASC`,
         )
         .all(scope.month, scope.month) as any[];
+    case "missing":
+      // Orders with no agreement rows. Designed to re-pick-up the orders
+      // that the pre-fix ingest dropped because of the read_returns scope
+      // error on ReturnAgreement.return.
+      return sqlite
+        .prepare(
+          `SELECT o.id, o.name FROM recon_orders o
+             LEFT JOIN recon_shopify_agreements a ON a.order_id = o.id
+             WHERE a.order_id IS NULL
+             ORDER BY o.created_at ASC`,
+        )
+        .all() as any[];
     case "all":
       return sqlite
         .prepare(`SELECT id, name FROM recon_orders ORDER BY created_at ASC`)
