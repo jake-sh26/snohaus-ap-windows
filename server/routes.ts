@@ -3546,16 +3546,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               ELSE 0
             END
           ), 0) AS taxes,
-          -- PR #114: orders column historically used a sales-row-presence
-          -- count, which over- or under-counted relative to ShopifyQL. The
-          -- actual ShopifyQL rule (verified empirically on April 2025 vs
-          -- Sales-by-Order CSV, 8/8 match): orders counts orders whose
-          -- placement (processed_at — ET) falls within the period AND
-          -- which had non-zero financial activity (gross or returns) in
-          -- that period. Orders placed earlier but only returned in this
-          -- period are excluded; orders placed in this period with zero
-          -- activity are also excluded. We compute this in a correlated
-          -- subquery to keep one row out from this aggregate.
+          -- PR #114: rule = placement-in-month + non-zero ORDER/PRODUCT or
+          --                 RETURN/(PRODUCT|ADJUSTMENT) activity.
+          -- PR #117: drop the (total_amount - total_tax) != 0 predicate.
+          -- The PR #116 orders-gap probe showed 100% of the Jan/Feb/Mar/May
+          -- misses (+17/+10/+7/+2) classified as ZERO_ACTIVITY — paid+
+          -- fulfilled orders whose ORDER/PRODUCT row sums to exactly $0.00
+          -- ex-tax (e.g. 100% discount, gift-card-only, comp/promo orders).
+          -- ShopifyQL counts them; PR #114's != 0 check filtered them out.
+          -- April still matches because the 6 April orders with
+          -- orders_col=0 in the Sales-by-Order CSV come from ShopifyQL's
+          -- orders=0 group (they had ZERO qualifying rows entirely, not
+          -- zero-sum qualifying rows), so this loosening is one-directional.
           (
             SELECT COUNT(*)
               FROM recon_orders o
@@ -3569,7 +3571,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                       OR (ss.action_type = 'RETURN'
                           AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
                     )
-                    AND (ss.total_amount - ss.total_tax) != 0
                )
           ) AS orders
         FROM recon_shopify_sales s
@@ -3627,8 +3628,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
-        build_id: "pr114",
+        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. PR #117 dropped the !=0 ex-tax check (ShopifyQL counts zero-sum orders too — 100% disc/comp/gift orders). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
+        build_id: "pr117",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
@@ -3702,7 +3703,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                     OR (ss.action_type = 'RETURN'
                         AND ss.line_type IN ('PRODUCT','ADJUSTMENT'))
                   )
-                  AND (ss.total_amount - ss.total_tax) != 0
              )
         `,
         )
