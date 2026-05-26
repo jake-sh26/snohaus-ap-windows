@@ -39,6 +39,7 @@ import {
   type GcRedemptionRow,
 } from "./storage";
 import { recordIntegrationWarn } from "./error-log";
+import { getGcIssuanceByGcId, GC_JE_CUTOVER_ISO } from "./shopify-recon-gc-issuance";
 
 function srWarn(scope: string, msg: string) {
   recordIntegrationWarn("shopify-recon", scope, msg);
@@ -113,14 +114,10 @@ function lookupRedeemerEntity(orderId: string): number | null {
   return row?.entity_id ?? null;
 }
 
-function lookupIssuerEntity(gcId: string): number | null {
-  const row = sqlite
-    .prepare(
-      `SELECT assigned_entity_id FROM recon_gift_card_issuance WHERE gc_id = ?`
-    )
-    .get(gcId) as { assigned_entity_id: number } | undefined;
-  return row?.assigned_entity_id ?? null;
-}
+// PR #123 — lookupIssuerEntity was inlined into processOrderForGCRedemption
+// alongside the new backfilled_at / cutover suppression logic. Use
+// getGcIssuanceByGcId from shopify-recon-gc-issuance.ts to fetch the full
+// issuance metadata (issuer entity + backfilled_at + assignment_method).
 
 // ----- Transaction extraction --------------------------------------------
 // Shopify reports a GC redemption as one row in order.transactions[] with
@@ -295,7 +292,10 @@ export function processOrderForGCRedemption(
   let recorded = 0;
   let legs = 0;
   for (const txn of gcTxns) {
-    const issuerEntityId = lookupIssuerEntity(txn.gc_id);
+    // PR #123 — fetch full issuance metadata so we can suppress JE generation
+    // for backfilled cards and for redemptions before the cutover.
+    const issuance = getGcIssuanceByGcId(txn.gc_id);
+    const issuerEntityId = issuance?.assigned_entity_id ?? null;
     if (issuerEntityId == null) {
       srWarn(
         "gc-redemption",
@@ -315,6 +315,25 @@ export function processOrderForGCRedemption(
       redeemed_at: redeemedAt,
     });
     recorded++;
+
+    // PR #123 — cross-entity JE suppression rules:
+    //   (1) The redemption is BEFORE the cutover (GC_JE_CUTOVER_ISO), OR
+    //   (2) The underlying issuance row was written by the historical
+    //       backfill (backfilled_at IS NOT NULL).
+    // In both cases the redemption itself is still recorded for audit, but
+    // the 3-leg inter-company JE is skipped. We log a single info-level
+    // warning per suppression so the suppression chain is traceable.
+    const preCutover = redeemedAt < GC_JE_CUTOVER_ISO;
+    const backfilledIssuance = issuance?.backfilled_at != null;
+    if (isCrossEntity && (preCutover || backfilledIssuance)) {
+      const why = preCutover ? "pre-cutover redemption" : "backfilled issuance";
+      srWarn(
+        "gc-redemption-je",
+        `Redemption #${redemption.id}: cross-entity JE suppressed (${why}); gc=${txn.gc_id} order=${orderId} amount=${txn.amount}`,
+      );
+      continue;
+    }
+
     legs += generateRedemptionJEs(redemption);
   }
 

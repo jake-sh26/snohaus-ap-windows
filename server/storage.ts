@@ -1159,7 +1159,7 @@ function bootstrapSchema() {
       line_item_id TEXT REFERENCES recon_line_items(id) ON DELETE CASCADE,
       face_value REAL NOT NULL,
       assigned_entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
-      -- 'customer_affinity' | 'zip_radius' | 'fallback_sd'
+      -- 'pos' | 'customer_affinity' | 'email_affinity' | 'zip_radius' | 'fallback_sd'
       assignment_method TEXT NOT NULL,
       -- Only populated when assignment_method = 'zip_radius'.
       assignment_distance_mi REAL,
@@ -1170,6 +1170,10 @@ function bootstrapSchema() {
       remaining REAL NOT NULL,
       issued_at TEXT NOT NULL,
       created_at TEXT NOT NULL,
+      -- PR #123: set by the historical backfill route. NULL on normal
+      -- per-order writes from the allocator. Cross-entity JE generation
+      -- in the redemption flow is suppressed when this is non-null.
+      backfilled_at TEXT,
       -- (order_id, line_item_id) is the natural key — one issuance row per
       -- gift-card line on an order. gc_id is nullable so we can't use it.
       PRIMARY KEY (order_id, line_item_id)
@@ -1255,6 +1259,28 @@ function bootstrapSchema() {
     { name: "order_id", defn: "TEXT" },
     { name: "gc_id", defn: "TEXT" },
     { name: "created_at", defn: "TEXT" },
+  ]);
+
+  // ----- PR #123 — Gift card identity completeness -----
+  // backfilled_at marks rows written by the historical backfill route. The
+  // redemption flow checks this column (along with the GC_JE_CUTOVER date)
+  // to decide whether a cross-store redemption should generate the 3-leg
+  // inter-company JE. Pre-cutover backfill rows DO populate identity (so we
+  // know which store originally sold the card) but do NOT trigger retroactive
+  // JEs — the historical per-store liability was never tracked correctly so
+  // shifting a phantom number around would just create noise.
+  //
+  // We also widen the assignment_method TEXT column's accepted vocabulary
+  // (no schema change needed since it's plain TEXT) to add:
+  //   'pos'             — physical POS-sold gift card; assigned to the POS
+  //                       location's entity. Required so a POS card later
+  //                       redeemed at another store can find its issuer.
+  //   'email_affinity'  — guest-checkout fallback when customer_id is null:
+  //                       match by lowercased email across recon_orders and
+  //                       pick the most-frequent allocated entity (with
+  //                       most-recent-order-location as the tiebreaker).
+  ensureColumns("recon_gift_card_issuance", [
+    { name: "backfilled_at", defn: "TEXT" },
   ]);
 
   // PR #R4l-a — add Shopify "current" totals to recon_orders. These are the
