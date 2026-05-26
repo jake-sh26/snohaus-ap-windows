@@ -2058,6 +2058,91 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // against Shopify's ShopifyQL `FROM sales` order_name list and identify the
   // exact orders that disagree. Returns per-order gross/discounts/refund flags
   // so the operator can spot draft/cancelled/test orders that Shopify excludes.
+  // V2-aware enumeration: lists every order that has at least one Sale event
+  // bucketed to :month via recon_shopify_sales.happened_month. This is the
+  // correct enumeration for V2 reconciliation against ShopifyQL Finance
+  // Summary because Shopify itself splits cross-month edits/refunds across
+  // the months their Sale events happened in (verified in PR #108 probes,
+  // 2026-05-26: orders #21526, #20326, #21647, #21683, #18147 all show
+  // split-month behavior in ShopifyQL day buckets).
+  //
+  // The legacy /orders/:month endpoint below filters by created_at and is
+  // intentionally preserved as-is for legacy projector debugging.
+  app.get("/api/recon/finance/debug/orders-v2/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const { sqlite } = require("./storage");
+    const orders = sqlite.prepare(`
+      SELECT
+        o.id, o.order_number, o.name,
+        o.created_at, o.processed_at, o.cancelled_at,
+        substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS created_month,
+        (
+          SELECT COUNT(*) FROM recon_shopify_sales s
+           WHERE s.order_id = o.id AND s.happened_month = ?
+        ) AS sales_rows_in_month,
+        (
+          SELECT GROUP_CONCAT(DISTINCT s.happened_month)
+            FROM recon_shopify_sales s
+           WHERE s.order_id = o.id
+        ) AS sales_months_all,
+        (
+          SELECT COALESCE(SUM(s.total_amount + s.total_discount_before_taxes - s.total_tax), 0)
+            FROM recon_shopify_sales s
+            JOIN recon_shopify_agreements a ON a.id = s.agreement_id
+           WHERE s.order_id = o.id
+             AND s.happened_month = ?
+             AND s.sale_type != 'GiftCardSale'
+             AND a.reason IN ('ORDER', 'ORDER_EDIT')
+        ) AS v2_gross_in_month,
+        (
+          SELECT COALESCE(SUM(-(s.total_amount - s.total_tax)), 0)
+            FROM recon_shopify_sales s
+            JOIN recon_shopify_agreements a ON a.id = s.agreement_id
+           WHERE s.order_id = o.id
+             AND s.happened_month = ?
+             AND s.sale_type != 'GiftCardSale'
+             AND a.reason IN ('REFUND', 'RETURN')
+        ) AS v2_returns_in_month,
+        (
+          SELECT COALESCE(SUM(s.total_tax), 0)
+            FROM recon_shopify_sales s
+           WHERE s.order_id = o.id AND s.happened_month = ?
+        ) AS v2_tax_in_month,
+        o.financial_status, o.fulfillment_status, o.source_name
+      FROM recon_orders o
+      WHERE EXISTS (
+        SELECT 1 FROM recon_shopify_sales s
+         WHERE s.order_id = o.id AND s.happened_month = ?
+      )
+      ORDER BY o.processed_at, o.created_at
+    `).all(month, month, month, month, month);
+    const totals = orders.reduce(
+      (acc: any, o: any) => {
+        acc.gross += Number(o.v2_gross_in_month || 0);
+        acc.returns += Number(o.v2_returns_in_month || 0);
+        acc.tax += Number(o.v2_tax_in_month || 0);
+        if (o.created_month !== month) acc.cross_month_count += 1;
+        return acc;
+      },
+      { gross: 0, returns: 0, tax: 0, cross_month_count: 0 },
+    );
+    res.json({
+      month,
+      order_count: orders.length,
+      cross_month_orders: totals.cross_month_count,
+      v2_totals: {
+        gross: Math.round(totals.gross * 100) / 100,
+        returns: Math.round(totals.returns * 100) / 100,
+        tax: Math.round(totals.tax * 100) / 100,
+      },
+      orders,
+      note: "V2-aware enumeration. Every order with at least one recon_shopify_sales row whose happened_month matches. Cross-month orders (created in a prior month, edited/refunded in :month) show created_month != :month. v2_gross/returns/tax use the tax-exclusive PR #108 formulas.",
+    });
+  });
+
   app.get("/api/recon/finance/debug/orders/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
@@ -3094,6 +3179,212 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       counts: { agreements: agreements.length, sales: sales.length },
       note: "Local DB copy of agreements ledger. Compare with /agreements (live GraphQL) to validate ingest.",
     });
+  });
+
+  // PR #108: per-Sale-event ledger, flattened. Same data as
+  // /agreements-ledger but laid out as a flat array of recon_shopify_sales
+  // rows with computed V2 columns (gross, returns, tax — all tax-exclusive
+  // per the PR #108 formulas) so we can verify per-order, per-month sums
+  // without nesting under agreements. Useful for cross-month edit debugging:
+  // an order that spans Jan + Apr will show its Jan rows and Apr rows in one
+  // chronological list with computed columns ready to sum.
+  app.get("/api/recon/finance/debug/orders/by-name/:name/sales-ledger", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const { sqlite } = require("./storage");
+    const raw = String(req.params.name || "").trim();
+    if (!raw) return res.status(400).json({ message: "name required" });
+    const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+    const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+    const row: any = sqlite.prepare(`
+      SELECT id, name FROM recon_orders
+      WHERE name = ? OR name = ? OR order_number = ?
+      LIMIT 1
+    `).get(withHash, noHash, noHash);
+    if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+    const {
+      ensureShopifyAgreementsSchema,
+    } = require("./shopify-recon-agreements");
+    ensureShopifyAgreementsSchema();
+
+    const rows: any[] = sqlite.prepare(`
+      SELECT
+        s.id AS sale_id,
+        s.agreement_id,
+        a.reason,
+        a.agreement_type,
+        s.happened_at,
+        s.happened_month,
+        s.sale_type,
+        s.action_type,
+        s.line_type,
+        s.quantity,
+        s.total_amount,
+        s.total_discount_before_taxes,
+        s.total_discount_after_taxes,
+        s.total_tax,
+        s.ref_id,
+        s.ref_name,
+        s.ref_sku
+      FROM recon_shopify_sales s
+      JOIN recon_shopify_agreements a ON a.id = s.agreement_id
+      WHERE s.order_id = ?
+      ORDER BY s.happened_at ASC, s.id ASC
+    `).all(row.id) as any[];
+
+    // Compute the same tax-exclusive V2 columns the projector uses (PR #108).
+    const enriched = rows.map((r) => {
+      const total = Number(r.total_amount || 0);
+      const disc = Number(r.total_discount_before_taxes || 0);
+      const tax = Number(r.total_tax || 0);
+      const isGc = r.sale_type === "GiftCardSale";
+      const reason = String(r.reason || "").toUpperCase();
+      const isRefundLike = reason === "REFUND" || reason === "RETURN";
+      let v2_gross = 0;
+      let v2_returns = 0;
+      if (!isGc && (reason === "ORDER" || reason === "ORDER_EDIT")) {
+        v2_gross = total + disc - tax;
+      } else if (!isGc && isRefundLike) {
+        v2_returns = -(total - tax);
+      }
+      return {
+        ...r,
+        v2_gross: Math.round(v2_gross * 100) / 100,
+        v2_discount: Math.round(disc * 100) / 100,
+        v2_returns: Math.round(v2_returns * 100) / 100,
+        v2_tax: Math.round(tax * 100) / 100,
+      };
+    });
+
+    // Per-month rollup for quick cross-month read.
+    const byMonth: Record<string, any> = {};
+    for (const r of enriched) {
+      const m = r.happened_month || "unknown";
+      const acc = (byMonth[m] = byMonth[m] || { rows: 0, gross: 0, discount: 0, returns: 0, tax: 0 });
+      acc.rows += 1;
+      acc.gross += r.v2_gross;
+      acc.discount += r.v2_discount;
+      acc.returns += r.v2_returns;
+      acc.tax += r.v2_tax;
+    }
+    for (const k of Object.keys(byMonth)) {
+      for (const col of ["gross", "discount", "returns", "tax"] as const) {
+        byMonth[k][col] = Math.round(byMonth[k][col] * 100) / 100;
+      }
+    }
+
+    res.json({
+      order_id: row.id,
+      order_name: row.name,
+      sales: enriched,
+      by_month: byMonth,
+      counts: { sales: enriched.length },
+      note: "Flat per-Sale-event ledger with PR #108 tax-exclusive V2 columns. by_month rollup uses happened_month and includes cross-month edit/refund events.",
+    });
+  });
+
+  // PR #108 acceptance test: V2 line sums vs ShopifyQL Finance Summary.
+  // Returns line-by-line diff so we can confirm V2 reconciles to the penny.
+  // V2 sums are computed directly from recon_shopify_sales using the
+  // tax-exclusive PR #108 formulas — deliberately NOT from
+  // recon_revenue_events_v2, so this is a check on the underlying fact table
+  // and is robust against future projector changes.
+  app.get("/api/recon/finance/debug/v2-vs-shopifyql/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const { sqlite } = require("./storage");
+      const { pullFinanceSummary } = require("./shopify-shopifyql");
+
+      // ShopifyQL uses INCLUSIVE UNTIL (verified PR #108 probes 2026-05-26).
+      // For month X, end-of-month is the last day of X, not first of X+1.
+      const [yy, mm] = month.split("-").map(Number);
+      const startDate = `${month}-01`;
+      const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate(); // mm here is 1-12, Date uses 0-11
+      const endDate = `${month}-${String(lastDay).padStart(2, "0")}`;
+
+      const ql: any = await pullFinanceSummary(startDate, endDate, "processed_at");
+
+      // V2 sums directly from recon_shopify_sales using PR #108 formulas.
+      const v2Row: any = sqlite.prepare(`
+        SELECT
+          COALESCE(SUM(
+            CASE
+              WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('ORDER','ORDER_EDIT')
+                THEN s.total_amount + s.total_discount_before_taxes - s.total_tax
+              ELSE 0
+            END
+          ), 0) AS gross_sales,
+          COALESCE(SUM(
+            CASE
+              WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('ORDER','ORDER_EDIT')
+                THEN -s.total_discount_before_taxes
+              ELSE 0
+            END
+          ), 0) AS discounts,
+          COALESCE(SUM(
+            CASE
+              WHEN s.sale_type != 'GiftCardSale' AND a.reason IN ('REFUND','RETURN')
+                THEN -(s.total_amount - s.total_tax)
+              ELSE 0
+            END
+          ), 0) AS returns,
+          COALESCE(SUM(
+            CASE
+              WHEN s.sale_type = 'ShippingLineSale' AND a.reason IN ('ORDER','ORDER_EDIT')
+                THEN s.total_amount - s.total_tax
+              WHEN s.sale_type = 'ShippingLineSale' AND a.reason IN ('REFUND','RETURN')
+                THEN s.total_amount - s.total_tax
+              ELSE 0
+            END
+          ), 0) AS shipping_charges,
+          COALESCE(SUM(s.total_tax), 0) AS taxes,
+          COUNT(DISTINCT s.order_id) AS orders
+        FROM recon_shopify_sales s
+        JOIN recon_shopify_agreements a ON a.id = s.agreement_id
+        WHERE s.happened_month = ?
+      `).get(month) as any;
+
+      const v2 = {
+        gross_sales: Math.round(Number(v2Row.gross_sales) * 100) / 100,
+        discounts: Math.round(Number(v2Row.discounts) * 100) / 100,
+        returns: Math.round(Number(v2Row.returns) * 100) / 100,
+        shipping_charges: Math.round(Number(v2Row.shipping_charges) * 100) / 100,
+        taxes: Math.round(Number(v2Row.taxes) * 100) / 100,
+        orders: Number(v2Row.orders) || 0,
+      };
+      const net_sales = Math.round((v2.gross_sales + v2.discounts + v2.returns) * 100) / 100;
+      const total_sales = Math.round((net_sales + v2.shipping_charges + v2.taxes) * 100) / 100;
+
+      const round2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
+      const cmp = (qlVal: any, v2Val: number) => {
+        const a = round2(qlVal);
+        const b = round2(v2Val);
+        const diff = round2(a - b);
+        return { shopifyql: a, v2: b, diff };
+      };
+
+      res.json({
+        month,
+        shopifyql_window: { start: startDate, end: endDate, note: "UNTIL is inclusive" },
+        lines: {
+          gross_sales: cmp(ql.gross_sales, v2.gross_sales),
+          discounts: cmp(ql.discounts, v2.discounts),
+          returns: cmp(ql.returns, v2.returns),
+          net_sales: cmp(ql.net_sales, net_sales),
+          shipping_charges: cmp(ql.shipping_charges, v2.shipping_charges),
+          taxes: cmp(ql.taxes, v2.taxes),
+          total_sales: cmp(ql.total_sales, total_sales),
+          orders: cmp(ql.orders, v2.orders),
+        },
+        v2_raw: { ...v2, net_sales, total_sales },
+        shopifyql_raw: ql,
+        note: "V2 sums come straight from recon_shopify_sales using PR #108 tax-exclusive formulas. Acceptance: every line.diff = 0.00 (or 0 for orders).",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
+    }
   });
 
   // ===================================================================
