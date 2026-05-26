@@ -2749,7 +2749,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                 ... on OrderAgreement      { app { handle } }
                 ... on OrderEditAgreement  { app { handle } }
                 ... on RefundAgreement     { app { handle } refund { id processedAt createdAt } }
-                ... on ReturnAgreement     { app { handle } return { id name status } }
+                # Intentionally NOT selecting return{id name status} -- that
+                # requires the read_returns scope this app does not have, and
+                # asking for it produces a partial GraphQL error on every
+                # order with a ReturnAgreement.
+                ... on ReturnAgreement     { app { handle } }
                 sales(first: 50) {
                   edges {
                     node {
@@ -2800,10 +2804,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     `;
     try {
       const r = await shopifyGraphqlCall(cfg, query, { id: orderGid });
-      if (r.errors) {
-        return res.status(502).json({ message: "GraphQL errors", errors: r.errors, data: r.data });
-      }
       const o: any = (r.data as any)?.order;
+      // Tolerate partial GraphQL errors when data still came back.
+      // Only 502 when there is truly no data.
+      if (r.errors && !o) {
+        return res.status(502).json({ message: "GraphQL errors (no data)", errors: r.errors });
+      }
       if (!o) return res.status(404).json({ message: "GraphQL order returned null" });
       const num = (mb: any) => mb?.shopMoney?.amount != null ? Number(mb.shopMoney.amount) : null;
       const agreements = (o.agreements?.edges || []).map((ae: any) => {
@@ -2980,6 +2986,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     let scope: any;
     if (kind === "all") {
       scope = { kind: "all" };
+    } else if (kind === "missing") {
+      scope = { kind: "missing" };
     } else if (kind === "edited") {
       scope = { kind: "edited" };
     } else if (kind === "month") {
@@ -2998,7 +3006,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       scope = { kind: "orders", ids: body.ids.map((n: any) => String(n)) };
     } else {
-      return res.status(400).json({ message: "body.scope must be one of: all | edited | month | names | orders" });
+      return res.status(400).json({ message: "body.scope must be one of: all | missing | edited | month | names | orders" });
     }
 
     try {
