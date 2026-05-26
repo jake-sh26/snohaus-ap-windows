@@ -6967,6 +6967,32 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // falls back to 'unknown' if not provided. Pure read, no auth required
   // because git SHA isn't sensitive.
   app.get("/api/build-info", (_req, res) => {
+    // PR #136 — also dump current sqlite PRAGMA settings so we can confirm
+    // whether better-sqlite3 is running with synchronous=FULL (the default,
+    // which fsyncs per commit) or NORMAL. Per-line ~30ms cost in the allocator
+    // backfill is consistent with fsync-bound writes on Windows storage.
+    let pragmas: Record<string, unknown> = {};
+    try {
+      const { sqlite } = require("./storage");
+      const journal = sqlite.pragma("journal_mode", { simple: true });
+      const sync = sqlite.pragma("synchronous", { simple: true });
+      const cache = sqlite.pragma("cache_size", { simple: true });
+      const tempStore = sqlite.pragma("temp_store", { simple: true });
+      const walAutoCp = sqlite.pragma("wal_autocheckpoint", { simple: true });
+      const busyTimeout = sqlite.pragma("busy_timeout", { simple: true });
+      const pageSize = sqlite.pragma("page_size", { simple: true });
+      pragmas = {
+        journal_mode: journal,
+        synchronous: sync,
+        cache_size: cache,
+        temp_store: tempStore,
+        wal_autocheckpoint: walAutoCp,
+        busy_timeout: busyTimeout,
+        page_size: pageSize,
+      };
+    } catch (e: any) {
+      pragmas = { error: e?.message || String(e) };
+    }
     res.json({
       git_sha: process.env.GIT_SHA || "unknown",
       build_time: process.env.BUILD_TIME || "unknown",
@@ -6974,6 +7000,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       pid: process.pid,
       uptime_sec: Math.round(process.uptime()),
       started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      sqlite_pragmas: pragmas,
     });
   });
 
