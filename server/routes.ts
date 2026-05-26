@@ -3462,15 +3462,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           taxes: cmp(ql.taxes, v2.taxes),
           total_sales: cmp(ql.total_sales, total_sales),
           orders: cmp(ql.orders, v2.orders),
-          // PR #110 — ShopifyQL Finance Summary parity lines (separate from
-          // sales math but exposed for cell-by-cell diff vs the Shopify UI).
+          // PR #110 — return_fees IS a real ShopifyQL column; diff applies.
           return_fees: cmp(ql.return_fees, v2.return_fees),
-          net_sales_gift_cards: cmp(ql.net_sales_gift_cards, v2.net_sales_gift_cards),
+          // PR #111 — ShopifyQL's `sales` dataset has no gift-card column,
+          // so we surface V2's value as info-only (diff will be null on
+          // shopifyql side; consumers should eyeball it against the Admin
+          // Finance Summary PDF "Gift cards" line).
+          net_sales_gift_cards: {
+            shopifyql: null,
+            v2: v2.net_sales_gift_cards,
+            diff: null,
+            note: "ShopifyQL has no gift-card column on `sales` dataset; visual check vs Admin Finance Summary PDF only.",
+          },
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). Acceptance: every line.diff = 0.00 (or 0 for orders).",
-        build_id: "pr110",
+        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
+        build_id: "pr111",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
