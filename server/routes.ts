@@ -3909,6 +3909,323 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // PR #131 — Fully-allocated by-store finance summary.
+  //
+  // Unlike /by-store-pos (PR #124–#125, POS-only via per-line
+  // pos_location_id), this endpoint ALSO attributes non-POS rows
+  // (pos_location_id IS NULL) to one of the 3 retail stores via the
+  // existing recon_allocations ledger — the same allocator that runs at
+  // order ingest time (server/shopify-recon-allocator.ts). The cascade:
+  //
+  //   1. POS row (pos_location_id NOT NULL)
+  //      → entity_id from recon_entity_pos_locations where kind='pos'
+  //   2. Non-POS row
+  //      → recon_allocations row matching (order_id, line_item_id) first;
+  //        fall back to order-level (line_item_id IS NULL) allocation
+  //      → if that entity_id maps to a POS-kind entity, attribute it
+  //      → otherwise treat as unallocated (SD/warehouse/needs_review)
+  //
+  // This means a single sales row is bucketed into exactly one of:
+  // {Greenvale, Huntington, Hempstead, Unallocated}. Sum across all four
+  // = V2 overall monthly total to the penny.
+  //
+  // The Unallocated bucket should be ~$0 in steady state — every non-POS
+  // order should resolve via the fulfillment cascade (PR #R4d) or GC
+  // affinity (PR #R4j). When non-zero, callers should hit
+  // `unallocated_orders` (returned only when total != 0) for the per-order
+  // list so the root cause can be diagnosed and fixed.
+  //
+  // Same 9-metric shape as /by-store-pos: gross_sales, discounts, returns,
+  // return_fees, net_sales_gift_cards, shipping_charges, taxes, net_sales,
+  // total_sales. Pennies, no rounding.
+  app.get("/api/recon/finance/by-store/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const { sqlite } = require("./storage");
+
+      // Resolve the 3 retail POS stores. Same filter as /by-store-pos:
+      // kind='pos' AND active=1.
+      const mappedLocs: Array<{ location_id: string; entity_id: number; entity_location: string }> =
+        sqlite.prepare(`
+          SELECT pl.shopify_location_id AS location_id,
+                 pl.entity_id           AS entity_id,
+                 e.location             AS entity_location
+            FROM recon_entity_pos_locations pl
+            JOIN payroll_entities e ON e.id = pl.entity_id
+           WHERE pl.shopify_location_id IS NOT NULL
+             AND pl.kind = 'pos'
+             AND pl.active = 1
+           ORDER BY pl.entity_id
+        `).all();
+
+      if (mappedLocs.length === 0) {
+        return res.status(404).json({
+          message: "No POS location mappings found in recon_entity_pos_locations",
+        });
+      }
+
+      // Pre-compute the set of POS-mapped entity_ids — used to decide
+      // whether an allocation row counts as "store-routed" or falls into
+      // Unallocated. Allocations to SD / warehouse / needs_review entities
+      // are intentionally bucketed as unallocated so the operator can
+      // diagnose root cause without polluting any store's revenue.
+      const posEntityIds: number[] = mappedLocs.map(l => l.entity_id);
+
+      // Build the per-row attribution CTE and aggregate.
+      //
+      // attributed_entity_id resolves to:
+      //   - POS row's entity (when pos_location_id is set and maps to POS)
+      //   - per-line allocation's entity (when present)
+      //   - order-level allocation's entity (when no per-line match)
+      //   - NULL otherwise (→ Unallocated bucket)
+      //
+      // The COALESCE+correlated-subquery shape is intentional: SQLite
+      // optimizes each subquery against an index lookup, so this scales
+      // linearly with the number of sales rows in the month. We GROUP BY
+      // entity_id (treating NULL as a distinct bucket via the IS NULL test
+      // in the outer SELECT). 9 metrics match Finance Summary exactly.
+      //
+      // NOTE: a sales row with attributed_entity_id pointing to a non-POS
+      // entity (e.g. SD = warehouse) will still aggregate — but only the
+      // 3 POS entities are exposed in `by_store`. The non-POS entity rows
+      // are collapsed into `unallocated` in the second query below. This
+      // keeps the math symmetric: every row counts exactly once.
+      const attributionCte = `
+        WITH attributed AS (
+          SELECT
+            s.*,
+            COALESCE(
+              CASE WHEN s.pos_location_id IS NOT NULL THEN
+                (SELECT pl.entity_id
+                   FROM recon_entity_pos_locations pl
+                  WHERE pl.shopify_location_id = s.pos_location_id
+                    AND pl.kind = 'pos'
+                    AND pl.active = 1
+                  LIMIT 1)
+              END,
+              (SELECT a.entity_id
+                 FROM recon_allocations a
+                WHERE a.order_id = s.order_id
+                  AND a.line_item_id = s.line_item_id
+                LIMIT 1),
+              (SELECT a.entity_id
+                 FROM recon_allocations a
+                WHERE a.order_id = s.order_id
+                  AND a.line_item_id IS NULL
+                LIMIT 1)
+            ) AS attributed_entity_id
+          FROM recon_shopify_sales s
+          WHERE s.happened_month = ?
+        )
+      `;
+
+      // 9-metric aggregator parameterized by an entity-id filter clause.
+      // We reuse the same SQL twice: once per POS entity, once for the
+      // "is null OR not in POS set" bucket = Unallocated.
+      const metricExpr = (filterClause: string) => `
+        ${attributionCte}
+        SELECT
+          COALESCE(SUM(
+            CASE
+              WHEN a.action_type IN ('ORDER','UPDATE') AND a.line_type = 'PRODUCT'
+                THEN a.total_amount + a.total_discount_before_taxes - a.total_tax
+              ELSE 0
+            END
+          ), 0) AS gross_sales,
+          COALESCE(SUM(
+            CASE
+              WHEN a.action_type IN ('ORDER','UPDATE') AND a.line_type = 'PRODUCT'
+                THEN -a.total_discount_before_taxes
+              ELSE 0
+            END
+          ), 0) AS discounts,
+          COALESCE(SUM(
+            CASE
+              WHEN a.action_type = 'RETURN'
+                   AND a.line_type IN ('PRODUCT', 'ADJUSTMENT')
+                THEN (a.total_amount - a.total_tax)
+              ELSE 0
+            END
+          ), 0) AS returns,
+          COALESCE(SUM(
+            CASE
+              WHEN a.action_type = 'ORDER' AND a.line_type = 'FEE'
+                THEN a.total_amount - a.total_tax
+              ELSE 0
+            END
+          ), 0) AS return_fees,
+          COALESCE(SUM(
+            CASE
+              WHEN a.line_type = 'GIFT_CARD'
+                THEN a.total_amount - a.total_tax
+              ELSE 0
+            END
+          ), 0) AS net_sales_gift_cards,
+          COALESCE(SUM(
+            CASE
+              WHEN a.line_type = 'SHIPPING'
+                THEN a.total_amount - a.total_tax
+              ELSE 0
+            END
+          ), 0) AS shipping_charges,
+          COALESCE(SUM(
+            CASE
+              WHEN a.line_type != 'GIFT_CARD'
+                THEN a.total_tax
+              ELSE 0
+            END
+          ), 0) AS taxes,
+          COUNT(DISTINCT CASE
+            WHEN (a.action_type = 'ORDER' AND a.line_type = 'PRODUCT')
+              OR (a.action_type = 'RETURN' AND a.line_type IN ('PRODUCT','ADJUSTMENT'))
+              THEN a.order_id
+          END) AS orders
+        FROM attributed a
+        WHERE ${filterClause}
+      `;
+
+      const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
+      const finalize = (row: any) => {
+        const gross = r2(row.gross_sales);
+        const disc = r2(row.discounts);
+        const ret = r2(row.returns);
+        const rf = r2(row.return_fees);
+        const gc = r2(row.net_sales_gift_cards);
+        const ship = r2(row.shipping_charges);
+        const tax = r2(row.taxes);
+        const netSales = r2(gross + disc + ret);
+        const totalSales = r2(netSales + ship + rf + tax);
+        return {
+          gross_sales: gross,
+          discounts: disc,
+          returns: ret,
+          return_fees: rf,
+          net_sales: netSales,
+          net_sales_gift_cards: gc,
+          shipping_charges: ship,
+          taxes: tax,
+          total_sales: totalSales,
+          orders: Number(row.orders) || 0,
+        };
+      };
+
+      // Per-store aggregates.
+      const byStore: any[] = [];
+      for (const loc of mappedLocs) {
+        const row = sqlite.prepare(metricExpr(`a.attributed_entity_id = ?`)).get(month, loc.entity_id) as any;
+        byStore.push({
+          entity_id: loc.entity_id,
+          entity_location: loc.entity_location,
+          location_id: loc.location_id,
+          ...finalize(row),
+        });
+      }
+
+      // Unallocated bucket: rows whose attributed_entity_id is NULL OR
+      // points to a non-POS entity. We use a NOT IN clause with the POS
+      // entity ids (the set is tiny — always 3 — so inlining is fine).
+      const posIdList = posEntityIds.join(",") || "-1";
+      const unallocRow = sqlite.prepare(
+        metricExpr(`(a.attributed_entity_id IS NULL OR a.attributed_entity_id NOT IN (${posIdList}))`)
+      ).get(month) as any;
+      const unallocated = finalize(unallocRow);
+
+      // Aggregate totals across {3 stores + unallocated} — these should
+      // tie to the V2 overall monthly total to the penny.
+      const r2sum = (x: number, y: number) => Math.round((x + y) * 100) / 100;
+      const totals = [...byStore, unallocated].reduce(
+        (acc, s) => ({
+          gross_sales: r2sum(acc.gross_sales, s.gross_sales),
+          discounts: r2sum(acc.discounts, s.discounts),
+          returns: r2sum(acc.returns, s.returns),
+          return_fees: r2sum(acc.return_fees, s.return_fees),
+          net_sales: r2sum(acc.net_sales, s.net_sales),
+          net_sales_gift_cards: r2sum(acc.net_sales_gift_cards, s.net_sales_gift_cards),
+          shipping_charges: r2sum(acc.shipping_charges, s.shipping_charges),
+          taxes: r2sum(acc.taxes, s.taxes),
+          total_sales: r2sum(acc.total_sales, s.total_sales),
+          orders: acc.orders + s.orders,
+        }),
+        {
+          gross_sales: 0, discounts: 0, returns: 0, return_fees: 0, net_sales: 0,
+          net_sales_gift_cards: 0, shipping_charges: 0, taxes: 0, total_sales: 0, orders: 0,
+        }
+      );
+
+      // Unallocated diagnostic: when unallocated.total_sales != 0, return
+      // the per-order list so the operator can drill in. We cap at 100
+      // orders to keep the payload small — if there are more, the count is
+      // returned separately and the operator can hit a paginated endpoint.
+      let unallocated_orders: Array<{
+        order_id: string;
+        order_name: string | null;
+        source_name: string | null;
+        has_allocation: boolean;
+        allocated_entity_id: number | null;
+        gross_sales: number;
+      }> | null = null;
+      let unallocated_order_count: number | null = null;
+      if (Math.abs(unallocated.total_sales) >= 0.005 || unallocated.orders > 0) {
+        const list = sqlite.prepare(`
+          ${attributionCte}
+          SELECT a.order_id,
+                 o.name AS order_name,
+                 o.source_name,
+                 a.attributed_entity_id,
+                 ROUND(SUM(CASE
+                   WHEN a.action_type IN ('ORDER','UPDATE') AND a.line_type = 'PRODUCT'
+                     THEN a.total_amount + a.total_discount_before_taxes - a.total_tax
+                   ELSE 0
+                 END) * 100) / 100.0 AS gross_sales
+            FROM attributed a
+            LEFT JOIN recon_orders o ON o.id = a.order_id
+           WHERE (a.attributed_entity_id IS NULL OR a.attributed_entity_id NOT IN (${posIdList}))
+           GROUP BY a.order_id
+           ORDER BY ABS(gross_sales) DESC
+           LIMIT 100
+        `).all(month) as Array<{
+          order_id: string;
+          order_name: string | null;
+          source_name: string | null;
+          attributed_entity_id: number | null;
+          gross_sales: number;
+        }>;
+        unallocated_orders = list.map(r => ({
+          order_id: r.order_id,
+          order_name: r.order_name,
+          source_name: r.source_name,
+          has_allocation: r.attributed_entity_id != null,
+          allocated_entity_id: r.attributed_entity_id,
+          gross_sales: r2(r.gross_sales),
+        }));
+        const countRow = sqlite.prepare(`
+          ${attributionCte}
+          SELECT COUNT(DISTINCT a.order_id) AS n
+            FROM attributed a
+           WHERE (a.attributed_entity_id IS NULL OR a.attributed_entity_id NOT IN (${posIdList}))
+        `).get(month) as { n: number };
+        unallocated_order_count = Number(countRow.n) || 0;
+      }
+
+      res.json({
+        month,
+        scope: "fully_allocated",
+        by_store: byStore,
+        unallocated,
+        totals,
+        unallocated_orders,
+        unallocated_order_count,
+        note: "PR #131: per-line POS attribution (pos_location_id) UNION allocator output (recon_allocations) bucketed into {Greenvale, Huntington, Hempstead, Unallocated}. Sum across all 4 buckets = V2 overall monthly total to the penny. Unallocated should be ~$0 in steady state; when non-zero, drill into unallocated_orders to diagnose.",
+        build_id: "pr131",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "by-store failed", error: String(e?.message || e) });
+    }
+  });
+
   // PR #125 — Ingest per-line pos_location_id from ShopifyQL `sales`.
   //
   // Body: { start: "YYYY-MM-DD", end: "YYYY-MM-DD" }  (half-open: [start, end))
