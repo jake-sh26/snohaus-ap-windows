@@ -3590,8 +3590,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       };
       // net_sales matches ShopifyQL: gross + disc + ret. (return_fees and GC
       // are tracked separately and don't roll into the net_sales line.)
+      //
+      // PR #118: total_sales DOES include return_fees. ShopifyQL's Finance
+      // Summary `total_sales` column = gross + discounts + returns + shipping
+      // + return_fees + taxes. Visible in the Admin UI: Feb 2025 was Net
+      // sales 283,203.48 + Shipping 59.96 + Return fees 10.00 + Taxes
+      // 24,328.53 = Total sales 307,601.97 — the $10 return fee is rolled in.
+      // V2 was previously omitting return_fees from total_sales, producing
+      // a flat $10 diff in any month with return fees ($10 Feb '25,
+      // Apr '25, Mar '26 — all months where return_fees > 0).
+      //
+      // NOTE on journal entries (your standing instruction): for QBO JE
+      // posting, return_fees rolls into Sales Revenue (gross), NOT into
+      // a separate account. That accounting treatment is independent of
+      // this reporting-line reconciliation — ShopifyQL's `total_sales`
+      // matches our V2 only when we sum the same 6 lines they sum.
       const net_sales = Math.round((v2.gross_sales + v2.discounts + v2.returns) * 100) / 100;
-      const total_sales = Math.round((net_sales + v2.shipping_charges + v2.taxes) * 100) / 100;
+      const total_sales =
+        Math.round((net_sales + v2.shipping_charges + v2.return_fees + v2.taxes) * 100) / 100;
 
       const round2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
       const cmp = (qlVal: any, v2Val: number) => {
@@ -3628,8 +3644,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
         v2_raw: { ...v2, net_sales, total_sales },
         shopifyql_raw: ql,
-        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. PR #117 dropped the !=0 ex-tax check (ShopifyQL counts zero-sum orders too — 100% disc/comp/gift orders). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
-        build_id: "pr117",
+        note: "V2 sums come straight from recon_shopify_sales using PR #110 action_type+line_type filters (matches ShopifyQL Finance Summary aggregation). PR #113 widened returns to include RETURN+ADJUSTMENT. PR #114 rewrote orders count to filter by recon_orders.created_month + non-zero PRODUCT/ADJUSTMENT activity. PR #117 dropped the !=0 ex-tax check (ShopifyQL counts zero-sum orders too — 100% disc/comp/gift orders). PR #118 added return_fees into total_sales (it's a real component of ShopifyQL's total_sales column — was producing a flat $10 diff in months with return fees). Acceptance: every line.diff = 0.00 (or 0 for orders). net_sales_gift_cards has no ShopifyQL parallel column — visual check only.",
+        build_id: "pr118",
       });
     } catch (e: any) {
       res.status(500).json({ message: "v2-vs-shopifyql failed", error: String(e?.message || e) });
