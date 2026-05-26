@@ -1254,22 +1254,7 @@ export default function ReconcilerTest() {
 
         {/* =================== BY STORE TAB =================== */}
         <TabsContent value="bystore" className="space-y-6 mt-0">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2"><Store className="size-4" /> Per-store breakdown</CardTitle>
-              <CardDescription>
-                Greenvale · Huntington · Hempstead. Per-line POS attribution from
-                ShopifyQL (PR #125–#127). Validated penny-perfect across all 17
-                months × 3 stores. Detailed UI lands in PR #129.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Coming next. Use the <button type="button" className="underline" onClick={() => onTabChange("reconcile")}>Reconcile</button> tab for the
-                current Finance Summary diff.
-              </p>
-            </CardContent>
-          </Card>
+          <ByStoreBreakdown />
         </TabsContent>
 
         {/* =================== SETUP TAB =================== */}
@@ -3761,6 +3746,257 @@ function GiftCardActivityCard({ month }: { month: string }) {
             ))}
           </div>
         </details>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ----- PR #130: By Store breakdown -----
+// 4-column table (Greenvale | Huntington | Hempstead | Total) showing the
+// same 9 metrics as the Finance Summary diff. Column order is fixed by
+// location_id so the layout stays stable as the server reorders rows.
+//
+// Total column = sum of the 3 POS stores (POS-channel total). The endpoint
+// already returns this in `totals`. We display it and ALSO cross-foot against
+// the overall V2 monthly total from /api/recon/finance/diff/:month (which
+// includes non-POS rows like online gift cards). If the two differ, we
+// surface a footnote per metric — this is expected when there are NULL
+// pos_location_id rows (e.g. Dec 2025 had 25 such rows / 99.84% coverage).
+// Pennies, no rounding. All numbers come from the server already r2'd.
+type ByStoreRow = {
+  entity_id: number;
+  entity_location: string;
+  location_id: string;
+  gross_sales: number;
+  discounts: number;
+  returns: number;
+  return_fees: number;
+  net_sales: number;
+  net_sales_gift_cards: number;
+  shipping_charges: number;
+  taxes: number;
+  total_sales: number;
+  orders: number;
+};
+type ByStorePosResp = {
+  month: string;
+  scope: string;
+  by_store: ByStoreRow[];
+  totals: Omit<ByStoreRow, "entity_id" | "entity_location" | "location_id">;
+  note: string;
+  build_id: string;
+};
+// Fixed column order: Greenvale, Huntington, Hempstead. Location IDs come
+// from server/shopify-recon-pos-locations.ts SNOHAUS_POS_LOCATIONS and
+// match the recon_entity_pos_locations table.
+const BY_STORE_COL_ORDER: Array<{ location_id: string; label: string }> = [
+  { location_id: "63208882365", label: "Greenvale" },
+  { location_id: "82273140978", label: "Huntington" },
+  { location_id: "82273206514", label: "Hempstead" },
+];
+// 9 metrics mirroring Finance Summary diff, with server keys for /by-store-pos.
+// Note: server uses `shipping_charges` here vs Finance Summary's `shipping`.
+const BY_STORE_METRICS: Array<{
+  label: string;
+  storeKey: keyof Omit<ByStoreRow, "entity_id" | "entity_location" | "location_id" | "orders">;
+  v2Key: keyof FinanceSummaryLocal;
+}> = [
+  { label: "Gross sales",            storeKey: "gross_sales",          v2Key: "gross_sales" },
+  { label: "Discounts",              storeKey: "discounts",            v2Key: "discounts" },
+  { label: "Returns",                storeKey: "returns",              v2Key: "returns" },
+  { label: "Net sales",              storeKey: "net_sales",            v2Key: "net_sales" },
+  { label: "Shipping",               storeKey: "shipping_charges",     v2Key: "shipping" },
+  { label: "Return fees",            storeKey: "return_fees",          v2Key: "return_fees" },
+  { label: "Taxes",                  storeKey: "taxes",                v2Key: "taxes" },
+  { label: "Total sales",            storeKey: "total_sales",          v2Key: "total_sales" },
+  { label: "Net sales (gift cards)", storeKey: "net_sales_gift_cards", v2Key: "net_sales_gift_cards" },
+];
+
+function ByStoreBreakdown() {
+  // Independent month state so browsing here doesn't affect Reconcile tab.
+  // Default: last completed month (today minus ~15 days, formatted YYYY-MM).
+  const [month, setMonth] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(1);
+    d.setMonth(d.getMonth() - 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  });
+  const valid = /^\d{4}-\d{2}$/.test(month);
+
+  const byStoreQ = useQuery<ByStorePosResp>({
+    queryKey: ["/api/recon/finance/by-store-pos", month],
+    queryFn: () => jsonGet(`/api/recon/finance/by-store-pos/${encodeURIComponent(month)}`),
+    enabled: valid,
+  });
+  // Overall V2 monthly total — for cross-foot against the 3-store POS sum.
+  // Non-POS rows (online gift cards, manual orders w/ NULL pos_location_id)
+  // live in `ours` but NOT in `by_store`, so a non-zero gap is expected and
+  // legitimate. We surface it inline so the operator can see exactly which
+  // metric(s) leak into non-POS.
+  const v2DiffQ = useQuery<FinanceDiffResult>({
+    queryKey: ["/api/recon/finance/diff", month],
+    queryFn: () => jsonGet(`/api/recon/finance/diff/${encodeURIComponent(month)}`),
+    enabled: valid,
+  });
+
+  // Map server rows by location_id so column order is deterministic.
+  const storeByLoc: Record<string, ByStoreRow | undefined> = {};
+  for (const r of byStoreQ.data?.by_store ?? []) {
+    storeByLoc[r.location_id] = r;
+  }
+  const totals = byStoreQ.data?.totals;
+  const v2 = v2DiffQ.data?.ours;
+
+  // Pennies, no rounding. Round each diff at 2dp to dodge float noise.
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Store className="size-4" /> Per-store breakdown — {valid ? monthLabel(month) : month}
+        </CardTitle>
+        <CardDescription>
+          Greenvale · Huntington · Hempstead, side-by-side. Per-line POS
+          attribution from ShopifyQL (PR #125–#127). Validated penny-perfect
+          across all 17 months × 3 stores. Auto-refreshes every 6h with the
+          Shopify orders cron (PR #129).
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Month picker */}
+        <div className="flex flex-wrap items-end gap-2">
+          <div>
+            <label className="text-xs text-muted-foreground block mb-1">Month</label>
+            <input
+              type="month"
+              className="border rounded-md px-2 py-1 text-sm"
+              value={month}
+              onChange={(e) => setMonth(e.target.value)}
+              data-testid="input-bystore-month"
+            />
+          </div>
+          <div className="text-xs text-muted-foreground pb-2">
+            ({valid ? monthLabel(month) : "invalid"})
+          </div>
+        </div>
+
+        {/* Diagnostics row */}
+        {byStoreQ.data && (
+          <div className="flex gap-2 text-xs text-muted-foreground flex-wrap">
+            <span>Scope: POS-only (pos_location_id IS NOT NULL)</span>
+            <span>·</span>
+            <span>Build: {byStoreQ.data.build_id}</span>
+            <span>·</span>
+            <span>POS orders: {num(totals?.orders ?? 0)}</span>
+            {v2 && (
+              <>
+                <span>·</span>
+                <span>V2 total orders: {num(v2.order_count)}</span>
+              </>
+            )}
+          </div>
+        )}
+
+        {byStoreQ.isLoading && (
+          <div className="text-sm text-muted-foreground">Loading per-store breakdown…</div>
+        )}
+        {byStoreQ.error && (
+          <div className="text-sm text-destructive">
+            Failed to load: {String((byStoreQ.error as any)?.message ?? byStoreQ.error)}
+          </div>
+        )}
+
+        {/* Main side-by-side table */}
+        {byStoreQ.data && totals && (
+          <div className="border rounded-md overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/50 text-xs text-muted-foreground">
+                <tr>
+                  <th className="text-left px-3 py-1.5 font-medium">Line</th>
+                  {BY_STORE_COL_ORDER.map((c) => (
+                    <th key={c.location_id} className="text-right px-3 py-1.5 font-medium">
+                      {c.label}
+                    </th>
+                  ))}
+                  <th className="text-right px-3 py-1.5 font-medium border-l">Total (POS)</th>
+                  {v2 && (
+                    <th className="text-right px-3 py-1.5 font-medium" title="Overall V2 monthly total — includes non-POS rows (online gift cards, manual orders with NULL pos_location_id)">
+                      V2 overall
+                    </th>
+                  )}
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {BY_STORE_METRICS.map((m) => {
+                  const totalPos = totals[m.storeKey];
+                  const overall = v2 ? v2[m.v2Key] : null;
+                  const gap = overall == null ? null : r2(Number(overall) - Number(totalPos));
+                  const hasGap = gap !== null && Math.abs(gap) >= 0.005;
+                  return (
+                    <tr key={m.storeKey} data-testid={`bystore-row-${m.storeKey}`}>
+                      <td className="px-3 py-1.5 font-medium">{m.label}</td>
+                      {BY_STORE_COL_ORDER.map((c) => {
+                        const row = storeByLoc[c.location_id];
+                        return (
+                          <td key={c.location_id} className="px-3 py-1.5 text-right font-mono">
+                            {row ? money(row[m.storeKey]) : "—"}
+                          </td>
+                        );
+                      })}
+                      <td className="px-3 py-1.5 text-right font-mono border-l">
+                        {money(totalPos)}
+                      </td>
+                      {v2 && (
+                        <td
+                          className={`px-3 py-1.5 text-right font-mono ${hasGap ? "text-amber-700" : ""}`}
+                          title={hasGap ? `Non-POS leak: ${money(gap)} not attributed to a register` : "POS sum matches V2 overall"}
+                        >
+                          {overall == null ? "—" : money(Number(overall))}
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Cross-foot footnote — only when 3-store POS sum != overall V2 */}
+        {byStoreQ.data && totals && v2 && (() => {
+          const leaks = BY_STORE_METRICS
+            .map((m) => ({
+              label: m.label,
+              gap: r2(Number(v2[m.v2Key]) - Number(totals[m.storeKey])),
+            }))
+            .filter((l) => Math.abs(l.gap) >= 0.005);
+          if (leaks.length === 0) {
+            return (
+              <div className="text-xs text-muted-foreground flex items-center gap-1">
+                <CheckCircle2 className="size-3 text-green-600" />
+                3-store POS sum reconciles to V2 overall to the penny.
+              </div>
+            );
+          }
+          return (
+            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 space-y-1">
+              <div className="font-medium">Non-POS leak (V2 overall − 3-store POS sum)</div>
+              <div className="text-amber-900/80">
+                Expected when there are rows with NULL pos_location_id — online
+                gift cards, manual orders, draft orders. POS coverage isn't a
+                bug; these rows simply have no register attached.
+              </div>
+              <ul className="font-mono text-amber-900/90 pl-4 list-disc">
+                {leaks.map((l) => (
+                  <li key={l.label}>
+                    {l.label}: {money(l.gap)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })()}
       </CardContent>
     </Card>
   );
