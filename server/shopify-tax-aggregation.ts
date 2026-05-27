@@ -95,6 +95,45 @@ export interface RefundForTax {
   is_pos: boolean;
 }
 
+/**
+ * PR #146 — Shipping-line tax forward input. Mirrors Shopify's "Taxes" column
+ * which includes shipping tax (`order.shipping_lines[].tax_lines[].price`),
+ * not just per-line product tax. By-store reads this via raw_json in
+ * shopify-finance-diff.ts; by-entity needs to mirror it to close Check A.
+ *
+ * One ShippingTaxForward per order's `shipping_lines[]` aggregate (one row
+ * per (entity, order) is fine — the caller pre-attributes by the order's
+ * allocator and pre-flattens shipping_lines[] into a single tax_lines list).
+ *
+ * No `line_subtotal` here: shipping is not a taxable sale subtotal — it has
+ * its own bucket in Shopify's Finance Summary and doesn't enter
+ * gross/taxable on the by-entity report.
+ */
+export interface ShippingTaxForward {
+  entity_id: number;
+  tax_lines: TaxLine[];
+  is_pos: boolean;
+  tax_channel_liable: number;
+}
+
+/**
+ * PR #146 — Shipping refund tax (adjustment_kind='shipping_refund'). By-store
+ * SUBTRACTS ABS(total_tax) from its taxes column; by-entity must too.
+ *
+ * These adjustment rows don't carry `tax_lines_json` (no per-jurisdiction
+ * breakdown). We subtract at the entity level only; per-jurisdiction
+ * reconciliation absorbs the residual into the largest jurisdiction bucket
+ * via the same residual-distribution pass that fixes Gap 1.
+ */
+export interface ShippingTaxRefund {
+  entity_id: number;
+  /** absolute-value tax cents to subtract — caller already ABS()'d this */
+  refund_tax: number;
+  is_pos: boolean;
+  /** 1 if marketplace-facilitated shipping (rare; mirror line behavior) */
+  tax_channel_liable: number;
+}
+
 export interface EntitySummary {
   entity_id: number;
   entity_name: string;
@@ -218,6 +257,8 @@ export function aggregateByEntity(
   inputs: AggregatorInput[],
   entityNames: Map<number, string>,
   refunds: RefundForTax[] = [],
+  shippingTaxForward: ShippingTaxForward[] = [],
+  shippingTaxRefunds: ShippingTaxRefund[] = [],
 ): EntitySummary[] {
   const buckets = new Map<number, EntityCents>();
 
@@ -292,6 +333,38 @@ export function aggregateByEntity(
       b.allocated_gross -= subCents;
       b.allocated_tax -= taxCents;
     }
+  }
+
+  // PR #146 — Shipping-line tax (forward). Mirrors Shopify's Finance Summary
+  // "Taxes" column which adds shipping_lines[].tax_lines[].price to
+  // per-line product tax. Does NOT contribute to gross/taxable_sales (shipping
+  // has its own column in Shopify) — only to tax_collected / tax_owed.
+  for (const st of shippingTaxForward) {
+    const eid = st.entity_id ?? 0;
+    let b = buckets.get(eid);
+    if (!b) { b = blankEntityCents(); buckets.set(eid, b); }
+    const taxCents = st.tax_lines.reduce((acc, tl) => acc + toCents(tl.price), 0);
+    const isMarketplace =
+      Boolean(st.tax_channel_liable) ||
+      st.tax_lines.some(tl => tl.channel_liable);
+    b.tax_collected += taxCents;
+    if (isMarketplace) b.marketplace_tax += taxCents;
+    if (st.is_pos) b.pos_tax += taxCents;
+    else b.allocated_tax += taxCents;
+  }
+
+  // PR #146 — Shipping-refund tax (adjustment_kind='shipping_refund').
+  // Caller passes ABS()'d cents. Subtract at entity-level only; no
+  // jurisdiction attribution available on these rows.
+  for (const sr of shippingTaxRefunds) {
+    const eid = sr.entity_id ?? 0;
+    let b = buckets.get(eid);
+    if (!b) { b = blankEntityCents(); buckets.set(eid, b); }
+    const taxCents = toCents(sr.refund_tax);
+    b.tax_collected -= taxCents;
+    if (sr.tax_channel_liable) b.marketplace_tax -= taxCents;
+    if (sr.is_pos) b.pos_tax -= taxCents;
+    else b.allocated_tax -= taxCents;
   }
 
   const out: EntitySummary[] = [];
@@ -391,9 +464,18 @@ export function aggregateByJurisdiction(
   inputs: AggregatorInput[],
   entityNames: Map<number, string>,
   refunds: RefundForTax[] = [],
+  shippingTaxForward: ShippingTaxForward[] = [],
+  shippingTaxRefunds: ShippingTaxRefund[] = [],
 ): EntityJurisdictionBreakdown[] {
   // entity_id → Map<jur-key-string, JurCents>
   const perEntity = new Map<number, Map<string, JurCents & JurKey>>();
+  // PR #146 — per-entity expected tax_owed in cents. Used at the end to
+  // distribute any residual into the largest non-marketplace jurisdiction so
+  // Σ jurisdictions.tax_due === entity.tax_owed exactly.
+  const expectedTaxOwedCents = new Map<number, number>();
+  const addExpected = (eid: number, delta: number) => {
+    expectedTaxOwedCents.set(eid, (expectedTaxOwedCents.get(eid) || 0) + delta);
+  };
 
   for (const { line } of inputs) {
     if (line.is_gift_card) continue;
@@ -427,6 +509,7 @@ export function aggregateByJurisdiction(
       } else {
         bucket.taxable += lineSubCents;
         bucket.tax_due += taxCents;
+        addExpected(eid, taxCents);
       }
     }
   }
@@ -492,6 +575,89 @@ export function aggregateByJurisdiction(
       } else {
         bucket.taxable -= subCents;
         bucket.tax_due -= refundTaxThisJur;
+        addExpected(eid, -refundTaxThisJur);
+      }
+    }
+  }
+
+  // PR #146 — Shipping forward tax: add to per-jurisdiction buckets. Shipping
+  // tax has its own tax_lines (one per jurisdiction at the order's ship-to).
+  // Shipping is NOT a taxable_sales subtotal (Shopify reports it in a separate
+  // column), so we add to tax_due only — taxable_sales unchanged.
+  for (const st of shippingTaxForward) {
+    if (st.tax_lines.length === 0) continue;
+    const eid = st.entity_id ?? 0;
+    let jurMap = perEntity.get(eid);
+    if (!jurMap) { jurMap = new Map(); perEntity.set(eid, jurMap); }
+    const stIsMarketplace = Boolean(st.tax_channel_liable);
+    for (const tl of st.tax_lines) {
+      const name = (tl.jurisdiction_name || tl.title || 'UNKNOWN').toString().toUpperCase();
+      const type = (tl.jurisdiction_type || inferType(name)).toString().toUpperCase();
+      const rate = canonRate(tl.rate);
+      const key = `${name}|${type}|${rate}`;
+      let bucket = jurMap.get(key);
+      if (!bucket) {
+        bucket = {
+          name, type, rate,
+          taxable: 0, tax_due: 0,
+          marketplace_taxable: 0, marketplace_tax: 0,
+        };
+        jurMap.set(key, bucket);
+      }
+      const isMp = stIsMarketplace || tl.channel_liable;
+      const taxCents = toCents(tl.price);
+      if (isMp) {
+        bucket.marketplace_tax += taxCents;
+      } else {
+        bucket.tax_due += taxCents;
+        addExpected(eid, taxCents);
+      }
+    }
+  }
+
+  // PR #146 — Shipping refund tax (adjustment_kind='shipping_refund'): no
+  // jurisdiction breakdown available on these rows. Subtract from the entity's
+  // expected tax_owed total; the residual-reconciliation pass below will
+  // absorb the delta into the entity's largest jurisdiction.
+  for (const sr of shippingTaxRefunds) {
+    if (sr.tax_channel_liable) continue; // marketplace — not in tax_owed
+    const eid = sr.entity_id ?? 0;
+    addExpected(eid, -toCents(sr.refund_tax));
+    if (!perEntity.has(eid)) perEntity.set(eid, new Map());
+  }
+
+  // PR #146 — Residual reconciliation. For each entity, ensure
+  //   Σ non-marketplace jurisdictions.tax_due === entity expected tax_owed.
+  //
+  // Drift comes from per-refund proportional rounding (each refund's residual
+  // hits the LAST jurisdiction, which accumulates across many refunds) and
+  // from shipping_refund adjustments with no jurisdiction attribution. We
+  // resolve by moving the cumulative residual into the jurisdiction with the
+  // largest |tax_due| — the standard "largest-bucket-absorbs-remainder"
+  // pattern. Skips entities with no non-marketplace jurisdictions.
+  for (const [eid, jurMap] of perEntity) {
+    const expected = expectedTaxOwedCents.get(eid) || 0;
+    let actual = 0;
+    let largest: (JurCents & JurKey) | null = null;
+    let largestAbs = -1;
+    for (const j of jurMap.values()) {
+      actual += j.tax_due;
+      const ab = Math.abs(j.tax_due);
+      if (ab > largestAbs) { largestAbs = ab; largest = j; }
+    }
+    const residual = expected - actual;
+    if (residual !== 0 && largest) {
+      largest.tax_due += residual;
+      // Dev-mode assertion: catch unexpected drift sources early.
+      // Warn only on unusually large drift — small drift is expected and
+      // healthy (every refund's pro-rate residual + shipping_refund rows have
+      // no jurisdiction attribution by construction). >$10 means something
+      // legitimate is missing — investigate.
+      if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production' && Math.abs(residual) > 1000) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[tax aggregator] entity ${eid} jurisdiction drift absorbed: ${residual}c into ${largest.name}`,
+        );
       }
     }
   }
