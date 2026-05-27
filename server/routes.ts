@@ -149,6 +149,8 @@ import {
   type AggregatorInput,
   type LineForTax,
   type RefundForTax,
+  type ShippingTaxForward,
+  type ShippingTaxRefund,
 } from "./shopify-tax-aggregation";
 import {
   syncPayoutsIncremental,
@@ -4362,6 +4364,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   function loadTaxInputsForMonth(month: string): {
     inputs: AggregatorInput[];
     refunds: RefundForTax[];
+    shippingTaxForward: ShippingTaxForward[];
+    shippingTaxRefunds: ShippingTaxRefund[];
     entityNames: Map<number, string>;
   } {
     const { sqlite } = require("./storage");
@@ -4608,7 +4612,178 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    return { inputs, refunds, entityNames };
+    // -----------------------------------------------------------------------
+    // PR #146 — Shipping-line tax (forward + refund).
+    //
+    // Source of truth for by-store's Taxes column (Rule #7b,
+    // shopify-finance-diff.ts:205-310):
+    //
+    //   taxes = Σ recon_line_items.tax_lines_json[].price        (per-line)
+    //         + Σ recon_orders.raw_json.shipping_lines[].tax_lines[].price
+    //         - Σ recon_refund_line_items.total_tax  (kind='item')
+    //         - Σ ABS(recon_refund_line_items.total_tax)  (kind='adjustment',
+    //                                                     adjustment_kind=
+    //                                                     'shipping_refund')
+    //
+    // By-entity (before #146) covered only the per-line and item-refund
+    // parts. We now add:
+    //   • shipping forward tax — bucketed on the SAME order date the by-store
+    //     gross uses (COALESCE(processed_at, created_at), -5h EST) so shipping
+    //     and shipping-tax land in the same month as the rest of the order.
+    //   • shipping refund tax — ABS()'d (Shopify ships these as signed cents,
+    //     usually negative; sign convention matches by-store).
+    //
+    // Entity attribution mirrors the per-line cascade but operates at the
+    // ORDER level (no line_item_id on shipping). We use the dominant POS
+    // allocator: any recon_shopify_sales row on the order with a mapped POS
+    // location → that POS entity; else the order-level allocator; else 0.
+    const shipTaxRows: Array<{
+      order_id: string;
+      raw_json: string | null;
+      pos_entity_id: number | null;
+      alloc_entity_id: number | null;
+    }> = sqlite.prepare(`
+      SELECT
+        o.id AS order_id,
+        o.raw_json AS raw_json,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos'
+            AND pl.active = 1
+          WHERE s.order_id = o.id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        COALESCE(
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = o.id AND a.line_item_id IS NULL LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = o.id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+        ) AS alloc_entity_id
+      FROM recon_orders o
+      WHERE substr(datetime(
+        COALESCE(o.processed_at, o.created_at),
+        '-5 hours'), 1, 7) = ?
+        AND o.raw_json IS NOT NULL
+        AND o.raw_json <> ''
+    `).all(month) as any;
+
+    const shippingTaxForward: ShippingTaxForward[] = [];
+    for (const r of shipTaxRows) {
+      let parsed: any;
+      try { parsed = typeof r.raw_json === 'string' ? JSON.parse(r.raw_json) : r.raw_json; }
+      catch { continue; }
+      const sLines = Array.isArray(parsed?.shipping_lines) ? parsed.shipping_lines : [];
+      if (sLines.length === 0) continue;
+
+      // Flatten all shipping_lines[].tax_lines[] into a single TaxLine[].
+      // Multiple shipping_lines on one order is rare; if it happens, they
+      // attribute to the same entity (the order's entity), so flattening
+      // before grouping is fine — same-jurisdiction tax_lines will merge in
+      // the aggregator.
+      const flatTaxLines = [] as ReturnType<typeof parseTaxLines>;
+      let anyMpFlag = false;
+      for (const s of sLines) {
+        const tls = Array.isArray(s?.tax_lines) ? s.tax_lines : [];
+        for (const tl of tls) {
+          const price = typeof tl?.price === 'number' ? tl.price : tl?.price != null ? Number(tl.price) : null;
+          if (price == null || !Number.isFinite(price)) continue;
+          const channel_liable = Boolean(tl?.channel_liable);
+          if (channel_liable) anyMpFlag = true;
+          flatTaxLines.push({
+            title: tl?.title ?? null,
+            rate: typeof tl?.rate === 'number' ? tl.rate : tl?.rate != null ? Number(tl.rate) : null,
+            price,
+            channel_liable,
+            jurisdiction_id: tl?.jurisdiction_id ?? null,
+            jurisdiction_name: tl?.jurisdiction_name ?? null,
+            jurisdiction_type: tl?.jurisdiction_type ?? null,
+          });
+        }
+      }
+      if (flatTaxLines.length === 0) continue;
+
+      let entity_id = 0;
+      let is_pos = false;
+      if (r.pos_entity_id != null && posEntityIds.has(r.pos_entity_id)) {
+        entity_id = r.pos_entity_id;
+        is_pos = true;
+      } else if (r.alloc_entity_id != null && posEntityIds.has(r.alloc_entity_id)) {
+        entity_id = r.alloc_entity_id;
+        is_pos = false;
+      }
+      shippingTaxForward.push({
+        entity_id,
+        tax_lines: flatTaxLines,
+        is_pos,
+        tax_channel_liable: anyMpFlag ? 1 : 0,
+      });
+    }
+
+    // Shipping refund adjustments: kind='adjustment', adjustment_kind='shipping_refund'.
+    // total_tax is signed (typically negative for the customer-side refund of
+    // shipping tax). By-store ABS()s; we do the same. Entity attribution: the
+    // order's dominant POS allocator (no line_item_id on these rows).
+    const shipRefundRows: Array<{
+      order_id: string;
+      total_tax: number | null;
+      pos_entity_id: number | null;
+      alloc_entity_id: number | null;
+    }> = sqlite.prepare(`
+      SELECT
+        rli.order_id AS order_id,
+        rli.total_tax AS total_tax,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos'
+            AND pl.active = 1
+          WHERE s.order_id = rli.order_id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        COALESCE(
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id AND a.line_item_id IS NULL LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+        ) AS alloc_entity_id
+      FROM recon_refund_line_items rli
+      JOIN recon_refunds rf ON rf.id = rli.refund_id
+      WHERE rli.kind = 'adjustment'
+        AND rli.adjustment_kind = 'shipping_refund'
+        AND substr(datetime(
+          COALESCE(rf.processed_at, rf.created_at),
+          '-5 hours'), 1, 7) = ?
+    `).all(month) as any;
+
+    const shippingTaxRefunds: ShippingTaxRefund[] = [];
+    for (const r of shipRefundRows) {
+      const absTax = Math.abs(Number(r.total_tax || 0));
+      if (absTax === 0) continue;
+      let entity_id = 0;
+      let is_pos = false;
+      if (r.pos_entity_id != null && posEntityIds.has(r.pos_entity_id)) {
+        entity_id = r.pos_entity_id;
+        is_pos = true;
+      } else if (r.alloc_entity_id != null && posEntityIds.has(r.alloc_entity_id)) {
+        entity_id = r.alloc_entity_id;
+        is_pos = false;
+      }
+      shippingTaxRefunds.push({
+        entity_id,
+        refund_tax: absTax,
+        is_pos,
+        tax_channel_liable: 0,
+      });
+    }
+
+    return { inputs, refunds, shippingTaxForward, shippingTaxRefunds, entityNames };
   }
 
   app.get("/api/recon/tax/by-entity/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
@@ -4617,15 +4792,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(400).json({ message: "Month must be YYYY-MM" });
     }
     try {
-      const { inputs, refunds, entityNames } = loadTaxInputsForMonth(month);
-      const entities = aggregateByEntity(inputs, entityNames, refunds);
+      const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, entityNames } = loadTaxInputsForMonth(month);
+      const entities = aggregateByEntity(inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds);
       const totals = sumEntities(entities);
       res.json({
         month,
         entities,
         totals,
-        note: "PR #143 + #145: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. PR #145: refund tax from recon_refund_line_items is SUBTRACTED in the refund's processed_at month, attributed to the original line's entity + jurisdictions. Money fields are strings (integer-cents internally) — no float drift. marketplace_* fields show the Shopify-facilitated portion (channel_liable=true); tax_owed excludes those.",
-        build_id: "pr145",
+        note: "PR #143 + #145 + #146: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. PR #145: refund tax from recon_refund_line_items is SUBTRACTED in the refund's processed_at month, attributed to the original line's entity + jurisdictions. PR #146: shipping_lines tax (forward) is ADDED and shipping_refund adjustment tax is SUBTRACTED (ABS), matching by-store's Rule #7b. Money fields are strings (integer-cents internally) — no float drift. marketplace_* fields show the Shopify-facilitated portion (channel_liable=true); tax_owed excludes those.",
+        build_id: "pr146",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax by-entity failed", error: String(e?.message || e) });
@@ -4656,21 +4831,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // already-aggregated string-money rows.
       const all: AggregatorInput[] = [];
       const allRefunds: RefundForTax[] = [];
+      const allShipFwd: ShippingTaxForward[] = [];
+      const allShipRef: ShippingTaxRefund[] = [];
       let entityNames = new Map<number, string>();
       for (const m of months) {
-        const { inputs, refunds, entityNames: en } = loadTaxInputsForMonth(m);
+        const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, entityNames: en } = loadTaxInputsForMonth(m);
         all.push(...inputs);
         allRefunds.push(...refunds);
+        allShipFwd.push(...shippingTaxForward);
+        allShipRef.push(...shippingTaxRefunds);
         for (const [k, v] of en) entityNames.set(k, v);
       }
 
-      const entities = aggregateByJurisdiction(all, entityNames, allRefunds);
+      const entities = aggregateByJurisdiction(all, entityNames, allRefunds, allShipFwd, allShipRef);
       res.json({
         ...(isMonth ? { month: period } : { quarter: period, months_included: months }),
         ...(calendarFallback ? { quarter_calendar_fallback: true, note_quarter: "NY DTF quarter calendar lookup failed — defaulted to calendar quarters. TODO verify Pub 718-Q." } : {}),
         entities,
-        note: "PR #143 + #145: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #145: refund tax from recon_refund_line_items is subtracted in the refund's processed_at month, pro-rated across the original line's jurisdictions (penny-exact via remainder-on-last-bucket). NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
-        build_id: "pr145",
+        note: "PR #143 + #145 + #146: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #145: refund tax from recon_refund_line_items is subtracted in the refund's processed_at month, pro-rated across the original line's jurisdictions. PR #146: shipping_lines forward tax is added per its own jurisdictions; shipping_refund adjustment tax (no jurisdictions) is reconciled via entity-level residual into the largest jurisdiction bucket — Σ jurisdictions.tax_due === entity.tax_owed exactly. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
+        build_id: "pr146",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax st810 failed", error: String(e?.message || e) });

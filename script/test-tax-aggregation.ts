@@ -16,6 +16,8 @@ import {
   type AggregatorInput,
   type LineForTax,
   type RefundForTax,
+  type ShippingTaxForward,
+  type ShippingTaxRefund,
   type TaxLine,
 } from "../server/shopify-tax-aggregation";
 
@@ -581,6 +583,190 @@ function refund(opts: Partial<RefundForTax>): RefundForTax {
   eq(result[0].entity_name, "Unallocated", "refund unalloc: name");
   eq(result[0].gross_sales, "-10.00", "refund unalloc: gross negative");
   eq(result[0].tax_collected_gross, "-0.86", "refund unalloc: tax negative");
+}
+
+// ---------------------------------------------------------------------------
+// PR #146 #1 — Per-jurisdiction rounding: 50 small refunds across 3 jurisdictions.
+// Each refund is small enough that the proportional pro-rate produces a residual
+// each time. Pre-#146 the last bucket absorbed each residual independently and
+// accumulated drift. Post-#146 the entity-level residual pass forces
+// Σ jurisdictions.tax_due === entity.tax_owed exactly.
+// ---------------------------------------------------------------------------
+{
+  // Build a forward sale large enough to cover all refunds: $20,000 sale,
+  // $1,725.00 tax (8.625% blended). 50 refunds of $10 / $0.86 each.
+  const origTLs: TaxLine[] = [
+    NY_STATE_TL(800.00),    // 4% of $20,000
+    NASSAU_TL(850.00),      // 4.25% of $20,000
+    MCTD_TL(75.00),         // 0.375% of $20,000
+  ];
+  const inputs: AggregatorInput[] = [{
+    line: line({ entity_id: 1, line_subtotal: 20000, tax_lines: origTLs }),
+    is_pos: true,
+  }];
+
+  // 50 refunds, each $10 / $0.86 (using original line's TL shape for pro-rate).
+  // 50 * 0.86 = $43.00 refund tax total.
+  const refundOrigTLs: TaxLine[] = [
+    NY_STATE_TL(0.40), NASSAU_TL(0.43), MCTD_TL(0.04),  // 0.87 sums but refund_tax=0.86 (penny-off pro-rate)
+  ];
+  const refunds: RefundForTax[] = [];
+  for (let i = 0; i < 50; i++) {
+    refunds.push(refund({
+      entity_id: 1,
+      line_subtotal_refunded: 10,
+      refund_tax: 0.86,
+      original_tax_lines: refundOrigTLs,
+      is_pos: true,
+    }));
+  }
+
+  const ents = aggregateByEntity(inputs, names, refunds);
+  // Entity tax_owed: 1725.00 - 50*0.86 = 1725.00 - 43.00 = 1682.00
+  eq(ents[0].tax_owed, "1682.00", "50-refund accumulation: entity tax_owed exact");
+
+  const jurs = aggregateByJurisdiction(inputs, names, refunds);
+  assert(jurs.length === 1, "50-refund accumulation: one entity in jurisdiction breakdown");
+  // Σ jurisdictions.tax_due must equal entity tax_owed exactly.
+  const sumJurCents = jurs[0].jurisdictions.reduce((acc, j) => acc + Math.round(parseFloat(j.tax_due) * 100), 0);
+  const entCents = Math.round(parseFloat(ents[0].tax_owed) * 100);
+  eq(sumJurCents, entCents, "50-refund accumulation: Σ jurisdictions.tax_due === entity.tax_owed (penny-exact)");
+  eq(jurs[0].totals.tax_due, "1682.00", "50-refund accumulation: totals.tax_due matches");
+}
+
+// ---------------------------------------------------------------------------
+// PR #146 #2 — Shipping forward tax: increases tax_collected without changing
+// taxable_sales (shipping has its own column in Shopify Finance Summary).
+// ---------------------------------------------------------------------------
+{
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 1, line_subtotal: 100,
+      tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+    }),
+    is_pos: false,
+  }];
+  // Shipping: $20 ship, $1.72 tax across same jurisdictions (8.625%).
+  const shipping: ShippingTaxForward[] = [{
+    entity_id: 1,
+    tax_lines: [NY_STATE_TL(0.80), NASSAU_TL(0.85), MCTD_TL(0.07)],
+    is_pos: false,
+    tax_channel_liable: 0,
+  }];
+  const ents = aggregateByEntity(inputs, names, [], shipping);
+  eq(ents[0].gross_sales, "100.00", "shipping forward: gross unchanged (no subtotal contribution)");
+  eq(ents[0].taxable_sales, "100.00", "shipping forward: taxable_sales unchanged");
+  // tax_collected = 8.63 (product) + 1.72 (shipping) = 10.35
+  eq(ents[0].tax_collected_gross, "10.35", "shipping forward: tax_collected includes shipping tax");
+  eq(ents[0].tax_owed, "10.35", "shipping forward: tax_owed includes shipping tax");
+  eq(ents[0].allocated_split, { gross: "100.00", tax: "10.35" }, "shipping forward: allocated split has shipping tax");
+
+  const jurs = aggregateByJurisdiction(inputs, names, [], shipping);
+  // Shipping tax goes per-jurisdiction: each one gets its share.
+  const sumJurCents = jurs[0].jurisdictions.reduce((acc, j) => acc + Math.round(parseFloat(j.tax_due) * 100), 0);
+  eq(sumJurCents, 1035, "shipping forward: jurisdictions sum to 10.35 = entity tax_owed");
+}
+
+// ---------------------------------------------------------------------------
+// PR #146 #3 — Shipping refund (adjustment_kind='shipping_refund'):
+// caller passes ABS()'d cents; aggregator subtracts. No jurisdiction
+// attribution available — entity residual pass absorbs into largest bucket.
+// ---------------------------------------------------------------------------
+{
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 1, line_subtotal: 100,
+      tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+    }),
+    is_pos: true,
+  }];
+  // Shipping refund: $0.90 ABS — should reduce tax_collected by 0.90.
+  const shipRefunds: ShippingTaxRefund[] = [{
+    entity_id: 1,
+    refund_tax: 0.90,
+    is_pos: true,
+    tax_channel_liable: 0,
+  }];
+  const ents = aggregateByEntity(inputs, names, [], [], shipRefunds);
+  eq(ents[0].tax_collected_gross, "7.73", "shipping refund: tax_collected = 8.63 - 0.90");
+  eq(ents[0].tax_owed, "7.73", "shipping refund: tax_owed = 8.63 - 0.90");
+  eq(ents[0].pos_split.tax, "7.73", "shipping refund: POS tax reduced");
+
+  const jurs = aggregateByJurisdiction(inputs, names, [], [], shipRefunds);
+  // Σ jurisdictions.tax_due === entity.tax_owed exactly (residual absorbed).
+  const sumJurCents = jurs[0].jurisdictions.reduce((acc, j) => acc + Math.round(parseFloat(j.tax_due) * 100), 0);
+  eq(sumJurCents, 773, "shipping refund: Σ jurisdictions === entity.tax_owed (residual absorbed into largest)");
+  // Largest forward jurisdiction = NASSAU_TL(4.25) = 425c. After absorbing -90c residual = 335c.
+  const nassau = jurs[0].jurisdictions.find(j => j.jurisdiction_name === "NASSAU COUNTY")!;
+  eq(nassau.tax_due, "3.35", "shipping refund: residual absorbed into NASSAU COUNTY (largest)");
+}
+
+// ---------------------------------------------------------------------------
+// PR #146 #4 — Marketplace shipping refund: NOT in tax_owed (mirrors marketplace
+// item refund logic). expectedTaxOwedCents excludes it; jurisdictions don't
+// need to change.
+// ---------------------------------------------------------------------------
+{
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 1, line_subtotal: 100,
+      tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+    }),
+    is_pos: true,
+  }];
+  const shipRefunds: ShippingTaxRefund[] = [{
+    entity_id: 1,
+    refund_tax: 0.90,
+    is_pos: true,
+    tax_channel_liable: 1,  // marketplace
+  }];
+  const ents = aggregateByEntity(inputs, names, [], [], shipRefunds);
+  // tax_collected drops by 0.90 (gross collected), marketplace_tax drops by 0.90,
+  // tax_owed = tax_collected - marketplace_tax = (8.63-0.90) - (-0.90) = 8.63
+  eq(ents[0].tax_owed, "8.63", "marketplace shipping refund: tax_owed unchanged");
+  eq(ents[0].marketplace_tax_collected, "-0.90", "marketplace shipping refund: marketplace_tax reduced");
+}
+
+// ---------------------------------------------------------------------------
+// PR #146 #5 — Mixed: per-line tax + shipping forward + item refund + shipping
+// refund + 50 small refunds. Final invariant: Σ jurisdictions.tax_due ===
+// entity.tax_owed regardless of which paths fire.
+// ---------------------------------------------------------------------------
+{
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 1, line_subtotal: 5000,
+      tax_lines: [NY_STATE_TL(200.00), NASSAU_TL(212.50), MCTD_TL(18.75)],
+    }),
+    is_pos: true,
+  }];
+  const shipping: ShippingTaxForward[] = [{
+    entity_id: 1,
+    tax_lines: [NY_STATE_TL(2.00), NASSAU_TL(2.12), MCTD_TL(0.19)],
+    is_pos: true,
+    tax_channel_liable: 0,
+  }];
+  const itemRefundTLs: TaxLine[] = [NY_STATE_TL(0.40), NASSAU_TL(0.43), MCTD_TL(0.04)];
+  const refunds: RefundForTax[] = [];
+  for (let i = 0; i < 30; i++) {
+    refunds.push(refund({
+      entity_id: 1, line_subtotal_refunded: 10, refund_tax: 0.86,
+      original_tax_lines: itemRefundTLs, is_pos: true,
+    }));
+  }
+  const shipRefunds: ShippingTaxRefund[] = [
+    { entity_id: 1, refund_tax: 1.32, is_pos: true, tax_channel_liable: 0 },
+    { entity_id: 1, refund_tax: 0.45, is_pos: true, tax_channel_liable: 0 },
+  ];
+  const ents = aggregateByEntity(inputs, names, refunds, shipping, shipRefunds);
+  const entCents = Math.round(parseFloat(ents[0].tax_owed) * 100);
+
+  const jurs = aggregateByJurisdiction(inputs, names, refunds, shipping, shipRefunds);
+  const sumJurCents = jurs[0].jurisdictions.reduce((acc, j) => acc + Math.round(parseFloat(j.tax_due) * 100), 0);
+  eq(sumJurCents, entCents, "mixed scenario: Σ jurisdictions === entity.tax_owed (penny-exact)");
+  // Expected: 431.25 (forward) + 4.31 (ship) - 30*0.86 (item refunds) - 1.32 - 0.45 (ship refunds)
+  //         = 431.25 + 4.31 - 25.80 - 1.32 - 0.45 = 407.99
+  eq(ents[0].tax_owed, "407.99", "mixed scenario: tax_owed exact");
 }
 
 // ---------------------------------------------------------------------------
