@@ -15,6 +15,8 @@ import {
   toCents,
   type AggregatorInput,
   type LineForTax,
+  type RefundForTax,
+  type TaxLine,
 } from "../server/shopify-tax-aggregation";
 
 let failed = 0;
@@ -353,6 +355,233 @@ eq(quarterToMonths("2026-Q4").months, ["2026-12", "2027-01", "2027-02"], "Q4=Dec
 let threw = false;
 try { quarterToMonths("2026-Q5"); } catch { threw = true; }
 assert(threw, "quarterToMonths invalid format throws");
+
+// ---------------------------------------------------------------------------
+// PR #145 — Refund tax subtraction.
+// ---------------------------------------------------------------------------
+
+// Standard NY blended jurisdictions used by refund tests below.
+const NY_STATE_TL = (price: number): TaxLine => ({
+  title: "NY State", rate: 0.04, price, channel_liable: false,
+  jurisdiction_id: null, jurisdiction_name: "NEW YORK STATE", jurisdiction_type: "STATE",
+});
+const NASSAU_TL = (price: number): TaxLine => ({
+  title: "Nassau County", rate: 0.0425, price, channel_liable: false,
+  jurisdiction_id: null, jurisdiction_name: "NASSAU COUNTY", jurisdiction_type: "COUNTY",
+});
+const MCTD_TL = (price: number): TaxLine => ({
+  title: "MCTD", rate: 0.00375, price, channel_liable: false,
+  jurisdiction_id: null, jurisdiction_name: "MCTD", jurisdiction_type: "SPECIAL",
+});
+
+function refund(opts: Partial<RefundForTax>): RefundForTax {
+  return {
+    entity_id: 1,
+    line_subtotal_refunded: 0,
+    refund_tax: 0,
+    tax_channel_liable: 0,
+    original_tax_lines: [],
+    is_pos: true,
+    ...opts,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #1 — Full refund subtracts from tax_owed correctly.
+// ---------------------------------------------------------------------------
+{
+  // Sale: $100 line w/ $8.63 NY blended tax (4 + 4.25 + 0.38).
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 1, line_subtotal: 100,
+      tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+    }),
+    is_pos: true,
+  }];
+  // Refund: full line refund.
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 1,
+    line_subtotal_refunded: 100,
+    refund_tax: 8.63,
+    original_tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+    is_pos: true,
+  })];
+  const result = aggregateByEntity(inputs, names, refunds);
+  eq(result[0].gross_sales, "0.00", "refund full: gross goes to 0");
+  eq(result[0].taxable_sales, "0.00", "refund full: taxable goes to 0");
+  eq(result[0].tax_collected_gross, "0.00", "refund full: tax_collected goes to 0");
+  eq(result[0].tax_owed, "0.00", "refund full: tax_owed goes to 0");
+  eq(result[0].pos_split, { gross: "0.00", tax: "0.00" }, "refund full: POS split nets to 0");
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #2 — Partial refund (qty=2 of qty=5) pro-rates to 40%.
+// The aggregator just consumes the refund's subtotal+tax (already pre-computed
+// upstream by Shopify), so we verify that a 40%-magnitude refund subtracts
+// exactly 40% of the gross/tax. Original: $500 sale, $43.13 tax across the
+// blended NY jurisdictions ($20 + $21.25 + $1.88). Refund: $200, $17.25.
+// ---------------------------------------------------------------------------
+{
+  const origTLs = [NY_STATE_TL(20.00), NASSAU_TL(21.25), MCTD_TL(1.88)];
+  const inputs: AggregatorInput[] = [{
+    line: line({ entity_id: 1, line_subtotal: 500, tax_lines: origTLs }),
+    is_pos: true,
+  }];
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 1,
+    line_subtotal_refunded: 200,      // 40% of 500
+    refund_tax: 17.25,                // 40% of 43.13 (rounded)
+    original_tax_lines: origTLs,
+    is_pos: true,
+  })];
+  const result = aggregateByEntity(inputs, names, refunds);
+  eq(result[0].gross_sales, "300.00", "partial refund: gross = 500 - 200");
+  eq(result[0].taxable_sales, "300.00", "partial refund: taxable = 500 - 200");
+  eq(result[0].tax_collected_gross, "25.88", "partial refund: tax = 43.13 - 17.25");
+  eq(result[0].tax_owed, "25.88", "partial refund: owed = 43.13 - 17.25");
+  eq(result[0].pos_split, { gross: "300.00", tax: "25.88" }, "partial refund: POS net");
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #3 — Marketplace refund flows to marketplace_tax_collected (NOT tax_owed).
+// Mirrors the forward rule: channel_liable lines are excluded from merchant
+// tax liability, so refunds on those lines should also be excluded.
+// ---------------------------------------------------------------------------
+{
+  const origMpTLs: TaxLine[] = [{
+    title: "NY", rate: 0.08, price: 8.00, channel_liable: true,
+    jurisdiction_id: null, jurisdiction_name: "NEW YORK STATE", jurisdiction_type: "STATE",
+  }];
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 2, line_subtotal: 100, tax_channel_liable: 1,
+      tax_lines: origMpTLs,
+    }),
+    is_pos: false,
+  }];
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 2,
+    line_subtotal_refunded: 50,
+    refund_tax: 4.00,
+    tax_channel_liable: 1,
+    original_tax_lines: origMpTLs,
+    is_pos: false,
+  })];
+  const result = aggregateByEntity(inputs, names, refunds);
+  eq(result[0].marketplace_gross, "50.00", "mp refund: marketplace_gross = 100 - 50");
+  eq(result[0].marketplace_tax_collected, "4.00", "mp refund: marketplace_tax = 8 - 4");
+  eq(result[0].taxable_sales, "0.00", "mp refund: taxable unaffected (was 0)");
+  eq(result[0].tax_owed, "0.00", "mp refund: tax_owed stays 0 (was 0)");
+  eq(result[0].tax_collected_gross, "4.00", "mp refund: collected_gross reduced");
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #4 — Cross-month refund: refund subtracted in refund-month bucket only.
+// The aggregator is month-agnostic; bucketing is done by the LOADER. We verify
+// here that passing ONLY the refund (no original sale line) still produces a
+// negative tax_collected_gross — proving that a 2025-12 sale refunded in
+// 2026-01 will correctly show as a negative adjustment in 2026-01's aggregate
+// without any echo of the sale's positive tax.
+// ---------------------------------------------------------------------------
+{
+  const inputs: AggregatorInput[] = []; // no sale this month
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 3,
+    line_subtotal_refunded: 120,
+    refund_tax: 10.35,
+    original_tax_lines: [NY_STATE_TL(4.80), NASSAU_TL(5.10), MCTD_TL(0.45)],
+    is_pos: true,
+  })];
+  const result = aggregateByEntity(inputs, names, refunds);
+  eq(result.length, 1, "cross-month: one entity bucket created");
+  eq(result[0].entity_id, 3, "cross-month: entity_id 3 (Hempstead)");
+  eq(result[0].gross_sales, "-120.00", "cross-month: gross goes negative");
+  eq(result[0].tax_collected_gross, "-10.35", "cross-month: tax_collected goes negative");
+  eq(result[0].tax_owed, "-10.35", "cross-month: tax_owed goes negative");
+  // Validates the user's "Hempstead 2026-04 = -$10.35" production case.
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #5 — Per-jurisdiction refund split is penny-exact across jurisdictions.
+// Refund of $8.63 split across (NY State $4.00) + (Nassau $4.25) + (MCTD $0.38).
+// The aggregator pro-rates by the original line's tax_lines.price and assigns
+// rounding remainder to the last bucket. Verify sum equals refund_tax exactly.
+// ---------------------------------------------------------------------------
+{
+  const origTLs = [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)];
+  // Two lines = $200 taxable, $17.26 tax pre-refund
+  const inputs: AggregatorInput[] = [
+    { line: line({ entity_id: 1, line_subtotal: 100, tax_lines: origTLs }), is_pos: true },
+    { line: line({ entity_id: 1, line_subtotal: 100, tax_lines: origTLs }), is_pos: true },
+  ];
+  // Refund one line.
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 1,
+    line_subtotal_refunded: 100,
+    refund_tax: 8.63,
+    original_tax_lines: origTLs,
+    is_pos: true,
+  })];
+  const result = aggregateByJurisdiction(inputs, names, refunds);
+  eq(result[0].jurisdictions.length, 3, "jur refund: still 3 jurisdictions");
+  // Each jurisdiction's taxable should be 200 (2 sales) - 100 (refund) = 100.
+  for (const j of result[0].jurisdictions) {
+    eq(j.taxable_sales, "100.00", `jur refund: ${j.jurisdiction_type} taxable=100`);
+  }
+  // Per-jurisdiction tax: original-line shares are 4.00, 4.25, 0.38 (sum 8.63).
+  // Two-line tax total = 8.00 + 8.50 + 0.76 = 17.26. After refund of 8.63 it
+  // should equal exactly: NY State 4.00, Nassau 4.25, MCTD 0.38.
+  const state = result[0].jurisdictions.find(j => j.jurisdiction_type === "STATE")!;
+  const county = result[0].jurisdictions.find(j => j.jurisdiction_type === "COUNTY")!;
+  const mctd = result[0].jurisdictions.find(j => j.jurisdiction_type === "SPECIAL")!;
+  eq(state.tax_due, "4.00", "jur refund: STATE tax_due = 8 - 4");
+  eq(county.tax_due, "4.25", "jur refund: COUNTY tax_due = 8.50 - 4.25");
+  eq(mctd.tax_due, "0.38", "jur refund: MCTD tax_due = 0.76 - 0.38");
+  // Total = refund_tax exactly.
+  const sumDue = toCents(parseFloat(state.tax_due))
+                + toCents(parseFloat(county.tax_due))
+                + toCents(parseFloat(mctd.tax_due));
+  eq(sumDue, toCents(17.26 - 8.63), "jur refund: sum of per-jur tax_due is penny-exact");
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #6 — Refund without a matching original line (e.g. adjustment-only):
+// original_tax_lines is empty, so it still subtracts from gross + tax_owed
+// at the entity level, but contributes nothing to per-jurisdiction breakdown.
+// ---------------------------------------------------------------------------
+{
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 1,
+    line_subtotal_refunded: 50,
+    refund_tax: 4.31,
+    original_tax_lines: [], // no jurisdictions — fall through
+    is_pos: true,
+  })];
+  const ents = aggregateByEntity([], names, refunds);
+  eq(ents[0].gross_sales, "-50.00", "no-tax-lines refund: gross still subtracts");
+  eq(ents[0].tax_collected_gross, "-4.31", "no-tax-lines refund: tax_collected still subtracts");
+  const jurs = aggregateByJurisdiction([], names, refunds);
+  // No jurisdictions at all — aggregator skipped this refund for per-jur.
+  eq(jurs.length, 0, "no-tax-lines refund: no jurisdiction rows produced");
+}
+
+// ---------------------------------------------------------------------------
+// PR #145 #7 — Refund attribution to Unallocated when entity_id=0.
+// ---------------------------------------------------------------------------
+{
+  const refunds: RefundForTax[] = [refund({
+    entity_id: 0,
+    line_subtotal_refunded: 10,
+    refund_tax: 0.86,
+    original_tax_lines: [NY_STATE_TL(0.40), NASSAU_TL(0.43), MCTD_TL(0.04)],
+    is_pos: false,
+  })];
+  const result = aggregateByEntity([], names, refunds);
+  eq(result[0].entity_id, 0, "refund unalloc: entity_id 0");
+  eq(result[0].entity_name, "Unallocated", "refund unalloc: name");
+  eq(result[0].gross_sales, "-10.00", "refund unalloc: gross negative");
+  eq(result[0].tax_collected_gross, "-0.86", "refund unalloc: tax negative");
+}
 
 // ---------------------------------------------------------------------------
 // Final tally

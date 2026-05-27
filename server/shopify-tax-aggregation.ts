@@ -55,6 +55,46 @@ export interface LineForTax {
   tax_lines: TaxLine[];
 }
 
+/**
+ * Refund input for the aggregator. PR #145 — subtracts refund tax from the
+ * original selling entity's totals in the month the refund was processed.
+ *
+ * Source: `recon_refund_line_items` joined to `recon_refunds.processed_at`.
+ * Bucketed by the REFUND's processed_at (not the original sale's date), so a
+ * 2025-12 sale refunded in 2026-01 appears as a negative adjustment in
+ * 2026-01 — matches Shopify Admin and by-store's `taxes` field.
+ *
+ * Per locked decisions:
+ *   - entity attribution: original sale's entity (from the same allocator
+ *     cascade we use for the sale line itself — looked up by line_item_id
+ *     in the loader).
+ *   - jurisdictions: original line's tax_lines_json, with each tax_line's
+ *     price pro-rated by (refund_total_tax / sum_of_original_tax_lines_price).
+ *     This preserves penny-exact subtraction at the entity level while
+ *     splitting per-jurisdiction in proportion to the original.
+ *   - line_subtotal_refunded: pre-tax refund subtotal (we subtract from
+ *     gross_sales + taxable_sales / marketplace_gross).
+ *   - tax_channel_liable: copied from the original line — marketplace
+ *     refunds reduce `marketplace_tax_collected`, NOT `tax_owed`.
+ */
+export interface RefundForTax {
+  /** entity_id from the original line's attribution. 0 = Unallocated. */
+  entity_id: number;
+  /** pre-tax refund subtotal (positive dollars; we negate internally) */
+  line_subtotal_refunded: number;
+  /** total refund tax (positive dollars; we negate internally) */
+  refund_tax: number;
+  /** 1 if the original line was marketplace-facilitator */
+  tax_channel_liable: number;
+  /**
+   * Original line's tax_lines (already parsed) — used for per-jurisdiction
+   * proportional subtraction. Empty array if the original line had no tax.
+   */
+  original_tax_lines: TaxLine[];
+  /** true if the original sale was attributed via POS (pos_location_id) */
+  is_pos: boolean;
+}
+
 export interface EntitySummary {
   entity_id: number;
   entity_name: string;
@@ -177,6 +217,7 @@ function blankEntityCents(): EntityCents {
 export function aggregateByEntity(
   inputs: AggregatorInput[],
   entityNames: Map<number, string>,
+  refunds: RefundForTax[] = [],
 ): EntitySummary[] {
   const buckets = new Map<number, EntityCents>();
 
@@ -210,6 +251,46 @@ export function aggregateByEntity(
     } else {
       b.allocated_gross += lineCents;
       b.allocated_tax += lineTaxCents;
+    }
+  }
+
+  // PR #145 — Subtract refund tax + refund subtotal from the original selling
+  // entity, bucketed in the refund's month (the caller already filtered the
+  // refunds array to the target month before passing it in).
+  //
+  // Marketplace refunds: tax_channel_liable=1 means the original sale was
+  // facilitated by Shopify, so the refund tax reduces `marketplace_tax`
+  // (Shopify will reverse the remittance) — NOT `tax_owed`. Mirrors the
+  // forward-flow rule above.
+  for (const r of refunds) {
+    const eid = r.entity_id ?? 0;
+    let b = buckets.get(eid);
+    if (!b) { b = blankEntityCents(); buckets.set(eid, b); }
+
+    const subCents = toCents(r.line_subtotal_refunded);
+    const taxCents = toCents(r.refund_tax);
+    const isMarketplace =
+      Boolean(r.tax_channel_liable) ||
+      r.original_tax_lines.some(tl => tl.channel_liable);
+
+    b.gross -= subCents;
+    b.tax_collected -= taxCents;
+
+    if (isMarketplace) {
+      b.marketplace_gross -= subCents;
+      b.marketplace_tax -= taxCents;
+    } else if (taxCents > 0) {
+      b.taxable -= subCents;
+    } else {
+      b.non_taxable -= subCents;
+    }
+
+    if (r.is_pos) {
+      b.pos_gross -= subCents;
+      b.pos_tax -= taxCents;
+    } else {
+      b.allocated_gross -= subCents;
+      b.allocated_tax -= taxCents;
     }
   }
 
@@ -309,6 +390,7 @@ function canonRate(rate: number | null | undefined): string {
 export function aggregateByJurisdiction(
   inputs: AggregatorInput[],
   entityNames: Map<number, string>,
+  refunds: RefundForTax[] = [],
 ): EntityJurisdictionBreakdown[] {
   // entity_id → Map<jur-key-string, JurCents>
   const perEntity = new Map<number, Map<string, JurCents & JurKey>>();
@@ -345,6 +427,71 @@ export function aggregateByJurisdiction(
       } else {
         bucket.taxable += lineSubCents;
         bucket.tax_due += taxCents;
+      }
+    }
+  }
+
+  // PR #145 — Subtract refunds per-jurisdiction. The refund's total tax is
+  // distributed across the ORIGINAL line's jurisdictions in proportion to
+  // each jurisdiction's share of the original line's tax. Penny-exact: the
+  // largest share absorbs the cumulative rounding remainder so that the sum
+  // of subtracted per-jurisdiction tax equals the refund's total tax exactly.
+  //
+  // Same logic for `taxable_sales`: the refund subtotal is allocated 1× to
+  // each jurisdiction's `taxable_sales` (mirrors the forward flow where every
+  // jurisdiction reports the same line subtotal as its taxable_sales).
+  for (const r of refunds) {
+    if (r.original_tax_lines.length === 0) continue; // no jurisdictions to attribute to
+    const eid = r.entity_id ?? 0;
+    let jurMap = perEntity.get(eid);
+    if (!jurMap) { jurMap = new Map(); perEntity.set(eid, jurMap); }
+
+    const subCents = toCents(r.line_subtotal_refunded);
+    const totalRefundTaxCents = toCents(r.refund_tax);
+    const origTaxCentsTotal = r.original_tax_lines.reduce((acc, tl) => acc + toCents(tl.price), 0);
+    const refundIsMarketplace =
+      Boolean(r.tax_channel_liable) ||
+      r.original_tax_lines.some(tl => tl.channel_liable);
+
+    // Pro-rate refund tax per original tax_line.price. Allocate to all but
+    // the LAST jurisdiction, then assign the remainder to the last entry so
+    // the per-jurisdiction subtractions sum penny-exact to totalRefundTaxCents.
+    const perJurRefundCents: number[] = new Array(r.original_tax_lines.length).fill(0);
+    if (origTaxCentsTotal > 0 && totalRefundTaxCents !== 0) {
+      let allocated = 0;
+      for (let i = 0; i < r.original_tax_lines.length - 1; i++) {
+        const share = Math.round(
+          (toCents(r.original_tax_lines[i].price) * totalRefundTaxCents) / origTaxCentsTotal,
+        );
+        perJurRefundCents[i] = share;
+        allocated += share;
+      }
+      perJurRefundCents[r.original_tax_lines.length - 1] = totalRefundTaxCents - allocated;
+    }
+
+    for (let i = 0; i < r.original_tax_lines.length; i++) {
+      const tl = r.original_tax_lines[i];
+      const name = (tl.jurisdiction_name || tl.title || 'UNKNOWN').toString().toUpperCase();
+      const type = (tl.jurisdiction_type || inferType(name)).toString().toUpperCase();
+      const rate = canonRate(tl.rate);
+      const key = `${name}|${type}|${rate}`;
+      let bucket = jurMap.get(key);
+      if (!bucket) {
+        bucket = {
+          name, type, rate,
+          taxable: 0, tax_due: 0,
+          marketplace_taxable: 0, marketplace_tax: 0,
+        };
+        jurMap.set(key, bucket);
+      }
+      const isMp = refundIsMarketplace || tl.channel_liable;
+      const refundTaxThisJur = perJurRefundCents[i];
+      if (isMp) {
+        bucket.marketplace_taxable -= subCents;
+        bucket.marketplace_tax -= refundTaxThisJur;
+      } else {
+        bucket.taxable -= subCents;
+        bucket.tax_due -= refundTaxThisJur;
       }
     }
   }

@@ -148,6 +148,7 @@ import {
   sumEntities,
   type AggregatorInput,
   type LineForTax,
+  type RefundForTax,
 } from "./shopify-tax-aggregation";
 import {
   syncPayoutsIncremental,
@@ -4360,6 +4361,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
    */
   function loadTaxInputsForMonth(month: string): {
     inputs: AggregatorInput[];
+    refunds: RefundForTax[];
     entityNames: Map<number, string>;
   } {
     const { sqlite } = require("./storage");
@@ -4490,7 +4492,123 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       inputs.push({ line, is_pos });
     }
 
-    return { inputs, entityNames };
+    // -----------------------------------------------------------------------
+    // PR #145 — Refund tax subtraction.
+    //
+    // Refund rows live in recon_refund_line_items, parented by recon_refunds.
+    // They net the sales tax back to the merchant when a customer returns a
+    // product. We bucket each refund by its OWN processed_at (or created_at
+    // fallback, with the same -5h EST shift the rest of the aggregator uses),
+    // NOT the original sale's date — matches Shopify's by-store treatment.
+    //
+    // Entity attribution: the refund's entity is the ORIGINAL line's entity
+    // (same POS / allocator cascade applied to the original line_item_id).
+    // Jurisdictions: same — pulled from the original line's tax_lines_json.
+    //
+    // Pro-rate: refund_subtotal/refund_tax are already pre-computed by
+    // Shopify per refund_line_item, so partial refunds (qty<original.qty)
+    // already net correctly without any explicit ratio math here. We just
+    // pass through the refund's subtotal + tax. Per-jurisdiction splitting
+    // (which uses the ORIGINAL tax_lines breakdown to keep the ST-810
+    // category attribution correct) lives in the aggregator.
+    //
+    // Edge cases handled:
+    //   - 'item' kind (line_item refund) — full subtraction with original
+    //     line attribution.
+    //   - 'adjustment' kind (shipping refund, restocking fee) — line_item_id
+    //     is NULL, so we attribute by ORDER-LEVEL allocator (the same
+    //     dominant-entity fallback by-store uses for non-line-keyed rows).
+    //     These rarely carry tax in NY but we honor whatever Shopify says.
+    //   - is_gift_card filter: gift-card lines are excluded from line inputs
+    //     and from refunds (gift-card refunds don't affect sales-tax math).
+    const refundRows: Array<{
+      refund_line_id: string;
+      order_id: string;
+      line_item_id: string | null;
+      kind: string;
+      refund_subtotal: number | null;
+      refund_tax: number | null;
+      refund_quantity: number | null;
+      orig_quantity: number | null;
+      orig_tax_lines_json: string | null;
+      orig_tax_channel_liable: number | null;
+      orig_is_gift_card: number | null;
+      pos_entity_id: number | null;
+      alloc_entity_id: number | null;
+    }> = sqlite.prepare(`
+      SELECT
+        rli.id AS refund_line_id,
+        rli.order_id AS order_id,
+        rli.line_item_id AS line_item_id,
+        rli.kind AS kind,
+        rli.subtotal AS refund_subtotal,
+        rli.total_tax AS refund_tax,
+        rli.quantity AS refund_quantity,
+        li.quantity AS orig_quantity,
+        li.tax_lines_json AS orig_tax_lines_json,
+        li.tax_channel_liable AS orig_tax_channel_liable,
+        li.is_gift_card AS orig_is_gift_card,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos'
+            AND pl.active = 1
+          WHERE s.order_id = rli.order_id
+            AND s.line_item_id = rli.line_item_id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        COALESCE(
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id AND a.line_item_id IS NULL LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+        ) AS alloc_entity_id
+      FROM recon_refund_line_items rli
+      JOIN recon_refunds rf ON rf.id = rli.refund_id
+      LEFT JOIN recon_line_items li
+        ON li.id = rli.line_item_id AND li.order_id = rli.order_id
+      WHERE substr(datetime(
+        COALESCE(rf.processed_at, rf.created_at),
+        '-5 hours'), 1, 7) = ?
+        AND COALESCE(li.is_gift_card, 0) = 0
+    `).all(month) as any;
+
+    const refunds: RefundForTax[] = [];
+    for (const r of refundRows) {
+      // Sub-cent refunds (and tax-only rows) are still valid — keep them.
+      // Pick attribution using the same cascade as sale lines:
+      //   1. POS entity (if mapped POS)
+      //   2. Allocation entity (if any, and it's a POS entity)
+      //   3. else 0 (Unallocated)
+      let entity_id = 0;
+      let is_pos = false;
+      if (r.pos_entity_id != null && posEntityIds.has(r.pos_entity_id)) {
+        entity_id = r.pos_entity_id;
+        is_pos = true;
+      } else if (r.alloc_entity_id != null && posEntityIds.has(r.alloc_entity_id)) {
+        entity_id = r.alloc_entity_id;
+        is_pos = false;
+      } else {
+        entity_id = 0;
+        is_pos = false;
+      }
+
+      refunds.push({
+        entity_id,
+        line_subtotal_refunded: Number(r.refund_subtotal || 0),
+        refund_tax: Number(r.refund_tax || 0),
+        tax_channel_liable: Number(r.orig_tax_channel_liable || 0),
+        original_tax_lines: parseTaxLines(r.orig_tax_lines_json),
+        is_pos,
+      });
+    }
+
+    return { inputs, refunds, entityNames };
   }
 
   app.get("/api/recon/tax/by-entity/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
@@ -4499,15 +4617,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(400).json({ message: "Month must be YYYY-MM" });
     }
     try {
-      const { inputs, entityNames } = loadTaxInputsForMonth(month);
-      const entities = aggregateByEntity(inputs, entityNames);
+      const { inputs, refunds, entityNames } = loadTaxInputsForMonth(month);
+      const entities = aggregateByEntity(inputs, entityNames, refunds);
       const totals = sumEntities(entities);
       res.json({
         month,
         entities,
         totals,
-        note: "PR #143: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. Money fields are strings (integer-cents internally) — no float drift. marketplace_* fields show the Shopify-facilitated portion (channel_liable=true); tax_owed excludes those.",
-        build_id: "pr143",
+        note: "PR #143 + #145: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. PR #145: refund tax from recon_refund_line_items is SUBTRACTED in the refund's processed_at month, attributed to the original line's entity + jurisdictions. Money fields are strings (integer-cents internally) — no float drift. marketplace_* fields show the Shopify-facilitated portion (channel_liable=true); tax_owed excludes those.",
+        build_id: "pr145",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax by-entity failed", error: String(e?.message || e) });
@@ -4537,20 +4655,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // aggregator once across the union. This avoids the need to merge
       // already-aggregated string-money rows.
       const all: AggregatorInput[] = [];
+      const allRefunds: RefundForTax[] = [];
       let entityNames = new Map<number, string>();
       for (const m of months) {
-        const { inputs, entityNames: en } = loadTaxInputsForMonth(m);
+        const { inputs, refunds, entityNames: en } = loadTaxInputsForMonth(m);
         all.push(...inputs);
+        allRefunds.push(...refunds);
         for (const [k, v] of en) entityNames.set(k, v);
       }
 
-      const entities = aggregateByJurisdiction(all, entityNames);
+      const entities = aggregateByJurisdiction(all, entityNames, allRefunds);
       res.json({
         ...(isMonth ? { month: period } : { quarter: period, months_included: months }),
         ...(calendarFallback ? { quarter_calendar_fallback: true, note_quarter: "NY DTF quarter calendar lookup failed — defaulted to calendar quarters. TODO verify Pub 718-Q." } : {}),
         entities,
-        note: "PR #143: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
-        build_id: "pr143",
+        note: "PR #143 + #145: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #145: refund tax from recon_refund_line_items is subtracted in the refund's processed_at month, pro-rated across the original line's jurisdictions (penny-exact via remainder-on-last-bucket). NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
+        build_id: "pr145",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax st810 failed", error: String(e?.message || e) });
