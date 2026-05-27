@@ -3346,6 +3346,65 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
+  // PR #140a — read-only debug: dump raw recon_allocations rows for a given
+  // order so we can confirm whether PR #139's order-level fallback rows are
+  // actually being written with a usable entity_id. Look up by recon_orders.id
+  // or, when the param starts with '#', also try recon_orders.name. Returns
+  // raw allocation rows + a small slice of recon_shopify_sales context rows
+  // and a tiny summary (row count, distinct entity_ids, has_order_level_row).
+  app.get("/api/recon/debug/allocations/:order_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const { sqlite } = require("./storage");
+    const raw = String(req.params.order_id || "").trim();
+    if (!raw) return res.status(400).json({ message: "order_id required" });
+
+    let orderRow: any = sqlite.prepare(
+      `SELECT id, name, cancelled_at FROM recon_orders WHERE id = ? LIMIT 1`
+    ).get(raw);
+    if (!orderRow && raw.startsWith("#")) {
+      orderRow = sqlite.prepare(
+        `SELECT id, name, cancelled_at FROM recon_orders WHERE name = ? LIMIT 1`
+      ).get(raw);
+    }
+    if (!orderRow) return res.status(404).json({ message: `Order ${raw} not found` });
+
+    const allocations: any[] = sqlite.prepare(`
+      SELECT id, order_id, line_item_id, entity_id, share, gross_amount,
+             tax_amount, method, reason, auto_method, auto_entity_id, created_at
+      FROM recon_allocations
+      WHERE order_id = ?
+      ORDER BY created_at, id
+    `).all(orderRow.id) as any[];
+
+    const sales: any[] = sqlite.prepare(`
+      SELECT id, order_id, line_item_id, pos_location_id, action_type,
+             line_type, ref_id, total_amount, total_tax, happened_month
+      FROM recon_shopify_sales
+      WHERE order_id = ?
+      ORDER BY happened_at, id
+      LIMIT 50
+    `).all(orderRow.id) as any[];
+
+    const distinctEntityIds = Array.from(
+      new Set(allocations.map((a) => a.entity_id))
+    ).sort((a, b) => Number(a) - Number(b));
+    const hasOrderLevelRow = allocations.some((a) => a.line_item_id === null);
+
+    res.json({
+      order_id: orderRow.id,
+      order_name: orderRow.name,
+      cancelled_at: orderRow.cancelled_at,
+      allocations,
+      sales,
+      summary: {
+        allocation_row_count: allocations.length,
+        distinct_entity_ids: distinctEntityIds,
+        has_order_level_row: hasOrderLevelRow,
+        sales_row_count: sales.length,
+      },
+      build_id: "pr140a",
+    });
+  });
+
   // PR #108 acceptance test: V2 line sums vs ShopifyQL Finance Summary.
   // Returns line-by-line diff so we can confirm V2 reconciles to the penny.
   // V2 sums are computed directly from recon_shopify_sales using the
