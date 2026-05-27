@@ -3881,6 +3881,23 @@ function ByStoreBreakdown() {
     return { pos: r2(pos), alloc, total: r2(total), mismatch };
   };
 
+  // Grand-total trio per metric: sum across visible stores + Unallocated.
+  // Total = sum of store totals + unallocated (matches V2 overall by construction).
+  // POS  = sum of store POS values (Unallocated has no POS attribution).
+  // Alloc = Total − POS.
+  const grandTrio = (key: keyof ByStoreTotals) => {
+    const total = BY_STORE_COL_ORDER.reduce(
+      (acc, c) => acc + Number(allocByLoc[c.location_id]?.[key] ?? 0),
+      0,
+    ) + (showUnalloc ? Number(unallocated?.[key] ?? 0) : 0);
+    const pos = BY_STORE_COL_ORDER.reduce(
+      (acc, c) => acc + Number(posByLoc[c.location_id]?.[key] ?? 0),
+      0,
+    );
+    const alloc = r2(total - pos);
+    return { pos: r2(pos), alloc, total: r2(total) };
+  };
+
   // Footer cross-foot: sum visible store Totals + Unallocated (if shown) per
   // metric, compare against V2 overall.
   const footerLeaks = (() => {
@@ -3987,6 +4004,12 @@ function ByStoreBreakdown() {
                     {showUnalloc && (
                       <th className="text-right px-3 py-1.5 font-medium border-l">Unallocated</th>
                     )}
+                    <th
+                      colSpan={3}
+                      className="text-center px-3 py-1.5 font-semibold border-l"
+                    >
+                      Total
+                    </th>
                   </tr>
                 )}
                 <tr>
@@ -4024,6 +4047,19 @@ function ByStoreBreakdown() {
                   )}
                   {showUnalloc && !showBreakdown && (
                     <th className="text-right px-3 py-1.5 font-medium border-l">Unallocated</th>
+                  )}
+                  {showBreakdown ? (
+                    <>
+                      <th className="text-right px-3 py-1.5 font-normal text-muted-foreground/80 border-l">
+                        POS
+                      </th>
+                      <th className="text-right px-3 py-1.5 font-normal text-muted-foreground/80 bg-muted/30">
+                        Alloc
+                      </th>
+                      <th className="text-right px-3 py-1.5 font-semibold">Total</th>
+                    </>
+                  ) : (
+                    <th className="text-right px-3 py-1.5 font-semibold border-l">Total</th>
                   )}
                 </tr>
               </thead>
@@ -4079,6 +4115,29 @@ function ByStoreBreakdown() {
                         {money(Number(unallocated?.[m.storeKey] ?? 0))}
                       </td>
                     )}
+                    {(() => {
+                      const g = grandTrio(m.storeKey);
+                      if (showBreakdown) {
+                        return (
+                          <>
+                            <td className="px-3 py-1.5 text-right font-mono text-muted-foreground border-l">
+                              {money(g.pos)}
+                            </td>
+                            <td className="px-3 py-1.5 text-right font-mono text-muted-foreground bg-muted/30">
+                              {money(g.alloc)}
+                            </td>
+                            <td className="px-3 py-1.5 text-right font-mono font-semibold">
+                              {money(g.total)}
+                            </td>
+                          </>
+                        );
+                      }
+                      return (
+                        <td className="px-3 py-1.5 text-right font-mono font-semibold border-l">
+                          {money(g.total)}
+                        </td>
+                      );
+                    })()}
                   </tr>
                 ))}
               </tbody>
