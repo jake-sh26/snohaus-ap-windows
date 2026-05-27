@@ -4046,6 +4046,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       //   - POS row's entity (when pos_location_id is set and maps to POS)
       //   - per-line allocation's entity (when present)
       //   - order-level allocation's entity (when no per-line match)
+      //   - dominant-entity fallback: the entity_id with the largest
+      //     SUM(gross_amount) across this order's recon_allocations rows
+      //     (tie-break by entity_id ASC). Added in PR #140b to plug the
+      //     shipping/fee leak: SHIPPING/FEE/RETURN-SHIPPING rows in
+      //     recon_shopify_sales carry line_item_id = "0" (a sentinel, not
+      //     a real line), so for non-POS orders the per-line branch
+      //     doesn't match and the order-level branch only fires for
+      //     cancelled orders. Result pre-#140b: an order's PRODUCT lines
+      //     attributed correctly to Greenvale/Huntington/Hempstead while
+      //     its shipping/fees fell to Unallocated. The dominant-entity
+      //     fallback attributes those non-line-keyed rows to whichever
+      //     entity already owns the bulk of the order's gross.
       //   - NULL otherwise (→ Unallocated bucket)
       //
       // The COALESCE+correlated-subquery shape is intentional: SQLite
@@ -4081,6 +4093,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                  FROM recon_allocations a
                 WHERE a.order_id = s.order_id
                   AND a.line_item_id IS NULL
+                LIMIT 1),
+              (SELECT a.entity_id
+                 FROM recon_allocations a
+                WHERE a.order_id = s.order_id
+                GROUP BY a.entity_id
+                ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC
                 LIMIT 1)
             ) AS attributed_entity_id
           FROM recon_shopify_sales s
