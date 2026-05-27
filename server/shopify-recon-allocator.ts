@@ -700,7 +700,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
       summary.orders_processed++;
 
       // Hoisted out of both branches — cancelled orders need lines + overrides
-      // too now that PR #138 emits a share=0 informational row per line.
+      // too (PR #139 emits one order-level fallback row, computed from lines).
       const t0_ovr = Date.now();
       const overrides = overridesStmt.all(o.id) as Array<{ line_item_id: string | null }>;
       t_overrides_query += Date.now() - t0_ovr;
@@ -710,40 +710,52 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
       const lines = linesStmt.all(o.id) as LineItemRow[];
       t_lines_query += Date.now() - t0_lines;
 
-      // PR #138 — cancelled orders: emit one share=0 row per line so they
-      // appear in the UI as needs_review, but contribute $0 to revenue. No
-      // cascade routing (no fulfillments / FO queries) — share=0 means the
-      // entity_id doesn't matter for revenue, and SD is the safe default.
+      // PR #139 — cancelled orders: emit ONE order-level fallback row with
+      // line_item_id=NULL so the by-store endpoint's COALESCE picks it up.
+      // recon_shopify_sales rows for online orders have line_item_id IS NULL
+      // (the pos-locations ingest only populates that column for POS sales
+      // rows), so per-line allocation rows (PR #138) could never be joined.
+      // The order-level NULL row is the fallback the by-store SQL is
+      // specifically designed to consume.
+      //
+      // share=1 so the cancellation's gross attributes to SD. The ledger's
+      // RETURN rows (also routed by this order-level fallback) carry negative
+      // amounts, netting total_sales to ~$0 — which matches Shopify's "gross
+      // of cancellations counts, net is $0" behavior.
       if (o.cancelled_at) {
-        let orderHasReview = false;
+        // If any manual override exists on a line, the operator has explicit
+        // routing intent — don't emit the order-level fallback on top of it.
+        if (overriddenLineIds.size > 0) {
+          continue;
+        }
+        let orderGross = 0;
+        let orderTax = 0;
         for (const line of lines) {
-          if (overriddenLineIds.has(line.id)) continue;
-          summary.line_items_processed++;
-          const gross =
+          orderGross +=
             line.line_subtotal != null
               ? line.line_subtotal
               : (line.price ?? 0) * (line.quantity ?? 0) - (line.total_discount ?? 0);
-          const tax = line.line_tax_total ?? 0;
-          const t0_ins = Date.now();
-          insertStmt.run(
-            o.id,
-            line.id,
-            ctx.sdEntityId ?? 0,
-            0,
-            gross,
-            tax,
-            "needs_review",
-            "Cancelled order — informational row (share=0)",
-            "needs_review",
-            null,
-            now,
-          );
-          t_insert_alloc += Date.now() - t0_ins;
-          summary.by_method.needs_review++;
-          summary.allocations_written++;
-          orderHasReview = true;
+          orderTax += line.line_tax_total ?? 0;
         }
-        if (orderHasReview) summary.needs_review_orders++;
+        const t0_ins = Date.now();
+        insertStmt.run(
+          o.id,
+          null,
+          ctx.sdEntityId ?? 0,
+          1,
+          orderGross,
+          orderTax,
+          "needs_review",
+          "Cancelled order — order-level fallback (line_item_id=NULL routes to SD)",
+          "needs_review",
+          null,
+          now,
+        );
+        t_insert_alloc += Date.now() - t0_ins;
+        summary.line_items_processed += lines.length;
+        summary.by_method.needs_review++;
+        summary.allocations_written++;
+        summary.needs_review_orders++;
         continue;
       }
 
