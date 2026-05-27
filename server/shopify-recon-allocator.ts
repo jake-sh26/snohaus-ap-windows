@@ -698,20 +698,54 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
 
     for (const o of orders) {
       summary.orders_processed++;
-      if (o.cancelled_at) {
-        // Cancelled orders still get a row so we can see them in the UI, but
-        // share=0 so they don't roll into revenue.
-        continue;
-      }
-      const t0_lines = Date.now();
-      const lines = linesStmt.all(o.id) as LineItemRow[];
-      t_lines_query += Date.now() - t0_lines;
 
-      // Check if any allocation for this order was overridden manually.
+      // Hoisted out of both branches — cancelled orders need lines + overrides
+      // too now that PR #138 emits a share=0 informational row per line.
       const t0_ovr = Date.now();
       const overrides = overridesStmt.all(o.id) as Array<{ line_item_id: string | null }>;
       t_overrides_query += Date.now() - t0_ovr;
       const overriddenLineIds = new Set(overrides.map(r => r.line_item_id));
+
+      const t0_lines = Date.now();
+      const lines = linesStmt.all(o.id) as LineItemRow[];
+      t_lines_query += Date.now() - t0_lines;
+
+      // PR #138 — cancelled orders: emit one share=0 row per line so they
+      // appear in the UI as needs_review, but contribute $0 to revenue. No
+      // cascade routing (no fulfillments / FO queries) — share=0 means the
+      // entity_id doesn't matter for revenue, and SD is the safe default.
+      if (o.cancelled_at) {
+        let orderHasReview = false;
+        for (const line of lines) {
+          if (overriddenLineIds.has(line.id)) continue;
+          summary.line_items_processed++;
+          const gross =
+            line.line_subtotal != null
+              ? line.line_subtotal
+              : (line.price ?? 0) * (line.quantity ?? 0) - (line.total_discount ?? 0);
+          const tax = line.line_tax_total ?? 0;
+          const t0_ins = Date.now();
+          insertStmt.run(
+            o.id,
+            line.id,
+            ctx.sdEntityId ?? 0,
+            0,
+            gross,
+            tax,
+            "needs_review",
+            "Cancelled order — informational row (share=0)",
+            "needs_review",
+            null,
+            now,
+          );
+          t_insert_alloc += Date.now() - t0_ins;
+          summary.by_method.needs_review++;
+          summary.allocations_written++;
+          orderHasReview = true;
+        }
+        if (orderHasReview) summary.needs_review_orders++;
+        continue;
+      }
 
       // PR #R4b — pre-load successful fulfillments for this order so the
       // online-physical branch can route each line by its actual ship-from
