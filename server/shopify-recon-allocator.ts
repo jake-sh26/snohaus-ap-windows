@@ -168,13 +168,28 @@ type FulfillmentRow = {
 // Lazy init lets the schema run() bootstrap before the first prepare().
 let _fulfillmentsStmt: ReturnType<typeof sqlite.prepare> | null = null;
 let _fulfillmentOrdersStmt: ReturnType<typeof sqlite.prepare> | null = null;
+// PR #137 — PR #136 instrumentation revealed listSuccessfulFulfillments was
+// 99.4% of allocator runtime (2511ms / 2525ms total in Aug 2025 with only 36
+// orders = ~70ms per call). Two changes:
+//
+//   1. Drop the SQL ORDER BY (created_at IS NULL), created_at ASC, id ASC.
+//      That expression-based sort can't be satisfied from the index, so even
+//      with idx_recon_fulfillments_order sqlite was building a temp sort tree
+//      per call. Findings are 0-2 rows in 99% of cases, so we sort in JS
+//      after parsing instead. Chronological semantics preserved — same key
+//      (created_at nulls last, then created_at ASC, id ASC tiebreak).
+//
+//   2. Inline-filter status='success' rather than relying on the index. The
+//      existing idx_recon_fulfillments_order covers order_id only — sqlite
+//      still has to read each matched row to check status. Pulling status
+//      into the SELECT and filtering in JS is equivalent and lets sqlite use
+//      the pure index lookup with no extra predicate work.
 function listSuccessfulFulfillments(orderId: string): FulfillmentRow[] {
   if (!_fulfillmentsStmt) {
     _fulfillmentsStmt = sqlite.prepare(
-      `SELECT id, location_id, status, line_item_ids_json
+      `SELECT id, location_id, status, created_at, line_item_ids_json
        FROM recon_order_fulfillments
-       WHERE order_id = ? AND status = 'success'
-       ORDER BY (created_at IS NULL), created_at ASC, id ASC`
+       WHERE order_id = ?`
     );
   }
   const rows = _fulfillmentsStmt
@@ -182,9 +197,22 @@ function listSuccessfulFulfillments(orderId: string): FulfillmentRow[] {
       id: string;
       location_id: string | null;
       status: string | null;
+      created_at: string | null;
       line_item_ids_json: string | null;
     }>;
-  return rows.map(r => ({
+  // Filter to status='success' AND sort chronologically in JS. Findings are
+  // small (0-3 rows in 99% of cases) so this is fast.
+  const successful = rows.filter(r => r.status === "success");
+  successful.sort((a, b) => {
+    const aNull = a.created_at == null;
+    const bNull = b.created_at == null;
+    if (aNull !== bNull) return aNull ? 1 : -1;        // nulls LAST
+    if (a.created_at !== b.created_at) {
+      return (a.created_at ?? "") < (b.created_at ?? "") ? -1 : 1; // ASC
+    }
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;     // tiebreak id ASC
+  });
+  return successful.map(r => ({
     id: r.id,
     location_id: r.location_id,
     status: r.status,
