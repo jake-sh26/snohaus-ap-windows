@@ -3751,18 +3751,11 @@ function GiftCardActivityCard({ month }: { month: string }) {
   );
 }
 
-// ----- PR #130: By Store breakdown -----
-// 4-column table (Greenvale | Huntington | Hempstead | Total) showing the
-// same 9 metrics as the Finance Summary diff. Column order is fixed by
-// location_id so the layout stays stable as the server reorders rows.
-//
-// Total column = sum of the 3 POS stores (POS-channel total). The endpoint
-// already returns this in `totals`. We display it and ALSO cross-foot against
-// the overall V2 monthly total from /api/recon/finance/diff/:month (which
-// includes non-POS rows like online gift cards). If the two differ, we
-// surface a footnote per metric — this is expected when there are NULL
-// pos_location_id rows (e.g. Dec 2025 had 25 such rows / 99.84% coverage).
-// Pennies, no rounding. All numbers come from the server already r2'd.
+// ----- PR #141: By Store breakdown (fully-allocated + POS/Alloc toggle) -----
+// Fetches /by-store (PR #131, fully-allocated) and /by-store-pos (PR #124,
+// POS-only) in parallel. Default view shows Total per store. Toggle expands
+// each store into POS / Alloc / Total sub-columns. Alloc = Total − POS.
+// Unallocated column is hidden when |unallocated.total_sales| < $0.005.
 type ByStoreRow = {
   entity_id: number;
   entity_location: string;
@@ -3778,11 +3771,21 @@ type ByStoreRow = {
   total_sales: number;
   orders: number;
 };
+type ByStoreTotals = Omit<ByStoreRow, "entity_id" | "entity_location" | "location_id">;
 type ByStorePosResp = {
   month: string;
   scope: string;
   by_store: ByStoreRow[];
-  totals: Omit<ByStoreRow, "entity_id" | "entity_location" | "location_id">;
+  totals: ByStoreTotals;
+  note: string;
+  build_id: string;
+};
+type ByStoreAllocResp = {
+  month: string;
+  scope: string;
+  by_store: ByStoreRow[];
+  unallocated: ByStoreTotals;
+  totals: ByStoreTotals;
   note: string;
   build_id: string;
 };
@@ -3813,42 +3816,87 @@ const BY_STORE_METRICS: Array<{
 ];
 
 function ByStoreBreakdown() {
-  // Independent month state so browsing here doesn't affect Reconcile tab.
-  // Default: last completed month (today minus ~15 days, formatted YYYY-MM).
   const [month, setMonth] = useState<string>(() => {
     const d = new Date();
     d.setDate(1);
     d.setMonth(d.getMonth() - 1);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   });
+  const [showBreakdown, setShowBreakdown] = useState<boolean>(false);
   const valid = /^\d{4}-\d{2}$/.test(month);
 
-  const byStoreQ = useQuery<ByStorePosResp>({
+  const allocQ = useQuery<ByStoreAllocResp>({
+    queryKey: ["/api/recon/finance/by-store", month],
+    queryFn: () => jsonGet(`/api/recon/finance/by-store/${encodeURIComponent(month)}`),
+    enabled: valid,
+  });
+  const posQ = useQuery<ByStorePosResp>({
     queryKey: ["/api/recon/finance/by-store-pos", month],
     queryFn: () => jsonGet(`/api/recon/finance/by-store-pos/${encodeURIComponent(month)}`),
     enabled: valid,
   });
-  // Overall V2 monthly total — for cross-foot against the 3-store POS sum.
-  // Non-POS rows (online gift cards, manual orders w/ NULL pos_location_id)
-  // live in `ours` but NOT in `by_store`, so a non-zero gap is expected and
-  // legitimate. We surface it inline so the operator can see exactly which
-  // metric(s) leak into non-POS.
   const v2DiffQ = useQuery<FinanceDiffResult>({
     queryKey: ["/api/recon/finance/diff", month],
     queryFn: () => jsonGet(`/api/recon/finance/diff/${encodeURIComponent(month)}`),
     enabled: valid,
   });
 
-  // Map server rows by location_id so column order is deterministic.
-  const storeByLoc: Record<string, ByStoreRow | undefined> = {};
-  for (const r of byStoreQ.data?.by_store ?? []) {
-    storeByLoc[r.location_id] = r;
-  }
-  const totals = byStoreQ.data?.totals;
+  const allocByLoc: Record<string, ByStoreRow | undefined> = {};
+  for (const r of allocQ.data?.by_store ?? []) allocByLoc[r.location_id] = r;
+  const posByLoc: Record<string, ByStoreRow | undefined> = {};
+  for (const r of posQ.data?.by_store ?? []) posByLoc[r.location_id] = r;
+
+  const allocTotals = allocQ.data?.totals;
+  const posTotals = posQ.data?.totals;
+  const unallocated = allocQ.data?.unallocated;
   const v2 = v2DiffQ.data?.ours;
 
-  // Pennies, no rounding. Round each diff at 2dp to dodge float noise.
   const r2 = (n: number) => Math.round(n * 100) / 100;
+  const showUnalloc = !!unallocated && Math.abs(unallocated.total_sales) >= 0.005;
+
+  // Sentinel: when /by-store-pos has a non-POS residual against V2 but
+  // /by-store unallocated is ~$0, the allocator absorbed the legacy bucket.
+  useEffect(() => {
+    if (!allocQ.data || !posQ.data || !v2 || !posTotals || !unallocated) return;
+    const posResidual = Math.round((Number(v2.total_sales) - Number(posTotals.total_sales)) * 100) / 100;
+    const allocUnalloc = Math.round(Number(unallocated.total_sales) * 100) / 100;
+    if (Math.abs(posResidual) > 0.005 && Math.abs(allocUnalloc) < 0.005) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[PR#141] /by-store-pos non-POS residual ${money(posResidual)} absorbed by allocator (/by-store unallocated = ${money(allocUnalloc)}). Swap working as designed.`,
+      );
+    }
+  }, [allocQ.data, posQ.data, v2, posTotals, unallocated]);
+
+  const loading = allocQ.isLoading || posQ.isLoading;
+  const firstErr = allocQ.error ?? posQ.error;
+  const errMsg = firstErr ? String((firstErr as any)?.message ?? firstErr) : null;
+
+  // Per-cell trio (POS, Allocated, Total) for a given store location & metric.
+  const cellTrio = (loc: string, key: keyof ByStoreTotals) => {
+    const total = Number(allocByLoc[loc]?.[key] ?? 0);
+    const pos = Number(posByLoc[loc]?.[key] ?? 0);
+    const alloc = r2(total - pos);
+    const mismatch = Math.abs(r2(total) - r2(pos + alloc)) > 0.005;
+    return { pos: r2(pos), alloc, total: r2(total), mismatch };
+  };
+
+  // Footer cross-foot: sum visible store Totals + Unallocated (if shown) per
+  // metric, compare against V2 overall.
+  const footerLeaks = (() => {
+    if (!allocTotals || !v2) return null as null | Array<{ label: string; gap: number }>;
+    const leaks: Array<{ label: string; gap: number }> = [];
+    for (const m of BY_STORE_METRICS) {
+      const storesSum = BY_STORE_COL_ORDER.reduce(
+        (acc, c) => acc + Number(allocByLoc[c.location_id]?.[m.storeKey] ?? 0),
+        0,
+      );
+      const unallocAdd = showUnalloc ? Number(unallocated?.[m.storeKey] ?? 0) : 0;
+      const gap = r2(Number(v2[m.v2Key]) - r2(storesSum + unallocAdd));
+      if (Math.abs(gap) >= 0.005) leaks.push({ label: m.label, gap });
+    }
+    return leaks;
+  })();
 
   return (
     <Card>
@@ -3857,15 +3905,14 @@ function ByStoreBreakdown() {
           <Store className="size-4" /> Per-store breakdown — {valid ? monthLabel(month) : month}
         </CardTitle>
         <CardDescription>
-          Greenvale · Huntington · Hempstead, side-by-side. Per-line POS
-          attribution from ShopifyQL (PR #125–#127). Validated penny-perfect
-          across all 17 months × 3 stores. Auto-refreshes every 6h with the
-          Shopify orders cron (PR #129).
+          Fully-allocated per-store totals (PR #131): per-line POS attribution
+          UNION allocator output. Toggle below to expose the POS / Allocated
+          split per cell. Reconciles to V2 overall to the penny.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* Month picker */}
-        <div className="flex flex-wrap items-end gap-2">
+        {/* Month picker + breakdown toggle */}
+        <div className="flex flex-wrap items-end gap-4">
           <div>
             <label className="text-xs text-muted-foreground block mb-1">Month</label>
             <input
@@ -3879,16 +3926,31 @@ function ByStoreBreakdown() {
           <div className="text-xs text-muted-foreground pb-2">
             ({valid ? monthLabel(month) : "invalid"})
           </div>
+          <label className="flex items-center gap-2 text-sm pb-1 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showBreakdown}
+              onChange={(e) => setShowBreakdown(e.target.checked)}
+              data-testid="toggle-bystore-breakdown"
+            />
+            <span>Show POS / Allocated breakdown</span>
+          </label>
         </div>
 
         {/* Diagnostics row */}
-        {byStoreQ.data && (
+        {allocQ.data && (
           <div className="flex gap-2 text-xs text-muted-foreground flex-wrap">
-            <span>Scope: POS-only (pos_location_id IS NOT NULL)</span>
+            <span>Scope: fully-allocated (POS + allocator)</span>
             <span>·</span>
-            <span>Build: {byStoreQ.data.build_id}</span>
+            <span>Build: {allocQ.data.build_id}</span>
             <span>·</span>
-            <span>POS orders: {num(totals?.orders ?? 0)}</span>
+            <span>Allocated orders: {num(allocTotals?.orders ?? 0)}</span>
+            {posTotals && (
+              <>
+                <span>·</span>
+                <span>POS orders: {num(posTotals.orders)}</span>
+              </>
+            )}
             {v2 && (
               <>
                 <span>·</span>
@@ -3898,105 +3960,152 @@ function ByStoreBreakdown() {
           </div>
         )}
 
-        {byStoreQ.isLoading && (
+        {loading && (
           <div className="text-sm text-muted-foreground">Loading per-store breakdown…</div>
         )}
-        {byStoreQ.error && (
-          <div className="text-sm text-destructive">
-            Failed to load: {String((byStoreQ.error as any)?.message ?? byStoreQ.error)}
-          </div>
+        {errMsg && (
+          <div className="text-sm text-destructive">Failed to load: {errMsg}</div>
         )}
 
         {/* Main side-by-side table */}
-        {byStoreQ.data && totals && (
-          <div className="border rounded-md overflow-hidden">
+        {allocQ.data && posQ.data && allocTotals && (
+          <div className="border rounded-md overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-muted/50 text-xs text-muted-foreground">
+                {showBreakdown && (
+                  <tr>
+                    <th className="text-left px-3 py-1.5 font-medium" />
+                    {BY_STORE_COL_ORDER.map((c, idx) => (
+                      <th
+                        key={c.location_id}
+                        colSpan={3}
+                        className={`text-center px-3 py-1.5 font-medium ${idx > 0 ? "border-l" : ""}`}
+                      >
+                        {c.label}
+                      </th>
+                    ))}
+                    {showUnalloc && (
+                      <th className="text-right px-3 py-1.5 font-medium border-l">Unallocated</th>
+                    )}
+                  </tr>
+                )}
                 <tr>
                   <th className="text-left px-3 py-1.5 font-medium">Line</th>
-                  {BY_STORE_COL_ORDER.map((c) => (
-                    <th key={c.location_id} className="text-right px-3 py-1.5 font-medium">
-                      {c.label}
-                    </th>
-                  ))}
-                  <th className="text-right px-3 py-1.5 font-medium border-l">Total (POS)</th>
-                  {v2 && (
-                    <th className="text-right px-3 py-1.5 font-medium" title="Overall V2 monthly total — includes non-POS rows (online gift cards, manual orders with NULL pos_location_id)">
-                      V2 overall
-                    </th>
+                  {BY_STORE_COL_ORDER.flatMap((c, idx) =>
+                    showBreakdown
+                      ? [
+                          <th
+                            key={`${c.location_id}-pos`}
+                            className={`text-right px-3 py-1.5 font-normal text-muted-foreground/80 ${idx > 0 ? "border-l" : ""}`}
+                          >
+                            POS
+                          </th>,
+                          <th
+                            key={`${c.location_id}-alloc`}
+                            className="text-right px-3 py-1.5 font-normal text-muted-foreground/80 bg-muted/30"
+                          >
+                            Alloc
+                          </th>,
+                          <th
+                            key={`${c.location_id}-total`}
+                            className="text-right px-3 py-1.5 font-semibold"
+                          >
+                            Total
+                          </th>,
+                        ]
+                      : [
+                          <th
+                            key={c.location_id}
+                            className="text-right px-3 py-1.5 font-medium"
+                          >
+                            {c.label}
+                          </th>,
+                        ],
+                  )}
+                  {showUnalloc && !showBreakdown && (
+                    <th className="text-right px-3 py-1.5 font-medium border-l">Unallocated</th>
                   )}
                 </tr>
               </thead>
               <tbody className="divide-y">
-                {BY_STORE_METRICS.map((m) => {
-                  const totalPos = totals[m.storeKey];
-                  const overall = v2 ? v2[m.v2Key] : null;
-                  const gap = overall == null ? null : r2(Number(overall) - Number(totalPos));
-                  const hasGap = gap !== null && Math.abs(gap) >= 0.005;
-                  return (
-                    <tr key={m.storeKey} data-testid={`bystore-row-${m.storeKey}`}>
-                      <td className="px-3 py-1.5 font-medium">{m.label}</td>
-                      {BY_STORE_COL_ORDER.map((c) => {
-                        const row = storeByLoc[c.location_id];
-                        return (
-                          <td key={c.location_id} className="px-3 py-1.5 text-right font-mono">
-                            {row ? money(row[m.storeKey]) : "—"}
-                          </td>
-                        );
-                      })}
-                      <td className="px-3 py-1.5 text-right font-mono border-l">
-                        {money(totalPos)}
-                      </td>
-                      {v2 && (
-                        <td
-                          className={`px-3 py-1.5 text-right font-mono ${hasGap ? "text-amber-700" : ""}`}
-                          title={hasGap ? `Non-POS leak: ${money(gap)} not attributed to a register` : "POS sum matches V2 overall"}
+                {BY_STORE_METRICS.map((m) => (
+                  <tr key={m.storeKey} data-testid={`bystore-row-${m.storeKey}`}>
+                    <td className="px-3 py-1.5 font-medium">{m.label}</td>
+                    {BY_STORE_COL_ORDER.flatMap((c, idx) => {
+                      const t = cellTrio(c.location_id, m.storeKey);
+                      const warn = t.mismatch ? (
+                        <span
+                          className="inline-flex items-center text-amber-600 ml-1"
+                          title={`Cross-foot mismatch: POS ${money(t.pos)} + Alloc ${money(t.alloc)} ≠ Total ${money(t.total)}`}
                         >
-                          {overall == null ? "—" : money(Number(overall))}
-                        </td>
-                      )}
-                    </tr>
-                  );
-                })}
+                          <AlertTriangle className="size-3" />
+                        </span>
+                      ) : null;
+                      if (showBreakdown) {
+                        return [
+                          <td
+                            key={`${c.location_id}-pos`}
+                            className={`px-3 py-1.5 text-right font-mono text-muted-foreground ${idx > 0 ? "border-l" : ""}`}
+                          >
+                            {money(t.pos)}
+                          </td>,
+                          <td
+                            key={`${c.location_id}-alloc`}
+                            className="px-3 py-1.5 text-right font-mono text-muted-foreground bg-muted/30"
+                          >
+                            {money(t.alloc)}
+                          </td>,
+                          <td
+                            key={`${c.location_id}-total`}
+                            className="px-3 py-1.5 text-right font-mono font-semibold"
+                          >
+                            {money(t.total)}
+                            {warn}
+                          </td>,
+                        ];
+                      }
+                      return [
+                        <td
+                          key={c.location_id}
+                          className="px-3 py-1.5 text-right font-mono"
+                        >
+                          {money(t.total)}
+                          {warn}
+                        </td>,
+                      ];
+                    })}
+                    {showUnalloc && (
+                      <td className="px-3 py-1.5 text-right font-mono border-l">
+                        {money(Number(unallocated?.[m.storeKey] ?? 0))}
+                      </td>
+                    )}
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
         )}
 
-        {/* Cross-foot footnote — only when 3-store POS sum != overall V2 */}
-        {byStoreQ.data && totals && v2 && (() => {
-          const leaks = BY_STORE_METRICS
-            .map((m) => ({
-              label: m.label,
-              gap: r2(Number(v2[m.v2Key]) - Number(totals[m.storeKey])),
-            }))
-            .filter((l) => Math.abs(l.gap) >= 0.005);
-          if (leaks.length === 0) {
-            return (
-              <div className="text-xs text-muted-foreground flex items-center gap-1">
-                <CheckCircle2 className="size-3 text-green-600" />
-                3-store POS sum reconciles to V2 overall to the penny.
-              </div>
-            );
-          }
-          return (
+        {/* Footer cross-foot note */}
+        {allocQ.data && allocTotals && v2 && footerLeaks && (
+          footerLeaks.length === 0 ? (
+            <div className="text-xs text-muted-foreground flex items-center gap-1">
+              <CheckCircle2 className="size-3 text-green-600" />
+              Sum across all columns matches V2 overall total_sales for the month.
+            </div>
+          ) : (
             <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 space-y-1">
-              <div className="font-medium">Non-POS leak (V2 overall − 3-store POS sum)</div>
-              <div className="text-amber-900/80">
-                Expected when there are rows with NULL pos_location_id — online
-                gift cards, manual orders, draft orders. POS coverage isn't a
-                bug; these rows simply have no register attached.
-              </div>
+              <div className="font-medium">Cross-foot mismatch (V2 overall − visible-column sum)</div>
               <ul className="font-mono text-amber-900/90 pl-4 list-disc">
-                {leaks.map((l) => (
+                {footerLeaks.map((l) => (
                   <li key={l.label}>
                     {l.label}: {money(l.gap)}
                   </li>
                 ))}
               </ul>
             </div>
-          );
-        })()}
+          )
+        )}
       </CardContent>
     </Card>
   );
