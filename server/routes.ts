@@ -141,6 +141,15 @@ import {
   requestCancelBackfill,
 } from "./shopify-recon-orders";
 import {
+  aggregateByEntity,
+  aggregateByJurisdiction,
+  parseTaxLines,
+  quarterToMonths,
+  sumEntities,
+  type AggregatorInput,
+  type LineForTax,
+} from "./shopify-tax-aggregation";
+import {
   syncPayoutsIncremental,
 } from "./shopify-recon-payouts";
 import {
@@ -4313,6 +4322,238 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     } catch (e: any) {
       res.status(500).json({ message: "by-store failed", error: String(e?.message || e) });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // PR #143 — Sales tax API (read-only query layer over recon_line_items).
+  //
+  //   GET /api/recon/tax/by-entity/:month     entity-level summary + marketplace split
+  //   GET /api/recon/tax/st810/:month         per-entity per-jurisdiction (ST-810)
+  //   GET /api/recon/tax/st810/:quarter       same, summed over NY tax quarter
+  //
+  // Source: recon_line_items.tax_lines_json (per-jurisdiction breakout
+  // already exists at ingest time — see shopify-recon-orders.ts:225-235).
+  // Entity attribution mirrors /api/recon/finance/by-store/:month: POS via
+  // recon_shopify_sales.pos_location_id → recon_entity_pos_locations.entity_id,
+  // else recon_allocations cascade (per-line → order-level → dominant entity).
+  //
+  // Marketplace facilitator (Shop channel) carve-out: tax_channel_liable=1
+  // lines stay in gross_sales (operator visibility) but are bucketed into
+  // marketplace_gross / marketplace_tax_collected. tax_owed excludes them.
+  //
+  // All money fields are strings to avoid float drift; aggregated as integer
+  // cents in shopify-tax-aggregation.ts and rendered fixed-2 at the boundary.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Internal: load the per-month line set with entity attribution + POS flag.
+   * Reused by all three tax endpoints (per-month, and per-quarter which calls
+   * this for each of its 3 months).
+   *
+   * Bucketing: uses `recon_line_items.recognized_at` (defaulting to order
+   * processed_at / created_at), the same default `grossBucketExpr` as
+   * shopify-finance-diff.ts. Lines are attributed using the same cascade as
+   * /api/recon/finance/by-store/:month.
+   *
+   * Returns { inputs, entityNames }. entity_id=0 = Unallocated.
+   */
+  function loadTaxInputsForMonth(month: string): {
+    inputs: AggregatorInput[];
+    entityNames: Map<number, string>;
+  } {
+    const { sqlite } = require("./storage");
+
+    // Resolve POS entity locations once.
+    const mappedLocs: Array<{ location_id: string; entity_id: number; entity_location: string }> =
+      sqlite.prepare(`
+        SELECT pl.shopify_location_id AS location_id,
+               pl.entity_id           AS entity_id,
+               e.location             AS entity_location
+          FROM recon_entity_pos_locations pl
+          JOIN payroll_entities e ON e.id = pl.entity_id
+         WHERE pl.shopify_location_id IS NOT NULL
+           AND pl.kind = 'pos'
+           AND pl.active = 1
+         ORDER BY pl.entity_id
+      `).all();
+
+    const entityNames = new Map<number, string>();
+    entityNames.set(0, 'Unallocated');
+    for (const loc of mappedLocs) entityNames.set(loc.entity_id, loc.entity_location);
+
+    // Pull lines for the month bucketed by recognized_at|processed_at|created_at
+    // (same default as shopify-finance-diff.ts grossBucketExpr).
+    //
+    // attribution cascade — mirrors by-store CTE:
+    //   1. POS: any recon_shopify_sales row for (order_id, line_item_id) with
+    //      pos_location_id mapped to a POS entity → that entity, marked as POS
+    //   2. recon_allocations per-line (order_id, line_item_id)
+    //   3. recon_allocations order-level (order_id, line_item_id IS NULL)
+    //   4. dominant-entity fallback (largest gross_amount on the order)
+    //   5. else entity_id=0 (Unallocated)
+    //
+    // We compute (1) as a separate column (`pos_entity_id`) so we can split
+    // POS vs Allocated in the response. If pos_entity_id is set we ALSO use
+    // it as the attribution; otherwise we use the allocation cascade.
+    const lineRows: Array<{
+      line_id: string;
+      order_id: string;
+      line_subtotal: number | null;
+      price: number | null;
+      quantity: number | null;
+      total_discount: number | null;
+      discount_allocations_total: number | null;
+      is_gift_card: number;
+      tax_channel_liable: number;
+      tax_lines_json: string | null;
+      pos_entity_id: number | null;
+      alloc_entity_id: number | null;
+    }> = sqlite.prepare(`
+      SELECT
+        li.id AS line_id,
+        li.order_id AS order_id,
+        li.line_subtotal AS line_subtotal,
+        li.price AS price,
+        li.quantity AS quantity,
+        li.total_discount AS total_discount,
+        li.discount_allocations_total AS discount_allocations_total,
+        li.is_gift_card AS is_gift_card,
+        li.tax_channel_liable AS tax_channel_liable,
+        li.tax_lines_json AS tax_lines_json,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos'
+            AND pl.active = 1
+          WHERE s.order_id = li.order_id
+            AND s.line_item_id = li.id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        COALESCE(
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = li.order_id AND a.line_item_id = li.id LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = li.order_id AND a.line_item_id IS NULL LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = li.order_id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+        ) AS alloc_entity_id
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+      WHERE substr(datetime(
+        COALESCE(li.recognized_at, o.processed_at, o.created_at),
+        '-5 hours'), 1, 7) = ?
+        AND li.is_gift_card = 0
+    `).all(month) as any;
+
+    // POS entity set — used to bucket non-POS entities into Unallocated.
+    const posEntityIds = new Set<number>(mappedLocs.map(l => l.entity_id));
+
+    const inputs: AggregatorInput[] = [];
+    for (const r of lineRows) {
+      // Effective discount = max(total_discount, discount_allocations_total)
+      // — matches shopify-recon-orders.ts:222 (Rule #7c).
+      const eff_disc = Math.max(
+        Number(r.total_discount || 0),
+        Number(r.discount_allocations_total || 0),
+      );
+      const computed_sub = (Number(r.price || 0) * Number(r.quantity || 0)) - eff_disc;
+      const sub = r.line_subtotal != null ? Number(r.line_subtotal) : computed_sub;
+
+      // Pick attribution:
+      //   1. POS entity (if mapped POS)
+      //   2. Allocation entity (if any, and it's a POS entity)
+      //   3. else 0 (Unallocated)
+      let entity_id = 0;
+      let is_pos = false;
+      if (r.pos_entity_id != null && posEntityIds.has(r.pos_entity_id)) {
+        entity_id = r.pos_entity_id;
+        is_pos = true;
+      } else if (r.alloc_entity_id != null && posEntityIds.has(r.alloc_entity_id)) {
+        entity_id = r.alloc_entity_id;
+        is_pos = false;
+      } else {
+        entity_id = 0;
+        is_pos = false;
+      }
+
+      const line: LineForTax = {
+        entity_id,
+        line_subtotal: sub,
+        is_gift_card: r.is_gift_card,
+        tax_channel_liable: r.tax_channel_liable,
+        tax_lines: parseTaxLines(r.tax_lines_json),
+      };
+      inputs.push({ line, is_pos });
+    }
+
+    return { inputs, entityNames };
+  }
+
+  app.get("/api/recon/tax/by-entity/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const { inputs, entityNames } = loadTaxInputsForMonth(month);
+      const entities = aggregateByEntity(inputs, entityNames);
+      const totals = sumEntities(entities);
+      res.json({
+        month,
+        entities,
+        totals,
+        note: "PR #143: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. Money fields are strings (integer-cents internally) — no float drift. marketplace_* fields show the Shopify-facilitated portion (channel_liable=true); tax_owed excludes those.",
+        build_id: "pr143",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "tax by-entity failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/tax/st810/:period", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const period = String(req.params.period);
+    // Accept either YYYY-MM (monthly) or YYYY-Q[1-4] (quarterly).
+    const isMonth = /^\d{4}-\d{2}$/.test(period);
+    const isQuarter = /^\d{4}-Q[1-4]$/.test(period);
+    if (!isMonth && !isQuarter) {
+      return res.status(400).json({ message: "Period must be YYYY-MM or YYYY-Q[1-4]" });
+    }
+    try {
+      let months: string[];
+      let calendarFallback = false;
+      if (isMonth) {
+        months = [period];
+      } else {
+        const q = quarterToMonths(period);
+        months = q.months;
+        calendarFallback = q.calendar_fallback;
+      }
+
+      // Concat the lines from each month and run the per-jurisdiction
+      // aggregator once across the union. This avoids the need to merge
+      // already-aggregated string-money rows.
+      const all: AggregatorInput[] = [];
+      let entityNames = new Map<number, string>();
+      for (const m of months) {
+        const { inputs, entityNames: en } = loadTaxInputsForMonth(m);
+        all.push(...inputs);
+        for (const [k, v] of en) entityNames.set(k, v);
+      }
+
+      const entities = aggregateByJurisdiction(all, entityNames);
+      res.json({
+        ...(isMonth ? { month: period } : { quarter: period, months_included: months }),
+        ...(calendarFallback ? { quarter_calendar_fallback: true, note_quarter: "NY DTF quarter calendar lookup failed — defaulted to calendar quarters. TODO verify Pub 718-Q." } : {}),
+        entities,
+        note: "PR #143: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
+        build_id: "pr143",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "tax st810 failed", error: String(e?.message || e) });
     }
   });
 
