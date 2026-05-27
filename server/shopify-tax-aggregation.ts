@@ -134,6 +134,39 @@ export interface ShippingTaxRefund {
   tax_channel_liable: number;
 }
 
+/**
+ * PR #147 — Unverified-return tax delta (Rule #8 in by-store).
+ *
+ * Some returns are encoded by Shopify on the order itself (not as a refund row):
+ * the customer returns merch and we issue a same-order gift card. Shopify
+ * shifts `current_subtotal_price` down and `current_total_tax` becomes
+ * negative on the order — there is NO recon_refunds row. By-store's
+ * shopify-finance-diff.ts:401-423 reconciles this by subtracting
+ * `(o.total_tax - o.current_total_tax)` from its Taxes column for orders
+ * that have NO refunds. By-entity must mirror this to match by-store.
+ *
+ * No per-jurisdiction breakdown is available on these order-level deltas
+ * (Shopify writes `current_total_tax` as a single signed number, no
+ * `tax_lines[]`). At the entity level we subtract the delta from
+ * tax_collected_gross / tax_owed. At the jurisdiction level the residual
+ * reconciliation pass absorbs it into the largest non-marketplace bucket —
+ * same pattern PR #146 uses for shipping_refund.
+ *
+ * Source: order's recognized date (mirrors by-store's unverifiedBucketExpr).
+ * The caller pre-filters to orders in the target month with no recon_refunds.
+ */
+export interface UnverifiedReturnTax {
+  entity_id: number;
+  /**
+   * tax delta cents = round((o.total_tax - o.current_total_tax) * 100).
+   * Stored as the SIGNED delta (caller does NOT abs). By-store subtracts
+   * this from its taxes column; we subtract from tax_collected_gross.
+   * Typical value: positive cents (customer reversed tax → reduces taxes).
+   */
+  tax_delta_cents: number;
+  is_pos: boolean;
+}
+
 export interface EntitySummary {
   entity_id: number;
   entity_name: string;
@@ -259,6 +292,7 @@ export function aggregateByEntity(
   refunds: RefundForTax[] = [],
   shippingTaxForward: ShippingTaxForward[] = [],
   shippingTaxRefunds: ShippingTaxRefund[] = [],
+  unverifiedReturnTax: UnverifiedReturnTax[] = [],
 ): EntitySummary[] {
   const buckets = new Map<number, EntityCents>();
 
@@ -367,6 +401,21 @@ export function aggregateByEntity(
     else b.allocated_tax -= taxCents;
   }
 
+  // PR #147 — Unverified-return tax delta (Rule #8). For orders encoded as
+  // same-order exchanges (no refund row, but current_total_tax shifted),
+  // subtract the delta from tax_collected so we match by-store's Taxes
+  // formula:  taxes = perLineTax + shippingTax − returns_tax − unverified.
+  // These deltas are always non-marketplace (Shopify doesn't reverse
+  // marketplace tax via current_*).
+  for (const u of unverifiedReturnTax) {
+    const eid = u.entity_id ?? 0;
+    let b = buckets.get(eid);
+    if (!b) { b = blankEntityCents(); buckets.set(eid, b); }
+    b.tax_collected -= u.tax_delta_cents;
+    if (u.is_pos) b.pos_tax -= u.tax_delta_cents;
+    else b.allocated_tax -= u.tax_delta_cents;
+  }
+
   const out: EntitySummary[] = [];
   // Stable ordering: known POS entities first (by id), then Unallocated last.
   const ids = Array.from(buckets.keys()).sort((a, b) => {
@@ -466,16 +515,32 @@ export function aggregateByJurisdiction(
   refunds: RefundForTax[] = [],
   shippingTaxForward: ShippingTaxForward[] = [],
   shippingTaxRefunds: ShippingTaxRefund[] = [],
+  unverifiedReturnTax: UnverifiedReturnTax[] = [],
 ): EntityJurisdictionBreakdown[] {
   // entity_id → Map<jur-key-string, JurCents>
   const perEntity = new Map<number, Map<string, JurCents & JurKey>>();
-  // PR #146 — per-entity expected tax_owed in cents. Used at the end to
-  // distribute any residual into the largest non-marketplace jurisdiction so
-  // Σ jurisdictions.tax_due === entity.tax_owed exactly.
+
+  // PR #147 — Use the entity-level tax_owed from aggregateByEntity as the
+  // residual-reconciliation target, instead of re-deriving it here. The two
+  // functions consume identical inputs, but their marketplace-detection
+  // criteria diverged: aggregateByEntity treats a line as marketplace when
+  // ANY of its tax_lines has channel_liable=true, while aggregateByJurisdiction
+  // (correctly, per-tax_line) splits each tax_line individually. That
+  // divergence caused Huntington Dec 2025 to over-count expected by $1.32:
+  // marketplace-only jurisdictions (FL, TX) contributed to NY's tax_due via
+  // residual reconciliation. Reusing aggregateByEntity's authoritative
+  // tax_owed total eliminates that drift class entirely.
+  const entitySummaries = aggregateByEntity(
+    inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax,
+  );
   const expectedTaxOwedCents = new Map<number, number>();
-  const addExpected = (eid: number, delta: number) => {
-    expectedTaxOwedCents.set(eid, (expectedTaxOwedCents.get(eid) || 0) + delta);
-  };
+  for (const e of entitySummaries) {
+    if (e.entity_id < 0) continue;
+    expectedTaxOwedCents.set(
+      e.entity_id,
+      Math.round(parseFloat(e.tax_owed) * 100),
+    );
+  }
 
   for (const { line } of inputs) {
     if (line.is_gift_card) continue;
@@ -509,7 +574,6 @@ export function aggregateByJurisdiction(
       } else {
         bucket.taxable += lineSubCents;
         bucket.tax_due += taxCents;
-        addExpected(eid, taxCents);
       }
     }
   }
@@ -575,7 +639,6 @@ export function aggregateByJurisdiction(
       } else {
         bucket.taxable -= subCents;
         bucket.tax_due -= refundTaxThisJur;
-        addExpected(eid, -refundTaxThisJur);
       }
     }
   }
@@ -610,31 +673,42 @@ export function aggregateByJurisdiction(
         bucket.marketplace_tax += taxCents;
       } else {
         bucket.tax_due += taxCents;
-        addExpected(eid, taxCents);
       }
     }
   }
 
   // PR #146 — Shipping refund tax (adjustment_kind='shipping_refund'): no
-  // jurisdiction breakdown available on these rows. Subtract from the entity's
-  // expected tax_owed total; the residual-reconciliation pass below will
-  // absorb the delta into the entity's largest jurisdiction.
+  // jurisdiction breakdown available on these rows. The entity-level tax_owed
+  // (built by aggregateByEntity above) already accounts for these; the
+  // residual reconciliation will absorb the delta into the largest bucket.
+  // We just need to make sure the entity has an entry in perEntity.
   for (const sr of shippingTaxRefunds) {
-    if (sr.tax_channel_liable) continue; // marketplace — not in tax_owed
+    if (sr.tax_channel_liable) continue;
     const eid = sr.entity_id ?? 0;
-    addExpected(eid, -toCents(sr.refund_tax));
     if (!perEntity.has(eid)) perEntity.set(eid, new Map());
   }
 
-  // PR #146 — Residual reconciliation. For each entity, ensure
-  //   Σ non-marketplace jurisdictions.tax_due === entity expected tax_owed.
+  // PR #147 — Unverified-return tax delta: same handling pattern as
+  // shipping_refund (no jurisdiction breakdown). The entity-level tax_owed
+  // already reflects the subtraction; ensure the entity exists in perEntity
+  // so residual reconciliation has a bucket to push into.
+  for (const u of unverifiedReturnTax) {
+    const eid = u.entity_id ?? 0;
+    if (!perEntity.has(eid)) perEntity.set(eid, new Map());
+  }
+
+  // PR #146 / PR #147 — Residual reconciliation. For each entity, ensure
+  //   Σ non-marketplace jurisdictions.tax_due === entity.tax_owed (exact).
   //
-  // Drift comes from per-refund proportional rounding (each refund's residual
-  // hits the LAST jurisdiction, which accumulates across many refunds) and
-  // from shipping_refund adjustments with no jurisdiction attribution. We
-  // resolve by moving the cumulative residual into the jurisdiction with the
-  // largest |tax_due| — the standard "largest-bucket-absorbs-remainder"
-  // pattern. Skips entities with no non-marketplace jurisdictions.
+  // Drift sources:
+  //   • per-refund proportional rounding (residual lands on the LAST
+  //     jurisdiction, accumulates across many refunds)
+  //   • shipping_refund adjustments with no jurisdiction attribution (PR #146)
+  //   • unverified-return tax deltas with no jurisdiction attribution (PR #147)
+  //
+  // We resolve by moving the residual into the jurisdiction with the largest
+  // |tax_due| — the standard "largest-bucket-absorbs-remainder" pattern.
+  // Skips entities with no non-marketplace jurisdictions.
   for (const [eid, jurMap] of perEntity) {
     const expected = expectedTaxOwedCents.get(eid) || 0;
     let actual = 0;

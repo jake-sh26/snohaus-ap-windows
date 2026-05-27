@@ -19,6 +19,7 @@ import {
   type ShippingTaxForward,
   type ShippingTaxRefund,
   type TaxLine,
+  type UnverifiedReturnTax,
 } from "../server/shopify-tax-aggregation";
 
 let failed = 0;
@@ -767,6 +768,192 @@ function refund(opts: Partial<RefundForTax>): RefundForTax {
   // Expected: 431.25 (forward) + 4.31 (ship) - 30*0.86 (item refunds) - 1.32 - 0.45 (ship refunds)
   //         = 431.25 + 4.31 - 25.80 - 1.32 - 0.45 = 407.99
   eq(ents[0].tax_owed, "407.99", "mixed scenario: tax_owed exact");
+}
+
+// ---------------------------------------------------------------------------
+// PR #147 — Marketplace-only jurisdictions (Huntington FL/TX shape).
+// Reproduces Huntington Dec 2025: most sales are NY (non-marketplace),
+// but two FL/TX lines are marketplace-only (channel_liable=true with no
+// non-marketplace tax in that jurisdiction). Before PR #147, the
+// expectedTaxOwedCents map diverged from aggregateByEntity's tax_owed
+// because the two functions used different marketplace-detection rules,
+// leaking $1.32 into the residual reconciliation. After PR #147
+// expectedTaxOwedCents is sourced from aggregateByEntity directly, so the
+// marketplace-only jurisdictions cannot contribute to the residual target.
+// ---------------------------------------------------------------------------
+{
+  const FL_STATE_TL = (price: number, mp: boolean): TaxLine => ({
+    title: "FL State", rate: 0.06, price, channel_liable: mp,
+    jurisdiction_id: null, jurisdiction_name: "FLORIDA STATE TAX", jurisdiction_type: "STATE",
+  });
+  const TX_STATE_TL = (price: number, mp: boolean): TaxLine => ({
+    title: "TX State", rate: 0.0625, price, channel_liable: mp,
+    jurisdiction_id: null, jurisdiction_name: "TEXAS STATE TAX", jurisdiction_type: "STATE",
+  });
+
+  const inputs: AggregatorInput[] = [];
+  // 1000 normal NY lines, $100 ea, tax = NY 4 + Nassau 4.25 + MCTD 0.38 = 8.63
+  for (let i = 0; i < 1000; i++) {
+    inputs.push({
+      line: line({
+        entity_id: 2,
+        line_subtotal: 100,
+        tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+      }),
+      is_pos: true,
+    });
+  }
+  // 1 FL marketplace-only line: $185 subtotal, tax $12 (channel_liable on every tl)
+  inputs.push({
+    line: line({
+      entity_id: 2,
+      line_subtotal: 185,
+      tax_channel_liable: 1,
+      tax_lines: [FL_STATE_TL(12.00, true)],
+    }),
+    is_pos: false,
+  });
+  // 1 TX marketplace-only line: $42 subtotal, tax $3.56
+  inputs.push({
+    line: line({
+      entity_id: 2,
+      line_subtotal: 42,
+      tax_channel_liable: 1,
+      tax_lines: [TX_STATE_TL(3.56, true)],
+    }),
+    is_pos: false,
+  });
+
+  const ents = aggregateByEntity(inputs, names);
+  const jurs = aggregateByJurisdiction(inputs, names, [], [], []);
+
+  // tax_collected_gross = 1000*8.63 + 12 + 3.56 = 8645.56
+  eq(ents[0].tax_collected_gross, "8645.56", "marketplace-only: tax_collected_gross");
+  // marketplace_tax = 12 + 3.56 = 15.56
+  eq(ents[0].marketplace_tax_collected, "15.56", "marketplace-only: marketplace_tax");
+  // tax_owed = 8645.56 - 15.56 = 8630.00
+  eq(ents[0].tax_owed, "8630.00", "marketplace-only: tax_owed");
+
+  // Σ non-marketplace jurisdictions.tax_due === tax_owed (penny-exact)
+  const sumJurCents = jurs[0].jurisdictions.reduce((a, j) => a + Math.round(parseFloat(j.tax_due) * 100), 0);
+  eq(sumJurCents, 863000, "marketplace-only: Σ jur tax_due === tax_owed (Huntington-shape)");
+
+  // Confirm FL/TX appear as marketplace-only (no tax_due, mp_tax > 0)
+  const fl = jurs[0].jurisdictions.find(j => j.jurisdiction_name === "FLORIDA STATE TAX");
+  const tx = jurs[0].jurisdictions.find(j => j.jurisdiction_name === "TEXAS STATE TAX");
+  assert(fl != null && tx != null, "marketplace-only: FL and TX jurisdictions exist");
+  eq(fl?.tax_due, "0.00", "marketplace-only: FL tax_due is zero");
+  eq(fl?.marketplace_tax, "12.00", "marketplace-only: FL marketplace_tax");
+  eq(tx?.tax_due, "0.00", "marketplace-only: TX tax_due is zero");
+  eq(tx?.marketplace_tax, "3.56", "marketplace-only: TX marketplace_tax");
+}
+
+// ---------------------------------------------------------------------------
+// PR #147 — Unverified-return tax (Rule #8).
+// Same-order exchange with no refund row. By-store subtracts
+// (total_tax − current_total_tax) from its Taxes column for these orders;
+// by-entity must mirror that subtraction.
+// ---------------------------------------------------------------------------
+{
+  const inputs: AggregatorInput[] = [{
+    line: line({
+      entity_id: 1,
+      line_subtotal: 100,
+      tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+    }),
+    is_pos: true,
+  }];
+  // The unverified return: customer reversed $2.15 of tax via current_total_tax.
+  // total_tax = 0, current_total_tax = -2.15 → delta = +2.15 cents to subtract.
+  const unverified: UnverifiedReturnTax[] = [
+    { entity_id: 1, tax_delta_cents: 215, is_pos: true },
+  ];
+
+  const ents = aggregateByEntity(inputs, names, [], [], [], unverified);
+  // tax_collected = 8.63 - 2.15 = 6.48
+  eq(ents[0].tax_collected_gross, "6.48", "unverified-return: tax_collected reduced by delta");
+  eq(ents[0].tax_owed, "6.48", "unverified-return: tax_owed reduced by delta");
+  eq(ents[0].pos_split.tax, "6.48", "unverified-return: POS-side tax reduced");
+
+  const jurs = aggregateByJurisdiction(inputs, names, [], [], [], unverified);
+  const sumJurCents = jurs[0].jurisdictions.reduce((a, j) => a + Math.round(parseFloat(j.tax_due) * 100), 0);
+  eq(sumJurCents, 648, "unverified-return: Σ jur tax_due === tax_owed (residual absorbed)");
+}
+
+// ---------------------------------------------------------------------------
+// PR #147 — Combined: marketplace + multiple refund kinds + unverified return.
+// Stress the full reconciliation: forward + item refund + shipping forward +
+// shipping refund + unverified return tax, with marketplace-only jurisdictions
+// in the mix. End state must be penny-exact at both entity and jurisdiction
+// levels.
+// ---------------------------------------------------------------------------
+{
+  const FL_STATE_TL = (price: number, mp: boolean): TaxLine => ({
+    title: "FL State", rate: 0.06, price, channel_liable: mp,
+    jurisdiction_id: null, jurisdiction_name: "FLORIDA STATE TAX", jurisdiction_type: "STATE",
+  });
+
+  const inputs: AggregatorInput[] = [];
+  // 50 NY lines @ $100 = $5,000 subtotal, $8.63 tax each
+  for (let i = 0; i < 50; i++) {
+    inputs.push({
+      line: line({
+        entity_id: 2,
+        line_subtotal: 100,
+        tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+      }),
+      is_pos: true,
+    });
+  }
+  // 1 FL marketplace-only line
+  inputs.push({
+    line: line({
+      entity_id: 2,
+      line_subtotal: 200,
+      tax_channel_liable: 1,
+      tax_lines: [FL_STATE_TL(12.00, true)],
+    }),
+    is_pos: false,
+  });
+  const shipping: ShippingTaxForward[] = [{
+    entity_id: 2,
+    tax_lines: [NY_STATE_TL(2.00), NASSAU_TL(2.13), MCTD_TL(0.19)],
+    is_pos: true,
+    tax_channel_liable: 0,
+  }];
+  const refunds: RefundForTax[] = [
+    refund({
+      entity_id: 2,
+      line_subtotal_refunded: 100,
+      refund_tax: 8.63,
+      original_tax_lines: [NY_STATE_TL(4.00), NASSAU_TL(4.25), MCTD_TL(0.38)],
+      is_pos: true,
+    }),
+  ];
+  const shipRefunds: ShippingTaxRefund[] = [
+    { entity_id: 2, refund_tax: 1.32, is_pos: true, tax_channel_liable: 0 },
+  ];
+  const unverified: UnverifiedReturnTax[] = [
+    { entity_id: 2, tax_delta_cents: 215, is_pos: true },
+  ];
+
+  const ents = aggregateByEntity(inputs, names, refunds, shipping, shipRefunds, unverified);
+  // Forward tax (50 NY lines): 50 * 8.63 = 431.50
+  // FL marketplace: +12.00 to tax_collected, +12.00 to marketplace_tax
+  // Shipping forward: +4.32
+  // Item refund: -8.63
+  // Shipping refund: -1.32
+  // Unverified: -2.15
+  // tax_collected_gross = 431.50 + 12.00 + 4.32 - 8.63 - 1.32 - 2.15 = 435.72
+  eq(ents[0].tax_collected_gross, "435.72", "combined: tax_collected_gross");
+  // marketplace_tax = 12.00
+  eq(ents[0].marketplace_tax_collected, "12.00", "combined: marketplace_tax");
+  // tax_owed = 435.72 - 12.00 = 423.72
+  eq(ents[0].tax_owed, "423.72", "combined: tax_owed");
+
+  const jurs = aggregateByJurisdiction(inputs, names, refunds, shipping, shipRefunds, unverified);
+  const sumJurCents = jurs[0].jurisdictions.reduce((a, j) => a + Math.round(parseFloat(j.tax_due) * 100), 0);
+  eq(sumJurCents, 42372, "combined: Σ jur tax_due === tax_owed (penny-exact)");
 }
 
 // ---------------------------------------------------------------------------

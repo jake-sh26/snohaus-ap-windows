@@ -151,6 +151,7 @@ import {
   type RefundForTax,
   type ShippingTaxForward,
   type ShippingTaxRefund,
+  type UnverifiedReturnTax,
 } from "./shopify-tax-aggregation";
 import {
   syncPayoutsIncremental,
@@ -4366,6 +4367,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     refunds: RefundForTax[];
     shippingTaxForward: ShippingTaxForward[];
     shippingTaxRefunds: ShippingTaxRefund[];
+    unverifiedReturnTax: UnverifiedReturnTax[];
     entityNames: Map<number, string>;
   } {
     const { sqlite } = require("./storage");
@@ -4783,7 +4785,85 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    return { inputs, refunds, shippingTaxForward, shippingTaxRefunds, entityNames };
+    // -----------------------------------------------------------------------
+    // PR #147 — Unverified-return tax delta (Rule #8 in by-store).
+    //
+    // Some returns are encoded on the order itself, not as a refund row: the
+    // customer returns merchandise and we issue a same-order gift card. The
+    // sale line stays at quantity=1, current_quantity=0; current_total_tax is
+    // shifted (typically to a negative cents value). By-store reconciles this
+    // in shopify-finance-diff.ts:401-423 by subtracting
+    //   (o.total_tax − o.current_total_tax)
+    // from its Taxes column, but ONLY for orders that have no recon_refunds
+    // row (otherwise regular refunds would double-count).
+    //
+    // We mirror that exactly: pull every order in the month (bucketed on
+    // o.processed_at|created_at — the same orderDateExprFor mode by-store
+    // uses by default) where current_total_tax differs from total_tax AND
+    // no recon_refunds row exists. Attribute via the order's dominant POS
+    // allocator (same cascade we use for shipping rows).
+    //
+    // March 2026 / Greenvale: order #37901 had total_tax=0,
+    // current_total_tax=-2.15 → delta = -(-2.15) = +2.15 → by-store reduced
+    // its Taxes by $2.15. Before PR #147 by-entity ignored this entirely and
+    // overstated Greenvale March by exactly $2.15.
+    const unverifiedRows: Array<{
+      order_id: string;
+      tax_delta: number;
+      pos_entity_id: number | null;
+      alloc_entity_id: number | null;
+    }> = sqlite.prepare(`
+      SELECT
+        o.id AS order_id,
+        (o.total_tax - o.current_total_tax) AS tax_delta,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos'
+            AND pl.active = 1
+          WHERE s.order_id = o.id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        COALESCE(
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = o.id AND a.line_item_id IS NULL LIMIT 1),
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = o.id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+        ) AS alloc_entity_id
+      FROM recon_orders o
+      WHERE substr(datetime(
+        COALESCE(o.processed_at, o.created_at),
+        '-5 hours'), 1, 7) = ?
+        AND o.current_total_tax IS NOT NULL
+        AND o.total_tax IS NOT NULL
+        AND (o.total_tax - o.current_total_tax) <> 0
+        AND NOT EXISTS (SELECT 1 FROM recon_refunds r WHERE r.order_id = o.id)
+    `).all(month) as any;
+
+    const unverifiedReturnTax: UnverifiedReturnTax[] = [];
+    for (const r of unverifiedRows) {
+      const deltaCents = Math.round(Number(r.tax_delta || 0) * 100);
+      if (deltaCents === 0) continue;
+      let entity_id = 0;
+      let is_pos = false;
+      if (r.pos_entity_id != null && posEntityIds.has(r.pos_entity_id)) {
+        entity_id = r.pos_entity_id;
+        is_pos = true;
+      } else if (r.alloc_entity_id != null && posEntityIds.has(r.alloc_entity_id)) {
+        entity_id = r.alloc_entity_id;
+        is_pos = false;
+      }
+      unverifiedReturnTax.push({
+        entity_id,
+        tax_delta_cents: deltaCents,
+        is_pos,
+      });
+    }
+
+    return { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames };
   }
 
   app.get("/api/recon/tax/by-entity/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
@@ -4792,15 +4872,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(400).json({ message: "Month must be YYYY-MM" });
     }
     try {
-      const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, entityNames } = loadTaxInputsForMonth(month);
-      const entities = aggregateByEntity(inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds);
+      const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames } = loadTaxInputsForMonth(month);
+      const entities = aggregateByEntity(inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax);
       const totals = sumEntities(entities);
       res.json({
         month,
         entities,
         totals,
-        note: "PR #143 + #145 + #146: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. PR #145: refund tax from recon_refund_line_items is SUBTRACTED in the refund's processed_at month, attributed to the original line's entity + jurisdictions. PR #146: shipping_lines tax (forward) is ADDED and shipping_refund adjustment tax is SUBTRACTED (ABS), matching by-store's Rule #7b. Money fields are strings (integer-cents internally) — no float drift. marketplace_* fields show the Shopify-facilitated portion (channel_liable=true); tax_owed excludes those.",
-        build_id: "pr146",
+        note: "PR #143 + #145 + #146 + #147: per-line tax aggregated from recon_line_items.tax_lines_json with the same entity-attribution cascade as /api/recon/finance/by-store/:month. PR #145: refund tax from recon_refund_line_items is SUBTRACTED in the refund's processed_at month, attributed to the original line's entity + jurisdictions. PR #146: shipping_lines tax (forward) is ADDED and shipping_refund adjustment tax is SUBTRACTED (ABS). PR #147: unverified-return tax delta (Rule #8: o.total_tax − o.current_total_tax for orders with no refund row) is SUBTRACTED, mirroring by-store. Σ jurisdictions.tax_due === entity.tax_owed (penny-exact) via residual reconciliation that uses aggregateByEntity's authoritative total as its target. Money fields are strings (integer-cents internally) — no float drift.",
+        build_id: "pr147",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax by-entity failed", error: String(e?.message || e) });
@@ -4833,23 +4913,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const allRefunds: RefundForTax[] = [];
       const allShipFwd: ShippingTaxForward[] = [];
       const allShipRef: ShippingTaxRefund[] = [];
+      const allUnverified: UnverifiedReturnTax[] = [];
       let entityNames = new Map<number, string>();
       for (const m of months) {
-        const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, entityNames: en } = loadTaxInputsForMonth(m);
+        const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames: en } = loadTaxInputsForMonth(m);
         all.push(...inputs);
         allRefunds.push(...refunds);
         allShipFwd.push(...shippingTaxForward);
         allShipRef.push(...shippingTaxRefunds);
+        allUnverified.push(...unverifiedReturnTax);
         for (const [k, v] of en) entityNames.set(k, v);
       }
 
-      const entities = aggregateByJurisdiction(all, entityNames, allRefunds, allShipFwd, allShipRef);
+      const entities = aggregateByJurisdiction(all, entityNames, allRefunds, allShipFwd, allShipRef, allUnverified);
       res.json({
         ...(isMonth ? { month: period } : { quarter: period, months_included: months }),
         ...(calendarFallback ? { quarter_calendar_fallback: true, note_quarter: "NY DTF quarter calendar lookup failed — defaulted to calendar quarters. TODO verify Pub 718-Q." } : {}),
         entities,
-        note: "PR #143 + #145 + #146: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #145: refund tax from recon_refund_line_items is subtracted in the refund's processed_at month, pro-rated across the original line's jurisdictions. PR #146: shipping_lines forward tax is added per its own jurisdictions; shipping_refund adjustment tax (no jurisdictions) is reconciled via entity-level residual into the largest jurisdiction bucket — Σ jurisdictions.tax_due === entity.tax_owed exactly. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
-        build_id: "pr146",
+        note: "PR #143 + #145 + #146 + #147: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #145: refund tax from recon_refund_line_items is subtracted in the refund's processed_at month, pro-rated across the original line's jurisdictions. PR #146: shipping_lines forward tax is added per its own jurisdictions; shipping_refund adjustment tax (no jurisdictions) is reconciled via entity-level residual into the largest jurisdiction bucket. PR #147: unverified-return tax delta (Rule #8) is reconciled the same way; residual reconciliation uses aggregateByEntity's authoritative tax_owed as its target so marketplace-only jurisdictions (FL/TX) don't leak. Σ jurisdictions.tax_due === entity.tax_owed exactly. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
+        build_id: "pr147",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax st810 failed", error: String(e?.message || e) });
