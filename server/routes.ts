@@ -5443,6 +5443,180 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ===================================================================
+  // PR #148 (debug) — per-order TAX diff to localize the $1.32 Huntington
+  // Dec 2025 residual between by-entity.tax_collected_gross (from
+  // recon_orders.tax_lines_json) and by-store.taxes (Σ recon_shopify_sales
+  // .total_tax). Same shape as per-order-gross-diff but tax-focused.
+  //
+  // GET /api/recon/finance/debug/per-order-tax-diff/:month?entity_id=N&limit=N
+  //   sales_tax        = Σ recon_shopify_sales.total_tax for rows where
+  //                      attributed_entity_id = :entity_id AND line_type != 'GIFT_CARD'
+  //                      (mirrors by-store.taxes math)
+  //   tax_lines_tax    = Σ tax_lines_json[].price across all line_items of
+  //                      recon_orders attributed to this entity, where the
+  //                      order's bucketing month = :month (mirrors by-entity)
+  //   diff = sales_tax - tax_lines_tax  (sorted by |diff| desc, top N)
+  // ===================================================================
+  app.get("/api/recon/finance/debug/per-order-tax-diff/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const entityIdRaw = req.query.entity_id;
+    if (entityIdRaw === undefined) {
+      return res.status(400).json({ message: "entity_id query param required" });
+    }
+    const entityId = Number(entityIdRaw);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ message: "entity_id must be a positive integer" });
+    }
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
+
+    try {
+      const { sqlite } = require("./storage");
+
+      // 1) Sales-ledger side: per-order Σ total_tax with the same
+      //    attribution cascade as by-store. Reuses the dominant-entity
+      //    fallback from PR #140b.
+      const salesRows: any[] = sqlite
+        .prepare(
+          `
+          WITH attributed AS (
+            SELECT
+              s.order_id,
+              s.total_tax,
+              s.line_type,
+              COALESCE(
+                CASE WHEN s.pos_location_id IS NOT NULL THEN
+                  (SELECT pl.entity_id
+                     FROM recon_entity_pos_locations pl
+                    WHERE pl.shopify_location_id = s.pos_location_id
+                      AND pl.kind = 'pos'
+                      AND pl.active = 1
+                    LIMIT 1)
+                END,
+                (SELECT a.entity_id FROM recon_allocations a
+                  WHERE a.order_id = s.order_id
+                    AND a.line_item_id = s.line_item_id LIMIT 1),
+                (SELECT a.entity_id FROM recon_allocations a
+                  WHERE a.order_id = s.order_id
+                    AND a.line_item_id IS NULL LIMIT 1),
+                (SELECT a.entity_id FROM recon_allocations a
+                  WHERE a.order_id = s.order_id
+                  GROUP BY a.entity_id
+                  ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+              ) AS attributed_entity_id
+            FROM recon_shopify_sales s
+            WHERE s.happened_month = ?
+          )
+          SELECT order_id,
+                 COALESCE(SUM(CASE WHEN line_type != 'GIFT_CARD' THEN total_tax ELSE 0 END), 0) AS sales_tax
+            FROM attributed
+           WHERE attributed_entity_id = ?
+           GROUP BY order_id
+           HAVING ABS(sales_tax) >= 0.005
+        `,
+        )
+        .all(month, entityId);
+      const salesMap = new Map<string, number>();
+      for (const r of salesRows) salesMap.set(String(r.order_id), Number(r.sales_tax) || 0);
+
+      // 2) tax_lines_json side: per-order Σ tax_lines_json[].price across
+      //    all line_items, attributed via the same cascade collapsed to
+      //    an order-level entity (use dominant-entity ranking on the
+      //    order's allocations). Only orders whose bucketing month
+      //    (processed_at ?? created_at, -5h ET) = :month.
+      const orderRows: any[] = sqlite
+        .prepare(
+          `
+          SELECT o.id          AS order_id,
+                 o.name        AS order_name,
+                 o.processed_at,
+                 o.created_at,
+                 o.raw_json,
+                 COALESCE(
+                   (SELECT a.entity_id FROM recon_allocations a
+                     WHERE a.order_id = o.id
+                       AND a.line_item_id IS NULL LIMIT 1),
+                   (SELECT a.entity_id FROM recon_allocations a
+                     WHERE a.order_id = o.id
+                     GROUP BY a.entity_id
+                     ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+                 ) AS order_entity_id
+            FROM recon_orders o
+           WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+        `,
+        )
+        .all(month);
+
+      const taxLinesMap = new Map<string, { name: string; tax: number }>();
+      for (const row of orderRows) {
+        if (row.order_entity_id !== entityId) continue;
+        let sumTl = 0;
+        try {
+          const raw = row.raw_json ? JSON.parse(row.raw_json) : null;
+          const lis = raw?.line_items || [];
+          for (const li of lis) {
+            const tls = li?.tax_lines || [];
+            for (const tl of tls) {
+              sumTl += Number(tl?.price) || 0;
+            }
+          }
+        } catch { /* malformed json — count as 0 */ }
+        if (Math.abs(sumTl) >= 0.005 || salesMap.has(String(row.order_id))) {
+          taxLinesMap.set(String(row.order_id), { name: row.order_name, tax: sumTl });
+        }
+      }
+
+      // 3) Walk union, compute diff. Round to cents.
+      const allIds = new Set<string>();
+      salesMap.forEach((_v, k) => allIds.add(k));
+      taxLinesMap.forEach((_v, k) => allIds.add(k));
+      const idsArr: string[] = [];
+      allIds.forEach((id) => idsArr.push(id));
+      const diffs: any[] = [];
+      let sumSales = 0, sumTl = 0, sumDiff = 0;
+      for (const id of idsArr) {
+        const sales = Math.round((salesMap.get(id) || 0) * 100) / 100;
+        const tl = taxLinesMap.get(id);
+        const tlTax = tl ? Math.round(tl.tax * 100) / 100 : 0;
+        const d = Math.round((sales - tlTax) * 100) / 100;
+        sumSales += sales;
+        sumTl += tlTax;
+        sumDiff += d;
+        if (Math.abs(d) >= 0.01) {
+          diffs.push({
+            order_id: id,
+            order_name: tl?.name || null,
+            sales_tax: sales,
+            tax_lines_tax: tlTax,
+            diff_sales_minus_tl: d,
+          });
+        }
+      }
+      diffs.sort((a, b) => Math.abs(b.diff_sales_minus_tl) - Math.abs(a.diff_sales_minus_tl));
+
+      res.json({
+        month,
+        entity_id: entityId,
+        counts: {
+          orders_with_sales_tax: salesMap.size,
+          orders_with_tax_lines: taxLinesMap.size,
+          diff_count: diffs.length,
+          sum_sales_tax: Math.round(sumSales * 100) / 100,
+          sum_tax_lines_tax: Math.round(sumTl * 100) / 100,
+          sum_diff: Math.round(sumDiff * 100) / 100,
+        },
+        diffs: diffs.slice(0, limit),
+        note: "PR #148-debug — per-order TAX diff. sales_tax = Σ recon_shopify_sales.total_tax (by-store path); tax_lines_tax = Σ recon_orders.raw_json.line_items[].tax_lines[].price (by-entity path). diff_sales_minus_tl > 0 means by-store sees more tax than by-entity.",
+        build_id: "pr148-debug-tax-diff",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "per-order-tax-diff failed", error: String(e?.message || e) });
+    }
+  });
+
+  // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
   // 4 endpoints behind the USE_AGREEMENTS_PROJECTOR feature flag. The V2
