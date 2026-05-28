@@ -5443,6 +5443,225 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ===================================================================
+  // PR #148-debug v2 — component-level tax breakdown for one entity-month.
+  // Returns the same 5 inputs aggregateByEntity uses, alongside the
+  // recon_shopify_sales subtotals by action_type/line_type that by-store
+  // reads. Tells us exactly which input bucket diverges by $1.32.
+  //
+  // GET /api/recon/finance/debug/tax-component-diff/:month?entity_id=N
+  // ===================================================================
+  app.get("/api/recon/finance/debug/tax-component-diff/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const entityIdRaw = req.query.entity_id;
+    if (entityIdRaw === undefined) {
+      return res.status(400).json({ message: "entity_id query param required" });
+    }
+    const entityId = Number(entityIdRaw);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ message: "entity_id must be a positive integer" });
+    }
+
+    try {
+      const { sqlite } = require("./storage");
+
+      // Helper: same attribution cascade as by-store, applied to recon_shopify_sales.
+      const salesByActionLine = sqlite.prepare(`
+        WITH attributed AS (
+          SELECT s.action_type, s.line_type, s.total_tax,
+            COALESCE(
+              CASE WHEN s.pos_location_id IS NOT NULL THEN
+                (SELECT pl.entity_id FROM recon_entity_pos_locations pl
+                  WHERE pl.shopify_location_id = s.pos_location_id
+                    AND pl.kind = 'pos' AND pl.active = 1 LIMIT 1)
+              END,
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id AND a.line_item_id = s.line_item_id LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id AND a.line_item_id IS NULL LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id
+                GROUP BY a.entity_id
+                ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+            ) AS aeid
+          FROM recon_shopify_sales s
+          WHERE s.happened_month = ?
+        )
+        SELECT action_type, line_type,
+               COALESCE(SUM(total_tax), 0) AS total_tax,
+               COUNT(*) AS n
+          FROM attributed
+         WHERE aeid = ?
+         GROUP BY action_type, line_type
+         ORDER BY action_type, line_type
+      `).all(month, entityId);
+
+      // Now compute each by-entity input bucket directly via the same SQL
+      // the routes.ts helper would use. Inline a minimal entity filter that
+      // mirrors the dominant-entity allocator for orders.
+      const orderEntityCte = `
+        WITH order_entity AS (
+          SELECT o.id AS order_id,
+            substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) AS bucket_month,
+            COALESCE(
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = o.id AND a.line_item_id IS NULL LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = o.id
+                GROUP BY a.entity_id
+                ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+            ) AS entity_id
+          FROM recon_orders o
+        )
+      `;
+
+      // (1) forward tax = Σ tax_lines_json.price across all line_items of
+      //     orders bucketed to :month and attributed to :entity_id.
+      const fwdRows: any[] = sqlite.prepare(`
+        ${orderEntityCte}
+        SELECT o.id, o.raw_json
+          FROM recon_orders o
+          JOIN order_entity oe ON oe.order_id = o.id
+         WHERE oe.bucket_month = ? AND oe.entity_id = ?
+      `).all(month, entityId);
+      let fwdTaxCents = 0;
+      let fwdShipTaxCents = 0;
+      for (const r of fwdRows) {
+        try {
+          const raw = JSON.parse(r.raw_json || 'null');
+          for (const li of (raw?.line_items || [])) {
+            if (li?.gift_card) continue;
+            for (const tl of (li?.tax_lines || [])) fwdTaxCents += Math.round((Number(tl?.price) || 0) * 100);
+          }
+          for (const sl of (raw?.shipping_lines || [])) {
+            for (const tl of (sl?.tax_lines || [])) fwdShipTaxCents += Math.round((Number(tl?.price) || 0) * 100);
+          }
+        } catch { /* skip malformed */ }
+      }
+
+      // (2) item refund tax = Σ recon_refund_line_items.total_tax for kind='item'
+      //     bucketed by refund processed_at-5h to :month, with original order attributed to :entity_id.
+      const itemRefundRow: any = sqlite.prepare(`
+        ${orderEntityCte}
+        SELECT COALESCE(SUM(rli.total_tax), 0) AS refund_tax, COUNT(*) AS n
+          FROM recon_refund_line_items rli
+          JOIN recon_refunds rf ON rf.id = rli.refund_id
+          JOIN order_entity oe ON oe.order_id = rf.order_id
+         WHERE substr(datetime(COALESCE(rf.processed_at, rf.created_at), '-5 hours'), 1, 7) = ?
+           AND oe.entity_id = ?
+           AND rli.kind = 'item'
+      `).get(month, entityId);
+      const itemRefundTaxCents = Math.round((Number(itemRefundRow.refund_tax) || 0) * 100);
+
+      // (3) shipping refund tax = Σ ABS(rli.total_tax) for kind='adjustment' AND adjustment_kind='shipping_refund'
+      const shipRefundRow: any = sqlite.prepare(`
+        ${orderEntityCte}
+        SELECT COALESCE(SUM(ABS(rli.total_tax)), 0) AS sr_tax, COUNT(*) AS n
+          FROM recon_refund_line_items rli
+          JOIN recon_refunds rf ON rf.id = rli.refund_id
+          JOIN order_entity oe ON oe.order_id = rf.order_id
+         WHERE substr(datetime(COALESCE(rf.processed_at, rf.created_at), '-5 hours'), 1, 7) = ?
+           AND oe.entity_id = ?
+           AND rli.kind = 'adjustment'
+           AND rli.adjustment_kind = 'shipping_refund'
+      `).get(month, entityId);
+      const shipRefundTaxCents = Math.round((Number(shipRefundRow.sr_tax) || 0) * 100);
+
+      // (4) any OTHER adjustment-kind (non shipping_refund) refund tax — PR #147 says these
+      //     should pass through with total_tax=0 typically, but let's confirm.
+      const otherAdjRow: any = sqlite.prepare(`
+        ${orderEntityCte}
+        SELECT COALESCE(SUM(rli.total_tax), 0) AS other_tax, COUNT(*) AS n,
+               GROUP_CONCAT(DISTINCT rli.adjustment_kind) AS kinds
+          FROM recon_refund_line_items rli
+          JOIN recon_refunds rf ON rf.id = rli.refund_id
+          JOIN order_entity oe ON oe.order_id = rf.order_id
+         WHERE substr(datetime(COALESCE(rf.processed_at, rf.created_at), '-5 hours'), 1, 7) = ?
+           AND oe.entity_id = ?
+           AND rli.kind = 'adjustment'
+           AND COALESCE(rli.adjustment_kind, '') != 'shipping_refund'
+      `).get(month, entityId);
+      const otherAdjTaxCents = Math.round((Number(otherAdjRow.other_tax) || 0) * 100);
+
+      // (5) unverified-return tax = Σ (o.total_tax - o.current_total_tax) for orders
+      //     with no recon_refunds row (Rule #8). Mirrors shopify-finance-diff.ts:401-423.
+      const unvRow: any = sqlite.prepare(`
+        ${orderEntityCte}
+        SELECT COALESCE(SUM(
+          CASE WHEN o.total_tax IS NOT NULL AND o.current_total_tax IS NOT NULL
+               THEN (o.total_tax - o.current_total_tax) ELSE 0 END
+        ), 0) AS unv_tax,
+               COUNT(*) AS n
+          FROM recon_orders o
+          JOIN order_entity oe ON oe.order_id = o.id
+         WHERE oe.bucket_month = ?
+           AND oe.entity_id = ?
+           AND NOT EXISTS (SELECT 1 FROM recon_refunds rf WHERE rf.order_id = o.id)
+           AND COALESCE(o.total_tax, 0) != COALESCE(o.current_total_tax, 0)
+      `).get(month, entityId);
+      const unvTaxCents = Math.round((Number(unvRow.unv_tax) || 0) * 100);
+
+      // Compose tax_collected_gross the same way aggregateByEntity does:
+      const aggregateByEntityFormula =
+        fwdTaxCents - itemRefundTaxCents + fwdShipTaxCents - shipRefundTaxCents - unvTaxCents;
+
+      // by-store taxes from the salesByActionLine aggregation (line_type != GIFT_CARD).
+      let bsTaxCents = 0;
+      for (const r of (salesByActionLine as any[])) {
+        if ((r.line_type || '') === 'GIFT_CARD') continue;
+        bsTaxCents += Math.round((Number(r.total_tax) || 0) * 100);
+      }
+
+      const fmt = (c: number) => (c / 100).toFixed(2);
+
+      res.json({
+        month,
+        entity_id: entityId,
+        components: {
+          fwd_line_tax_cents:       fwdTaxCents,
+          item_refund_tax_cents:    itemRefundTaxCents,
+          fwd_ship_tax_cents:       fwdShipTaxCents,
+          ship_refund_tax_cents:    shipRefundTaxCents,
+          unverified_return_tax_cents: unvTaxCents,
+          other_adjustment_tax_cents:  otherAdjTaxCents,
+          fwd_line_tax_dollars:       fmt(fwdTaxCents),
+          item_refund_tax_dollars:    fmt(itemRefundTaxCents),
+          fwd_ship_tax_dollars:       fmt(fwdShipTaxCents),
+          ship_refund_tax_dollars:    fmt(shipRefundTaxCents),
+          unverified_return_tax_dollars: fmt(unvTaxCents),
+          other_adjustment_tax_dollars: fmt(otherAdjTaxCents),
+          other_adjustment_kinds: otherAdjRow.kinds || null,
+        },
+        component_counts: {
+          fwd_orders: fwdRows.length,
+          item_refund_rows: Number(itemRefundRow.n) || 0,
+          ship_refund_rows: Number(shipRefundRow.n) || 0,
+          other_adj_rows: Number(otherAdjRow.n) || 0,
+          unv_orders: Number(unvRow.n) || 0,
+        },
+        formula: {
+          description: "tax_collected_gross = fwd_line + fwd_ship - item_refund - ship_refund - unverified_return",
+          tax_collected_gross_cents: aggregateByEntityFormula,
+          tax_collected_gross_dollars: fmt(aggregateByEntityFormula),
+        },
+        by_store: {
+          taxes_cents: bsTaxCents,
+          taxes_dollars: fmt(bsTaxCents),
+          breakdown_by_action_line: salesByActionLine,
+        },
+        delta_cents: aggregateByEntityFormula - bsTaxCents,
+        delta_dollars: fmt(aggregateByEntityFormula - bsTaxCents),
+        note: "PR #148-debug v2 — component-level tax breakdown. Compare each input to by_store.breakdown_by_action_line. If delta non-zero, the difference lives in whichever component matches the missing row.",
+        build_id: "pr148-debug-tax-component-diff",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "tax-component-diff failed", error: String(e?.message || e) });
+    }
+  });
+
+  // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
   // 4 endpoints behind the USE_AGREEMENTS_PROJECTOR feature flag. The V2
