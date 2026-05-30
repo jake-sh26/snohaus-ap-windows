@@ -6196,6 +6196,179 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // -------------------------------------------------------------------
+  // PR #155-debug — refund-tax-per-order
+  //   Splits the entity-vs-store gap by order: for the given month + entity,
+  //   returns, per order_id, entity's item_refund_tax contribution
+  //   (loop #2 of aggregateByEntity) vs by-store's RETURN/PRODUCT sum
+  //   (recon_shopify_sales attributed via the standard cascade).
+  //   The order(s) whose deltas sum to the residual gap fall out the top
+  //   when sorted by ABS(delta) DESC.
+  // GET /api/recon/finance/debug/refund-tax-per-order/:month?entity_id=N
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/refund-tax-per-order/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const entityIdRaw = req.query.entity_id;
+    if (entityIdRaw === undefined) {
+      return res.status(400).json({ message: "entity_id query param required" });
+    }
+    const entityId = Number(entityIdRaw);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ message: "entity_id must be a positive integer" });
+    }
+
+    try {
+      const { sqlite } = require("./storage");
+
+      // ----- ENTITY SIDE (loop #2): use loadTaxInputsForMonth so we read
+      // EXACTLY what aggregateByEntity reads (post-attribution + filters).
+      const { refunds } = loadTaxInputsForMonth(month);
+      const entityByOrder = new Map<string, { cents: number; rows: number }>();
+      for (const r of refunds as any[]) {
+        if (r.entity_id !== entityId) continue;
+        const oid = String(r.order_id);
+        const cents = Math.round(Number(r.refund_tax || 0) * 100);
+        const cur = entityByOrder.get(oid) || { cents: 0, rows: 0 };
+        cur.cents += cents;
+        cur.rows += 1;
+        entityByOrder.set(oid, cur);
+      }
+
+      // ----- BY-STORE SIDE: RETURN/PRODUCT rows attributed to this entity
+      // using the same cascade as by-store.
+      const bsRows = sqlite.prepare(`
+        WITH attributed AS (
+          SELECT s.order_id, s.total_tax,
+            COALESCE(
+              CASE WHEN s.pos_location_id IS NOT NULL THEN
+                (SELECT pl.entity_id FROM recon_entity_pos_locations pl
+                  WHERE pl.shopify_location_id = s.pos_location_id
+                    AND pl.kind = 'pos' AND pl.active = 1 LIMIT 1)
+              END,
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id AND a.line_item_id = s.line_item_id LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id AND a.line_item_id IS NULL LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id
+                GROUP BY a.entity_id
+                ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+            ) AS aeid
+          FROM recon_shopify_sales s
+          WHERE s.happened_month = ?
+            AND s.action_type = 'RETURN'
+            AND s.line_type   = 'PRODUCT'
+        )
+        SELECT order_id,
+               COALESCE(SUM(total_tax), 0) AS total_tax,
+               COUNT(*) AS n
+          FROM attributed
+         WHERE aeid = ?
+         GROUP BY order_id
+      `).all(month, entityId) as Array<{ order_id: string; total_tax: number; n: number }>;
+
+      const bsByOrder = new Map<string, { cents: number; rows: number }>();
+      for (const r of bsRows) {
+        // by-store RETURN/PRODUCT tax is signed-negative; we want absolute
+        // refund tax for direct comparison to entity's item_refund_tax.
+        const cents = Math.abs(Math.round(Number(r.total_tax || 0) * 100));
+        bsByOrder.set(String(r.order_id), { cents, rows: r.n });
+      }
+
+      // Merge both sides into one row-per-order list.
+      const allOrderIds = new Set<string>();
+      entityByOrder.forEach((_v, k) => allOrderIds.add(k));
+      bsByOrder.forEach((_v, k) => allOrderIds.add(k));
+      const fmt = (c: number) => (c / 100).toFixed(2);
+      const merged: Array<{
+        order_id: string;
+        entity_item_refund_tax_dollars: string;
+        entity_rows: number;
+        bystore_return_product_tax_dollars: string;
+        bystore_rows: number;
+        delta_dollars: string;
+        delta_cents: number;
+      }> = [];
+      let totalEntityCents = 0;
+      let totalBsCents = 0;
+      allOrderIds.forEach((oid) => {
+        const e = entityByOrder.get(oid) || { cents: 0, rows: 0 };
+        const b = bsByOrder.get(oid) || { cents: 0, rows: 0 };
+        totalEntityCents += e.cents;
+        totalBsCents += b.cents;
+        const deltaCents = e.cents - b.cents; // entity - store
+        merged.push({
+          order_id: oid,
+          entity_item_refund_tax_dollars: fmt(e.cents),
+          entity_rows: e.rows,
+          bystore_return_product_tax_dollars: fmt(b.cents),
+          bystore_rows: b.rows,
+          delta_dollars: ((deltaCents) / 100).toFixed(2),
+          delta_cents: deltaCents,
+        });
+      });
+      merged.sort((a, b) => Math.abs(b.delta_cents) - Math.abs(a.delta_cents));
+
+      // Enrich the top-20 non-zero deltas with order_name + refund_line_items
+      // detail so the diagnosis is one paste away.
+      const topNonZero = merged.filter((r) => r.delta_cents !== 0).slice(0, 20);
+      const enriched: any[] = [];
+      for (const row of topNonZero) {
+        const hdr = sqlite.prepare(`SELECT id, name FROM recon_orders WHERE id = ?`).get(row.order_id) as any;
+        const rlis = sqlite.prepare(`
+          SELECT rli.id AS rli_id, rli.refund_id, rli.line_item_id,
+                 rli.kind, rli.adjustment_kind, rli.restock_type,
+                 rli.quantity, rli.subtotal, rli.total_tax,
+                 rf.processed_at AS refund_processed_at,
+                 li.is_gift_card AS line_is_gift_card,
+                 li.sku AS line_sku
+            FROM recon_refund_line_items rli
+            JOIN recon_refunds rf ON rf.id = rli.refund_id
+       LEFT JOIN recon_line_items li ON li.id = rli.line_item_id
+           WHERE rli.order_id = ?
+             AND substr(rf.processed_at, 1, 7) = ?
+           ORDER BY rli.id
+        `).all(row.order_id, month) as any[];
+        const bsDetail = sqlite.prepare(`
+          SELECT action_type, line_type, line_item_id, total_tax,
+                 total_amount, quantity, pos_location_id, happened_at
+            FROM recon_shopify_sales
+           WHERE order_id = ?
+             AND happened_month = ?
+             AND action_type = 'RETURN'
+           ORDER BY happened_at, line_item_id
+        `).all(row.order_id, month) as any[];
+        enriched.push({
+          ...row,
+          order_name: hdr?.name ?? null,
+          recon_refund_line_items_in_month: rlis,
+          recon_shopify_sales_return_rows_in_month: bsDetail,
+        });
+      }
+
+      res.json({
+        month,
+        entity_id: entityId,
+        totals: {
+          entity_item_refund_tax_dollars:    fmt(totalEntityCents),
+          bystore_return_product_tax_dollars: fmt(totalBsCents),
+          delta_dollars:                     fmt(totalEntityCents - totalBsCents),
+        },
+        order_count: merged.length,
+        nonzero_delta_count: merged.filter((r) => r.delta_cents !== 0).length,
+        top_diffs: enriched,
+        all_orders: merged,
+        note: "PR #155-debug — entity loop #2 (recon_refund_line_items kind='item', non-gift-card, attributed via loadTaxInputsForMonth) vs by-store RETURN/PRODUCT (recon_shopify_sales attributed via cascade). delta_cents = entity - store. Both compared in ABSOLUTE refund-tax magnitude. Top 20 are enriched with the underlying refund + RETURN rows in-month.",
+        build_id: "pr155-debug-refund-tax-per-order",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "refund-tax-per-order failed", error: String(e?.message || e) });
+    }
+  });
+
   // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
