@@ -6113,18 +6113,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
       } catch {}
 
-      // 5) Refund line items.
+      // 5) Refund line items. recon_refund_line_items has no created_at;
+      // timestamps live on the parent recon_refunds (processed_at/created_at).
       const refundLineItems = sqlite.prepare(`
-        SELECT refund_id, line_item_id, kind, adjustment_kind,
-               quantity, subtotal, total_tax, created_at
-          FROM recon_refund_line_items
-         WHERE order_id = ?
-         ORDER BY created_at, refund_id, line_item_id
+        SELECT rli.id AS rli_id, rli.refund_id, rli.line_item_id,
+               rli.kind, rli.adjustment_kind, rli.restock_type,
+               rli.quantity, rli.subtotal, rli.total_tax,
+               rf.processed_at AS refund_processed_at,
+               rf.created_at   AS refund_created_at
+          FROM recon_refund_line_items rli
+          JOIN recon_refunds rf ON rf.id = rli.refund_id
+         WHERE rli.order_id = ?
+         ORDER BY rf.processed_at, rli.refund_id, rli.line_item_id
       `).all(orderId);
 
-      // 6) Allocations for this order.
+      // 6) Allocations for this order. recon_allocations columns:
+      // id, order_id, line_item_id, entity_id, share, gross_amount, tax_amount, method, reason
       const allocations = sqlite.prepare(`
-        SELECT entity_id, line_item_id, gross_amount, allocation_kind
+        SELECT entity_id, line_item_id, share, gross_amount, tax_amount, method, reason
           FROM recon_allocations
          WHERE order_id = ?
          ORDER BY entity_id, line_item_id
