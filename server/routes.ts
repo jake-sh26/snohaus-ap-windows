@@ -6032,15 +6032,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const { sqlite } = require("./storage");
 
-      // 1) Order header.
+      // 1) Order header. recon_orders.id is the order_id.
       const orderHeader = sqlite.prepare(`
-        SELECT order_id, order_name, processed_at, created_at, updated_at,
+        SELECT id AS order_id, name AS order_name, processed_at, created_at, updated_at,
                total_tax, current_total_tax, total_price, current_total_price,
-               subtotal_price, total_shipping, financial_status,
-               json_extract(raw_json, '$.taxes_included') AS taxes_included,
-               json_extract(raw_json, '$.tax_exempt')     AS tax_exempt
+               subtotal, total_shipping,
+               json_extract(raw_json, '$.financial_status') AS financial_status,
+               json_extract(raw_json, '$.taxes_included')   AS taxes_included,
+               json_extract(raw_json, '$.tax_exempt')       AS tax_exempt
           FROM recon_orders
-         WHERE order_id = ?
+         WHERE id = ?
       `).get(orderId);
 
       // 2) ALL recon_shopify_sales rows for the order.
@@ -6053,9 +6054,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
          ORDER BY happened_at, action_type, line_type, line_item_id
       `).all(orderId);
 
-      // 3) recon_line_items + their tax_lines_json totals.
+      // 3) recon_line_items + their tax_lines_json totals. recon_line_items.id
+      // is the line_item_id; order_id is FK to recon_orders.id.
       const lineItems = sqlite.prepare(`
-        SELECT line_item_id, sku, title, quantity, price,
+        SELECT id AS line_item_id, sku, title, quantity, price,
                is_gift_card, recognized_at, tax_lines_json
           FROM recon_line_items
          WHERE order_id = ?
@@ -6084,7 +6086,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       let rawLineTaxByLi: Record<string, { count: number; cents: number }> = {};
       let rawShipTax = { count: 0, cents: 0 };
       try {
-        const raw = sqlite.prepare(`SELECT raw_json FROM recon_orders WHERE order_id = ?`).get(orderId) as any;
+        const raw = sqlite.prepare(`SELECT raw_json FROM recon_orders WHERE id = ?`).get(orderId) as any;
         const rj = raw?.raw_json ? JSON.parse(raw.raw_json) : null;
         if (rj && Array.isArray(rj.line_items)) {
           for (const li of rj.line_items) {
