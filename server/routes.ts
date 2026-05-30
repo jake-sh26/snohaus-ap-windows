@@ -6014,6 +6014,181 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ===================================================================
+  // PR #152-debug — order-tax-truth: dump everything tax-related for one
+  // order_id across recon_shopify_sales (ORDER + UPDATE + RETURN rows),
+  // recon_line_items (tax_lines_json totals), recon_orders.raw_json
+  // (line_items[].tax_lines + shipping_lines[].tax_lines), and
+  // recon_refund_line_items. Goal: localize the \$1.32 between by-entity
+  // and by-store for order_id (default 6223048868082).
+  //
+  // GET /api/recon/finance/debug/order-tax-truth/:order_id
+  // ===================================================================
+  app.get("/api/recon/finance/debug/order-tax-truth/:order_id", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const orderId = String(req.params.order_id);
+    if (!/^[0-9]+$/.test(orderId)) {
+      return res.status(400).json({ message: "order_id must be numeric" });
+    }
+
+    try {
+      const { sqlite } = require("./storage");
+
+      // 1) Order header.
+      const orderHeader = sqlite.prepare(`
+        SELECT order_id, order_name, processed_at, created_at, updated_at,
+               total_tax, current_total_tax, total_price, current_total_price,
+               subtotal_price, total_shipping, financial_status,
+               json_extract(raw_json, '$.taxes_included') AS taxes_included,
+               json_extract(raw_json, '$.tax_exempt')     AS tax_exempt
+          FROM recon_orders
+         WHERE order_id = ?
+      `).get(orderId);
+
+      // 2) ALL recon_shopify_sales rows for the order.
+      const sales = sqlite.prepare(`
+        SELECT action_type, line_type, line_item_id,
+               total_tax, total_amount, quantity,
+               pos_location_id, happened_at, happened_month
+          FROM recon_shopify_sales
+         WHERE order_id = ?
+         ORDER BY happened_at, action_type, line_type, line_item_id
+      `).all(orderId);
+
+      // 3) recon_line_items + their tax_lines_json totals.
+      const lineItems = sqlite.prepare(`
+        SELECT line_item_id, sku, title, quantity, price,
+               is_gift_card, recognized_at, tax_lines_json
+          FROM recon_line_items
+         WHERE order_id = ?
+      `).all(orderId);
+
+      const liEnriched = (lineItems as any[]).map((li) => {
+        let txCents = 0;
+        let txCount = 0;
+        try {
+          const tls = JSON.parse(li.tax_lines_json || '[]');
+          if (Array.isArray(tls)) {
+            txCount = tls.length;
+            for (const t of tls) {
+              txCents += Math.round(Number(t?.price || 0) * 100);
+            }
+          }
+        } catch {}
+        return {
+          ...li,
+          tax_lines_count: txCount,
+          tax_lines_total_dollars: (txCents / 100).toFixed(2),
+        };
+      });
+
+      // 4) recon_orders.raw_json.line_items[].tax_lines + shipping_lines[].tax_lines.
+      let rawLineTaxByLi: Record<string, { count: number; cents: number }> = {};
+      let rawShipTax = { count: 0, cents: 0 };
+      try {
+        const raw = sqlite.prepare(`SELECT raw_json FROM recon_orders WHERE order_id = ?`).get(orderId) as any;
+        const rj = raw?.raw_json ? JSON.parse(raw.raw_json) : null;
+        if (rj && Array.isArray(rj.line_items)) {
+          for (const li of rj.line_items) {
+            const key = String(li?.id ?? '');
+            let c = 0, n = 0;
+            if (Array.isArray(li?.tax_lines)) {
+              for (const t of li.tax_lines) {
+                c += Math.round(Number(t?.price || 0) * 100);
+                n++;
+              }
+            }
+            rawLineTaxByLi[key] = { count: n, cents: c };
+          }
+        }
+        if (rj && Array.isArray(rj.shipping_lines)) {
+          for (const sl of rj.shipping_lines) {
+            if (Array.isArray(sl?.tax_lines)) {
+              for (const t of sl.tax_lines) {
+                rawShipTax.cents += Math.round(Number(t?.price || 0) * 100);
+                rawShipTax.count++;
+              }
+            }
+          }
+        }
+      } catch {}
+
+      // 5) Refund line items.
+      const refundLineItems = sqlite.prepare(`
+        SELECT refund_id, line_item_id, kind, adjustment_kind,
+               quantity, subtotal, total_tax, created_at
+          FROM recon_refund_line_items
+         WHERE order_id = ?
+         ORDER BY created_at, refund_id, line_item_id
+      `).all(orderId);
+
+      // 6) Allocations for this order.
+      const allocations = sqlite.prepare(`
+        SELECT entity_id, line_item_id, gross_amount, allocation_kind
+          FROM recon_allocations
+         WHERE order_id = ?
+         ORDER BY entity_id, line_item_id
+      `).all(orderId);
+
+      // Aggregate by_store-style for this order alone (excluding GIFT_CARD).
+      let salesTaxCents = 0;
+      const salesByAL: Record<string, number> = {};
+      for (const r of (sales as any[])) {
+        const k = `${r.action_type}/${r.line_type}`;
+        salesByAL[k] = (salesByAL[k] || 0) + Math.round((Number(r.total_tax) || 0) * 100);
+        if ((r.line_type || '') !== 'GIFT_CARD') {
+          salesTaxCents += Math.round((Number(r.total_tax) || 0) * 100);
+        }
+      }
+
+      // Aggregate component-style: fwd_line (from recon_line_items.tax_lines_json,
+      // gift cards skipped) + fwd_ship (from raw_json.shipping_lines.tax_lines)
+      // - item_refund_tax (from recon_refund_line_items.kind='item')
+      // - ship_refund_tax (from recon_refund_line_items.adjustment_kind='shipping_refund').
+      let compFwdLineCents = 0;
+      for (const li of liEnriched) {
+        if (li.is_gift_card) continue;
+        compFwdLineCents += Math.round(Number(li.tax_lines_total_dollars) * 100);
+      }
+      let compItemRefundCents = 0;
+      let compShipRefundCents = 0;
+      for (const r of (refundLineItems as any[])) {
+        const taxCents = Math.round(Math.abs(Number(r.total_tax) || 0) * 100);
+        if (r.kind === 'item') compItemRefundCents += taxCents;
+        else if (r.kind === 'adjustment' && r.adjustment_kind === 'shipping_refund') compShipRefundCents += taxCents;
+      }
+      const compFwdShipCents = rawShipTax.cents;
+      const compFormulaCents = compFwdLineCents + compFwdShipCents - compItemRefundCents - compShipRefundCents;
+
+      res.json({
+        order_id: orderId,
+        order_header: orderHeader || null,
+        shopify_sales_rows: sales,
+        shopify_sales_rollup_by_action_line_dollars: Object.fromEntries(
+          Object.entries(salesByAL).map(([k, v]) => [k, ((v as number) / 100).toFixed(2)])
+        ),
+        shopify_sales_total_tax_ex_giftcard_dollars: (salesTaxCents / 100).toFixed(2),
+        line_items: liEnriched,
+        raw_json_line_tax_by_line_item: Object.fromEntries(
+          Object.entries(rawLineTaxByLi).map(([k, v]) => [k, { count: v.count, total_dollars: (v.cents / 100).toFixed(2) }])
+        ),
+        raw_json_shipping_tax: { count: rawShipTax.count, total_dollars: (rawShipTax.cents / 100).toFixed(2) },
+        refund_line_items: refundLineItems,
+        allocations,
+        component_view: {
+          fwd_line_tax_dollars:    (compFwdLineCents / 100).toFixed(2),
+          fwd_ship_tax_dollars:    (compFwdShipCents / 100).toFixed(2),
+          item_refund_tax_dollars: (compItemRefundCents / 100).toFixed(2),
+          ship_refund_tax_dollars: (compShipRefundCents / 100).toFixed(2),
+          formula_dollars:         (compFormulaCents / 100).toFixed(2),
+        },
+        delta_dollars: ((compFormulaCents - salesTaxCents) / 100).toFixed(2),
+        build_id: "pr152-debug-order-tax-truth",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "order-tax-truth failed", error: String(e?.message || e) });
+    }
+  });
+
+  // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
   // 4 endpoints behind the USE_AGREEMENTS_PROJECTOR feature flag. The V2
