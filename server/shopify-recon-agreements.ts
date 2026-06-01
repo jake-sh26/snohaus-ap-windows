@@ -5,8 +5,8 @@
  * PURPOSE
  * -------
  * Mirror Shopify's `Order.agreements -> sales` ledger directly into our
- * database so we can project recon_revenue_events 1:1 from the same
- * source that powers Shopify's own finance reports.
+ * database, sourced 1:1 from the same ledger that powers Shopify's own
+ * finance reports.
  *
  * Path A (synthesize edit-deltas from our hand-rolled detector rules) was
  * abandoned because it kept drifting from Shopify in edge cases (returns,
@@ -114,8 +114,8 @@
  *
  * WARNINGS
  * --------
- * Re-uses the existing `recon_event_warnings` table from
- * shopify-recon-revenue-events.ts. Malformed sale nodes (missing
+ * Owns the `recon_event_warnings` table (created in
+ * ensureShopifyAgreementsSchema). Malformed sale nodes (missing
  * happenedAt, unrecognized sale_type, etc.) log a warning and skip.
  * The schema migration itself never throws.
  */
@@ -285,7 +285,8 @@ function buildTaxBreakdown(
 }
 
 // ---------------------------------------------------------------------------
-// Warnings logging — reuses recon_event_warnings table from PR #94.
+// Warnings logging — writes to the recon_event_warnings table owned by
+// ensureShopifyAgreementsSchema.
 // ---------------------------------------------------------------------------
 
 function logWarning(
@@ -316,8 +317,7 @@ export function ensureShopifyAgreementsSchema(): void {
       id TEXT PRIMARY KEY,
       order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
       happened_at TEXT NOT NULL,
-      -- Store-local (ET) YYYY-MM bucket. Matches recon_revenue_events
-      -- convention so the two ledgers join cleanly on event_month.
+      -- Store-local (ET) YYYY-MM bucket (UTC-5 offset).
       happened_month TEXT GENERATED ALWAYS AS
         (substr(datetime(happened_at, '-5 hours'), 1, 7)) VIRTUAL,
       reason TEXT NOT NULL,
@@ -376,6 +376,21 @@ export function ensureShopifyAgreementsSchema(): void {
       ON recon_shopify_sales(action_type);
     CREATE INDEX IF NOT EXISTS idx_recon_shopify_sales_happened_at
       ON recon_shopify_sales(happened_at);
+
+    CREATE TABLE IF NOT EXISTS recon_event_warnings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT,
+      refund_id TEXT,
+      line_item_id TEXT,
+      event_type TEXT,
+      reason TEXT NOT NULL,
+      detail_json TEXT,
+      logged_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_event_warnings_order
+      ON recon_event_warnings(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_event_warnings_logged_at
+      ON recon_event_warnings(logged_at);
   `);
 
   // PR #125 — Store-attribution columns sourced from ShopifyQL `sales`
