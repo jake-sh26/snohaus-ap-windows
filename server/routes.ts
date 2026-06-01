@@ -7198,6 +7198,230 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // -------------------------------------------------------------------
+  // PR #162 — Web-order fulfillment backfill.
+  //
+  // Some historical WEB orders never got recon_allocations rows because the
+  // allocator only routed by order.location_id (null for web) and the
+  // dedicated recon_order_fulfillments / recon_fulfillment_orders tables were
+  // empty for them — even though raw_json.fulfillments[] carried the real
+  // ship-from location. PR #162 added a raw_json.fulfillments[] fallback to
+  // the allocator (branch b2). This endpoint re-runs the now-fixed allocator
+  // over every NY-month that contains a candidate order, picking up the fix.
+  //
+  // Candidate = a non-gift-card order line that currently attributes to
+  // entity_id=0 (Unallocated) AND whose order.raw_json carries a successful
+  // fulfillment. Re-running runAllocationEngine(month) is idempotent (it
+  // deletes only non-manual allocations for the month then rewrites), so
+  // running this endpoint twice does not double-write recon_allocations rows.
+  //
+  // POST /api/recon/finance/debug/backfill-web-fulfillment-allocations
+  // Body (optional): { dry_run?: boolean }
+  app.post("/api/recon/finance/debug/backfill-web-fulfillment-allocations", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    const { sqlite } = require("./storage");
+    const dryRun = req.body?.dry_run === true;
+
+    // POS entity set — same definition the attribution engine uses to decide
+    // whether a candidate entity counts as "allocated" vs collapses to 0.
+    const posEntitySet = new Set<number>(
+      (sqlite.prepare(`
+        SELECT entity_id FROM recon_entity_pos_locations
+         WHERE kind = 'pos' AND active = 1 AND shopify_location_id IS NOT NULL
+      `).all() as any[]).map((r) => Number(r.entity_id)),
+    );
+
+    // Enumerate candidate orders: a forward (non-gift-card) line in
+    // v_attributed_sales whose best attribution candidate is NOT a POS entity
+    // (i.e. it lands in Unallocated/0), AND whose order.raw_json carries a
+    // successful fulfillment. We compute "still unallocated" in JS using the
+    // same pickEntity cascade as computeAttributionForMonth so the candidate
+    // set matches what the by-store report shows as Unallocated.
+    const pickEntity = (
+      perLineEid: number | null,
+      orderEid: number | null,
+      dominantEid: number | null,
+    ): number => {
+      if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
+      if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
+      if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
+      return 0;
+    };
+
+    try {
+      // Pull every forward line + its allocation candidates + the order's
+      // raw_json fulfillment-success flag + its NY month. INSTR keeps the scan
+      // cheap (no JSON.parse of every order) — we only need to know whether a
+      // successful fulfillment exists at all.
+      const rows = sqlite.prepare(`
+        SELECT
+          v.order_id,
+          v.line_item_id,
+          v.happened_month,
+          v.per_line_entity_id,
+          v.order_entity_id,
+          v.dominant_entity_id,
+          (CASE WHEN o.raw_json IS NOT NULL
+                 AND INSTR(o.raw_json, '"fulfillments"') > 0
+                 AND INSTR(o.raw_json, '"status":"success"') > 0
+                THEN 1 ELSE 0 END) AS has_success_fulfillment,
+          o.name AS order_name
+        FROM v_attributed_sales v
+        JOIN recon_orders o ON o.id = v.order_id
+      `).all() as any[];
+
+      const candidateMonths = new Set<string>();
+      const candidateOrderIds = new Set<string>();
+      const candidateOrderNames = new Map<string, string | null>();
+      for (const r of rows) {
+        const eid = pickEntity(r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id);
+        if (eid !== 0) continue;                      // already allocated
+        if (Number(r.has_success_fulfillment) !== 1) continue; // no fulfillment to route by
+        if (r.happened_month) candidateMonths.add(String(r.happened_month));
+        candidateOrderIds.add(String(r.order_id));
+        candidateOrderNames.set(String(r.order_id), r.order_name ?? null);
+      }
+
+      const candidates_found = candidateOrderIds.size;
+      const months = Array.from(candidateMonths).sort();
+
+      if (dryRun) {
+        return res.json({
+          build_id: "pr162-backfill-web-fulfillment",
+          dry_run: true,
+          candidates_found,
+          candidate_months: months,
+          candidate_orders: Array.from(candidateOrderIds).map((id) => ({ order_id: id, order_name: candidateOrderNames.get(id) ?? null })),
+          note: "Dry run — no allocations written. Re-run without dry_run to apply.",
+        });
+      }
+
+      // Re-run the now-fixed allocator over each candidate month. Idempotent:
+      // runAllocationEngine deletes non-manual allocations for the month then
+      // rewrites, so running this endpoint twice converges to the same state.
+      let allocations_written = 0;
+      const errors: Array<{ month: string; error: string }> = [];
+      const per_month: any[] = [];
+      for (const month of months) {
+        try {
+          const s = runAllocationEngine(month);
+          allocations_written += s.allocations_written;
+          per_month.push({ month, allocations_written: s.allocations_written, orders_processed: s.orders_processed, needs_review_orders: s.needs_review_orders, warnings: s.warnings });
+        } catch (e: any) {
+          errors.push({ month, error: String(e?.message || e) });
+        }
+      }
+
+      // Re-check: how many candidate orders are now fully allocated (every
+      // forward line resolves to a POS entity) vs still unallocated.
+      const recheck = sqlite.prepare(`
+        SELECT
+          v.order_id,
+          v.per_line_entity_id,
+          v.order_entity_id,
+          v.dominant_entity_id
+        FROM v_attributed_sales v
+        WHERE v.order_id IN (${candidateOrderIds.size > 0 ? Array.from(candidateOrderIds).map(() => "?").join(",") : "''"})
+      `).all(...Array.from(candidateOrderIds)) as any[];
+
+      const stillUnallocatedByOrder = new Map<string, boolean>();
+      for (const id of Array.from(candidateOrderIds)) stillUnallocatedByOrder.set(id, false);
+      for (const r of recheck) {
+        const eid = pickEntity(r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id);
+        if (eid === 0) stillUnallocatedByOrder.set(String(r.order_id), true);
+      }
+      let orders_still_unallocated = 0;
+      for (const v of Array.from(stillUnallocatedByOrder.values())) if (v) orders_still_unallocated += 1;
+      const orders_now_fully_allocated = candidates_found - orders_still_unallocated;
+
+      res.json({
+        build_id: "pr162-backfill-web-fulfillment",
+        dry_run: false,
+        candidates_found,
+        candidate_months: months,
+        allocations_written,
+        orders_now_fully_allocated,
+        orders_still_unallocated,
+        errors,
+        per_month,
+        still_unallocated_orders: Array.from(stillUnallocatedByOrder.entries())
+          .filter(([, v]) => v)
+          .map(([id]) => ({ order_id: id, order_name: candidateOrderNames.get(id) ?? null })),
+        note: "PR #162. Re-ran runAllocationEngine over each NY-month containing a candidate (Unallocated forward line + successful raw_json fulfillment). Idempotent — re-running does not double-write recon_allocations. orders_still_unallocated should be 0 once the raw_json fulfillment fallback routes every candidate; any remainder ships from an unmapped location or has no raw_json fulfillment matching its line.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "backfill-web-fulfillment-allocations failed", error: String(e?.message || e) });
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // PR #162 — Verification of the two known May 2026 web orders + the
+  // 2026-05 attribution invariant Unallocated row. Read-only.
+  //
+  // GET /api/recon/finance/debug/verify-web-fulfillment-backfill
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/verify-web-fulfillment-backfill", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    const { sqlite } = require("./storage");
+    try {
+      // Per-order allocation read-back: entity_id, share, line count.
+      const readOrder = (orderId: string) => {
+        const hdr = sqlite.prepare(`SELECT id, name FROM recon_orders WHERE id = ?`).get(orderId) as any;
+        const allocs = sqlite.prepare(`
+          SELECT line_item_id, entity_id, share, gross_amount, tax_amount, method, reason
+          FROM recon_allocations
+          WHERE order_id = ?
+          ORDER BY id ASC
+        `).all(orderId) as any[];
+        const distinctEntities = Array.from(new Set(allocs.map((a) => Number(a.entity_id))));
+        return {
+          order_id: orderId,
+          order_name: hdr?.name ?? null,
+          allocation_count: allocs.length,
+          distinct_entity_ids: distinctEntities,
+          distinct_entity_names: distinctEntities.map((e) => entityNameOf(e)),
+          all_share_one: allocs.length > 0 && allocs.every((a) => Number(a.share) === 1),
+          allocations: allocs.map((a) => ({
+            line_item_id: a.line_item_id,
+            entity_id: Number(a.entity_id),
+            entity_name: entityNameOf(Number(a.entity_id)),
+            share: Number(a.share),
+            gross_amount: a.gross_amount,
+            tax_amount: a.tax_amount,
+            method: a.method,
+            reason: a.reason,
+          })),
+        };
+      };
+
+      const order38144 = readOrder("6523563114738"); // expect Greenvale (entity 1)
+      const order38175 = readOrder("6539583979762"); // expect Huntington (entity 2)
+
+      // 2026-05 invariant Unallocated (entity 0) tax row, via the same engine.
+      const a = computeAttributionForMonth("2026-05");
+      const netOf = (eid: number) =>
+        (a.fwdByEntity.get(eid) || 0)
+        - (a.refByEntity.get(eid) || 0)
+        + (a.shipByEntity.get(eid) || 0)
+        - (a.shipRefByEntity.get(eid) || 0);
+      const unallocatedTaxCents2026_05 = netOf(0);
+
+      res.json({
+        build_id: "pr162-verify-web-fulfillment",
+        order_38144: order38144,
+        order_38175: order38175,
+        expectations: {
+          order_38144: "Greenvale (entity_id=1), share=1, single line",
+          order_38175: "Huntington (entity_id=2), share=1, single line",
+          invariant_2026_05_unallocated: "$0.00 tax",
+        },
+        invariant_2026_05_unallocated_tax_dollars: fromCents(unallocatedTaxCents2026_05),
+        invariant_2026_05_unallocated_is_zero: unallocatedTaxCents2026_05 === 0,
+        note: "PR #162. order_* blocks read recon_allocations directly. invariant_2026_05_unallocated_tax_dollars is the net tax attributed to entity 0 (Unallocated) for 2026-05 via computeAttributionForMonth — should be $0.00 once both orders route. Run the backfill POST first if these still show Unallocated.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "verify-web-fulfillment-backfill failed", error: String(e?.message || e) });
+    }
+  });
+
   // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
