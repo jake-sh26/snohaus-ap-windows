@@ -5,8 +5,8 @@
  * PURPOSE
  * -------
  * Mirror Shopify's `Order.agreements -> sales` ledger directly into our
- * database, sourced 1:1 from the same ledger that powers Shopify's own
- * finance reports.
+ * database so we can project recon_revenue_events 1:1 from the same
+ * source that powers Shopify's own finance reports.
  *
  * Path A (synthesize edit-deltas from our hand-rolled detector rules) was
  * abandoned because it kept drifting from Shopify in edge cases (returns,
@@ -114,8 +114,9 @@
  *
  * WARNINGS
  * --------
- * Owns the `recon_event_warnings` table (created in
- * ensureShopifyAgreementsSchema). Malformed sale nodes (missing
+ * Writes to the `recon_event_warnings` table (canonical DDL in
+ * shopify-recon-revenue-events.ts; also ensured idempotently in
+ * ensureShopifyAgreementsSchema as belt-and-suspenders). Malformed sale nodes (missing
  * happenedAt, unrecognized sale_type, etc.) log a warning and skip.
  * The schema migration itself never throws.
  */
@@ -285,8 +286,7 @@ function buildTaxBreakdown(
 }
 
 // ---------------------------------------------------------------------------
-// Warnings logging — writes to the recon_event_warnings table owned by
-// ensureShopifyAgreementsSchema.
+// Warnings logging — reuses recon_event_warnings table from PR #94.
 // ---------------------------------------------------------------------------
 
 function logWarning(
@@ -317,7 +317,8 @@ export function ensureShopifyAgreementsSchema(): void {
       id TEXT PRIMARY KEY,
       order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
       happened_at TEXT NOT NULL,
-      -- Store-local (ET) YYYY-MM bucket (UTC-5 offset).
+      -- Store-local (ET) YYYY-MM bucket. Matches recon_revenue_events
+      -- convention so the two ledgers join cleanly on event_month.
       happened_month TEXT GENERATED ALWAYS AS
         (substr(datetime(happened_at, '-5 hours'), 1, 7)) VIRTUAL,
       reason TEXT NOT NULL,
@@ -377,6 +378,11 @@ export function ensureShopifyAgreementsSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_recon_shopify_sales_happened_at
       ON recon_shopify_sales(happened_at);
 
+    -- Belt-and-suspenders: also ensure recon_event_warnings here. The
+    -- canonical DDL lives in shopify-recon-revenue-events.ts; this
+    -- idempotent CREATE TABLE IF NOT EXISTS guarantees the table exists
+    -- even if the agreements safety-net cron runs before the projector
+    -- schema-ensure, since logWarning() below writes to it.
     CREATE TABLE IF NOT EXISTS recon_event_warnings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_id TEXT,
