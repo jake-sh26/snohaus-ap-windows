@@ -127,9 +127,39 @@ export async function listSalesTaxFilings(
 
 /**
  * 5. Export URL for a period in the given format. Returns the relative path —
- * callers (PR #167) decide whether to fetch via apiRequest (Bearer header) or
- * open as a download. The backend currently returns 501 until #167.
+ * callers decide whether to fetch via apiRequest (Bearer header) or open as a
+ * download.
  */
 export function salesTaxExportPath(periodKey: string, format: ExportFormat): string {
   return `${BASE}/export/${encodeURIComponent(periodKey)}/${format}`;
+}
+
+const EXT: Record<ExportFormat, string> = { csv: "csv", pdf: "pdf", xlsx: "xlsx" };
+const TAG: Record<ExportFormat, string> = { csv: "summary", pdf: "st810", xlsx: "workbook" };
+
+/**
+ * Download an export for a period as a file. Fetches through apiRequest so the
+ * Bearer token is attached (export endpoints are permission-gated), reads the
+ * body as a blob, and triggers a browser download. Prefers the server's
+ * Content-Disposition filename, falling back to the documented convention.
+ */
+export async function downloadSalesTaxExport(
+  periodKey: string,
+  format: ExportFormat,
+): Promise<void> {
+  const res = await apiRequest("GET", salesTaxExportPath(periodKey, format));
+  const blob = await res.blob();
+
+  const cd = res.headers.get("Content-Disposition") || "";
+  const match = /filename="?([^"]+)"?/.exec(cd);
+  const filename = match?.[1] ?? `snohaus-sales-tax-${periodKey}-${TAG[format]}.${EXT[format]}`;
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }

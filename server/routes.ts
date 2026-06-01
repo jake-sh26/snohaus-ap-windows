@@ -166,6 +166,14 @@ import {
   type FilingStatus,
 } from "./sales-tax-filings";
 import {
+  buildSalesTaxCsv,
+  buildSalesTaxXlsx,
+  buildSalesTaxPdf,
+  type ExportPayload,
+  type ExportLineDetail,
+} from "./sales-tax-exports";
+import { mappingByEntityId } from "./sales-tax-mapping";
+import {
   syncPayoutsIncremental,
 } from "./shopify-recon-payouts";
 import {
@@ -7271,6 +7279,110 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   const filingBlockFor = (periodKey: string) =>
     getFiling(periodKey) ?? openFilingPlaceholder(periodKey);
 
+  // -------------------------------------------------------------------
+  // Export support (PR #167). Per-line taxable detail for the XLSX "Line
+  // Detail" sheet — every forward taxable line for a month, attributed to a
+  // store via the identical pickEntity cascade used by computeSalesTaxForMonth.
+  // Refund lines (negative tax) are surfaced with refund_flag=true. Integer
+  // cents throughout; refund amounts ABS-wrapped. v_attributed_sales is the
+  // only sales source.
+  // -------------------------------------------------------------------
+  const lineDetailForMonth = (month: string): ExportLineDetail[] => {
+    const { sqlite } = require("./storage");
+    const attribution = computeAttributionForMonth(month);
+    const posEntitySet: Set<number> = attribution.posEntitySet;
+    const pickEntity = (
+      posEid: number | null, perLineEid: number | null,
+      orderEid: number | null, dominantEid: number | null,
+    ): number => {
+      if (posEid != null && posEntitySet.has(Number(posEid))) return Number(posEid);
+      if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
+      if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
+      if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
+      return 0;
+    };
+
+    const rows = sqlite.prepare(`
+      SELECT
+        o.name AS order_name,
+        substr(datetime(COALESCE(li.recognized_at, o.processed_at, o.created_at), '-5 hours'), 1, 19) AS date_et,
+        v.per_line_entity_id, v.per_line_share, v.order_entity_id, v.dominant_entity_id,
+        li.line_subtotal AS line_subtotal,
+        li.line_tax_total AS line_tax_total,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos' AND pl.active = 1
+          WHERE s.order_id = v.order_id AND s.line_item_id = v.line_item_id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id
+      FROM v_attributed_sales v
+      JOIN recon_line_items li ON li.id = v.line_item_id AND li.order_id = v.order_id
+      JOIN recon_orders o ON o.id = v.order_id
+      WHERE v.happened_month = ?
+        AND COALESCE(li.line_tax_total, 0) <> 0
+      ORDER BY date_et ASC, order_name ASC
+    `).all(month) as any[];
+
+    const out: ExportLineDetail[] = [];
+    for (const r of rows) {
+      const eid = pickEntity(r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id);
+      const m = mappingByEntityId(eid);
+      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
+      out.push({
+        order_name: r.order_name ?? "(unknown)",
+        order_date_eastern: r.date_et ?? "",
+        store_name: m?.name ?? (eid === 0 ? "Unallocated" : `Entity ${eid}`),
+        county: m?.county ?? "",
+        rate_bps: m?.rate_bps ?? 0,
+        taxable_amount_cents: Math.round(Math.abs(Number(r.line_subtotal || 0)) * 100 * share),
+        tax_amount_cents: Math.round(Math.abs(Number(r.line_tax_total || 0)) * 100),
+        refund_flag: false,
+      });
+    }
+    return out;
+  };
+
+  // Assemble the full ExportPayload for either a month or a quarter period key.
+  const buildExportPayload = (periodKey: string): ExportPayload => {
+    const isQuarter = /^\d{4}-Q[1-4]$/.test(periodKey);
+    const months = isQuarter ? quarterToMonths(periodKey).months : [periodKey];
+    const monthPayloads = months.map((m) => computeSalesTaxForMonth(m));
+    const lineDetail = months.flatMap((m) => lineDetailForMonth(m));
+
+    const totals = monthPayloads.reduce(
+      (acc, mm) => ({
+        gross_sales_cents: acc.gross_sales_cents + mm.totals.gross_sales_cents,
+        taxable_sales_cents: acc.taxable_sales_cents + mm.totals.taxable_sales_cents,
+        tax_collected_cents: acc.tax_collected_cents + mm.totals.tax_collected_cents,
+        net_tax_cents: acc.net_tax_cents + mm.totals.net_tax_cents,
+      }),
+      { gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0, net_tax_cents: 0 },
+    );
+    const perEntitySum = monthPayloads.reduce((a, mm) => a + mm.invariant.per_entity_sum_cents, 0);
+    const viewTotal = monthPayloads.reduce((a, mm) => a + mm.invariant.view_total_cents, 0);
+    const delta = perEntitySum - viewTotal;
+
+    const generatedAtET = new Date(Date.now() - 5 * 3600 * 1000)
+      .toISOString().slice(0, 19).replace("T", " ") + " ET";
+
+    return {
+      periodKey,
+      isQuarter,
+      months: monthPayloads,
+      totals,
+      invariant: {
+        ok: delta === 0 && monthPayloads.every((mm) => mm.invariant.ok),
+        per_entity_sum_cents: perEntitySum,
+        view_total_cents: viewTotal,
+        delta_cents: delta,
+      },
+      lineDetail,
+      generatedAtET,
+    };
+  };
+
   // 1. GET /api/recon/finance/sales-tax/:month — composite monthly payload.
   app.get(
     "/api/recon/finance/sales-tax/:month",
@@ -7383,32 +7495,66 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   );
 
-  // 5. Export endpoints — registered + auth-gated, body lands in PR #167.
-  const exportNotImplemented = (format: string) => (req: any, res: any) => {
-    res.status(501).json({
-      message: `Sales-tax ${format.toUpperCase()} export not implemented yet`,
-      detail: "Implemented in PR #167",
-      period_key: String(req.params.periodKey),
-      format,
-    });
-  };
+  // 5. Export endpoints (PR #167) — CSV / PDF / XLSX. periodKey is YYYY-MM or
+  // YYYY-QN. Source data via buildExportPayload (reuses computeSalesTaxForMonth);
+  // builders live in ./sales-tax-exports. Filename convention:
+  //   snohaus-sales-tax-{periodKey}-{tag}.{ext}
+  const validPeriodKey = (pk: string) => /^\d{4}-(\d{2}|Q[1-4])$/.test(pk);
+  const sendExportError = (res: any, e: any) =>
+    res.status(500).json({ message: e?.message || "export failed" });
+
   app.get(
     "/api/recon/finance/sales-tax/export/:periodKey/csv",
     authMiddleware,
     requirePermission("finance.sales_tax.export"),
-    exportNotImplemented("csv"),
+    (req, res) => {
+      const periodKey = String(req.params.periodKey);
+      if (!validPeriodKey(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      try {
+        const csv = buildSalesTaxCsv(buildExportPayload(periodKey));
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="snohaus-sales-tax-${periodKey}-summary.csv"`);
+        res.send(csv);
+      } catch (e: any) { sendExportError(res, e); }
+    },
   );
-  app.get(
-    "/api/recon/finance/sales-tax/export/:periodKey/pdf",
-    authMiddleware,
-    requirePermission("finance.sales_tax.export"),
-    exportNotImplemented("pdf"),
-  );
+
   app.get(
     "/api/recon/finance/sales-tax/export/:periodKey/xlsx",
     authMiddleware,
     requirePermission("finance.sales_tax.export"),
-    exportNotImplemented("xlsx"),
+    async (req, res) => {
+      const periodKey = String(req.params.periodKey);
+      if (!validPeriodKey(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      try {
+        const buf = await buildSalesTaxXlsx(buildExportPayload(periodKey));
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", `attachment; filename="snohaus-sales-tax-${periodKey}-workbook.xlsx"`);
+        res.send(buf);
+      } catch (e: any) { sendExportError(res, e); }
+    },
+  );
+
+  app.get(
+    "/api/recon/finance/sales-tax/export/:periodKey/pdf",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    async (req, res) => {
+      const periodKey = String(req.params.periodKey);
+      if (!validPeriodKey(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      try {
+        const buf = await buildSalesTaxPdf(buildExportPayload(periodKey));
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename="snohaus-sales-tax-${periodKey}-st810.pdf"`);
+        res.send(buf);
+      } catch (e: any) { sendExportError(res, e); }
+    },
   );
 
   // -------------------------------------------------------------------
