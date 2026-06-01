@@ -6369,6 +6369,221 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // -------------------------------------------------------------------
+  // PR #156-debug — refund-tax-per-order-v2 (CORRECTED)
+  //   PR #155-debug had a bug: it read order_id off RefundForTax rows,
+  //   but that interface only carries entity_id (no order_id). All 325
+  //   entity refund rows landed under order_id="undefined". This v2
+  //   queries recon_refund_line_items directly with the SAME WHERE
+  //   clauses + attribution cascade as loadTaxInputsForMonth refunds
+  //   query, so we get order_id natively and the per-order grouping
+  //   actually works.
+  // GET /api/recon/finance/debug/refund-tax-per-order-v2/:month?entity_id=N
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/refund-tax-per-order-v2/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const entityIdRaw = req.query.entity_id;
+    if (entityIdRaw === undefined) {
+      return res.status(400).json({ message: "entity_id query param required" });
+    }
+    const entityId = Number(entityIdRaw);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ message: "entity_id must be a positive integer" });
+    }
+
+    try {
+      const { sqlite } = require("./storage");
+
+      // ----- ENTITY SIDE: replicate loadTaxInputsForMonth's refundRows
+      // query EXACTLY, but keep order_id in the result and only include
+      // kind='item' (loop #2). adjustment_kind rows belong to ship_refund
+      // (loop #4) and are NOT in item_refund_tax.
+      const entityRows = sqlite.prepare(`
+        SELECT
+          rli.id           AS refund_line_id,
+          rli.order_id     AS order_id,
+          rli.line_item_id AS line_item_id,
+          rli.kind         AS kind,
+          rli.subtotal     AS refund_subtotal,
+          rli.total_tax    AS refund_tax,
+          li.is_gift_card  AS orig_is_gift_card,
+          (SELECT pl.entity_id
+             FROM recon_shopify_sales s
+             JOIN recon_entity_pos_locations pl
+               ON pl.shopify_location_id = s.pos_location_id
+              AND pl.kind = 'pos'
+              AND pl.active = 1
+            WHERE s.order_id = rli.order_id
+              AND s.line_item_id = rli.line_item_id
+              AND s.pos_location_id IS NOT NULL
+            LIMIT 1)        AS pos_entity_id,
+          COALESCE(
+            (SELECT a.entity_id FROM recon_allocations a
+              WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1),
+            (SELECT a.entity_id FROM recon_allocations a
+              WHERE a.order_id = rli.order_id AND a.line_item_id IS NULL LIMIT 1),
+            (SELECT a.entity_id FROM recon_allocations a
+              WHERE a.order_id = rli.order_id
+              GROUP BY a.entity_id
+              ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+          )                AS alloc_entity_id
+        FROM recon_refund_line_items rli
+        JOIN recon_refunds rf ON rf.id = rli.refund_id
+   LEFT JOIN recon_line_items li
+          ON li.id = rli.line_item_id AND li.order_id = rli.order_id
+        WHERE substr(datetime(
+                COALESCE(rf.processed_at, rf.created_at),
+                '-5 hours'), 1, 7) = ?
+          AND COALESCE(li.is_gift_card, 0) = 0
+          AND rli.kind = 'item'
+      `).all(month) as any[];
+
+      // Build POS-entity set once (mirrors loadTaxInputsForMonth posEntityIds)
+      const posEntitySet = new Set<number>(
+        (sqlite.prepare(`
+          SELECT entity_id FROM recon_entity_pos_locations
+          WHERE kind='pos' AND active=1 AND shopify_location_id IS NOT NULL
+        `).all() as any[]).map((r) => Number(r.entity_id)),
+      );
+
+      // Apply the SAME final-entity pick the production refund loop uses:
+      //   1. POS entity (if set AND in posEntitySet)
+      //   2. else alloc entity (if set AND in posEntitySet)
+      //   3. else 0 (Unallocated)
+      const entityByOrder = new Map<string, { cents: number; rows: number; details: any[] }>();
+      for (const r of entityRows) {
+        let eid = 0;
+        if (r.pos_entity_id != null && posEntitySet.has(Number(r.pos_entity_id))) eid = Number(r.pos_entity_id);
+        else if (r.alloc_entity_id != null && posEntitySet.has(Number(r.alloc_entity_id))) eid = Number(r.alloc_entity_id);
+        if (eid !== entityId) continue;
+        const oid = String(r.order_id);
+        const cents = Math.round(Number(r.refund_tax || 0) * 100);
+        const cur = entityByOrder.get(oid) || { cents: 0, rows: 0, details: [] };
+        cur.cents += cents;
+        cur.rows += 1;
+        cur.details.push({
+          refund_line_id: r.refund_line_id,
+          line_item_id: r.line_item_id,
+          kind: r.kind,
+          refund_subtotal: r.refund_subtotal,
+          refund_tax: r.refund_tax,
+          orig_is_gift_card: r.orig_is_gift_card,
+          pos_entity_id: r.pos_entity_id,
+          alloc_entity_id: r.alloc_entity_id,
+          picked_entity_id: eid,
+        });
+        entityByOrder.set(oid, cur);
+      }
+
+      // ----- BY-STORE SIDE: RETURN/PRODUCT rows attributed to this entity
+      // using the same cascade as by-store. (Same query as PR #155.)
+      const bsRows = sqlite.prepare(`
+        WITH attributed AS (
+          SELECT s.order_id, s.line_item_id, s.total_tax, s.total_amount,
+                 s.quantity, s.pos_location_id, s.happened_at,
+            COALESCE(
+              CASE WHEN s.pos_location_id IS NOT NULL THEN
+                (SELECT pl.entity_id FROM recon_entity_pos_locations pl
+                  WHERE pl.shopify_location_id = s.pos_location_id
+                    AND pl.kind = 'pos' AND pl.active = 1 LIMIT 1)
+              END,
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id AND a.line_item_id = s.line_item_id LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id AND a.line_item_id IS NULL LIMIT 1),
+              (SELECT a.entity_id FROM recon_allocations a
+                WHERE a.order_id = s.order_id
+                GROUP BY a.entity_id
+                ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+            ) AS aeid
+          FROM recon_shopify_sales s
+          WHERE s.happened_month = ?
+            AND s.action_type = 'RETURN'
+            AND s.line_type   = 'PRODUCT'
+        )
+        SELECT order_id, line_item_id, total_tax, total_amount, quantity,
+               pos_location_id, happened_at
+          FROM attributed
+         WHERE aeid = ?
+         ORDER BY order_id, happened_at, line_item_id
+      `).all(month, entityId) as any[];
+
+      const bsByOrder = new Map<string, { cents: number; rows: number; details: any[] }>();
+      for (const r of bsRows) {
+        const cents = Math.abs(Math.round(Number(r.total_tax || 0) * 100));
+        const oid = String(r.order_id);
+        const cur = bsByOrder.get(oid) || { cents: 0, rows: 0, details: [] };
+        cur.cents += cents;
+        cur.rows += 1;
+        cur.details.push(r);
+        bsByOrder.set(oid, cur);
+      }
+
+      const allOrderIds = new Set<string>();
+      entityByOrder.forEach((_v, k) => allOrderIds.add(k));
+      bsByOrder.forEach((_v, k) => allOrderIds.add(k));
+      const fmt = (c: number) => (c / 100).toFixed(2);
+
+      const merged: any[] = [];
+      let totalEntityCents = 0;
+      let totalBsCents = 0;
+      allOrderIds.forEach((oid) => {
+        const e = entityByOrder.get(oid) || { cents: 0, rows: 0, details: [] };
+        const b = bsByOrder.get(oid) || { cents: 0, rows: 0, details: [] };
+        totalEntityCents += e.cents;
+        totalBsCents += b.cents;
+        const deltaCents = e.cents - b.cents;
+        merged.push({
+          order_id: oid,
+          entity_item_refund_tax_dollars: fmt(e.cents),
+          entity_rows: e.rows,
+          bystore_return_product_tax_dollars: fmt(b.cents),
+          bystore_rows: b.rows,
+          delta_dollars: ((deltaCents) / 100).toFixed(2),
+          delta_cents: deltaCents,
+        });
+      });
+      merged.sort((a, b) => Math.abs(b.delta_cents) - Math.abs(a.delta_cents));
+
+      // Enrich top-20 non-zero deltas with order_name + full per-side detail.
+      const topNonZero = merged.filter((r) => r.delta_cents !== 0).slice(0, 20);
+      const enriched: any[] = [];
+      for (const row of topNonZero) {
+        const hdr = sqlite.prepare(`SELECT id, name, processed_at, total_tax, current_total_tax FROM recon_orders WHERE id = ?`).get(row.order_id) as any;
+        enriched.push({
+          ...row,
+          order_name: hdr?.name ?? null,
+          order_processed_at: hdr?.processed_at ?? null,
+          order_total_tax: hdr?.total_tax ?? null,
+          order_current_total_tax: hdr?.current_total_tax ?? null,
+          entity_refund_rows: entityByOrder.get(row.order_id)?.details ?? [],
+          bystore_return_rows: bsByOrder.get(row.order_id)?.details ?? [],
+        });
+      }
+
+      res.json({
+        month,
+        entity_id: entityId,
+        totals: {
+          entity_item_refund_tax_dollars:    fmt(totalEntityCents),
+          bystore_return_product_tax_dollars: fmt(totalBsCents),
+          delta_dollars:                     fmt(totalEntityCents - totalBsCents),
+        },
+        order_count: merged.length,
+        nonzero_delta_count: merged.filter((r) => r.delta_cents !== 0).length,
+        top_diffs: enriched,
+        all_orders: merged,
+        note: "PR #156-debug — corrects PR #155-debug (which read non-existent r.order_id off RefundForTax). Queries recon_refund_line_items directly with the same WHERE + attribution cascade as loadTaxInputsForMonth's refundRows, but ONLY kind='item' (loop #2). Compares per-order to by-store RETURN/PRODUCT (abs).",
+        build_id: "pr156-debug-refund-tax-per-order-v2",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "refund-tax-per-order-v2 failed", error: String(e?.message || e) });
+    }
+  });
+
   // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
