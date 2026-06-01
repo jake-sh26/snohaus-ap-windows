@@ -143,6 +143,7 @@ import {
 import {
   aggregateByEntity,
   aggregateByJurisdiction,
+  fromCents,
   parseTaxLines,
   quarterToMonths,
   sumEntities,
@@ -6581,6 +6582,317 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     } catch (e: any) {
       res.status(500).json({ message: "refund-tax-per-order-v2 failed", error: String(e?.message || e) });
+    }
+  });
+
+  // ===================================================================
+  // PR #158-debug — line-tax-truth: a FOURTH, projector-independent
+  //   source of truth for monthly entity sales tax. Reads
+  //   recon_line_items (forward tax via tax_lines_json) +
+  //   recon_refund_line_items (refund tax) DIRECTLY, replicating the
+  //   production POS→per-line→order-level→dominant attribution cascade,
+  //   but NEVER touching recon_shopify_sales (the projector output we are
+  //   trying to validate). Used to localize the $1.32 Huntington Dec 2025
+  //   entity-vs-store delta. Does NOT fix it — it's the diagnostic.
+  //
+  // GET /api/recon/finance/debug/line-tax-truth/:month?entity_id=N
+  // ===================================================================
+  app.get("/api/recon/finance/debug/line-tax-truth/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const entityIdRaw = req.query.entity_id;
+    if (entityIdRaw === undefined) {
+      return res.status(400).json({ message: "entity_id query param required" });
+    }
+    const entityId = Number(entityIdRaw);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ message: "entity_id must be a positive integer" });
+    }
+
+    try {
+      const { sqlite } = require("./storage");
+
+      // Entity display name + its mapped POS location (informational only).
+      const entityRow = sqlite.prepare(
+        `SELECT id, location FROM payroll_entities WHERE id = ?`,
+      ).get(entityId) as any;
+      const entityName = entityRow?.location ?? null;
+      const posLocRow = sqlite.prepare(`
+        SELECT shopify_location_id FROM recon_entity_pos_locations
+         WHERE entity_id = ? AND kind = 'pos' AND active = 1
+           AND shopify_location_id IS NOT NULL
+         LIMIT 1
+      `).get(entityId) as any;
+      const posLocationId = posLocRow?.shopify_location_id ?? null;
+
+      // POS entity set — used to bucket non-POS allocations into Unallocated,
+      // mirroring loadTaxInputsForMonth's posEntityIds gate exactly.
+      const posEntitySet = new Set<number>(
+        (sqlite.prepare(`
+          SELECT entity_id FROM recon_entity_pos_locations
+           WHERE kind = 'pos' AND active = 1 AND shopify_location_id IS NOT NULL
+        `).all() as any[]).map((r) => Number(r.entity_id)),
+      );
+
+      // -------------------------------------------------------------------
+      // Pick the final entity + attribution method for a cascade row.
+      // Branches (in priority order), matching the production by-store CTE
+      // and loadTaxInputsForMonth:
+      //   1. pos_location      — a recon_shopify_sales POS row mapped the
+      //      (order,line) to a POS entity   [NOTE: this reads pos_location_id
+      //      attribution, NOT tax amounts, so it does not violate the
+      //      "ignore the projector output" rule — the tax itself comes only
+      //      from recon_line_items / recon_refund_line_items]
+      //   2. per_line_alloc    — recon_allocations row keyed to this line
+      //   3. order_alloc       — recon_allocations order-level row (line NULL)
+      //   4. dominant_fallback — largest gross_amount entity on the order
+      //   else entity_id = 0 (Unallocated)
+      // Returns { eid, method } where method is null when the picked entity
+      // isn't a POS entity (→ Unallocated).
+      const pickEntity = (
+        posEid: number | null,
+        perLineEid: number | null,
+        orderEid: number | null,
+        dominantEid: number | null,
+      ): { eid: number; method: string | null } => {
+        if (posEid != null && posEntitySet.has(Number(posEid))) {
+          return { eid: Number(posEid), method: "pos_location" };
+        }
+        if (perLineEid != null && posEntitySet.has(Number(perLineEid))) {
+          return { eid: Number(perLineEid), method: "per_line_alloc" };
+        }
+        if (orderEid != null && posEntitySet.has(Number(orderEid))) {
+          return { eid: Number(orderEid), method: "order_alloc" };
+        }
+        if (dominantEid != null && posEntitySet.has(Number(dominantEid))) {
+          return { eid: Number(dominantEid), method: "dominant_fallback" };
+        }
+        return { eid: 0, method: null };
+      };
+
+      // -------------------------------------------------------------------
+      // FORWARD: per-line tax straight from recon_line_items.tax_lines_json.
+      // Month boundary = America/New_York via the canonical -5h shift on
+      // COALESCE(recognized_at, processed_at, created_at) — same bucket as
+      // loadTaxInputsForMonth. Gift cards skipped (is_gift_card = 0).
+      // Each cascade branch is computed as its own column so we can pick the
+      // final entity in JS and tally attribution_method_counts.
+      const fwdRows = sqlite.prepare(`
+        SELECT
+          li.id        AS line_id,
+          li.order_id  AS order_id,
+          li.tax_lines_json AS tax_lines_json,
+          (SELECT pl.entity_id
+             FROM recon_shopify_sales s
+             JOIN recon_entity_pos_locations pl
+               ON pl.shopify_location_id = s.pos_location_id
+              AND pl.kind = 'pos' AND pl.active = 1
+            WHERE s.order_id = li.order_id
+              AND s.line_item_id = li.id
+              AND s.pos_location_id IS NOT NULL
+            LIMIT 1) AS pos_entity_id,
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = li.order_id AND a.line_item_id = li.id LIMIT 1) AS per_line_entity_id,
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = li.order_id AND a.line_item_id IS NULL LIMIT 1) AS order_entity_id,
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = li.order_id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1) AS dominant_entity_id,
+          (SELECT a.share FROM recon_allocations a
+            WHERE a.order_id = li.order_id AND a.line_item_id = li.id
+              AND a.entity_id = ? LIMIT 1) AS entity_share
+        FROM recon_line_items li
+        JOIN recon_orders o ON o.id = li.order_id
+        WHERE substr(datetime(
+                COALESCE(li.recognized_at, o.processed_at, o.created_at),
+                '-5 hours'), 1, 7) = ?
+          AND li.is_gift_card = 0
+      `).all(entityId, month) as any[];
+
+      const methodCounts: Record<string, number> = {
+        pos_location: 0,
+        per_line_alloc: 0,
+        order_alloc: 0,
+        dominant_fallback: 0,
+      };
+
+      // Per-order accumulators (cents) for drill-down + totals.
+      const fwdByOrder = new Map<string, number>();
+      let fwdTaxCents = 0;
+      let fwdLineCount = 0;
+      const fwdOrderSet = new Set<string>();
+
+      for (const r of fwdRows) {
+        const picked = pickEntity(
+          r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+        );
+        if (picked.eid !== entityId) continue;
+
+        // share defaults to 1 (recon_allocations uses share=1 in practice;
+        // multiply defensively in case a line is ever split across entities).
+        const share = r.entity_share != null ? Number(r.entity_share) : 1;
+
+        // Sum the tax_lines_json prices for this line (penny-exact cents).
+        let lineTaxCents = 0;
+        for (const tl of parseTaxLines(r.tax_lines_json)) {
+          lineTaxCents += Math.round(Number(tl.price || 0) * 100);
+        }
+        const attributedCents = Math.round(lineTaxCents * share);
+
+        fwdTaxCents += attributedCents;
+        fwdLineCount += 1;
+        const oid = String(r.order_id);
+        fwdOrderSet.add(oid);
+        fwdByOrder.set(oid, (fwdByOrder.get(oid) || 0) + attributedCents);
+        if (picked.method) methodCounts[picked.method] += 1;
+      }
+
+      // -------------------------------------------------------------------
+      // REFUND: per-line refund tax straight from recon_refund_line_items.
+      // Bucketed by the PARENT recon_refunds.processed_at (-5h NY shift) —
+      // same bucket as loadTaxInputsForMonth's refundRows. ABS()-wrap each
+      // total_tax (Shopify sometimes stores refund tax negative — known
+      // sign-convention trap). Attributed via the SAME cascade on the
+      // ORIGINAL line_item_id. Gift cards skipped.
+      const refRows = sqlite.prepare(`
+        SELECT
+          rli.id           AS refund_line_id,
+          rli.order_id     AS order_id,
+          rli.line_item_id AS line_item_id,
+          rli.total_tax    AS refund_tax,
+          (SELECT pl.entity_id
+             FROM recon_shopify_sales s
+             JOIN recon_entity_pos_locations pl
+               ON pl.shopify_location_id = s.pos_location_id
+              AND pl.kind = 'pos' AND pl.active = 1
+            WHERE s.order_id = rli.order_id
+              AND s.line_item_id = rli.line_item_id
+              AND s.pos_location_id IS NOT NULL
+            LIMIT 1) AS pos_entity_id,
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1) AS per_line_entity_id,
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id AND a.line_item_id IS NULL LIMIT 1) AS order_entity_id,
+          (SELECT a.entity_id FROM recon_allocations a
+            WHERE a.order_id = rli.order_id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1) AS dominant_entity_id,
+          (SELECT a.share FROM recon_allocations a
+            WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id
+              AND a.entity_id = ? LIMIT 1) AS entity_share
+        FROM recon_refund_line_items rli
+        JOIN recon_refunds rf ON rf.id = rli.refund_id
+   LEFT JOIN recon_line_items li
+          ON li.id = rli.line_item_id AND li.order_id = rli.order_id
+        WHERE substr(datetime(
+                COALESCE(rf.processed_at, rf.created_at),
+                '-5 hours'), 1, 7) = ?
+          AND COALESCE(li.is_gift_card, 0) = 0
+      `).all(entityId, month) as any[];
+
+      const refByOrder = new Map<string, number>();
+      let refTaxCents = 0;
+      let refLineCount = 0;
+      const refOrderSet = new Set<string>();
+
+      for (const r of refRows) {
+        const picked = pickEntity(
+          r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+        );
+        if (picked.eid !== entityId) continue;
+
+        const share = r.entity_share != null ? Number(r.entity_share) : 1;
+        const taxCents = Math.round(Math.abs(Number(r.refund_tax || 0)) * 100);
+        const attributedCents = Math.round(taxCents * share);
+
+        refTaxCents += attributedCents;
+        refLineCount += 1;
+        const oid = String(r.order_id);
+        refOrderSet.add(oid);
+        refByOrder.set(oid, (refByOrder.get(oid) || 0) + attributedCents);
+      }
+
+      // -------------------------------------------------------------------
+      // Drill-down: top 10 orders by net tax, top 10 by refund tax.
+      const allOrderIds = new Set<string>();
+      fwdByOrder.forEach((_v, k) => allOrderIds.add(k));
+      refByOrder.forEach((_v, k) => allOrderIds.add(k));
+
+      const perOrder: Array<{ order_id: string; fwd: number; ref: number; net: number }> = [];
+      allOrderIds.forEach((oid) => {
+        const fwd = fwdByOrder.get(oid) || 0;
+        const ref = refByOrder.get(oid) || 0;
+        perOrder.push({ order_id: oid, fwd, ref, net: fwd - ref });
+      });
+
+      // Resolve order names once for whatever orders we surface.
+      const nameCache = new Map<string, string | null>();
+      const nameOf = (oid: string): string | null => {
+        if (nameCache.has(oid)) return nameCache.get(oid)!;
+        const hdr = sqlite.prepare(`SELECT name FROM recon_orders WHERE id = ?`).get(oid) as any;
+        const nm = hdr?.name ?? null;
+        nameCache.set(oid, nm);
+        return nm;
+      };
+
+      const fmt = (c: number) => fromCents(c);
+
+      const topNet = [...perOrder]
+        .sort((a, b) => b.net - a.net)
+        .slice(0, 10)
+        .map((r) => ({
+          order_id: r.order_id,
+          order_name: nameOf(r.order_id),
+          forward_tax: fmt(r.fwd),
+          refund_tax: fmt(r.ref),
+          net_tax: fmt(r.net),
+        }));
+
+      const topRefund = [...perOrder]
+        .filter((r) => r.ref !== 0)
+        .sort((a, b) => b.ref - a.ref)
+        .slice(0, 10)
+        .map((r) => ({
+          order_id: r.order_id,
+          order_name: nameOf(r.order_id),
+          forward_tax: fmt(r.fwd),
+          refund_tax: fmt(r.ref),
+          net_tax: fmt(r.net),
+        }));
+
+      const netTaxCents = fwdTaxCents - refTaxCents;
+
+      res.json({
+        build_id: "pr158-debug-line-tax-truth",
+        month,
+        entity_id: entityId,
+        entity_name: entityName,
+        pos_location_id: posLocationId,
+        forward: {
+          line_tax_dollars: fmt(fwdTaxCents),
+          line_count: fwdLineCount,
+          order_count: fwdOrderSet.size,
+        },
+        refund: {
+          refund_tax_dollars: fmt(refTaxCents),
+          refund_line_count: refLineCount,
+          refund_order_count: refOrderSet.size,
+        },
+        net: {
+          net_tax_dollars: fmt(netTaxCents),
+        },
+        attribution_method_counts: methodCounts,
+        drill_down: {
+          top_10_orders_by_net_tax: topNet,
+          top_10_orders_by_refund_tax: topRefund,
+        },
+        note: "PR #158-debug — fourth, projector-independent tax truth source. Forward tax summed directly from recon_line_items.tax_lines_json; refund tax from recon_refund_line_items.total_tax (ABS-wrapped). Attribution replicates the production POS→per-line→order→dominant cascade. Does NOT read recon_shopify_sales for tax amounts (only for POS-location attribution). Penny-exact via integer cents.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "line-tax-truth failed", error: String(e?.message || e) });
     }
   });
 
