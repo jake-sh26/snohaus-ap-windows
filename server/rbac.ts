@@ -171,3 +171,34 @@ export function requirePermission(
     next();
   };
 }
+
+/**
+ * Finance-section gate with graceful cutover (PR #165).
+ *
+ * The Finance section is migrating from `payroll.view` to the new
+ * `finance.view` permission. During the cutover, /api/recon/finance/* routes
+ * accept EITHER permission: a user passes if they have finance.view OR the
+ * legacy payroll.view. The seedRbacBaseline() auto-grant gives finance.view to
+ * every payroll.view holder on boot, so in practice both checks succeed for
+ * existing users; the OR keeps the very first boot (pre-grant) from locking
+ * anyone out. New sales-tax routes do NOT use this — they require the strict
+ * finance.sales_tax.* keys with no legacy fallback.
+ */
+export function requireFinanceView() {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const userId = (req as any).userId as number | undefined;
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    if (
+      userHasPermission(userId, "finance.view") ||
+      userHasPermission(userId, "payroll.view")
+    ) {
+      return next();
+    }
+    return res.status(403).json({
+      message: "Forbidden",
+      required_permission: "finance.view",
+    });
+  };
+}
