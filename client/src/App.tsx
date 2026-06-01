@@ -22,7 +22,32 @@ import Payroll from "@/pages/Payroll";
 import PayrollEntities from "@/pages/PayrollEntities";
 import PayrollEmployees from "@/pages/PayrollEmployees";
 import ReconcilerTest from "@/pages/ReconcilerTest";
+import SalesTax from "@/pages/SalesTax";
 import NotFound from "@/pages/not-found";
+
+/**
+ * Backward-compat redirect for the old flat Reconciler route (PR #166).
+ *
+ * The single /reconciler/test page split into 4 Finance routes. We map the old
+ * URL — including its ?tab= deep links — to the new home:
+ *   ?tab=bystore            -> /finance/per-store-sales
+ *   ?tab=sync|mapping|setup -> /finance/options?tab=<tab>
+ *   ?tab=reconcile / none   -> /finance/monthly-summary
+ */
+function ReconcilerRedirect() {
+  const [location, navigate] = useLocation();
+  useEffect(() => {
+    const qIdx = location.indexOf("?");
+    const tab = qIdx >= 0 ? new URLSearchParams(location.slice(qIdx + 1)).get("tab") : null;
+    let target = "/finance/monthly-summary";
+    if (tab === "bystore") target = "/finance/per-store-sales";
+    else if (tab === "sync" || tab === "mapping" || tab === "setup") {
+      target = `/finance/options?tab=${tab}`;
+    }
+    navigate(target, { replace: true });
+  }, [location, navigate]);
+  return null;
+}
 
 function ProtectedRoutes() {
   const { token } = useAuth();
@@ -60,7 +85,18 @@ function ProtectedRoutes() {
         <Route path="/payroll" component={Payroll} />
         <Route path="/payroll/entities" component={PayrollEntities} />
         <Route path="/payroll/employees" component={PayrollEmployees} />
-        <Route path="/reconciler/test" component={ReconcilerTest} />
+        <Route path="/finance/monthly-summary">
+          {() => <ReconcilerTest view="monthly-summary" />}
+        </Route>
+        <Route path="/finance/per-store-sales">
+          {() => <ReconcilerTest view="per-store-sales" />}
+        </Route>
+        <Route path="/finance/options">
+          {() => <ReconcilerTest view="options" />}
+        </Route>
+        <Route path="/finance/sales-tax" component={SalesTax} />
+        {/* Backward-compat: old flat Reconciler URL + its ?tab= deep links. */}
+        <Route path="/reconciler/test" component={ReconcilerRedirect} />
         <Route component={NotFound} />
       </Switch>
     </Layout>

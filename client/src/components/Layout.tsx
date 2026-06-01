@@ -23,7 +23,10 @@ import {
   Wrench,
   Building2,
   Users,
-  Scale,
+  LineChart,
+  CalendarRange,
+  Store,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
@@ -37,6 +40,10 @@ type NavItem = {
   icon: any;
   countKey?: "inbox_count" | "receiving_count" | "problem_count" | "skipped_count";
   toneIfPositive?: "amber" | "red";
+  // Optional per-item RBAC gate, in addition to the parent section's gate.
+  // Used for Finance > Sales Tax, which needs finance.sales_tax.view on top of
+  // the Finance section's finance.view/payroll.view gate. Hidden if missing.
+  permissionKey?: string;
 };
 
 type NavSection = {
@@ -51,6 +58,10 @@ type NavSection = {
   // hide the System > Settings link from non-Owners while keeping the rest
   // of the sidebar (AP, Payroll) visible to everyone.
   permissionKey?: string;
+  // Optional OR-gate: section is visible if the user has ANY of these keys.
+  // Used for Finance's graceful cutover (finance.view OR legacy payroll.view),
+  // mirroring the server's requireFinanceView() helper.
+  anyPermissionKeys?: string[];
 };
 
 // Sidebar is grouped into modules. Each section is a collapsible master menu with
@@ -80,10 +91,18 @@ const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    label: "Reconciler",
-    icon: Scale,
+    label: "Finance",
+    icon: LineChart,
+    // Graceful cutover: visible to finance.view holders OR legacy payroll.view
+    // holders, matching the server's requireFinanceView().
+    anyPermissionKeys: ["finance.view", "payroll.view"],
     items: [
-      { href: "/reconciler/test", label: "Test Console", icon: Wrench },
+      { href: "/finance/monthly-summary", label: "Monthly Summary", icon: CalendarRange },
+      { href: "/finance/per-store-sales", label: "Per Store Sales", icon: Store },
+      // Sales Tax needs the extra finance.sales_tax.view grant on top of the
+      // section gate; content lands in PR #167.
+      { href: "/finance/sales-tax", label: "Sales Tax", icon: Receipt, permissionKey: "finance.sales_tax.view" },
+      { href: "/finance/options", label: "Finance Options", icon: SlidersHorizontal },
     ],
   },
   {
@@ -149,12 +168,23 @@ export function Layout({ children }: { children: ReactNode }) {
     if (typeof window !== "undefined") window.location.hash = "#/login";
   }
 
-  // Filter sidebar sections by RBAC permission. A section with `permissionKey`
-  // is only rendered when the user has that permission for any entity. Owner
-  // gets all permissions (via seedRbacBaseline) so this is invisible for them.
-  const visibleSections = NAV_SECTIONS.filter(
-    (s) => !s.permissionKey || hasPermission(s.permissionKey),
-  );
+  // Filter sidebar sections + their children by RBAC permission. A section is
+  // hidden unless the user satisfies its `permissionKey` (single) AND/OR
+  // `anyPermissionKeys` (OR-gate). Per-item `permissionKey` further hides
+  // individual children. Owner gets all permissions (via seedRbacBaseline) so
+  // these gates are invisible for them.
+  const sectionVisible = (s: NavSection): boolean => {
+    if (s.permissionKey && !hasPermission(s.permissionKey)) return false;
+    if (s.anyPermissionKeys && !s.anyPermissionKeys.some((k) => hasPermission(k))) return false;
+    return true;
+  };
+  const visibleSections = NAV_SECTIONS
+    .filter(sectionVisible)
+    .map((s) => ({
+      ...s,
+      items: s.items.filter((it) => !it.permissionKey || hasPermission(it.permissionKey)),
+    }))
+    .filter((s) => s.items.length > 0);
   const { theme, toggle } = useTheme();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
