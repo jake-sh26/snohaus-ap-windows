@@ -1557,6 +1557,59 @@ function bootstrapSchema() {
       ON recon_allocations(method, order_id);
   `);
 
+  // ----- PR #159-debug — v_attributed_sales VIEW -----
+  // One row per forward line item (gift cards excluded), carrying the raw
+  // per-line tax JSON plus the allocation-derived attribution candidates and
+  // share. This formalizes the per-line forward-tax path that PR #158-debug
+  // (line-tax-truth) proved is the smallest disagreeing source. Reading from
+  // ONE view means ST-810 entity totals, by-store breakdowns and grand totals
+  // all GROUP BY differently over the SAME atomic rows — sum-of-parts == whole
+  // is then enforced by SQL, not by careful coding.
+  //
+  // Penny-exact policy: the view exposes tax_lines_json + share raw. The
+  // endpoint sums tax_lines[].price into integer cents and multiplies by share
+  // with a single ROUND() per row, so no float aggregation happens in SQL.
+  //
+  // happened_month is the canonical America/New_York month bucket: the same
+  // -5h shift on COALESCE(recognized_at, processed_at, created_at) used by
+  // loadTaxInputsForMonth and PR #158.
+  //
+  // NOTE: the highest-priority cascade branch (pos_location, which reads
+  // recon_shopify_sales) is intentionally applied in the endpoint, NOT here —
+  // recon_shopify_sales is created in a different init module, so referencing
+  // it from a storage.ts-time CREATE VIEW would be ordering-fragile. The view
+  // therefore exposes the three allocation-derived candidates; the endpoint
+  // layers the POS-location candidate on top, identical to PR #158's cascade.
+  sqlite.exec(`
+    CREATE VIEW IF NOT EXISTS v_attributed_sales AS
+      SELECT
+        li.id        AS line_item_id,
+        li.order_id  AS order_id,
+        li.tax_lines_json AS tax_lines_json,
+        li.is_gift_card   AS is_gift_card,
+        COALESCE(li.recognized_at, o.processed_at, o.created_at) AS happened_at,
+        substr(datetime(
+          COALESCE(li.recognized_at, o.processed_at, o.created_at),
+          '-5 hours'), 1, 7) AS happened_month,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = li.order_id AND a.line_item_id = li.id
+          LIMIT 1) AS per_line_entity_id,
+        (SELECT a.share FROM recon_allocations a
+          WHERE a.order_id = li.order_id AND a.line_item_id = li.id
+          LIMIT 1) AS per_line_share,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = li.order_id AND a.line_item_id IS NULL
+          LIMIT 1) AS order_entity_id,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = li.order_id
+          GROUP BY a.entity_id
+          ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC
+          LIMIT 1) AS dominant_entity_id
+      FROM recon_line_items li
+      JOIN recon_orders o ON o.id = li.order_id
+      WHERE li.is_gift_card = 0;
+  `);
+
   // ----- Gift cards issued -----
   // The Shopify GC ledger: one row per card created. Used to compute prior-year
   // pro-rata when the card was DIGITAL and is later redeemed. We also store
