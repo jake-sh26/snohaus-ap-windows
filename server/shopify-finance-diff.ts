@@ -851,6 +851,173 @@ export function computeFinanceDiff(
 }
 
 // =====================================================================
+// PR #95 — Parallel-validation: legacy vs events vs Shopify.
+//
+// Returns the three monthly summaries side-by-side plus two delta series
+// per field:
+//   legacy_vs_events  — legacy.ours − events_aggregate. Should be ~$0 on
+//                       reconciled months (proves the projection matches
+//                       legacy math). Non-zero on Bug 3 months until
+//                       PR #96 lands.
+//   events_vs_shopify — events_aggregate − |shopify_snapshot|. The real
+//                       accounting reconciliation. Bug 3 months stay
+//                       non-zero here too until PR #96.
+//
+// Differences from computeFinanceDiff():
+//   - Returns three sources, not two.
+//   - Adds a `summary` object with all_ok flags and per-comparison total
+//     dollar deltas so operators can scan quickly.
+//   - Surfaces the events `event_count` and detector_source so we can
+//     verify the ledger was backfilled.
+//
+// Endpoint: GET /api/recon/finance/diff-compare/:month
+//   (wired in routes.ts; this function does the heavy lifting).
+//
+// Note on shipping + total_sales: the events ledger does NOT include
+// shipping (that lives in recon_orders.total_shipping and feeds in via
+// computeLocalFinanceSummary's shipping query, NOT via per-line events).
+// PR #97 will compose `events_aggregate + shipping + return_fees` into
+// the final monthly summary. For PR #95 we compare each field
+// independently and leave `shipping`/`total_sales`/`net_sales_gift_cards`
+// unfilled on the events side (null in the response) so it's obvious to
+// the operator that those still flow through the legacy code path.
+// =====================================================================
+export type FinanceDiffCompareLine = {
+  field: string;
+  legacy: number | null;
+  events: number | null;
+  shopify: number | null;
+  shopify_raw: number | null;
+  legacy_vs_events: number | null;   // legacy − events
+  events_vs_shopify: number | null;  // events − shopify
+  legacy_vs_shopify: number | null;  // legacy − shopify (for reference)
+  ok_legacy_events: boolean | null;  // |legacy_vs_events|  ≤ tolerance
+  ok_events_shopify: boolean | null; // |events_vs_shopify| ≤ tolerance
+};
+
+export type FinanceDiffCompareResult = {
+  month: string;
+  tolerance: number;
+  legacy: FinanceSummaryLocal;
+  events: any | null;                // EventsMonthlyRow shape from PR #94
+  shopify: any | null;
+  lines: FinanceDiffCompareLine[];
+  summary: {
+    legacy_vs_events_all_ok: boolean | null;
+    events_vs_shopify_all_ok: boolean | null;
+    legacy_vs_events_total_abs: number;   // sum of |delta| across comparable fields
+    events_vs_shopify_total_abs: number;
+    events_count: number | null;
+  };
+};
+
+// Fields the events ledger CAN currently produce. shipping / total_sales /
+// net_sales_gift_cards are filled by legacy-side composition; events-side
+// stays null in PR #95 so operators see the gap clearly.
+const EVENTS_LEDGER_FIELDS = new Set([
+  "gross_sales",
+  "discounts",
+  "returns",
+  "net_sales",
+  "taxes",
+  "return_fees",
+  // net_sales_gift_cards IS in the events ledger but the legacy formula
+  // is `gc_net_sales - gc_refund_subtotal` bucketed on different dates;
+  // we include it here so operators can spot drift, but null-fill where
+  // the events table has no contribution yet.
+  "net_sales_gift_cards",
+]);
+
+export function computeFinanceDiffCompare(
+  monthKey: string,
+  opts: { tolerance?: number; snapshotKind?: string } = {},
+): FinanceDiffCompareResult {
+  ensureSchemaOnce();
+  const tolerance = opts.tolerance ?? 0.01;
+  const legacy = computeLocalFinanceSummary(monthKey);
+  const shopify = getShopifySnapshot(monthKey, opts.snapshotKind ?? "all_channels");
+
+  // Pull from the PR #94 events ledger. Lazy import keeps the events
+  // module out of the legacy code path until PR #97 promotes it.
+  let events: any | null = null;
+  let eventsCount: number | null = null;
+  try {
+    const { aggregateRevenueEventsByMonth } = require("./shopify-recon-revenue-events");
+    events = aggregateRevenueEventsByMonth(monthKey);
+    eventsCount = events?.event_count ?? null;
+  } catch {
+    events = null;
+  }
+
+  const CONTRA_REVENUE_FIELDS = new Set(["discounts", "returns"]);
+
+  const lines: FinanceDiffCompareLine[] = DIFF_FIELDS.map((f) => {
+    const legacyVal = (legacy as any)?.[f];
+    const L = legacyVal == null ? null : Number(legacyVal);
+
+    // Events side — only fill for fields the ledger projects today.
+    const eventsVal = EVENTS_LEDGER_FIELDS.has(f) && events != null
+      ? Number(events[f] ?? 0)
+      : null;
+    const E = eventsVal == null || !Number.isFinite(eventsVal) ? null : eventsVal;
+
+    // Shopify side — sign normalize contra-revenue.
+    const rawS = shopify?.[f] == null ? null : Number(shopify[f]);
+    const S = rawS == null
+      ? null
+      : (CONTRA_REVENUE_FIELDS.has(f) ? Math.abs(rawS) : rawS);
+
+    const lvE = L != null && E != null ? round2(L - E) : null;
+    const evS = E != null && S != null ? round2(E - S) : null;
+    const lvS = L != null && S != null ? round2(L - S) : null;
+
+    return {
+      field: f,
+      legacy: L,
+      events: E,
+      shopify: S,
+      shopify_raw: rawS,
+      legacy_vs_events: lvE,
+      events_vs_shopify: evS,
+      legacy_vs_shopify: lvS,
+      ok_legacy_events: lvE == null ? null : Math.abs(lvE) <= tolerance,
+      ok_events_shopify: evS == null ? null : Math.abs(evS) <= tolerance,
+    };
+  });
+
+  const lvERows = lines.filter((l) => l.legacy_vs_events != null);
+  const evSRows = lines.filter((l) => l.events_vs_shopify != null);
+  const lvETotalAbs = round2(
+    lvERows.reduce((acc, l) => acc + Math.abs(Number(l.legacy_vs_events ?? 0)), 0),
+  );
+  const evSTotalAbs = round2(
+    evSRows.reduce((acc, l) => acc + Math.abs(Number(l.events_vs_shopify ?? 0)), 0),
+  );
+  const lvEAllOk = lvERows.length === 0
+    ? null
+    : lvERows.every((l) => l.ok_legacy_events === true);
+  const evSAllOk = evSRows.length === 0
+    ? null
+    : evSRows.every((l) => l.ok_events_shopify === true);
+
+  return {
+    month: monthKey,
+    tolerance,
+    legacy,
+    events,
+    shopify,
+    lines,
+    summary: {
+      legacy_vs_events_all_ok: lvEAllOk,
+      events_vs_shopify_all_ok: evSAllOk,
+      legacy_vs_events_total_abs: lvETotalAbs,
+      events_vs_shopify_total_abs: evSTotalAbs,
+      events_count: eventsCount,
+    },
+  };
+}
+
+// =====================================================================
 // PR #122 — V2 finance summary, the new source of truth for the UI.
 //
 // Replaces computeLocalFinanceSummary as the `ours` side of the Finance

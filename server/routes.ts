@@ -1544,6 +1544,49 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     );
   });
 
+  // PR #95 — Parallel-validation endpoint: legacy vs events vs Shopify in
+  // one shot. Pure read; touches no production reconciler state. Lets
+  // operators monitor the events-ledger path across the historical
+  // backfill before PR #97 switches the production reconciler over.
+  //
+  //   GET /api/recon/finance/diff-compare/:month
+  //   GET /api/recon/finance/diff-compare/:month?tolerance=0.01
+  //
+  // Response shape (FinanceDiffCompareResult):
+  //   {
+  //     month, tolerance,
+  //     legacy:  { gross_sales, discounts, returns, net_sales, taxes, ... },
+  //     events:  { gross_sales, discounts, returns, net_sales, taxes, return_fees, net_sales_gift_cards, event_count },
+  //     shopify: <recon_shopify_finance_snapshots row>,
+  //     lines: [{ field, legacy, events, shopify, shopify_raw,
+  //               legacy_vs_events, events_vs_shopify, legacy_vs_shopify,
+  //               ok_legacy_events, ok_events_shopify }, ...],
+  //     summary: {
+  //       legacy_vs_events_all_ok,
+  //       events_vs_shopify_all_ok,
+  //       legacy_vs_events_total_abs,
+  //       events_vs_shopify_total_abs,
+  //       events_count,
+  //     }
+  //   }
+  app.get("/api/recon/finance/diff-compare/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const tolerance = Number(req.query.tolerance);
+    try {
+      const { computeFinanceDiffCompare } = require("./shopify-finance-diff");
+      res.json(
+        computeFinanceDiffCompare(month, {
+          tolerance: Number.isFinite(tolerance) ? tolerance : undefined,
+        }),
+      );
+    } catch (e: any) {
+      res.status(502).json({ message: "diff-compare failed", error: String(e?.message || e) });
+    }
+  });
+
   // Debug: dump the internal components of computeLocalFinanceSummary so we
   // can see exactly which sub-total contributes to each line. Read-only.
   app.get("/api/recon/finance/debug/components/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
@@ -3376,10 +3419,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
-  // PR #108 acceptance test: line sums vs ShopifyQL Finance Summary.
-  // Returns line-by-line diff so we can confirm the sums reconcile to the
-  // penny. Sums are computed directly from recon_shopify_sales using the
-  // tax-exclusive PR #108 formulas — a check on the underlying fact table.
+  // PR #108 acceptance test: V2 line sums vs ShopifyQL Finance Summary.
+  // Returns line-by-line diff so we can confirm V2 reconciles to the penny.
+  // V2 sums are computed directly from recon_shopify_sales using the
+  // tax-exclusive PR #108 formulas — deliberately NOT from
+  // recon_revenue_events_v2, so this is a check on the underlying fact table
+  // and is robust against future projector changes.
   // PR #112: Single-query diagnostic for residual reconciliation gaps.
   // Returns:
   //   (a) full action_type x line_type x sale_type matrix for :month with
@@ -7378,17 +7423,261 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ===================================================================
+  // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
+  // ===================================================================
+  // 4 endpoints behind the USE_AGREEMENTS_PROJECTOR feature flag. The V2
+  // projector writes to recon_revenue_events_v2 (a separate table) so
+  // legacy and V2 coexist for diff-compare validation.
+  // -------------------------------------------------------------------
+
+  // POST /api/recon/finance/debug/projector-v2/project
+  // Body: { scope: 'all' } | { scope: 'order', orderId: string }
+  // Synchronously runs the V2 projector. Wipes target scope, re-emits
+  // from recon_shopify_sales. Returns counts + by_type + by_reason.
+  app.post("/api/recon/finance/debug/projector-v2/project", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+    try {
+      const {
+        projectRevenueEventsV2,
+        ensureRevenueEventsV2Schema,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      const body = req.body || {};
+      const scope = String(body.scope || "all");
+      if (scope === "all") {
+        const summary = projectRevenueEventsV2({ scope: "all" });
+        return res.json({ build_id: "pr102", ...summary });
+      }
+      if (scope === "order") {
+        const orderId = String(body.orderId || body.order_id || "").trim();
+        if (!orderId) {
+          return res.status(400).json({ message: "orderId required when scope='order'" });
+        }
+        const summary = projectRevenueEventsV2({ scope: "order", orderId });
+        return res.json({ build_id: "pr102", ...summary });
+      }
+      return res.status(400).json({ message: "scope must be 'all' or 'order'" });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-v2 failed", error: String(e?.message || e) });
+    }
+  });
+
+  // GET /api/recon/finance/debug/projector-compare/:month
+  // Diffs legacy recon_revenue_events vs V2 recon_revenue_events_v2 for
+  // a single month (YYYY-MM, ET). Returns:
+  //   - legacy totals (from aggregateRevenueEventsByMonth)
+  //   - v2 totals (from aggregateRevenueEventsV2ByMonth)
+  //   - delta = v2 - legacy for each column
+  //   - per-order discrepancies where the two projectors disagree
+  app.get("/api/recon/finance/debug/projector-compare/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const month = String(req.params.month || "").trim();
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      const {
+        aggregateRevenueEventsByMonth,
+      } = require("./shopify-recon-revenue-events");
+      const {
+        aggregateRevenueEventsV2ByMonth,
+        ensureRevenueEventsV2Schema,
+        isV2ProjectorActive,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+      const { sqlite } = require("./storage");
+
+      const legacy = aggregateRevenueEventsByMonth(month);
+      const v2 = aggregateRevenueEventsV2ByMonth(month);
+
+      const cols = ["gross_sales", "discounts", "returns", "taxes", "return_fees", "net_sales_gift_cards", "net_sales"];
+      const delta: Record<string, number> = {};
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      for (const c of cols) {
+        delta[c] = round2(Number((v2 as any)[c]) - Number((legacy as any)[c]));
+      }
+
+      // Per-order discrepancies — orders where legacy and v2 totals diverge
+      // by more than $0.01 on net_sales. Limit to 200 worst offenders so
+      // the response stays manageable.
+      const orderDiffs: any[] = sqlite.prepare(`
+        SELECT
+          o.id AS order_id,
+          o.name AS order_name,
+          COALESCE(L.gross,0) - COALESCE(V.gross,0)   AS d_gross,
+          COALESCE(L.disc,0)  - COALESCE(V.disc,0)    AS d_discount,
+          COALESCE(L.ret,0)   - COALESCE(V.ret,0)     AS d_returns,
+          COALESCE(L.tax,0)   - COALESCE(V.tax,0)     AS d_tax,
+          COALESCE(L.rfee,0)  - COALESCE(V.rfee,0)    AS d_return_fees,
+          COALESCE(L.gc,0)    - COALESCE(V.gc,0)      AS d_gc,
+          -- PR #109: V2 stores disc/ret NEGATIVE (ShopifyQL convention),
+          -- so V net = gross + disc + ret. Legacy still stores positive,
+          -- so L net = gross - disc - ret. Both expressions below yield
+          -- the correctly-signed net for their respective tables.
+          (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
+            - (COALESCE(V.gross,0)+COALESCE(V.disc,0)+COALESCE(V.ret,0)) AS d_net_sales
+        FROM recon_orders o
+        LEFT JOIN (
+          SELECT order_id,
+                 SUM(gross) AS gross, SUM(discount) AS disc,
+                 SUM(returns) AS ret, SUM(tax) AS tax,
+                 SUM(return_fees) AS rfee, SUM(net_sales_gift_cards) AS gc
+          FROM recon_revenue_events
+          WHERE event_month = ?
+          GROUP BY order_id
+        ) L ON L.order_id = o.id
+        LEFT JOIN (
+          SELECT order_id,
+                 SUM(gross) AS gross, SUM(discount) AS disc,
+                 SUM(returns) AS ret, SUM(tax) AS tax,
+                 SUM(return_fees) AS rfee, SUM(net_sales_gift_cards) AS gc
+          FROM recon_revenue_events_v2
+          WHERE event_month = ?
+          GROUP BY order_id
+        ) V ON V.order_id = o.id
+        WHERE (L.order_id IS NOT NULL OR V.order_id IS NOT NULL)
+          AND ABS(
+            (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
+            - (COALESCE(V.gross,0)+COALESCE(V.disc,0)+COALESCE(V.ret,0))
+          ) > 0.01
+        ORDER BY ABS(
+          (COALESCE(L.gross,0)-COALESCE(L.disc,0)-COALESCE(L.ret,0))
+          - (COALESCE(V.gross,0)+COALESCE(V.disc,0)+COALESCE(V.ret,0))
+        ) DESC
+        LIMIT 200
+      `).all(month, month) as any[];
+
+      res.json({
+        build_id: "pr102",
+        month,
+        active_projector: isV2ProjectorActive() ? "v2" : "legacy",
+        flag_env: process.env.USE_AGREEMENTS_PROJECTOR || "(unset)",
+        legacy,
+        v2,
+        delta,
+        is_clean: cols.every((c) => Math.abs(delta[c]) < 0.01),
+        order_diffs: orderDiffs.map((d) => ({
+          ...d,
+          d_gross: round2(d.d_gross),
+          d_discount: round2(d.d_discount),
+          d_returns: round2(d.d_returns),
+          d_tax: round2(d.d_tax),
+          d_return_fees: round2(d.d_return_fees),
+          d_gc: round2(d.d_gc),
+          d_net_sales: round2(d.d_net_sales),
+        })),
+        order_diff_count: orderDiffs.length,
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-compare failed", error: String(e?.message || e) });
+    }
+  });
+
+  // GET /api/recon/finance/debug/projector-compare/order/:name
+  // Side-by-side diff of legacy and V2 events for a single order. Useful
+  // when projector-compare/:month surfaces a discrepant order and you
+  // want to drill into which specific events differ.
+  app.get("/api/recon/finance/debug/projector-compare/order/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const raw = String(req.params.name || "").trim();
+      if (!raw) return res.status(400).json({ message: "name required" });
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+      const row: any = sqlite.prepare(`
+        SELECT id, name FROM recon_orders
+        WHERE name = ? OR name = ? OR order_number = ?
+        LIMIT 1
+      `).get(withHash, noHash, noHash);
+      if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+      const {
+        listEventsForOrder,
+      } = require("./shopify-recon-revenue-events");
+      const {
+        listEventsV2ForOrder,
+        ensureRevenueEventsV2Schema,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      const legacy = listEventsForOrder(row.id);
+      const v2 = listEventsV2ForOrder(row.id);
+
+      const sumCols = (rows: any[]) => {
+        const t = { gross: 0, discount: 0, tax: 0, returns: 0, return_fees: 0, net_sales_gift_cards: 0 };
+        for (const r of rows) {
+          t.gross += Number(r.gross || 0);
+          t.discount += Number(r.discount || 0);
+          t.tax += Number(r.tax || 0);
+          t.returns += Number(r.returns || 0);
+          t.return_fees += Number(r.return_fees || 0);
+          t.net_sales_gift_cards += Number(r.net_sales_gift_cards || 0);
+        }
+        return t;
+      };
+
+      res.json({
+        build_id: "pr102",
+        order_id: row.id,
+        order_name: row.name,
+        legacy: { events: legacy, totals: sumCols(legacy) },
+        v2: { events: v2, totals: sumCols(v2) },
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-compare/order failed", error: String(e?.message || e) });
+    }
+  });
+
+  // GET /api/recon/finance/debug/projector-v2/orders/by-name/:name
+  // List V2 events for a single order. Mirrors the legacy /events endpoint
+  // for direct inspection of the V2 projector output.
+  app.get("/api/recon/finance/debug/projector-v2/orders/by-name/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const raw = String(req.params.name || "").trim();
+      if (!raw) return res.status(400).json({ message: "name required" });
+      const withHash = raw.startsWith("#") ? raw : `#${raw}`;
+      const noHash = raw.startsWith("#") ? raw.slice(1) : raw;
+      const row: any = sqlite.prepare(`
+        SELECT id, name FROM recon_orders
+        WHERE name = ? OR name = ? OR order_number = ?
+        LIMIT 1
+      `).get(withHash, noHash, noHash);
+      if (!row) return res.status(404).json({ message: `Order ${raw} not found` });
+
+      const {
+        listEventsV2ForOrder,
+        ensureRevenueEventsV2Schema,
+      } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
+
+      const events = listEventsV2ForOrder(row.id);
+      res.json({
+        build_id: "pr102",
+        order_id: row.id,
+        order_name: row.name,
+        count: events.length,
+        events,
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "projector-v2/orders failed", error: String(e?.message || e) });
+    }
+  });
+
+  // ===================================================================
   // PR #103 GROUND TRUTH — Shopify vs Our Ingest vs Our Projection
   // ===================================================================
   // GET /api/recon/finance/debug/shopify-ground-truth/:month
   // Calls live Shopify GraphQL orders() for ALL orders created in the
-  // month (ET window), paginated, and compares Shopify's own totals to
-  // what's in recon_shopify_sales (our ingest layer).
+  // month (ET window), paginated, and compares Shopify's own totals to:
+  //   - what's in recon_shopify_sales (our ingest layer)
+  //   - what's in recon_revenue_events_v2 (our projection layer)
   //
-  // Returns two side-by-side total objects plus per-order detail so we
-  // can see exactly which orders our ingest dropped. This is the
-  // ingest-gap diagnostic: any order Shopify reports but our ingest
-  // missed shows up as dropped_by_ingest.
+  // Returns three side-by-side total objects plus per-order detail so
+  // we can see exactly which orders our ingest dropped vs. which our
+  // projector miscalculated.
+  //
+  // This is the check that should have gated PR #97. Running it now to
+  // diagnose why the V2 projector totals are short.
   // -------------------------------------------------------------------
   app.get("/api/recon/finance/debug/shopify-ground-truth/:month", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
     try {
@@ -7401,6 +7690,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const { shopifyGraphqlCall } = require("./shopify-recon");
       const { sqlite } = require("./storage");
+      const { ensureRevenueEventsV2Schema } = require("./shopify-recon-events-projector-v2");
+      ensureRevenueEventsV2Schema();
 
       // ET window for the month. We use created_at:>=START created_at:<END
       // in Shopify's query DSL, where START/END are ET local boundaries
@@ -7507,8 +7798,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         ingest[k] = round2(Number(ingest[k] || 0));
       }
 
+      // Our projection layer: aggregate recon_revenue_events_v2 for same month
+      const v2: any = sqlite.prepare(`
+        SELECT
+          COUNT(DISTINCT order_id) AS order_count,
+          COUNT(*)                  AS event_count,
+          COALESCE(SUM(gross), 0)                  AS gross,
+          COALESCE(SUM(discount), 0)               AS discount,
+          COALESCE(SUM(returns), 0)                AS returns,
+          COALESCE(SUM(tax), 0)                    AS tax,
+          COALESCE(SUM(return_fees), 0)            AS return_fees,
+          COALESCE(SUM(net_sales_gift_cards), 0)   AS net_sales_gift_cards
+        FROM recon_revenue_events_v2
+        WHERE event_month = ?
+      `).get(month) as any;
+      for (const k of ["gross","discount","returns","tax","return_fees","net_sales_gift_cards"]) {
+        v2[k] = round2(Number(v2[k] || 0));
+      }
+
       // Per-order: for each Shopify order in the month, look up our ingest
-      // counts. Anything where Shopify > 0 but we have 0 is a dropped order.
+      // + v2 counts. Anything where Shopify > 0 but we have 0 is a dropped
+      // order. Anything where amounts differ by >$0.01 is a calculation gap.
       const lookupSales = sqlite.prepare(`
         SELECT COUNT(*) AS sales_count, COALESCE(SUM(total_amount), 0) AS total_amount
         FROM recon_shopify_sales
@@ -7519,6 +7829,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         FROM recon_shopify_agreements
         WHERE order_id = ?
       `);
+      const lookupV2 = sqlite.prepare(`
+        SELECT COUNT(*) AS event_count, COALESCE(SUM(gross), 0) AS gross
+        FROM recon_revenue_events_v2
+        WHERE order_id = ? AND event_month = ?
+      `);
       const perOrder: any[] = [];
       let droppedCount = 0;
       let droppedGross = 0;
@@ -7526,6 +7841,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const orderId = String(o.id).replace("gid://shopify/Order/", "");
         const s: any = lookupSales.get(orderId, month) || {};
         const a: any = lookupAgreements.get(orderId) || {};
+        const ve: any = lookupV2.get(orderId, month) || {};
         const shopifyTotal = num(o.currentTotalPriceSet);
         const ingested = Number(s.sales_count || 0) > 0;
         if (!ingested && shopifyTotal > 0) {
@@ -7544,6 +7860,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ingest_sales_count: Number(s.sales_count || 0),
           ingest_total_amount: round2(Number(s.total_amount || 0)),
           ingest_agreement_count: Number(a.agreement_count || 0),
+          v2_event_count: Number(ve.event_count || 0),
+          v2_gross: round2(Number(ve.gross || 0)),
           dropped_by_ingest: !ingested && shopifyTotal > 0,
         });
       }
@@ -7560,7 +7878,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         window_et: { start: startET, end: endET },
         shopify: shopifyTotals,
         our_ingest: ingest,
+        our_projection_v2: v2,
         gaps: {
+          shopify_current_total_vs_v2_gross: round2(shopifyTotals.current_total - Number(v2.gross || 0)),
+          shopify_current_subtotal_vs_v2_gross: round2(shopifyTotals.current_subtotal - Number(v2.gross || 0)),
+          shopify_orders_vs_v2_orders: shopifyTotals.order_count - Number(v2.order_count || 0),
           shopify_orders_vs_ingest_orders: shopifyTotals.order_count - Number(ingest.order_count || 0),
           dropped_by_ingest_count: droppedCount,
           dropped_by_ingest_gross: round2(droppedGross),
@@ -7581,7 +7903,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Single-call investigation for one Shopify order. Returns everything
   // needed to figure out why an order is over/under-booked:
   //   - Shopify live truth (currentTotalPriceSet etc. + refunds)
-  //   - Our ingest view (recon_shopify_agreements + recon_shopify_sales)
+  //   - Legacy projector view (recon_revenue_events rows)
+  //   - V2 shadow view (recon_shopify_agreements + recon_shopify_sales
+  //     + recon_revenue_events_v2 rows)
   //   - recon_orders row (lifecycle / refund_variance_flag / etc.)
   //
   // Designed as the standard tool when month totals show a gap: run
@@ -7611,13 +7935,35 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       const orderId = orderRow.id;
 
+      // Legacy projector events
+      const legacyEvents: any[] = sqlite.prepare(`
+        SELECT event_id, event_date, event_month, event_type,
+               gross, discount, returns, tax, return_fees, net_sales_gift_cards,
+               detector_source, detected_at, line_item_id, refund_id
+        FROM recon_revenue_events
+        WHERE order_id = ?
+        ORDER BY event_date ASC, event_id ASC
+      `).all(orderId);
+
       const round2 = (n: number) => Math.round(n * 100) / 100;
       const sumCol = (rows: any[], col: string) =>
         round2(rows.reduce((s, r) => s + Number(r[col] || 0), 0));
+      const legacyTotals = {
+        event_count: legacyEvents.length,
+        gross: sumCol(legacyEvents, "gross"),
+        discount: sumCol(legacyEvents, "discount"),
+        returns: sumCol(legacyEvents, "returns"),
+        tax: sumCol(legacyEvents, "tax"),
+        return_fees: sumCol(legacyEvents, "return_fees"),
+        net_sales_gift_cards: sumCol(legacyEvents, "net_sales_gift_cards"),
+      };
 
-      // Our ingest view: agreements + sales
-      let ingestBlock: any = { available: false };
+      // V2 shadow: agreements + sales + v2 events
+      let v2Block: any = { available: false };
       try {
+        const { ensureRevenueEventsV2Schema } = require("./shopify-recon-events-projector-v2");
+        ensureRevenueEventsV2Schema();
+
         const agreements: any[] = sqlite.prepare(`
           SELECT id, happened_at, reason, agreement_type, app_handle,
                  refund_id, return_id, ingest_version
@@ -7637,21 +7983,40 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           ORDER BY happened_at ASC, id ASC
         `).all(orderId);
 
-        ingestBlock = {
+        const v2Events: any[] = sqlite.prepare(`
+          SELECT event_id, event_date, event_month, event_type,
+                 gross, discount, returns, tax, return_fees, net_sales_gift_cards,
+                 sale_id, agreement_id, detector_source
+          FROM recon_revenue_events_v2
+          WHERE order_id = ?
+          ORDER BY event_date ASC, event_id ASC
+        `).all(orderId);
+
+        v2Block = {
           available: true,
           agreement_count: agreements.length,
           sales_count: sales.length,
+          event_count: v2Events.length,
           agreements,
           sales,
+          events: v2Events,
           sales_totals: {
             total_amount: sumCol(sales, "total_amount"),
             total_tax: sumCol(sales, "total_tax"),
             total_discount_after_taxes: sumCol(sales, "total_discount_after_taxes"),
             total_discount_before_taxes: sumCol(sales, "total_discount_before_taxes"),
           },
+          event_totals: {
+            gross: sumCol(v2Events, "gross"),
+            discount: sumCol(v2Events, "discount"),
+            returns: sumCol(v2Events, "returns"),
+            tax: sumCol(v2Events, "tax"),
+            return_fees: sumCol(v2Events, "return_fees"),
+            net_sales_gift_cards: sumCol(v2Events, "net_sales_gift_cards"),
+          },
         };
       } catch (e: any) {
-        ingestBlock = { available: false, error: String(e?.message || e) };
+        v2Block = { available: false, error: String(e?.message || e) };
       }
 
       // Optionally: live Shopify GraphQL look-up for this order (current totals)
@@ -7707,7 +8072,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         build_id: "pr104-diagnose-order",
         order: orderRow,
         shopify_live: shopifyLive,
-        our_ingest: ingestBlock,
+        legacy_projector: {
+          source_of_truth: true,
+          totals: legacyTotals,
+          events: legacyEvents,
+        },
+        v2_shadow: {
+          source_of_truth: false,
+          ...v2Block,
+        },
       });
     } catch (e: any) {
       res.status(500).json({ message: "diagnose-order failed", error: String(e?.message || e) });
@@ -8388,6 +8761,136 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     } catch (e: any) {
       res.status(502).json({ message: "probe failed", error: String(e?.message || e), build_id: "86a-fix2" });
+    }
+  });
+
+  // =====================================================================
+  // PR #94 — Revenue events ledger (data layer only).
+  //
+  // These endpoints expose the new recon_revenue_events projection without
+  // touching the production reconciler math. They exist so we can build,
+  // backfill, and inspect the ledger in parallel with the legacy path,
+  // then compare in PR #95 before switching over in PR #97.
+  //
+  //   POST /api/recon/finance/debug/events/backfill
+  //     Body: { scope: "all" } | { scope: "order", order_id }
+  //     Wipes (in scope) and re-projects events from recon_line_items +
+  //     recon_refunds + recon_refund_line_items.
+  //
+  //   GET  /api/recon/finance/debug/events/monthly/:month
+  //     Returns the new path's monthly aggregate for inspection.
+  //
+  //   GET  /api/recon/finance/debug/events/order/:order_id
+  //     Returns every event row for one order. Useful for verifying that
+  //     an edited order generated the right sale/refund/return_fee rows.
+  //
+  //   GET  /api/recon/finance/debug/events/warnings
+  //     Returns recent rows from recon_event_warnings.
+  //
+  //   GET  /api/recon/finance/debug/events/health
+  //     Quick counts: total events, by type, distinct months, latest detected_at.
+  // =====================================================================
+  app.post("/api/recon/finance/debug/events/backfill", authMiddleware, requirePermission("system.manage_config"), (req: any, res) => {
+    try {
+      const {
+        projectRevenueEvents,
+      } = require("./shopify-recon-revenue-events");
+      const scope = req.body?.scope === "order" ? "order" : "all";
+      if (scope === "order") {
+        const orderId = String(req.body?.order_id || "").trim();
+        if (!orderId) {
+          return res.status(400).json({ message: "order_id required for scope=order" });
+        }
+        const summary = projectRevenueEvents({ scope, orderId });
+        return res.json({ ok: true, build_id: "pr94", summary });
+      }
+      const summary = projectRevenueEvents({ scope: "all" });
+      res.json({ ok: true, build_id: "pr94", summary });
+    } catch (e: any) {
+      res.status(502).json({ message: "projectRevenueEvents failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/monthly/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const {
+        aggregateRevenueEventsByMonth,
+      } = require("./shopify-recon-revenue-events");
+      const monthKey = String(req.params.month || "").trim();
+      if (!/^\d{4}-\d{2}$/.test(monthKey)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      const row = aggregateRevenueEventsByMonth(monthKey);
+      res.json({ ok: true, build_id: "pr94", month: monthKey, row });
+    } catch (e: any) {
+      res.status(502).json({ message: "aggregateRevenueEventsByMonth failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/order/:order_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const {
+        listEventsForOrder,
+      } = require("./shopify-recon-revenue-events");
+      const orderId = String(req.params.order_id || "").trim();
+      if (!orderId) {
+        return res.status(400).json({ message: "order_id required" });
+      }
+      const events = listEventsForOrder(orderId);
+      res.json({ ok: true, build_id: "pr94", order_id: orderId, count: events.length, events });
+    } catch (e: any) {
+      res.status(502).json({ message: "listEventsForOrder failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/warnings", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+    try {
+      const {
+        listRecentEventWarnings,
+      } = require("./shopify-recon-revenue-events");
+      const limit = Math.min(Math.max(Number(req.query?.limit) || 100, 1), 1000);
+      const rows = listRecentEventWarnings(limit);
+      res.json({ ok: true, build_id: "pr94", count: rows.length, warnings: rows });
+    } catch (e: any) {
+      res.status(502).json({ message: "listRecentEventWarnings failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.get("/api/recon/finance/debug/events/health", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const {
+        ensureRevenueEventsSchema,
+      } = require("./shopify-recon-revenue-events");
+      ensureRevenueEventsSchema();
+      const total = (sqlite.prepare(`SELECT COUNT(*) AS n FROM recon_revenue_events`).get() as any).n;
+      const byType = sqlite.prepare(`
+        SELECT event_type, COUNT(*) AS n
+        FROM recon_revenue_events
+        GROUP BY event_type
+        ORDER BY event_type
+      `).all();
+      const months = sqlite.prepare(`
+        SELECT event_month, COUNT(*) AS n
+        FROM recon_revenue_events
+        GROUP BY event_month
+        ORDER BY event_month ASC
+      `).all();
+      const latest = (sqlite.prepare(`
+        SELECT MAX(detected_at) AS d FROM recon_revenue_events
+      `).get() as any).d;
+      const warnings = (sqlite.prepare(`SELECT COUNT(*) AS n FROM recon_event_warnings`).get() as any).n;
+      res.json({
+        ok: true,
+        build_id: "pr94",
+        total_events: total,
+        by_type: byType,
+        by_month: months,
+        latest_detected_at: latest,
+        warnings_total: warnings,
+      });
+    } catch (e: any) {
+      res.status(502).json({ message: "events health failed", error: String(e?.message || e) });
     }
   });
 
