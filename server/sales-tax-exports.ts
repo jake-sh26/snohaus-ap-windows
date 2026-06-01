@@ -1,20 +1,24 @@
 /**
- * Sales Tax — export builders (PR #167).
+ * Sales Tax — form-aware export builders (PR #167, reworked PR #168).
  *
  * Pure builder functions for the three sales-tax export formats. They take
- * already-computed sales-tax data (the same SalesTaxMonth shape the
- * /sales-tax/:month endpoint returns) plus optional line detail, and return a
- * string (CSV) or Buffer (XLSX/PDF). No DB access here — the route layer does
- * the compute and passes the data in, so this module stays importable + the
- * canonical compute (computeSalesTaxForMonth, a closure in routes.ts) is reused
- * rather than duplicated.
+ * already-computed sales-tax data plus the per-entity (and, for ST-810,
+ * per-jurisdiction) filing rows the route assembles from the single-source-of-
+ * truth aggregator, and return a string (CSV) or Buffer (XLSX/PDF). No DB access
+ * here — the route layer does the compute + entity_settings/DTF enrichment and
+ * passes everything in.
+ *
+ * Form differentiation (PR #168): NY files ST-809 for the 8 non-quarter-end
+ * months (long method, per-entity only) and ST-810 for the 4 quarter-end months
+ * (per-entity + per-jurisdiction with DTF codes + fractional rates). `formType`
+ * on the payload drives which layout each builder emits.
  *
  * Money: every figure arrives as integer cents and is formatted to 2 decimals
- * exactly once, at render time (centsToFixed). No intermediate float math, no
- * rounding drift. Refund tax is already ABS-wrapped + subtracted upstream.
+ * exactly once, at render time (centsToFixed). No intermediate float math.
  */
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
+import { formatRateAsFraction } from "@shared/format-rate";
 
 // ---- Shapes mirrored from the routes.ts compute (kept in sync by hand) ----
 
@@ -33,6 +37,8 @@ export interface ExportStoreRow {
   tax_collected_cents: number;
   refund_tax_in_period_cents: number;
   net_tax_cents: number;
+  marketplace_sales_cents: number;
+  marketplace_tax_cents: number;
 }
 
 export interface ExportTotals {
@@ -40,6 +46,8 @@ export interface ExportTotals {
   taxable_sales_cents: number;
   tax_collected_cents: number;
   net_tax_cents: number;
+  marketplace_sales_cents: number;
+  marketplace_tax_cents: number;
 }
 
 export interface ExportInvariant {
@@ -71,19 +79,57 @@ export interface ExportLineDetail {
 }
 
 /**
+ * Per-entity filing row (the ST-809/ST-810 entity summary). Money is integer
+ * cents. `tin` is null when unset → renderers show a blank underline. Spans the
+ * whole period (quarter-rolled-up for ST-810).
+ */
+export interface ExportEntityRow {
+  entity_id: number;
+  legal_name: string;
+  tin: string | null;
+  county: string;
+  dtf_code: string;
+  gross_sales_cents: number;
+  marketplace_sales_cents: number;
+  taxable_sales_cents: number;
+  tax_due_cents: number;
+}
+
+/**
+ * Per-jurisdiction filing row (ST-810 only). One per (entity, jurisdiction).
+ * `rate` is the decimal rate; `rate_display` the NY fraction ("8 5/8%").
+ */
+export interface ExportJurisdictionRow {
+  entity_id: number;
+  entity_legal_name: string;
+  jurisdiction_name: string;
+  dtf_code: string | null;
+  rate: number;
+  rate_display: string;
+  taxable_sales_cents: number;
+  tax_due_cents: number;
+}
+
+/**
  * The unit of work for an export: a single period that is either one month
- * (simple mode) or a quarter (three months rolled up). `months` always lists
- * the constituent month payloads; `periodKey`/`isQuarter` drive titles +
- * filenames. `lineDetail` spans the whole period.
+ * (ST-809) or a quarter (ST-810, three months rolled up). `months` always lists
+ * the constituent month payloads; `periodKey`/`formType` drive titles +
+ * filenames. `entities`/`jurisdictions` carry the form-faithful filing rows.
  */
 export interface ExportPayload {
   periodKey: string;
   isQuarter: boolean;
+  formType: "ST-809" | "ST-810";
   months: ExportMonth[];
-  /** Quarter-level totals + invariant (only meaningful when isQuarter). */
   totals: ExportTotals;
   invariant: ExportInvariant;
   lineDetail: ExportLineDetail[];
+  /** Per-entity filing rows (always present; all 3 entities). */
+  entities: ExportEntityRow[];
+  /** Per-jurisdiction rows (ST-810 only; empty for ST-809). */
+  jurisdictions: ExportJurisdictionRow[];
+  /** Any jurisdiction name lacking a DTF code (ST-810 warning). */
+  unmappedJurisdictions: string[];
   generatedAtET: string;
 }
 
@@ -111,6 +157,11 @@ export function bpsToPct(bps: number): string {
   return `${(bps / 1000).toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}%`;
 }
 
+/** Decimal rate (0.08625) -> NY fraction ("8 5/8%"). */
+export function rateFraction(rate: number): string {
+  return formatRateAsFraction(rate);
+}
+
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
@@ -130,44 +181,80 @@ export function quarterCoverageLabel(months: ExportMonth[]): string {
   return `${shortNames.join(" / ")} ${year}`;
 }
 
-// ---- CSV -----------------------------------------------------------------
+/** Slug a legal name for filenames: "SD Ski and Patio Inc" -> "SD-Ski-and-Patio-Inc". */
+export function slugLegalName(name: string): string {
+  return name.trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
 
-const CSV_HEADER = [
-  "period_key", "month", "store_id", "store_name", "entity_id", "county",
-  "state", "rate_pct", "gross_sales", "taxable_sales", "exempt_sales",
-  "tax_collected", "refund_tax_in_period", "net_tax",
-];
+const TIN_BLANK = "___________";
+
+// ---- CSV -----------------------------------------------------------------
 
 function csvEscape(field: string): string {
   if (/[",\n\r]/.test(field)) return `"${field.replace(/"/g, '""')}"`;
   return field;
 }
 
-/** Per-store monthly summary CSV. One row per store per month in the period. */
+function csvRow(fields: (string | number)[]): string {
+  return fields.map((f) => csvEscape(String(f))).join(",");
+}
+
+/**
+ * Form-aware CSV. ST-809 = one row per entity. ST-810 = entity summary rows
+ * then clearly-labeled jurisdiction-detail rows. CSV keeps the raw DECIMAL rate.
+ */
 export function buildSalesTaxCsv(payload: ExportPayload): string {
-  const lines: string[] = [CSV_HEADER.join(",")];
-  for (const mm of payload.months) {
-    for (const s of mm.stores) {
-      const row = [
-        payload.periodKey,
-        mm.month,
-        s.store_id,
-        s.name,
-        String(s.entity_id),
-        s.county,
-        s.state,
-        bpsToPct(s.rate_bps),
-        centsToFixed(s.gross_sales_cents),
-        centsToFixed(s.taxable_sales_cents),
-        centsToFixed(s.exempt_sales_cents),
-        centsToFixed(s.tax_collected_cents),
-        centsToFixed(s.refund_tax_in_period_cents),
-        centsToFixed(s.net_tax_cents),
-      ];
-      lines.push(row.map((f) => csvEscape(String(f))).join(","));
+  const lines: string[] = [];
+  lines.push(csvRow([`form_type`, payload.formType]));
+  lines.push(csvRow([`period`, payload.periodKey]));
+  lines.push("");
+
+  // Entity summary section.
+  lines.push(csvRow([
+    "section", "entity_id", "legal_name", "tin", "county", "dtf_code",
+    "gross_sales", "marketplace_sales", "taxable_sales", "tax_due",
+  ]));
+  for (const e of payload.entities) {
+    lines.push(csvRow([
+      "ENTITY",
+      e.entity_id,
+      e.legal_name,
+      e.tin ?? "",
+      e.county,
+      e.dtf_code,
+      centsToFixed(e.gross_sales_cents),
+      centsToFixed(e.marketplace_sales_cents),
+      centsToFixed(e.taxable_sales_cents),
+      centsToFixed(e.tax_due_cents),
+    ]));
+  }
+
+  // Jurisdiction detail section (ST-810 only).
+  if (payload.formType === "ST-810" && payload.jurisdictions.length > 0) {
+    lines.push("");
+    lines.push(csvRow([
+      "section", "entity_id", "entity_legal_name", "jurisdiction", "dtf_code",
+      "rate_decimal", "taxable_sales", "tax_due",
+    ]));
+    for (const j of payload.jurisdictions) {
+      lines.push(csvRow([
+        "JURISDICTION",
+        j.entity_id,
+        j.entity_legal_name,
+        j.jurisdiction_name,
+        j.dtf_code ?? "",
+        j.rate.toFixed(5),
+        centsToFixed(j.taxable_sales_cents),
+        centsToFixed(j.tax_due_cents),
+      ]));
     }
   }
-  // Trailing CRLF — Excel-friendly.
+
+  if (payload.unmappedJurisdictions.length > 0) {
+    lines.push("");
+    lines.push(csvRow(["unmapped_jurisdictions", payload.unmappedJurisdictions.join("; ")]));
+  }
+
   return lines.join("\r\n") + "\r\n";
 }
 
@@ -175,111 +262,131 @@ export function buildSalesTaxCsv(payload: ExportPayload): string {
 
 const MONEY_FMT = '$#,##0.00';
 
-/** Multi-sheet workbook: Summary, Line Detail, Reconciliation. */
+/**
+ * Form-aware workbook. ST-809 = Entity Summary + Reconciliation. ST-810 =
+ * Entity Summary + Jurisdiction Detail + Line Detail + Reconciliation.
+ */
 export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
   wb.creator = "Sno-Haus AP";
   wb.created = new Date();
 
-  // ----- Sheet 1: Summary (same columns as CSV) -----
-  const summary = wb.addWorksheet("Summary");
+  // ----- Sheet: Entity Summary -----
+  const summary = wb.addWorksheet("Entity Summary");
   summary.columns = [
-    { header: "Period", key: "period_key", width: 12 },
-    { header: "Month", key: "month", width: 10 },
-    { header: "Store ID", key: "store_id", width: 16 },
-    { header: "Store", key: "store_name", width: 14 },
     { header: "Entity", key: "entity_id", width: 8 },
+    { header: "Legal Name", key: "legal_name", width: 24 },
+    { header: "TIN", key: "tin", width: 14 },
     { header: "County", key: "county", width: 12 },
-    { header: "State", key: "state", width: 7 },
-    { header: "Rate", key: "rate_pct", width: 9 },
+    { header: "DTF Code", key: "dtf_code", width: 12 },
     { header: "Gross Sales", key: "gross_sales", width: 14 },
+    { header: "Marketplace Sales", key: "marketplace_sales", width: 16 },
     { header: "Taxable Sales", key: "taxable_sales", width: 14 },
-    { header: "Exempt Sales", key: "exempt_sales", width: 14 },
-    { header: "Tax Collected", key: "tax_collected", width: 14 },
-    { header: "Refund Tax", key: "refund_tax_in_period", width: 14 },
-    { header: "Net Tax", key: "net_tax", width: 14 },
+    { header: "Tax Due", key: "tax_due", width: 14 },
   ];
-  const moneyCols = ["gross_sales", "taxable_sales", "exempt_sales", "tax_collected", "refund_tax_in_period", "net_tax"];
-  for (const mm of payload.months) {
-    for (const s of mm.stores) {
-      summary.addRow({
-        period_key: payload.periodKey,
-        month: mm.month,
-        store_id: s.store_id,
-        store_name: s.name,
-        entity_id: s.entity_id,
-        county: s.county,
-        state: s.state,
-        rate_pct: bpsToPct(s.rate_bps),
-        gross_sales: s.gross_sales_cents / 100,
-        taxable_sales: s.taxable_sales_cents / 100,
-        exempt_sales: s.exempt_sales_cents / 100,
-        tax_collected: s.tax_collected_cents / 100,
-        refund_tax_in_period: s.refund_tax_in_period_cents / 100,
-        net_tax: s.net_tax_cents / 100,
-      });
-    }
+  const entityMoneyCols = ["gross_sales", "marketplace_sales", "taxable_sales", "tax_due"];
+  for (const e of payload.entities) {
+    summary.addRow({
+      entity_id: e.entity_id,
+      legal_name: e.legal_name,
+      tin: e.tin ?? "TIN not set",
+      county: e.county,
+      dtf_code: e.dtf_code,
+      gross_sales: e.gross_sales_cents / 100,
+      marketplace_sales: e.marketplace_sales_cents / 100,
+      taxable_sales: e.taxable_sales_cents / 100,
+      tax_due: e.tax_due_cents / 100,
+    });
   }
-  // Totals row.
-  const t = payload.totals;
+  const et = payload.totals;
   summary.addRow({
-    period_key: "TOTAL",
-    gross_sales: t.gross_sales_cents / 100,
-    taxable_sales: t.taxable_sales_cents / 100,
-    tax_collected: t.tax_collected_cents / 100,
-    net_tax: t.net_tax_cents / 100,
+    entity_id: "TOTAL",
+    gross_sales: et.gross_sales_cents / 100,
+    marketplace_sales: et.marketplace_sales_cents / 100,
+    taxable_sales: et.taxable_sales_cents / 100,
+    tax_due: et.net_tax_cents / 100,
   });
   summary.getRow(1).font = { bold: true };
   summary.lastRow!.font = { bold: true };
-  for (const key of moneyCols) {
+  for (const key of entityMoneyCols) {
     const col = summary.getColumn(key);
     col.numFmt = MONEY_FMT;
     col.alignment = { horizontal: "right" };
   }
 
-  // ----- Sheet 2: Line Detail -----
-  const detail = wb.addWorksheet("Line Detail");
-  detail.columns = [
-    { header: "Order", key: "order_name", width: 14 },
-    { header: "Date (ET)", key: "order_date_eastern", width: 22 },
-    { header: "Store", key: "store_name", width: 14 },
-    { header: "County", key: "county", width: 12 },
-    { header: "Rate", key: "rate_pct", width: 9 },
-    { header: "Taxable Amount", key: "taxable_amount", width: 16 },
-    { header: "Tax Amount", key: "tax_amount", width: 14 },
-    { header: "Refund?", key: "refund_flag", width: 9 },
-  ];
-  for (const ld of payload.lineDetail) {
-    detail.addRow({
-      order_name: ld.order_name,
-      order_date_eastern: ld.order_date_eastern,
-      store_name: ld.store_name,
-      county: ld.county,
-      rate_pct: bpsToPct(ld.rate_bps),
-      taxable_amount: ld.taxable_amount_cents / 100,
-      tax_amount: ld.tax_amount_cents / 100,
-      refund_flag: ld.refund_flag ? "REFUND" : "",
-    });
-  }
-  detail.getRow(1).font = { bold: true };
-  for (const key of ["taxable_amount", "tax_amount"]) {
-    const col = detail.getColumn(key);
-    col.numFmt = MONEY_FMT;
-    col.alignment = { horizontal: "right" };
+  // ----- Sheet: Jurisdiction Detail (ST-810 only) -----
+  if (payload.formType === "ST-810") {
+    const jur = wb.addWorksheet("Jurisdiction Detail");
+    jur.columns = [
+      { header: "Entity", key: "entity_id", width: 8 },
+      { header: "Legal Name", key: "legal_name", width: 24 },
+      { header: "Jurisdiction", key: "jurisdiction", width: 18 },
+      { header: "DTF Code", key: "dtf_code", width: 12 },
+      { header: "Rate", key: "rate_display", width: 10 },
+      { header: "Taxable Sales", key: "taxable_sales", width: 14 },
+      { header: "Tax Due", key: "tax_due", width: 14 },
+    ];
+    for (const j of payload.jurisdictions) {
+      jur.addRow({
+        entity_id: j.entity_id,
+        legal_name: j.entity_legal_name,
+        jurisdiction: j.jurisdiction_name,
+        dtf_code: j.dtf_code ?? "(unmapped)",
+        rate_display: j.rate_display,
+        taxable_sales: j.taxable_sales_cents / 100,
+        tax_due: j.tax_due_cents / 100,
+      });
+    }
+    jur.getRow(1).font = { bold: true };
+    for (const key of ["taxable_sales", "tax_due"]) {
+      const col = jur.getColumn(key);
+      col.numFmt = MONEY_FMT;
+      col.alignment = { horizontal: "right" };
+    }
+
+    // ----- Sheet: Line Detail (ST-810 only) -----
+    const detail = wb.addWorksheet("Line Detail");
+    detail.columns = [
+      { header: "Order", key: "order_name", width: 14 },
+      { header: "Date (ET)", key: "order_date_eastern", width: 22 },
+      { header: "Store", key: "store_name", width: 14 },
+      { header: "County", key: "county", width: 12 },
+      { header: "Rate", key: "rate_pct", width: 9 },
+      { header: "Taxable Amount", key: "taxable_amount", width: 16 },
+      { header: "Tax Amount", key: "tax_amount", width: 14 },
+      { header: "Refund?", key: "refund_flag", width: 9 },
+    ];
+    for (const ld of payload.lineDetail) {
+      detail.addRow({
+        order_name: ld.order_name,
+        order_date_eastern: ld.order_date_eastern,
+        store_name: ld.store_name,
+        county: ld.county,
+        rate_pct: bpsToPct(ld.rate_bps),
+        taxable_amount: ld.taxable_amount_cents / 100,
+        tax_amount: ld.tax_amount_cents / 100,
+        refund_flag: ld.refund_flag ? "REFUND" : "",
+      });
+    }
+    detail.getRow(1).font = { bold: true };
+    for (const key of ["taxable_amount", "tax_amount"]) {
+      const col = detail.getColumn(key);
+      col.numFmt = MONEY_FMT;
+      col.alignment = { horizontal: "right" };
+    }
   }
 
-  // ----- Sheet 3: Reconciliation -----
+  // ----- Sheet: Reconciliation -----
   const recon = wb.addWorksheet("Reconciliation");
   recon.columns = [
-    { header: "Check", key: "check", width: 40 },
+    { header: "Check", key: "check", width: 44 },
     { header: "Per-Entity Sum", key: "a", width: 18 },
     { header: "View Total", key: "b", width: 18 },
     { header: "Delta (cents)", key: "delta", width: 14 },
     { header: "Status", key: "status", width: 10 },
   ];
   recon.getRow(1).font = { bold: true };
-  // Section 1: per-store sum vs engine view total (per month + quarter total).
-  recon.addRow({ check: "Section 1 — per-store net-tax sum vs view total" }).font = { bold: true };
+  recon.addRow({ check: "Per-entity tax-due sum vs aggregator view total" }).font = { bold: true };
   for (const mm of payload.months) {
     recon.addRow({
       check: `  ${mm.month}`,
@@ -298,29 +405,6 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
       status: payload.invariant.ok ? "OK" : "VIOLATION",
     });
   }
-  // Section 2: per-jurisdiction (county) tax sum vs total tax.
-  recon.addRow({});
-  recon.addRow({ check: "Section 2 — per-jurisdiction tax sum vs total tax" }).font = { bold: true };
-  const countyTax = new Map<string, number>();
-  let totalTax = 0;
-  for (const mm of payload.months) {
-    for (const s of mm.stores) {
-      countyTax.set(s.county, (countyTax.get(s.county) || 0) + s.net_tax_cents);
-      totalTax += s.net_tax_cents;
-    }
-  }
-  let countySum = 0;
-  Array.from(countyTax.entries()).forEach(([county, cents]) => {
-    countySum += cents;
-    recon.addRow({ check: `  ${county}`, a: cents / 100 });
-  });
-  recon.addRow({
-    check: "  Σ counties vs total net tax",
-    a: countySum / 100,
-    b: totalTax / 100,
-    delta: countySum - totalTax,
-    status: countySum - totalTax === 0 ? "OK" : "VIOLATION",
-  });
   for (const key of ["a", "b"]) {
     const col = recon.getColumn(key);
     col.numFmt = MONEY_FMT;
@@ -333,7 +417,11 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
 
 // ---- PDF -----------------------------------------------------------------
 
-/** ST-810 filing-ready PDF. Resolves with the full document Buffer. */
+/**
+ * Form-faithful PDF. ST-809: one page per entity (gross / taxable / tax-due,
+ * TIN, long method). ST-810: one page per entity + a Jurisdiction Summary table
+ * with DTF codes + fractional rates. Resolves with the full document Buffer.
+ */
 export function buildSalesTaxPdf(payload: ExportPayload): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "LETTER", margin: 48 });
@@ -342,152 +430,120 @@ export function buildSalesTaxPdf(payload: ExportPayload): Promise<Buffer> {
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    const title = payload.isQuarter
-      ? `Sno-Haus Sales Tax — ${payload.periodKey.replace("-", " ")} (NY ST-810)`
-      : `Sno-Haus Sales Tax — ${monthLabel(payload.months[0].month)}`;
-    doc.font("Helvetica-Bold").fontSize(16).text(title);
-    doc.moveDown(0.3);
+    const periodLabel = payload.isQuarter
+      ? payload.periodKey.replace("-", " ")
+      : monthLabel(payload.months[0].month);
+
+    payload.entities.forEach((e, idx) => {
+      if (idx > 0) doc.addPage();
+      drawEntityPage(doc, payload, e, periodLabel);
+    });
+
+    // Trailing reconciliation note.
+    doc.addPage();
+    doc.font("Helvetica-Bold").fontSize(13).text(`${payload.formType} — Filing reconciliation`);
+    doc.moveDown(0.5);
     doc.font("Helvetica").fontSize(9).fillColor("#444")
-      .text(`Filing period: ${payload.periodKey} · Generated: ${payload.generatedAtET}`);
+      .text(`Period: ${payload.periodKey} · Generated: ${payload.generatedAtET}`);
     doc.fillColor("#000").moveDown(1);
-
-    if (payload.isQuarter) {
-      drawQuarterlySchedule(doc, payload);
-    } else {
-      drawSimpleSummary(doc, payload.months[0]);
-    }
-
-    // Invariant footer.
-    doc.moveDown(1);
-    doc.font("Helvetica").fontSize(9);
     if (payload.invariant.ok) {
-      doc.fillColor("#15803d").text("Invariant holds to the penny — per-store sum equals view total.");
+      doc.fillColor("#15803d").fontSize(10)
+        .text("Invariant holds to the penny — Σ per-entity tax due equals the aggregator total (marketplace-carved).");
     } else {
-      doc.fillColor("#b91c1c").text(
-        `Invariant VIOLATION — per-store sum ${centsToDisplay(payload.invariant.per_entity_sum_cents)} `
+      doc.fillColor("#b91c1c").fontSize(10).text(
+        `Invariant VIOLATION — per-entity sum ${centsToDisplay(payload.invariant.per_entity_sum_cents)} `
         + `vs view total ${centsToDisplay(payload.invariant.view_total_cents)} `
         + `(delta ${centsToDisplay(payload.invariant.delta_cents)}). Do not file until resolved.`,
       );
     }
     doc.fillColor("#000");
-
-    // Signature block.
-    doc.moveDown(2);
-    doc.font("Helvetica-Bold").fontSize(10).text("Filing record");
-    doc.moveDown(0.5);
-    doc.font("Helvetica").fontSize(10);
-    const sigLines = ["Prepared by", "Date", "Confirmation #", "Filed at"];
-    for (const label of sigLines) {
-      doc.text(`${label}: ______________________________`);
-      doc.moveDown(0.4);
+    if (payload.unmappedJurisdictions.length > 0) {
+      doc.moveDown(0.8);
+      doc.fillColor("#b45309").fontSize(9).text(
+        `Warning — jurisdictions with no DTF code (verify manually): ${payload.unmappedJurisdictions.join(", ")}`,
+      );
+      doc.fillColor("#000");
     }
 
     doc.end();
   });
 }
 
-// Monospaced money cell to keep columns aligned.
-function moneyCell(doc: PDFKit.PDFDocument, text: string, x: number, y: number, w: number) {
-  doc.font("Courier").fontSize(8).text(text, x, y, { width: w, align: "right" });
-}
-function textCell(doc: PDFKit.PDFDocument, text: string, x: number, y: number, w: number, bold = false) {
-  doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(8).text(text, x, y, { width: w, align: "left" });
-}
+function drawEntityPage(
+  doc: PDFKit.PDFDocument,
+  payload: ExportPayload,
+  e: ExportEntityRow,
+  periodLabel: string,
+) {
+  doc.font("Helvetica-Bold").fontSize(15)
+    .text(`${payload.formType} — ${payload.formType === "ST-809" ? "Long Method" : "Quarter-End"}`);
+  doc.moveDown(0.2);
+  doc.font("Helvetica-Bold").fontSize(13).text(e.legal_name);
+  doc.moveDown(0.2);
+  doc.font("Helvetica").fontSize(9).fillColor("#444")
+    .text(`Period: ${periodLabel} · County: ${e.county} (DTF ${e.dtf_code})`);
+  doc.text(`TIN: ${e.tin ?? TIN_BLANK}`);
+  doc.fillColor("#000").moveDown(1);
 
-function drawSimpleSummary(doc: PDFKit.PDFDocument, mm: ExportMonth) {
-  doc.font("Helvetica-Bold").fontSize(11).text("Per-store summary");
+  // Entity summary block.
+  doc.font("Helvetica-Bold").fontSize(11).text("Entity summary");
   doc.moveDown(0.4);
-  // Columns: Store | County | Rate | Taxable | Tax Collected | Net Tax
-  const left = doc.page.margins.left;
-  const cols = [
-    { label: "Store", x: left, w: 90, money: false },
-    { label: "County", x: left + 92, w: 70, money: false },
-    { label: "Rate", x: left + 164, w: 45, money: false },
-    { label: "Taxable", x: left + 211, w: 90, money: true },
-    { label: "Tax Collected", x: left + 303, w: 95, money: true },
-    { label: "Net Tax", x: left + 400, w: 95, money: true },
+  const rows: [string, string][] = [
+    ["Gross sales", centsToDisplay(e.gross_sales_cents)],
+    ["Marketplace sales (Shopify-remitted)", centsToDisplay(e.marketplace_sales_cents)],
+    ["Taxable sales", centsToDisplay(e.taxable_sales_cents)],
+    ["Tax due (you owe)", centsToDisplay(e.tax_due_cents)],
   ];
+  const left = doc.page.margins.left;
   let y = doc.y;
-  for (const c of cols) {
-    if (c.money) moneyCellHeader(doc, c.label, c.x, y, c.w);
-    else textCell(doc, c.label, c.x, y, c.w, true);
+  for (const [label, val] of rows) {
+    doc.font("Helvetica").fontSize(10).text(label, left, y, { width: 320, align: "left" });
+    doc.font("Courier").fontSize(10).text(val, left + 330, y, { width: 130, align: "right" });
+    y += 18;
   }
-  y += 16;
-  for (const s of mm.stores) {
-    const closedTag = s.closed && s.gross_sales_cents === 0 ? " (closed)" : "";
-    textCell(doc, s.name + closedTag, cols[0].x, y, cols[0].w);
-    textCell(doc, s.county, cols[1].x, y, cols[1].w);
-    textCell(doc, bpsToPct(s.rate_bps), cols[2].x, y, cols[2].w);
-    moneyCell(doc, centsToDisplay(s.taxable_sales_cents), cols[3].x, y, cols[3].w);
-    moneyCell(doc, centsToDisplay(s.tax_collected_cents), cols[4].x, y, cols[4].w);
-    moneyCell(doc, centsToDisplay(s.net_tax_cents), cols[5].x, y, cols[5].w);
-    y += 14;
-  }
-  // Totals row.
-  textCell(doc, "TOTAL", cols[0].x, y, cols[0].w, true);
-  moneyCell(doc, centsToDisplay(mm.totals.taxable_sales_cents), cols[3].x, y, cols[3].w);
-  moneyCell(doc, centsToDisplay(mm.totals.tax_collected_cents), cols[4].x, y, cols[4].w);
-  moneyCell(doc, centsToDisplay(mm.totals.net_tax_cents), cols[5].x, y, cols[5].w);
-  doc.y = y + 18;
-}
+  doc.y = y + 6;
 
-function drawQuarterlySchedule(doc: PDFKit.PDFDocument, payload: ExportPayload) {
-  doc.font("Helvetica-Bold").fontSize(11).text("Quarterly ST-810 schedule");
-  doc.moveDown(0.4);
-  const left = doc.page.margins.left;
-  const cols = [
-    { label: "Month", x: left, w: 55, money: false },
-    { label: "Store", x: left + 57, w: 80, money: false },
-    { label: "Jurisdiction", x: left + 139, w: 70, money: false },
-    { label: "Rate", x: left + 211, w: 42, money: false },
-    { label: "Taxable", x: left + 255, w: 105, money: true },
-    { label: "Tax Collected", x: left + 362, w: 105, money: true },
-  ];
-  let y = doc.y;
-  for (const c of cols) {
-    if (c.money) moneyCellHeader(doc, c.label, c.x, y, c.w);
-    else textCell(doc, c.label, c.x, y, c.w, true);
-  }
-  y += 16;
-  // Rows sorted by month then store (months already in order; stores in mapping order).
-  const countySubtotal = new Map<string, { taxable: number; tax: number }>();
-  for (const mm of payload.months) {
-    for (const s of mm.stores) {
-      if (y > doc.page.height - doc.page.margins.bottom - 60) {
-        doc.addPage();
-        y = doc.page.margins.top;
-      }
-      textCell(doc, monthLabel(mm.month).split(" ")[0].slice(0, 3), cols[0].x, y, cols[0].w);
-      textCell(doc, s.name, cols[1].x, y, cols[1].w);
-      textCell(doc, s.county, cols[2].x, y, cols[2].w);
-      textCell(doc, bpsToPct(s.rate_bps), cols[3].x, y, cols[3].w);
-      moneyCell(doc, centsToDisplay(s.taxable_sales_cents), cols[4].x, y, cols[4].w);
-      moneyCell(doc, centsToDisplay(s.tax_collected_cents), cols[5].x, y, cols[5].w);
-      const cs = countySubtotal.get(s.county) || { taxable: 0, tax: 0 };
-      cs.taxable += s.taxable_sales_cents;
-      cs.tax += s.net_tax_cents;
-      countySubtotal.set(s.county, cs);
-      y += 13;
+  // ST-810: jurisdiction summary table for this entity.
+  if (payload.formType === "ST-810") {
+    const jrows = payload.jurisdictions.filter((j) => j.entity_id === e.entity_id);
+    doc.moveDown(0.6);
+    doc.font("Helvetica-Bold").fontSize(11).text("Jurisdiction summary (ST-810)");
+    doc.moveDown(0.4);
+    const cols = [
+      { label: "Jurisdiction", x: left, w: 120, money: false },
+      { label: "DTF Code", x: left + 124, w: 70, money: false },
+      { label: "Rate", x: left + 196, w: 60, money: false },
+      { label: "Taxable", x: left + 258, w: 100, money: true },
+      { label: "Tax Due", x: left + 360, w: 100, money: true },
+    ];
+    let yy = doc.y;
+    for (const c of cols) {
+      doc.font("Helvetica-Bold").fontSize(8)
+        .text(c.label, c.x, yy, { width: c.w, align: c.money ? "right" : "left" });
     }
+    yy += 14;
+    for (const j of jrows) {
+      if (yy > doc.page.height - doc.page.margins.bottom - 40) {
+        doc.addPage();
+        yy = doc.page.margins.top;
+      }
+      doc.font("Helvetica").fontSize(8).text(j.jurisdiction_name, cols[0].x, yy, { width: cols[0].w });
+      doc.font("Helvetica").fontSize(8).text(j.dtf_code ?? "(unmapped)", cols[1].x, yy, { width: cols[1].w });
+      doc.font("Helvetica").fontSize(8).text(j.rate_display, cols[2].x, yy, { width: cols[2].w });
+      doc.font("Courier").fontSize(8).text(centsToDisplay(j.taxable_sales_cents), cols[3].x, yy, { width: cols[3].w, align: "right" });
+      doc.font("Courier").fontSize(8).text(centsToDisplay(j.tax_due_cents), cols[4].x, yy, { width: cols[4].w, align: "right" });
+      yy += 13;
+    }
+    doc.y = yy + 10;
   }
-  // Per-county subtotals (NY ST-810 wants the jurisdictional breakdown).
-  y += 6;
-  textCell(doc, "Per-county subtotals", cols[0].x, y, 200, true);
-  y += 15;
-  Array.from(countySubtotal.entries()).forEach(([county, cs]) => {
-    textCell(doc, county, cols[2].x, y, cols[2].w, true);
-    moneyCell(doc, centsToDisplay(cs.taxable), cols[4].x, y, cols[4].w);
-    moneyCell(doc, centsToDisplay(cs.tax), cols[5].x, y, cols[5].w);
-    y += 13;
-  });
-  // Grand total.
-  y += 4;
-  textCell(doc, "GRAND TOTAL", cols[0].x, y, 200, true);
-  moneyCell(doc, centsToDisplay(payload.totals.taxable_sales_cents), cols[4].x, y, cols[4].w);
-  moneyCell(doc, centsToDisplay(payload.totals.tax_collected_cents), cols[5].x, y, cols[5].w);
-  doc.y = y + 18;
-}
 
-function moneyCellHeader(doc: PDFKit.PDFDocument, text: string, x: number, y: number, w: number) {
-  doc.font("Helvetica-Bold").fontSize(8).text(text, x, y, { width: w, align: "right" });
+  // Signature block.
+  doc.moveDown(1.5);
+  doc.font("Helvetica-Bold").fontSize(10).text("Filing record");
+  doc.moveDown(0.5);
+  doc.font("Helvetica").fontSize(10);
+  for (const label of ["Prepared by", "Date", "Confirmation #", "Filed at"]) {
+    doc.text(`${label}: ______________________________`);
+    doc.moveDown(0.4);
+  }
 }
