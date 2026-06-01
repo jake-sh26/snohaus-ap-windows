@@ -1757,6 +1757,25 @@ function bootstrapSchema() {
   } catch (e: any) {
     console.error("[storage] ensureSalesTaxFilingsSchema failed:", e?.message);
   }
+
+  // Sales Tax filing forms (PR #168): per-entity TIN settings, NY DTF
+  // jurisdiction seed, and the derived filing-totals cache. Same lazy-require
+  // pattern (each module imports `sqlite` from this module).
+  try {
+    require("./entity-settings").ensureEntitySettingsSchema();
+  } catch (e: any) {
+    console.error("[storage] ensureEntitySettingsSchema failed:", e?.message);
+  }
+  try {
+    require("./ny-dtf-jurisdictions").ensureNyDtfJurisdictionsSchema();
+  } catch (e: any) {
+    console.error("[storage] ensureNyDtfJurisdictionsSchema failed:", e?.message);
+  }
+  try {
+    require("./sales-tax-filing-totals").ensureSalesTaxFilingTotalsSchema();
+  } catch (e: any) {
+    console.error("[storage] ensureSalesTaxFilingTotalsSchema failed:", e?.message);
+  }
 }
 
 // ===== app_users helpers =====
@@ -2200,6 +2219,7 @@ function seedRbacBaseline(): void {
       "finance.view",
       "finance.sales_tax.view",
       "finance.sales_tax.export",
+      "finance.entity_settings.edit",
     ];
     const payrollViewPerm = getPermIdByKey.get("payroll.view") as { id: number } | undefined;
     if (payrollViewPerm) {

@@ -824,6 +824,7 @@ export const PERMISSION_CATALOG: Array<{
   { key: "finance.view", module: "finance", label: "View Finance", description: "See the Finance section: reconciler finance reports, by-store totals, and sales tax." },
   { key: "finance.sales_tax.view", module: "finance", label: "View Sales Tax", description: "See sales-tax summaries, jurisdiction breakdowns, and filing status." },
   { key: "finance.sales_tax.export", module: "finance", label: "Export / file Sales Tax", description: "Download sales-tax exports (CSV/PDF/XLSX) and mark a period as filed." },
+  { key: "finance.entity_settings.edit", module: "finance", label: "Edit Entity Settings", description: "Manage entity-level filing settings such as the TIN used on ST-809/ST-810 forms." },
 
   // ----- Users / RBAC -----
   { key: "users.view", module: "users", label: "View users", description: "See the users list and their assigned roles." },
