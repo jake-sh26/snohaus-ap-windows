@@ -43,6 +43,9 @@ export interface SalesTaxStoreRow {
   tax_collected_cents: number;
   refund_tax_in_period_cents: number;
   net_tax_cents: number;
+  // PR #168: marketplace-facilitator carve-out (Shopify already remits these).
+  marketplace_sales_cents: number;
+  marketplace_tax_cents: number;
 }
 
 export interface SalesTaxTotals {
@@ -50,6 +53,15 @@ export interface SalesTaxTotals {
   taxable_sales_cents: number;
   tax_collected_cents: number;
   net_tax_cents: number;
+  marketplace_sales_cents: number;
+  marketplace_tax_cents: number;
+}
+
+/** PR #168: a taxable sale attributed to a warehouse location (non-blocking). */
+export interface WarehouseAnomaly {
+  location_id: string;
+  name: string;
+  taxable_cents: number;
 }
 
 export interface SalesTaxInvariant {
@@ -64,10 +76,78 @@ export interface SalesTaxMonth {
   month: string;
   filing_mode: PeriodType;
   quarter_key: string | null;
+  form_type: "ST-809" | "ST-810";
   stores: SalesTaxStoreRow[];
   totals: SalesTaxTotals;
+  warehouse_anomalies: WarehouseAnomaly[];
   invariant: SalesTaxInvariant;
   filing: SalesTaxFiling;
+}
+
+// ----- PR #168: ST-809 / ST-810 form payloads + entity settings -----
+
+export interface St809Entity {
+  entity_id: number;
+  legal_name: string;
+  tin: string | null;
+  county: string;
+  dtf_code: string;
+  gross_sales: string;
+  marketplace_sales: string;
+  taxable_sales: string;
+  non_taxable_sales: string;
+  tax_due: string;
+}
+
+export interface St809Payload {
+  period: string;
+  formType: "ST-809";
+  method: "long";
+  entities: St809Entity[];
+}
+
+export interface St810Jurisdiction {
+  jurisdiction_name: string;
+  jurisdiction_type: string;
+  rate: string;
+  taxable_sales: string;
+  tax_due: string;
+  marketplace_taxable: string;
+  marketplace_tax: string;
+  dtf_code: string | null;
+  rate_display: string;
+}
+
+export interface St810Entity {
+  entity_id: number;
+  entity_name: string;
+  legal_name: string;
+  tin: string | null;
+  jurisdictions: St810Jurisdiction[];
+  totals: { taxable_sales: string; tax_due: string };
+}
+
+export interface St810Payload {
+  month?: string;
+  quarter?: string;
+  months_included?: string[];
+  formType: "ST-810";
+  entities: St810Entity[];
+  unmapped_jurisdictions: string[];
+}
+
+export interface EntitySetting {
+  entity_id: number;
+  legal_name: string;
+  county: string;
+  dtf_code: string;
+  tin: string | null;
+}
+
+export interface RecomputeResult {
+  months_processed: number;
+  entities_written: number;
+  summary: Array<{ period: string; entity_id: number; tax_due: string; marketplace_sales: string }>;
 }
 
 /** ST-810 quarter rollup from GET /sales-tax/quarter/:quarterKey. */
@@ -125,6 +205,39 @@ export async function listSalesTaxFilings(
   return res.json();
 }
 
+/** PR #168 — ST-809 long-method monthly payload. `period` is YYYY-MM (non-quarter-end). */
+export async function getSt809(period: string): Promise<St809Payload> {
+  const res = await apiRequest("GET", `/api/recon/tax/st809/${encodeURIComponent(period)}`);
+  return res.json();
+}
+
+/** PR #168 — ST-810 enriched payload. `period` is YYYY-MM or YYYY-QN. */
+export async function getSt810(period: string): Promise<St810Payload> {
+  const res = await apiRequest("GET", `/api/recon/tax/st810/${encodeURIComponent(period)}`);
+  return res.json();
+}
+
+/** PR #168 — all 3 filing entities with legal name + current TIN. */
+export async function getEntitySettings(): Promise<{ entities: EntitySetting[] }> {
+  const res = await apiRequest("GET", `/api/recon/tax/entity-settings`);
+  return res.json();
+}
+
+/** PR #168 — set/clear an entity's TIN. Empty string clears. */
+export async function upsertEntityTin(
+  entityId: number,
+  tin: string,
+): Promise<{ entity_id: number; tin: string | null; updated_at: string }> {
+  const res = await apiRequest("PUT", `/api/recon/tax/entity-settings/${entityId}`, { tin });
+  return res.json();
+}
+
+/** PR #168 — admin: rebuild the filing-totals cache from the aggregator. */
+export async function recomputeAllFilings(): Promise<RecomputeResult> {
+  const res = await apiRequest("POST", `/api/recon/tax/recompute-all`);
+  return res.json();
+}
+
 /**
  * 5. Export URL for a period in the given format. Returns the relative path —
  * callers decide whether to fetch via apiRequest (Bearer header) or open as a
@@ -135,7 +248,6 @@ export function salesTaxExportPath(periodKey: string, format: ExportFormat): str
 }
 
 const EXT: Record<ExportFormat, string> = { csv: "csv", pdf: "pdf", xlsx: "xlsx" };
-const TAG: Record<ExportFormat, string> = { csv: "summary", pdf: "st810", xlsx: "workbook" };
 
 /**
  * Download an export for a period as a file. Fetches through apiRequest so the
@@ -152,7 +264,7 @@ export async function downloadSalesTaxExport(
 
   const cd = res.headers.get("Content-Disposition") || "";
   const match = /filename="?([^"]+)"?/.exec(cd);
-  const filename = match?.[1] ?? `snohaus-sales-tax-${periodKey}-${TAG[format]}.${EXT[format]}`;
+  const filename = match?.[1] ?? `sales-tax_${periodKey}_all-entities.${EXT[format]}`;
 
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");

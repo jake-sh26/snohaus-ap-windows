@@ -17,7 +17,11 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { apiRequest } from "@/lib/queryClient";
+import { useAuth } from "@/lib/auth";
+import { getEntitySettings, upsertEntityTin, type EntitySetting } from "@/api/sales-tax";
 import { CheckCircle2, XCircle, RefreshCw, Plug, Cable, ListChecks, AlertTriangle, Trash2, KeyRound, ShieldCheck, ExternalLink, BarChart3, Store, CalendarRange, Banknote, ShieldAlert, MapPin, Building2, Save, Check, BookOpen, Upload, Calculator, Layers } from "lucide-react";
 
 // ----- PR #R4l-a-fix9: disposition triage row -----
@@ -444,6 +448,102 @@ function moneyOrDash(n: number | null): string {
 function shortTime(iso: string | null | undefined): string {
   if (!iso) return "—";
   try { return new Date(iso).toLocaleString(); } catch { return iso; }
+}
+
+// =============================================================================
+/**
+ * Entity Settings (PR #168) — per-entity TIN entry for ST-809/ST-810 filing.
+ *
+ * The 3 filing entities (SD Ski and Patio Inc / SH Huntington / SH Hempstead)
+ * file under a legal name + TIN. Entity 1's TIN is seeded (86-3624190); 2 + 3
+ * are entered here. Gated by `finance.entity_settings.edit`: without it the
+ * inputs are read-only. TIN is validated `XX-XXXXXXX` (server re-validates).
+ */
+function EntitySettingsCard() {
+  const qc = useQueryClient();
+  const { hasPermission } = useAuth();
+  const canEdit = hasPermission("finance.entity_settings.edit");
+
+  const settingsQ = useQuery<{ entities: EntitySetting[] }>({
+    queryKey: ["/api/recon/tax/entity-settings"],
+    queryFn: () => getEntitySettings(),
+  });
+
+  const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const [savedId, setSavedId] = useState<number | null>(null);
+
+  const saveMut = useMutation({
+    mutationFn: ({ entityId, tin }: { entityId: number; tin: string }) =>
+      upsertEntityTin(entityId, tin),
+    onSuccess: (_r, vars) => {
+      setSavedId(vars.entityId);
+      setTimeout(() => setSavedId((id) => (id === vars.entityId ? null : id)), 2000);
+      qc.invalidateQueries({ queryKey: ["/api/recon/tax/entity-settings"] });
+    },
+  });
+
+  const TIN_RE = /^\d{2}-\d{7}$/;
+  const draftFor = (e: EntitySetting) => drafts[e.entity_id] ?? e.tin ?? "";
+  const isDirty = (e: EntitySetting) => draftFor(e) !== (e.tin ?? "");
+  const isValid = (v: string) => v === "" || TIN_RE.test(v.trim());
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><Building2 className="size-4" /> Entity Settings</CardTitle>
+        <CardDescription>
+          Filing TINs for the 3 sales-tax entities. Used on ST-809 / ST-810 exports. Format <span className="font-mono">XX-XXXXXXX</span>.
+          {!canEdit && <span className="text-amber-700"> Requires <span className="font-mono">finance.entity_settings.edit</span> to change.</span>}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {settingsQ.isLoading ? (
+          <div className="text-sm text-muted-foreground">Loading…</div>
+        ) : !settingsQ.data ? (
+          <div className="text-sm text-red-600">Failed to load entity settings.</div>
+        ) : (
+          settingsQ.data.entities.map((e) => {
+            const draft = draftFor(e);
+            const valid = isValid(draft);
+            const dirty = isDirty(e);
+            return (
+              <div key={e.entity_id} className="flex flex-wrap items-end gap-3 border-b pb-3 last:border-b-0 last:pb-0">
+                <div className="min-w-[200px]">
+                  <div className="text-sm font-medium">{e.legal_name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    Entity {e.entity_id} · {e.county} · DTF {e.dtf_code}
+                    {!e.tin && <span className="ml-1 text-amber-700">· TIN not set</span>}
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor={`tin-${e.entity_id}`} className="text-xs">TIN</Label>
+                  <Input
+                    id={`tin-${e.entity_id}`}
+                    value={draft}
+                    placeholder="XX-XXXXXXX"
+                    disabled={!canEdit || saveMut.isPending}
+                    onChange={(ev) => setDrafts((d) => ({ ...d, [e.entity_id]: ev.target.value }))}
+                    className={`h-9 w-40 font-mono ${!valid ? "border-red-400" : ""}`}
+                  />
+                  {!valid && <span className="text-xs text-red-600">Format must be XX-XXXXXXX (or blank to clear).</span>}
+                </div>
+                <Button
+                  size="sm"
+                  disabled={!canEdit || !dirty || !valid || saveMut.isPending}
+                  onClick={() => saveMut.mutate({ entityId: e.entity_id, tin: draft.trim() })}
+                >
+                  {savedId === e.entity_id ? <><Check className="size-4 mr-1.5" /> Saved</> : <><Save className="size-4 mr-1.5" /> Save</>}
+                </Button>
+              </div>
+            );
+          })
+        )}
+        {saveMut.isError && (
+          <div className="text-sm text-red-600">{(saveMut.error as Error)?.message ?? "Save failed."}</div>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 // =============================================================================
@@ -1478,6 +1578,9 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
           )}
         </CardContent>
       </Card>
+
+      {/* ===== Entity Settings (PR #168): per-entity filing TINs ===== */}
+      <EntitySettingsCard />
 
         </TabsContent>
 
