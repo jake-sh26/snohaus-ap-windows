@@ -27,8 +27,8 @@ export interface StoreTaxMapping {
   entity_id: number;
   /**
    * Last NY-month (YYYY-MM) the store had normal activity. null = open/active.
-   * Hempstead closed after April 2026 — kept visible (surfaced as $0 / closed),
-   * never filtered out, and any post-close activity should be flagged.
+   * All three stores are continuously active (null). The field + helper are
+   * retained for blast-radius safety, but no store currently closes.
    */
   closed_after_month: string | null;
 }
@@ -59,9 +59,20 @@ export const STORE_TAX_MAPPING: StoreTaxMapping[] = [
     state: "NY",
     rate_bps: 8625,
     entity_id: 3,
-    closed_after_month: "2026-04",
+    closed_after_month: null,
   },
 ];
+
+/**
+ * Shopify warehouse/fulfillment location ids that should NEVER carry taxable
+ * retail sales (they don't sell — they ship). A taxable line attributed to one
+ * is surfaced as a non-blocking anomaly by computeSalesTaxForMonth. Attribution
+ * is NOT changed; this is a data-quality signal only.
+ */
+export const WAREHOUSE_LOCATION_IDS: Record<string, string> = {
+  "84465123570": "Amityville (warehouse)",
+  "68468211954": "Syosset (warehouse)",
+};
 
 /** Lookup helpers (entity_id and store_id are both 1:1 unique). */
 export function mappingByEntityId(entityId: number): StoreTaxMapping | undefined {

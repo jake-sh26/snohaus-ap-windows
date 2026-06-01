@@ -19,9 +19,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
-} from "@/components/ui/table";
-import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
@@ -33,6 +30,12 @@ import {
   getSalesTaxMonth, upsertSalesTaxFiling, downloadSalesTaxExport,
   type SalesTaxMonth, type SalesTaxStoreRow, type FilingStatus, type ExportFormat,
 } from "@/api/sales-tax";
+
+const ENTITY_LEGAL_NAMES: Record<number, string> = {
+  1: "SD Ski and Patio Inc",
+  2: "SH Huntington",
+  3: "SH Hempstead",
+};
 
 const MONTH_NAMES = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -159,9 +162,10 @@ export default function SalesTax() {
 
       {data && (
         <>
+          <FormModeBanner data={data} />
           <InvariantBanner data={data} />
-          <PerStoreTable data={data} />
-          {isQuarter && <QuarterlySchedule data={data} />}
+          <WarehouseAnomalies data={data} />
+          <EntityCards data={data} />
           <FilingChecklist
             data={data}
             periodKey={periodKey}
@@ -187,7 +191,7 @@ function InvariantBanner({ data }: { data: SalesTaxMonth }) {
         className="rounded-md border border-green-500/40 bg-green-500/10 px-4 py-2.5 text-sm text-green-800 dark:text-green-300"
         data-testid="banner-invariant-ok"
       >
-        ✓ Invariant holds — per-store sum equals view total to the penny ({formatCents(inv.view_total_cents)}).
+        ✓ Invariant holds — per-entity tax due equals the aggregator total to the penny ({formatCents(inv.view_total_cents)}).
       </div>
     );
   }
@@ -196,134 +200,132 @@ function InvariantBanner({ data }: { data: SalesTaxMonth }) {
       className="rounded-md border border-red-500/40 bg-red-500/10 px-4 py-2.5 text-sm text-red-800 dark:text-red-300"
       data-testid="banner-invariant-violation"
     >
-      ⚠ Invariant violation — per-store sum {formatCents(inv.per_entity_sum_cents)} differs from view total{" "}
+      ⚠ Invariant violation — per-entity sum {formatCents(inv.per_entity_sum_cents)} differs from view total{" "}
       {formatCents(inv.view_total_cents)} by {formatCents(inv.delta_cents)}. Do not file until resolved.
     </div>
   );
 }
 
-function storeNameCell(s: SalesTaxStoreRow) {
-  if (s.closed && s.unexpected_activity) {
-    return (
-      <span className="flex items-center gap-1.5">
-        {s.name}
-        <Badge className="bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 text-[10px]">
-          Unexpected activity at closed store
-        </Badge>
-      </span>
-    );
-  }
-  if (s.closed && s.gross_sales_cents === 0) {
-    return (
-      <span>
-        {s.name} <span className="italic text-muted-foreground">Closed post-Apr 2026</span>
-      </span>
-    );
-  }
-  return <span>{s.name}</span>;
-}
-
-function PerStoreTable({ data }: { data: SalesTaxMonth }) {
+/** Form-mode banner: ST-809 (long method) vs ST-810 (quarter-end). */
+function FormModeBanner({ data }: { data: SalesTaxMonth }) {
+  const isSt810 = data.form_type === "ST-810";
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">Per-store breakdown — {monthLong(data.month)}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Store</TableHead>
-              <TableHead>Entity</TableHead>
-              <TableHead>County</TableHead>
-              <TableHead>Rate</TableHead>
-              <TableHead className="text-right">Gross Sales</TableHead>
-              <TableHead className="text-right">Taxable Sales</TableHead>
-              <TableHead className="text-right">Exempt Sales</TableHead>
-              <TableHead className="text-right">Tax Collected</TableHead>
-              <TableHead className="text-right">Refund Tax</TableHead>
-              <TableHead className="text-right">Net Tax</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {data.stores.map((s) => (
-              <TableRow key={s.store_id} data-testid={`row-store-${s.entity_id}`}>
-                <TableCell className="font-medium">{storeNameCell(s)}</TableCell>
-                <TableCell>{s.entity_id}</TableCell>
-                <TableCell>{s.county}</TableCell>
-                <TableCell>{bpsToPct(s.rate_bps)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.gross_sales_cents)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.taxable_sales_cents)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.exempt_sales_cents)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.tax_collected_cents)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.refund_tax_in_period_cents)}</TableCell>
-                <TableCell className="text-right tabular-nums font-medium">{formatCents(s.net_tax_cents)}</TableCell>
-              </TableRow>
-            ))}
-            <TableRow className="font-semibold border-t-2">
-              <TableCell>Total</TableCell>
-              <TableCell colSpan={3} />
-              <TableCell className="text-right tabular-nums">{formatCents(data.totals.gross_sales_cents)}</TableCell>
-              <TableCell className="text-right tabular-nums">{formatCents(data.totals.taxable_sales_cents)}</TableCell>
-              <TableCell className="text-right tabular-nums">
-                {formatCents(data.totals.gross_sales_cents - data.totals.taxable_sales_cents)}
-              </TableCell>
-              <TableCell className="text-right tabular-nums">{formatCents(data.totals.tax_collected_cents)}</TableCell>
-              <TableCell className="text-right tabular-nums" />
-              <TableCell className="text-right tabular-nums">{formatCents(data.totals.net_tax_cents)}</TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
-      </CardContent>
-    </Card>
+    <div
+      className={
+        "rounded-md border px-4 py-2.5 text-sm " +
+        (isSt810
+          ? "border-blue-500/40 bg-blue-500/10 text-blue-800 dark:text-blue-300"
+          : "border-slate-500/30 bg-slate-500/10 text-slate-800 dark:text-slate-300")
+      }
+      data-testid="banner-form-mode"
+    >
+      {isSt810
+        ? `Filing form: ST-810 — Quarter-End (per-entity + per-jurisdiction). Covers ${quarterCoverageLabel(data)}.`
+        : "Filing form: ST-809 — Long Method (per-entity, monthly)."}
+    </div>
   );
 }
 
-function QuarterlySchedule({ data }: { data: SalesTaxMonth }) {
-  // Single-month payload only carries one month's stores; the full 3-month
-  // schedule is rendered from the quarter export / endpoint. Here we present
-  // the selected month's jurisdictional rows in the ST-810 grouping (month →
-  // store) so the operator sees the filing-portal structure; the downloadable
-  // PDF/XLSX exports carry the full 3-month rollup.
+/** Non-blocking warnings for taxable sales attributed to a warehouse location. */
+function WarehouseAnomalies({ data }: { data: SalesTaxMonth }) {
+  const anomalies = data.warehouse_anomalies ?? [];
+  if (anomalies.length === 0) return null;
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">Quarterly ST-810 schedule — jurisdictional breakdown</CardTitle>
+    <div
+      className="rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-800 dark:text-amber-300"
+      data-testid="banner-warehouse-anomaly"
+    >
+      ⚠ Warehouse fulfillment anomaly — taxable sales attributed to a non-selling location:
+      <ul className="mt-1 list-disc list-inside">
+        {anomalies.map((a) => (
+          <li key={a.location_id} className="tabular-nums">
+            {a.name} ({a.location_id}): {formatCents(a.taxable_cents)} taxable
+          </li>
+        ))}
+      </ul>
+      <span className="text-xs">Attribution is unchanged — verify these orders rang up at the correct POS.</span>
+    </div>
+  );
+}
+
+/** Three per-entity filing cards with a collapsible per-store breakdown. */
+function EntityCards({ data }: { data: SalesTaxMonth }) {
+  // Group stores by entity_id (one store per entity today, but keep it general).
+  const byEntity = new Map<number, SalesTaxStoreRow[]>();
+  for (const s of data.stores) {
+    const arr = byEntity.get(s.entity_id) ?? [];
+    arr.push(s);
+    byEntity.set(s.entity_id, arr);
+  }
+  const entityIds = [1, 2, 3];
+  return (
+    <div className="grid gap-4 md:grid-cols-3">
+      {entityIds.map((eid) => {
+        const stores = byEntity.get(eid) ?? [];
+        const sum = (pick: (s: SalesTaxStoreRow) => number) => stores.reduce((a, s) => a + pick(s), 0);
+        return (
+          <EntityCard
+            key={eid}
+            entityId={eid}
+            stores={stores}
+            gross={sum((s) => s.gross_sales_cents)}
+            marketplace={sum((s) => s.marketplace_sales_cents)}
+            taxable={sum((s) => s.taxable_sales_cents)}
+            taxDue={sum((s) => s.net_tax_cents)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function EntityCard({
+  entityId, stores, gross, marketplace, taxable, taxDue,
+}: {
+  entityId: number;
+  stores: SalesTaxStoreRow[];
+  gross: number;
+  marketplace: number;
+  taxable: number;
+  taxDue: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const legal = ENTITY_LEGAL_NAMES[entityId] ?? `Entity ${entityId}`;
+  return (
+    <Card data-testid={`card-entity-${entityId}`}>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm">{legal}</CardTitle>
+        <span className="text-xs text-muted-foreground">Entity {entityId}</span>
       </CardHeader>
-      <CardContent>
-        <p className="text-xs text-muted-foreground mb-3">
-          NY filing-portal grouping (month · store · jurisdiction). The full three-month
-          rollup is included in the PDF and XLSX exports below.
-        </p>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Month</TableHead>
-              <TableHead>Store</TableHead>
-              <TableHead>Jurisdiction</TableHead>
-              <TableHead>Rate</TableHead>
-              <TableHead className="text-right">Taxable Sales</TableHead>
-              <TableHead className="text-right">Tax Collected</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {data.stores.map((s) => (
-              <TableRow key={`q-${s.store_id}`}>
-                <TableCell>{MONTH_NAMES[Number(data.month.split("-")[1]) - 1]}</TableCell>
-                <TableCell className="font-medium">{s.name}</TableCell>
-                <TableCell>{s.county}</TableCell>
-                <TableCell>{bpsToPct(s.rate_bps)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.taxable_sales_cents)}</TableCell>
-                <TableCell className="text-right tabular-nums">{formatCents(s.tax_collected_cents)}</TableCell>
-              </TableRow>
-            ))}
-            <TableRow className="font-semibold border-t-2">
-              <TableCell colSpan={4}>Total ({monthLong(data.month)})</TableCell>
-              <TableCell className="text-right tabular-nums">{formatCents(data.totals.taxable_sales_cents)}</TableCell>
-              <TableCell className="text-right tabular-nums">{formatCents(data.totals.tax_collected_cents)}</TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
+      <CardContent className="space-y-1.5 text-sm">
+        <div className="flex justify-between"><span className="text-muted-foreground">Gross</span><span className="tabular-nums">{formatCents(gross)}</span></div>
+        <div className="flex justify-between"><span className="text-muted-foreground">Marketplace</span><span className="tabular-nums">{formatCents(marketplace)}</span></div>
+        <div className="flex justify-between"><span className="text-muted-foreground">Taxable</span><span className="tabular-nums">{formatCents(taxable)}</span></div>
+        <div className="flex justify-between font-medium border-t pt-1.5 mt-1.5"><span>Tax due</span><span className="tabular-nums" data-testid={`text-entity-${entityId}-tax-due`}>{formatCents(taxDue)}</span></div>
+        {stores.length > 0 && (
+          <div className="pt-2">
+            <button
+              type="button"
+              className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+              onClick={() => setOpen((v) => !v)}
+              data-testid={`button-entity-${entityId}-breakdown`}
+            >
+              {open ? "Hide" : "Show"} per-store breakdown
+            </button>
+            {open && (
+              <div className="mt-2 space-y-2">
+                {stores.map((s) => (
+                  <div key={s.store_id} className="rounded border px-2 py-1.5 text-xs">
+                    <div className="font-medium">{s.name} · {s.county} · {bpsToPct(s.rate_bps)}</div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">Gross</span><span className="tabular-nums">{formatCents(s.gross_sales_cents)}</span></div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">Taxable</span><span className="tabular-nums">{formatCents(s.taxable_sales_cents)}</span></div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">Tax due</span><span className="tabular-nums">{formatCents(s.net_tax_cents)}</span></div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );

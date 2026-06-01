@@ -144,10 +144,12 @@ import {
   aggregateByEntity,
   aggregateByJurisdiction,
   fromCents,
+  toCents,
   parseTaxLines,
   quarterToMonths,
   sumEntities,
   type AggregatorInput,
+  type EntitySummary,
   type LineForTax,
   type RefundForTax,
   type ShippingTaxForward,
@@ -156,6 +158,7 @@ import {
 } from "./shopify-tax-aggregation";
 import {
   STORE_TAX_MAPPING,
+  WAREHOUSE_LOCATION_IDS,
   isStoreClosedForMonth,
 } from "./sales-tax-mapping";
 import {
@@ -173,6 +176,16 @@ import {
   type ExportLineDetail,
 } from "./sales-tax-exports";
 import { mappingByEntityId } from "./sales-tax-mapping";
+import {
+  getEntitySettings,
+  upsertTin,
+  legalNameFor,
+  filingInfoFor,
+  ENTITY_FILING_INFO,
+} from "./entity-settings";
+import { dtfByName, NyDtfJurisdiction } from "./ny-dtf-jurisdictions";
+import { formatRateAsFraction } from "@shared/format-rate";
+import { replaceForPeriod as replaceFilingTotals, listAll as listFilingTotals } from "./sales-tax-filing-totals";
 import {
   syncPayoutsIncremental,
 } from "./shopify-recon-payouts";
@@ -4983,15 +4996,188 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       const entities = aggregateByJurisdiction(all, entityNames, allRefunds, allShipFwd, allShipRef, allUnverified);
+
+      // PR #168 enrichment: attach DTF jurisdiction code + fractional rate
+      // display to each jurisdiction row (NY ST-810 prints "NA 2811" + "8 5/8%"),
+      // and per-entity legal_name + TIN. Any jurisdiction name with no DTF map
+      // is surfaced in unmapped_jurisdictions (not dropped). Enrichment happens
+      // at the route boundary — the aggregator is untouched.
+      const tinByEntity = getEntitySettings();
+      const unmappedSet = new Set<string>();
+      const enriched = entities.map((ent) => {
+        const info = filingInfoFor(ent.entity_id);
+        const jurisdictions = ent.jurisdictions.map((j) => {
+          const dtf = dtfByName(j.jurisdiction_name) as NyDtfJurisdiction | undefined;
+          if (!dtf) unmappedSet.add(j.jurisdiction_name);
+          const rateNum = Number(j.rate);
+          return {
+            ...j,
+            dtf_code: dtf?.code ?? null,
+            rate_display: dtf?.rate_display ?? formatRateAsFraction(rateNum),
+          };
+        });
+        return {
+          ...ent,
+          legal_name: info?.legal_name ?? legalNameFor(ent.entity_id),
+          tin: tinByEntity.get(String(ent.entity_id))?.tin ?? null,
+          jurisdictions,
+        };
+      });
+
       res.json({
         ...(isMonth ? { month: period } : { quarter: period, months_included: months }),
         ...(calendarFallback ? { quarter_calendar_fallback: true, note_quarter: "NY DTF quarter calendar lookup failed — defaulted to calendar quarters. TODO verify Pub 718-Q." } : {}),
-        entities,
-        note: "PR #143 + #145 + #146 + #147: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #145: refund tax from recon_refund_line_items is subtracted in the refund's processed_at month, pro-rated across the original line's jurisdictions. PR #146: shipping_lines forward tax is added per its own jurisdictions; shipping_refund adjustment tax (no jurisdictions) is reconciled via entity-level residual into the largest jurisdiction bucket. PR #147: unverified-return tax delta (Rule #8) is reconciled the same way; residual reconciliation uses aggregateByEntity's authoritative tax_owed as its target so marketplace-only jurisdictions (FL/TX) don't leak. Σ jurisdictions.tax_due === entity.tax_owed exactly. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
-        build_id: "pr147",
+        formType: "ST-810",
+        entities: enriched,
+        unmapped_jurisdictions: Array.from(unmappedSet).sort(),
+        note: "PR #143 + #145 + #146 + #147 + #168: per-entity, per-jurisdiction taxable-sales + tax-due from recon_line_items.tax_lines_json. Grouped by (entity, jurisdiction_name, type, rate). channel_liable lines are reported under marketplace_taxable/marketplace_tax — merchant still must list them on ST-810 but does not owe the tax. PR #168: each jurisdiction row enriched with dtf_code + rate_display (NY fractional); per-entity legal_name + TIN added; names lacking a DTF code listed in unmapped_jurisdictions. Σ jurisdictions.tax_due === entity.tax_owed exactly. NY tax quarters are non-standard: Q1=Mar-May, Q2=Jun-Aug, Q3=Sep-Nov, Q4=Dec-Feb.",
+        build_id: "pr168",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax st810 failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #168 — ST-809 (the 8 non-quarter-end months: long method, per-entity
+  // only, no jurisdiction breakdown). Rejects quarter-end months (those file
+  // ST-810). Always returns all 3 filing entities (even at $0) so the form is
+  // complete. Marketplace-carved via aggregateByEntity (the filing number is
+  // tax_owed, not tax_collected_gross).
+  app.get("/api/recon/tax/st809/:period", authMiddleware, requirePermission("finance.sales_tax.view"), async (req, res) => {
+    const period = String(req.params.period);
+    if (!/^\d{4}-\d{2}$/.test(period)) {
+      return res.status(400).json({ message: "Period must be YYYY-MM (ST-809 is monthly)" });
+    }
+    const monthNum = Number(period.split("-")[1]);
+    if (QUARTER_END_MONTHS.has(monthNum)) {
+      return res.status(400).json({
+        message: `${period} is a quarter-end month — file ST-810, not ST-809`,
+        formType: "ST-810",
+      });
+    }
+    try {
+      const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames } =
+        loadTaxInputsForMonth(period);
+      const summaries = aggregateByEntity(inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax);
+      const byEntity = new Map<number, typeof summaries[number]>();
+      for (const s of summaries) byEntity.set(s.entity_id, s);
+      const tinByEntity = getEntitySettings();
+
+      const entities = ENTITY_FILING_INFO.map((info) => {
+        const s = byEntity.get(info.entity_id);
+        return {
+          entity_id: info.entity_id,
+          legal_name: info.legal_name,
+          tin: tinByEntity.get(String(info.entity_id))?.tin ?? null,
+          county: info.county,
+          dtf_code: info.dtf_code,
+          gross_sales: s?.gross_sales ?? "0.00",
+          marketplace_sales: s?.marketplace_gross ?? "0.00",
+          taxable_sales: s?.taxable_sales ?? "0.00",
+          non_taxable_sales: s?.non_taxable_sales ?? "0.00",
+          tax_due: s?.tax_owed ?? "0.00",
+        };
+      });
+
+      res.json({
+        period,
+        formType: "ST-809",
+        method: "long",
+        entities,
+        note: "PR #168: ST-809 long-method monthly filing. Per-entity only (no jurisdiction breakdown). tax_due is marketplace-carved (aggregateByEntity.tax_owed). All 3 entities always present.",
+        build_id: "pr168",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "tax st809 failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #168 — admin recompute. Walks every month present in the sales data,
+  // runs the marketplace-carved aggregator per month, and (re)writes the
+  // sales_tax_filing_totals cache via delete-then-insert. Idempotent. Gated by
+  // the highest existing finance write perm (no separate admin perm exists).
+  app.post("/api/recon/tax/recompute-all", authMiddleware, requirePermission("finance.sales_tax.export"), async (_req, res) => {
+    try {
+      const { sqlite } = require("./storage");
+      const monthRows = sqlite.prepare(`
+        SELECT DISTINCT happened_month AS month
+          FROM v_attributed_sales
+         WHERE happened_month IS NOT NULL
+         ORDER BY happened_month ASC
+      `).all() as Array<{ month: string }>;
+
+      const summary: Array<{ period: string; entity_id: number; tax_due: string; marketplace_sales: string }> = [];
+      let entitiesWritten = 0;
+      for (const { month } of monthRows) {
+        const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames } =
+          loadTaxInputsForMonth(month);
+        const summaries = aggregateByEntity(inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax);
+        const rows = summaries.map((s) => ({
+          entity_id: s.entity_id,
+          gross_sales: s.gross_sales,
+          marketplace_sales: s.marketplace_gross,
+          taxable_sales: s.taxable_sales,
+          tax_due: s.tax_owed,
+        }));
+        replaceFilingTotals(month, rows);
+        entitiesWritten += rows.length;
+        for (const r of rows) {
+          summary.push({ period: month, entity_id: r.entity_id, tax_due: r.tax_due, marketplace_sales: r.marketplace_sales });
+        }
+      }
+
+      res.json({
+        months_processed: monthRows.length,
+        entities_written: entitiesWritten,
+        summary,
+        note: "PR #168: rebuilt sales_tax_filing_totals from the marketplace-carved aggregator. Idempotent (delete-then-insert per period).",
+        build_id: "pr168",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "tax recompute-all failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #168 — read the cached filing totals (rebuilt by recompute-all).
+  app.get("/api/recon/tax/filing-totals", authMiddleware, requirePermission("finance.sales_tax.view"), async (_req, res) => {
+    try {
+      res.json({ rows: listFilingTotals(), build_id: "pr168" });
+    } catch (e: any) {
+      res.status(500).json({ message: "filing-totals read failed", error: String(e?.message || e) });
+    }
+  });
+
+  // PR #168 — entity filing settings (TINs). GET is readable by anyone who can
+  // view sales tax; PUT requires the dedicated edit perm. Returns all 3 filing
+  // entities with legal name + current TIN (null if unset).
+  app.get("/api/recon/tax/entity-settings", authMiddleware, requirePermission("finance.sales_tax.view"), async (_req, res) => {
+    try {
+      const settings = getEntitySettings();
+      const entities = ENTITY_FILING_INFO.map((info) => ({
+        entity_id: info.entity_id,
+        legal_name: info.legal_name,
+        county: info.county,
+        dtf_code: info.dtf_code,
+        tin: settings.get(String(info.entity_id))?.tin ?? null,
+      }));
+      res.json({ entities, build_id: "pr168" });
+    } catch (e: any) {
+      res.status(500).json({ message: "entity-settings read failed", error: String(e?.message || e) });
+    }
+  });
+
+  app.put("/api/recon/tax/entity-settings/:entityId", authMiddleware, requirePermission("finance.entity_settings.edit"), async (req, res) => {
+    const entityId = String(req.params.entityId);
+    if (!ENTITY_FILING_INFO.some((e) => String(e.entity_id) === entityId)) {
+      return res.status(400).json({ message: `Unknown entity ${entityId}` });
+    }
+    try {
+      const tin = String(req.body?.tin ?? "");
+      const row = upsertTin(entityId, tin);
+      res.json({ entity_id: Number(row.entity_id), tin: row.tin, updated_at: row.updated_at, build_id: "pr168" });
+    } catch (e: any) {
+      // upsertTin throws on a malformed (non-empty) TIN → 400, not 500.
+      res.status(400).json({ message: String(e?.message || e) });
     }
   });
 
@@ -7097,19 +7283,34 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     tax_collected_cents: number;
     refund_tax_in_period_cents: number;
     net_tax_cents: number;
+    // PR #168: marketplace-facilitator carve-out. Shopify already remits these
+    // to NY, so they are EXCLUDED from net_tax_cents (the filing number) and
+    // surfaced separately for the ST-810 "report but don't owe" column.
+    marketplace_sales_cents: number;
+    marketplace_tax_cents: number;
+  };
+
+  type WarehouseAnomaly = {
+    location_id: string;
+    name: string;
+    taxable_cents: number;
   };
 
   type SalesTaxMonth = {
     month: string;
     filing_mode: "month" | "quarter";
     quarter_key: string | null;
+    form_type: "ST-809" | "ST-810";
     stores: SalesTaxStoreRow[];
     totals: {
       gross_sales_cents: number;
       taxable_sales_cents: number;
       tax_collected_cents: number;
       net_tax_cents: number;
+      marketplace_sales_cents: number;
+      marketplace_tax_cents: number;
     };
+    warehouse_anomalies: WarehouseAnomaly[];
     invariant: {
       ok: boolean;
       per_entity_sum_cents: number;
@@ -7142,84 +7343,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // minus the filing block (callers attach filing state).
   const computeSalesTaxForMonth = (month: string): SalesTaxMonth => {
     const { sqlite } = require("./storage");
-    const attribution = computeAttributionForMonth(month);
-    const posEntitySet: Set<number> = attribution.posEntitySet;
 
-    // pickEntity cascade, identical to the engine, applied to gross lines.
-    const pickEntity = (
-      posEid: number | null,
-      perLineEid: number | null,
-      orderEid: number | null,
-      dominantEid: number | null,
-    ): number => {
-      if (posEid != null && posEntitySet.has(Number(posEid))) return Number(posEid);
-      if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
-      if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
-      if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
-      return 0;
-    };
+    // PR #168 marketplace fix: read the single-source-of-truth aggregator
+    // instead of summing raw per-line tax from v_attributed_sales. The raw tax
+    // INCLUDES Shopify-marketplace-facilitated tax (channel_liable=true) that
+    // Shopify already remits to NY; filing from it double-pays. aggregateByEntity
+    // carves marketplace out into marketplace_tax_collected, leaving tax_owed as
+    // the merchant's actual liability. The aggregation itself is UNTOUCHED.
+    const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames } =
+      loadTaxInputsForMonth(month);
+    const entities: EntitySummary[] = aggregateByEntity(
+      inputs, entityNames, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax,
+    );
+    const byEntity = new Map<number, EntitySummary>();
+    for (const e of entities) byEntity.set(e.entity_id, e);
 
-    // Gross / taxable lines from the view joined to line_items for the pre-tax
-    // subtotal + per-line tax total. Share-weighted to match the tax engine.
-    const grossRows = sqlite.prepare(`
-      SELECT
-        v.line_item_id,
-        v.per_line_entity_id,
-        v.per_line_share,
-        v.order_entity_id,
-        v.dominant_entity_id,
-        li.line_subtotal AS line_subtotal,
-        li.line_tax_total AS line_tax_total,
-        (SELECT pl.entity_id
-           FROM recon_shopify_sales s
-           JOIN recon_entity_pos_locations pl
-             ON pl.shopify_location_id = s.pos_location_id
-            AND pl.kind = 'pos' AND pl.active = 1
-          WHERE s.order_id = v.order_id
-            AND s.line_item_id = v.line_item_id
-            AND s.pos_location_id IS NOT NULL
-          LIMIT 1) AS pos_entity_id
-      FROM v_attributed_sales v
-      JOIN recon_line_items li ON li.id = v.line_item_id AND li.order_id = v.order_id
-      WHERE v.happened_month = ?
-    `).all(month) as any[];
-
-    const grossByEntity = new Map<number, number>();
-    const taxableByEntity = new Map<number, number>();
-    for (const r of grossRows) {
-      const eid = pickEntity(
-        r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
-      );
-      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
-      const subtotalCents = Math.round(Math.abs(Number(r.line_subtotal || 0)) * 100 * share);
-      const lineTaxCents = Math.round(Math.abs(Number(r.line_tax_total || 0)) * 100);
-      grossByEntity.set(eid, (grossByEntity.get(eid) || 0) + subtotalCents);
-      if (lineTaxCents > 0) {
-        taxableByEntity.set(eid, (taxableByEntity.get(eid) || 0) + subtotalCents);
-      }
-    }
-
-    const netTaxOf = (eid: number) =>
-      (attribution.fwdByEntity.get(eid) || 0)
-      - (attribution.refByEntity.get(eid) || 0)
-      + (attribution.shipByEntity.get(eid) || 0)
-      - (attribution.shipRefByEntity.get(eid) || 0);
-    const taxCollectedOf = (eid: number) =>
-      (attribution.fwdByEntity.get(eid) || 0)
-      + (attribution.shipByEntity.get(eid) || 0);
-    const refundTaxOf = (eid: number) =>
-      (attribution.refByEntity.get(eid) || 0)
-      + (attribution.shipRefByEntity.get(eid) || 0);
+    // dollars-string → integer cents (aggregator output is fixed-2 strings).
+    const cents = (s: string | undefined): number => toCents(s != null ? Number(s) : 0);
 
     const stores: SalesTaxStoreRow[] = STORE_TAX_MAPPING.map((m) => {
       const eid = m.entity_id;
+      const e = byEntity.get(eid);
+      const gross = e ? cents(e.gross_sales) : 0;
+      const taxable = e ? cents(e.taxable_sales) : 0;
+      const nonTaxable = e ? cents(e.non_taxable_sales) : 0;
+      const taxOwed = e ? cents(e.tax_owed) : 0;
+      const taxCollected = e ? cents(e.tax_collected_gross) : 0;
+      const mktSales = e ? cents(e.marketplace_gross) : 0;
+      const mktTax = e ? cents(e.marketplace_tax_collected) : 0;
+      // All three stores are continuously active (closed_after_month=null).
       const closed = isStoreClosedForMonth(m, month);
-      const gross = grossByEntity.get(eid) || 0;
-      const taxable = taxableByEntity.get(eid) || 0;
-      const netTax = netTaxOf(eid);
-      // A closed store with any activity in the period is a data-quality
-      // signal — surface it via a flag rather than hiding the store.
-      const unexpected = closed && (gross !== 0 || netTax !== 0);
       return {
         store_id: m.store_id,
         name: m.name,
@@ -7228,13 +7381,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         state: m.state,
         rate_bps: m.rate_bps,
         closed,
-        unexpected_activity: unexpected,
+        unexpected_activity: false,
         gross_sales_cents: gross,
         taxable_sales_cents: taxable,
-        exempt_sales_cents: gross - taxable,
-        tax_collected_cents: taxCollectedOf(eid),
-        refund_tax_in_period_cents: refundTaxOf(eid),
-        net_tax_cents: netTax,
+        exempt_sales_cents: nonTaxable,
+        tax_collected_cents: taxCollected,
+        // marketplace tax is collected-but-remitted-by-Shopify; the refund delta
+        // is already folded into tax_owed by the aggregator, so the displayed
+        // "refund tax in period" is the difference between collected and owed
+        // minus marketplace (kept for back-compat; not used for filing).
+        refund_tax_in_period_cents: taxCollected - mktTax - taxOwed,
+        net_tax_cents: taxOwed,
+        marketplace_sales_cents: mktSales,
+        marketplace_tax_cents: mktTax,
       };
     });
 
@@ -7244,29 +7403,63 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         taxable_sales_cents: acc.taxable_sales_cents + s.taxable_sales_cents,
         tax_collected_cents: acc.tax_collected_cents + s.tax_collected_cents,
         net_tax_cents: acc.net_tax_cents + s.net_tax_cents,
+        marketplace_sales_cents: acc.marketplace_sales_cents + s.marketplace_sales_cents,
+        marketplace_tax_cents: acc.marketplace_tax_cents + s.marketplace_tax_cents,
       }),
-      { gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0, net_tax_cents: 0 },
+      {
+        gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0,
+        net_tax_cents: 0, marketplace_sales_cents: 0, marketplace_tax_cents: 0,
+      },
     );
 
-    // Invariant: Σ net tax over ALL entities the engine saw (every store +
-    // Unallocated + any non-POS bucket) must equal the engine grand total. We
-    // compare the 3-store sum against the engine total; the difference is the
-    // Unallocated/non-POS remainder, which the assertion folds in so delta=0.
-    let viewTotal = 0;
-    Array.from(attribution.allEntities).forEach((eid) => { viewTotal += netTaxOf(eid); });
+    // Invariant: Σ tax_owed over the 3 mapped stores + Unallocated must equal
+    // the aggregator's grand total tax_owed. Both sides now read the same
+    // marketplace-carved source, so they tie to the penny.
+    const viewTotal = entities.reduce((a, e) => a + cents(e.tax_owed), 0);
+    const unallocated = byEntity.get(0);
     const perEntitySum = stores.reduce((a, s) => a + s.net_tax_cents, 0)
-      + netTaxOf(0); // include Unallocated so the parts tie to the engine total
+      + (unallocated ? cents(unallocated.tax_owed) : 0);
     const delta = perEntitySum - viewTotal;
 
+    // Warehouse anomaly: any taxable line attributed to a warehouse/fulfillment
+    // location (which should never sell). Non-blocking — attribution unchanged.
+    const warehouseRows = sqlite.prepare(`
+      SELECT s.pos_location_id AS location_id,
+             SUM(ABS(COALESCE(li.line_subtotal, 0)) * 100) AS taxable_cents
+        FROM v_attributed_sales v
+        JOIN recon_line_items li ON li.id = v.line_item_id AND li.order_id = v.order_id
+        JOIN recon_shopify_sales s
+          ON s.order_id = v.order_id AND s.line_item_id = v.line_item_id
+       WHERE v.happened_month = ?
+         AND li.line_tax_total IS NOT NULL AND li.line_tax_total != 0
+         AND s.pos_location_id IS NOT NULL
+       GROUP BY s.pos_location_id
+    `).all(month) as Array<{ location_id: string; taxable_cents: number }>;
+    const warehouse_anomalies: WarehouseAnomaly[] = [];
+    for (const r of warehouseRows) {
+      const id = String(r.location_id);
+      const name = WAREHOUSE_LOCATION_IDS[id];
+      if (name) {
+        warehouse_anomalies.push({
+          location_id: id,
+          name,
+          taxable_cents: Math.round(Number(r.taxable_cents || 0)),
+        });
+      }
+    }
+
     const [, mStr] = month.split("-");
-    const filingMode: "month" | "quarter" = QUARTER_END_MONTHS.has(Number(mStr)) ? "quarter" : "month";
+    const isQuarterEnd = QUARTER_END_MONTHS.has(Number(mStr));
+    const filingMode: "month" | "quarter" = isQuarterEnd ? "quarter" : "month";
 
     return {
       month,
       filing_mode: filingMode,
       quarter_key: quarterKeyForMonth(month),
+      form_type: isQuarterEnd ? "ST-810" : "ST-809",
       stores,
       totals,
+      warehouse_anomalies,
       invariant: {
         ok: delta === 0,
         per_entity_sum_cents: perEntitySum,
@@ -7351,18 +7544,94 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const monthPayloads = months.map((m) => computeSalesTaxForMonth(m));
     const lineDetail = months.flatMap((m) => lineDetailForMonth(m));
 
+    // Form type: ST-810 for a quarter export OR a single quarter-end month;
+    // ST-809 otherwise. monthPayloads carry form_type, which agrees.
+    const formType: "ST-809" | "ST-810" =
+      isQuarter || monthPayloads.some((mm) => mm.form_type === "ST-810") ? "ST-810" : "ST-809";
+
     const totals = monthPayloads.reduce(
       (acc, mm) => ({
         gross_sales_cents: acc.gross_sales_cents + mm.totals.gross_sales_cents,
         taxable_sales_cents: acc.taxable_sales_cents + mm.totals.taxable_sales_cents,
         tax_collected_cents: acc.tax_collected_cents + mm.totals.tax_collected_cents,
         net_tax_cents: acc.net_tax_cents + mm.totals.net_tax_cents,
+        marketplace_sales_cents: acc.marketplace_sales_cents + mm.totals.marketplace_sales_cents,
+        marketplace_tax_cents: acc.marketplace_tax_cents + mm.totals.marketplace_tax_cents,
       }),
-      { gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0, net_tax_cents: 0 },
+      {
+        gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0,
+        net_tax_cents: 0, marketplace_sales_cents: 0, marketplace_tax_cents: 0,
+      },
     );
     const perEntitySum = monthPayloads.reduce((a, mm) => a + mm.invariant.per_entity_sum_cents, 0);
     const viewTotal = monthPayloads.reduce((a, mm) => a + mm.invariant.view_total_cents, 0);
     const delta = perEntitySum - viewTotal;
+
+    // Per-entity filing rows: sum each entity's store rows across the period.
+    const tinByEntity = getEntitySettings();
+    const entities = ENTITY_FILING_INFO.map((info) => {
+      let gross = 0, mkt = 0, taxable = 0, taxDue = 0;
+      for (const mm of monthPayloads) {
+        const s = mm.stores.find((st) => st.entity_id === info.entity_id);
+        if (!s) continue;
+        gross += s.gross_sales_cents;
+        mkt += s.marketplace_sales_cents;
+        taxable += s.taxable_sales_cents;
+        taxDue += s.net_tax_cents;
+      }
+      return {
+        entity_id: info.entity_id,
+        legal_name: info.legal_name,
+        tin: tinByEntity.get(String(info.entity_id))?.tin ?? null,
+        county: info.county,
+        dtf_code: info.dtf_code,
+        gross_sales_cents: gross,
+        marketplace_sales_cents: mkt,
+        taxable_sales_cents: taxable,
+        tax_due_cents: taxDue,
+      };
+    });
+
+    // Per-jurisdiction rows (ST-810 only): run aggregateByJurisdiction across
+    // the period union + enrich with DTF code + fractional rate.
+    const jurisdictions: ExportPayload["jurisdictions"] = [];
+    const unmappedSet = new Set<string>();
+    if (formType === "ST-810") {
+      const all: AggregatorInput[] = [];
+      const allRefunds: RefundForTax[] = [];
+      const allShipFwd: ShippingTaxForward[] = [];
+      const allShipRef: ShippingTaxRefund[] = [];
+      const allUnverified: UnverifiedReturnTax[] = [];
+      const names = new Map<number, string>();
+      for (const m of months) {
+        const { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames } = loadTaxInputsForMonth(m);
+        all.push(...inputs);
+        allRefunds.push(...refunds);
+        allShipFwd.push(...shippingTaxForward);
+        allShipRef.push(...shippingTaxRefunds);
+        allUnverified.push(...unverifiedReturnTax);
+        for (const [k, v] of entityNames) names.set(k, v);
+      }
+      const breakdown = aggregateByJurisdiction(all, names, allRefunds, allShipFwd, allShipRef, allUnverified);
+      for (const ent of breakdown) {
+        const legal = legalNameFor(ent.entity_id);
+        for (const j of ent.jurisdictions) {
+          const dtf = dtfByName(j.jurisdiction_name);
+          if (!dtf) unmappedSet.add(j.jurisdiction_name);
+          const rateNum = Number(j.rate);
+          jurisdictions.push({
+            entity_id: ent.entity_id,
+            entity_legal_name: legal,
+            jurisdiction_name: j.jurisdiction_name,
+            dtf_code: dtf?.code ?? null,
+            rate: rateNum,
+            rate_display: dtf?.rate_display ?? formatRateAsFraction(rateNum),
+            taxable_sales_cents: toCents(Number(j.taxable_sales)),
+            tax_due_cents: toCents(Number(j.tax_due)),
+          });
+        }
+      }
+    }
 
     const generatedAtET = new Date(Date.now() - 5 * 3600 * 1000)
       .toISOString().slice(0, 19).replace("T", " ") + " ET";
@@ -7370,6 +7639,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return {
       periodKey,
       isQuarter,
+      formType,
       months: monthPayloads,
       totals,
       invariant: {
@@ -7379,6 +7649,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         delta_cents: delta,
       },
       lineDetail,
+      entities,
+      jurisdictions,
+      unmappedJurisdictions: Array.from(unmappedSet).sort(),
       generatedAtET,
     };
   };
@@ -7513,9 +7786,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
       }
       try {
-        const csv = buildSalesTaxCsv(buildExportPayload(periodKey));
+        const payload = buildExportPayload(periodKey);
+        const csv = buildSalesTaxCsv(payload);
         res.setHeader("Content-Type", "text/csv; charset=utf-8");
-        res.setHeader("Content-Disposition", `attachment; filename="snohaus-sales-tax-${periodKey}-summary.csv"`);
+        res.setHeader("Content-Disposition", `attachment; filename="${payload.formType}_${periodKey}_all-entities.csv"`);
         res.send(csv);
       } catch (e: any) { sendExportError(res, e); }
     },
@@ -7531,9 +7805,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
       }
       try {
-        const buf = await buildSalesTaxXlsx(buildExportPayload(periodKey));
+        const payload = buildExportPayload(periodKey);
+        const buf = await buildSalesTaxXlsx(payload);
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-        res.setHeader("Content-Disposition", `attachment; filename="snohaus-sales-tax-${periodKey}-workbook.xlsx"`);
+        res.setHeader("Content-Disposition", `attachment; filename="${payload.formType}_${periodKey}_all-entities.xlsx"`);
         res.send(buf);
       } catch (e: any) { sendExportError(res, e); }
     },
@@ -7549,9 +7824,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
       }
       try {
-        const buf = await buildSalesTaxPdf(buildExportPayload(periodKey));
+        const payload = buildExportPayload(periodKey);
+        const buf = await buildSalesTaxPdf(payload);
         res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `attachment; filename="snohaus-sales-tax-${periodKey}-st810.pdf"`);
+        res.setHeader("Content-Disposition", `attachment; filename="${payload.formType}_${periodKey}_all-entities.pdf"`);
         res.send(buf);
       } catch (e: any) { sendExportError(res, e); }
     },
