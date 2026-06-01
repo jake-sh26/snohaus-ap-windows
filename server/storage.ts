@@ -1749,6 +1749,14 @@ function bootstrapSchema() {
   // Reconciler baseline (PR #R1): one settings row + entity_pos_locations
   // shells seeded from the 3 payroll_entities. Idempotent.
   seedReconcilerBaseline();
+
+  // Sales Tax filings table (PR #165). Lazy require avoids a load-order cycle
+  // (sales-tax-filings imports `sqlite` from this module).
+  try {
+    require("./sales-tax-filings").ensureSalesTaxFilingsSchema();
+  } catch (e: any) {
+    console.error("[storage] ensureSalesTaxFilingsSchema failed:", e?.message);
+  }
 }
 
 // ===== app_users helpers =====
@@ -2176,6 +2184,34 @@ function seedRbacBaseline(): void {
       `);
       for (const a of admins) {
         insertUserRole.run(a.id, ownerRole.id, now);
+      }
+    }
+
+    // ----- PR #165: auto-grant Finance permissions to payroll.view holders -----
+    // Rollout strategy: every role that currently grants payroll.view also gets
+    // finance.view + finance.sales_tax.view + finance.sales_tax.export. Granting
+    // at the ROLE level (not per-user) preserves each role's existing entity
+    // scope and means anyone who can see payroll today can see Finance / Sales
+    // Tax on the next boot — without us touching the Owner-edited role configs
+    // beyond adding these keys. Fully idempotent (INSERT OR IGNORE on the
+    // role_permissions unique constraint). Removing payroll.view from a role
+    // later won't auto-revoke these — that's an intentional one-way cutover.
+    const FINANCE_GRANT_KEYS = [
+      "finance.view",
+      "finance.sales_tax.view",
+      "finance.sales_tax.export",
+    ];
+    const payrollViewPerm = getPermIdByKey.get("payroll.view") as { id: number } | undefined;
+    if (payrollViewPerm) {
+      const rolesWithPayrollView = sqlite.prepare(
+        `SELECT DISTINCT role_id FROM role_permissions WHERE permission_id = ?`
+      ).all(payrollViewPerm.id) as Array<{ role_id: number }>;
+      for (const key of FINANCE_GRANT_KEYS) {
+        const perm = getPermIdByKey.get(key) as { id: number } | undefined;
+        if (!perm) continue;
+        for (const r of rolesWithPayrollView) {
+          insertRolePerm.run(r.role_id, perm.id);
+        }
       }
     }
   } catch (e: any) {

@@ -155,6 +155,17 @@ import {
   type UnverifiedReturnTax,
 } from "./shopify-tax-aggregation";
 import {
+  STORE_TAX_MAPPING,
+  isStoreClosedForMonth,
+} from "./sales-tax-mapping";
+import {
+  getFiling,
+  upsertFiling,
+  listFilings,
+  openFilingPlaceholder,
+  type FilingStatus,
+} from "./sales-tax-filings";
+import {
   syncPayoutsIncremental,
 } from "./shopify-recon-payouts";
 import {
@@ -186,7 +197,7 @@ import {
   shopifyInstalledStatusHandler,
   shopifyDeleteTokenHandler,
 } from "./shopify-oauth";
-import { getUserPermissions, requirePermission } from "./rbac";
+import { getUserPermissions, requirePermission, requireFinanceView } from "./rbac";
 import {
   isGoogleConfigured,
   getDriveAuthUrl,
@@ -1465,7 +1476,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   4. If all_ok is false, drill into specific orders and fix the ingest bug
 
   // Local rollup only — no snapshot required. Useful for spot-checking.
-  app.get("/api/recon/finance/local/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/local/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -1480,7 +1491,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // total_shipping, plus each refund-adjustment row that touches shipping,
   // and the grand totals — so an operator can spot duplicates or missing
   // shipping-refund rows immediately.
-  app.get("/api/recon/finance/debug/shipping/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/shipping/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -1530,7 +1541,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // recon_shopify_sales-derived with the same formulas as /v2-vs-shopifyql).
   // V2 reconciles to the penny across all 17 months of 2025–2026 (acceptance
   // run after PR #121). Response shape is identical so the UI is unchanged.
-  app.get("/api/recon/finance/diff/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/diff/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -1569,7 +1580,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //       events_count,
   //     }
   //   }
-  app.get("/api/recon/finance/diff-compare/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/diff-compare/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -1589,7 +1600,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Debug: dump the internal components of computeLocalFinanceSummary so we
   // can see exactly which sub-total contributes to each line. Read-only.
-  app.get("/api/recon/finance/debug/components/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/components/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -1602,7 +1613,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Rule #6 (gift-card line exclusion + line-level recognized_at bucketing).
   // Pure read — no code path changed. Confirm $0.00 vs Shopify here BEFORE we
   // touch shopify-finance-diff.ts.
-  app.get("/api/recon/finance/debug/dryrun-rule6/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/dryrun-rule6/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -1700,7 +1711,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // months. Pure read — no code path changed. If all months land within
   // tolerance, the next step is a tiny PR making 'order_processed_at' the
   // default in computeLocalFinanceSummary.
-  app.get("/api/recon/finance/debug/dryrun-order-bucket", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/dryrun-order-bucket", authMiddleware, requireFinanceView(), (req, res) => {
     const { sqlite } = require("./storage");
     const { computeLocalFinanceSummary } = require("./shopify-finance-diff");
     const tolerance = Number.isFinite(Number(req.query.tolerance))
@@ -1859,7 +1870,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Plus per-month breakdown of recognition-vs-creation drift. Helps answer:
   //   - is the Oct/Nov over-recognition unique, or systemic?
   //   - what gap threshold (7d, 14d, 30d, 90d) would have caught the bug?
-  app.get("/api/recon/finance/debug/exchange-gap-audit", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+  app.get("/api/recon/finance/debug/exchange-gap-audit", authMiddleware, requireFinanceView(), (_req, res) => {
     const { sqlite } = require("./storage");
     const tz = "'-5 hours'";
 
@@ -1943,7 +1954,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // (added_via_exchange_refund_id), the count of non-equal lines should equal
   // the count of exchange lines. If it's much larger, the override is firing
   // on more cases than intended.
-  app.get("/api/recon/finance/debug/recognized-vs-created-audit", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+  app.get("/api/recon/finance/debug/recognized-vs-created-audit", authMiddleware, requireFinanceView(), (_req, res) => {
     const { sqlite } = require("./storage");
     const tz = "'-5 hours'";
     const overall = sqlite.prepare(`
@@ -1994,7 +2005,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   - per-order gross + discount + tax + refund totals
   // Sort by absolute gross contribution descending so the biggest outliers
   // bubble to the top. Read-only.
-  app.get("/api/recon/finance/debug/date-mismatches/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/date-mismatches/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -2091,7 +2102,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // The legacy /orders/:month endpoint below filters by created_at and is
   // intentionally preserved as-is for legacy projector debugging.
-  app.get("/api/recon/finance/debug/orders-v2/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/orders-v2/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -2187,7 +2198,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
-  app.get("/api/recon/finance/debug/orders/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/orders/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -2245,7 +2256,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Debug endpoint for Rule #9 (retained return-shipping fees). Lists every
   // order that would be flagged by Rule #9 in :month, with the contributing
   // current_total_price and refund-side discrepancy details. Read-only.
-  app.get("/api/recon/finance/debug/rule9/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/rule9/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -2317,7 +2328,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // every refund row that hits Dec on its own processed_at so we can compare
   // against Shopify's Finance Summary detail and identify which one(s) Shopify
   // excludes (or which the aggregator double-counts).
-  app.get("/api/recon/finance/debug/refunds/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/refunds/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -2405,7 +2416,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // Orders are sorted by ABS(net diff) so the operator can see the biggest
   // mirror contributors first. No truncation — ALL orders affecting the diff.
-  app.get("/api/recon/finance/debug/bug3-forensics/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/bug3-forensics/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -2521,7 +2532,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // full Shopify order payload including `transactions[]`, `order_adjustments[]`,
   // `current_*` vs `original_*` totals, and `updated_at` — which is where the
   // edit-month deltas live.
-  app.get("/api/recon/finance/debug/orders/by-name/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/orders/by-name/:name", authMiddleware, requireFinanceView(), (req, res) => {
     const { sqlite } = require("./storage");
     const raw = String(req.params.name || "").trim();
     if (!raw) return res.status(400).json({ message: "name required" });
@@ -2581,7 +2592,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Read-only. Returns: per-month buckets keyed by close_month, with the
   // sum of total_discounts moving (the most common delta), plus a flat list
   // of every cross-month order.
-  app.get("/api/recon/finance/debug/cross-month-close", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/cross-month-close", authMiddleware, requireFinanceView(), (req, res) => {
     const { sqlite } = require("./storage");
     const rows: any[] = sqlite.prepare(`
       SELECT
@@ -2653,7 +2664,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // and #21840 (Jun 22 backend item add) before designing the attribution fix.
   //
   // Read-only. payroll.view permission. No DB writes.
-  app.get("/api/recon/finance/debug/orders/by-name/:name/events", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/orders/by-name/:name/events", authMiddleware, requireFinanceView(), async (req, res) => {
     const { sqlite } = require("./storage");
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
@@ -2723,7 +2734,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // GraphQL has what we need to model Bug 3 attribution.
   //
   // Read-only. payroll.view. No DB writes.
-  app.get("/api/recon/finance/debug/orders/by-name/:name/graphql-totals", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/orders/by-name/:name/graphql-totals", authMiddleware, requireFinanceView(), async (req, res) => {
     const { sqlite } = require("./storage");
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
@@ -2841,7 +2852,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // tax/discount breakdowns. We use this to validate that we can mirror
   // Shopify's ledger directly instead of synthesizing edit-deltas
   // ourselves.
-  app.get("/api/recon/finance/debug/orders/by-name/:name/agreements", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/orders/by-name/:name/agreements", authMiddleware, requireFinanceView(), async (req, res) => {
     const { sqlite } = require("./storage");
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
@@ -3039,7 +3050,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // PR #96 schema-health (read-only). Materializes the new
   // recon_shopify_agreements + recon_shopify_sales tables on first hit
   // and returns current row counts.
-  app.get("/api/recon/finance/debug/agreements-ledger/health", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+  app.get("/api/recon/finance/debug/agreements-ledger/health", authMiddleware, requireFinanceView(), (_req, res) => {
     try {
       const {
         ensureShopifyAgreementsSchema,
@@ -3064,7 +3075,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // recon_shopify_sales. Idempotent (re-runs bump ingest_version).
   // Read-only against Shopify.
   // Body: { name: string } e.g. "22338" or "#22338"
-  app.post("/api/recon/finance/debug/agreements-ledger/ingest", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.post("/api/recon/finance/debug/agreements-ledger/ingest", authMiddleware, requireFinanceView(), async (req: any, res) => {
     const { sqlite } = require("./storage");
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
@@ -3107,7 +3118,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   { scope: "month", month: "2025-11" }
   //   { scope: "names", names: ["22338", "21840"] }
   //   { scope: "orders", ids: ["123456789", ...] }
-  app.post("/api/recon/finance/debug/agreements-ledger/backfill", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+  app.post("/api/recon/finance/debug/agreements-ledger/backfill", authMiddleware, requireFinanceView(), (req: any, res) => {
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
     const body = req.body || {};
@@ -3148,7 +3159,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // PR #97 backfill progress polling.
-  app.get("/api/recon/finance/debug/agreements-ledger/backfill/:job_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/agreements-ledger/backfill/:job_id", authMiddleware, requireFinanceView(), (req, res) => {
     try {
       const { getBackfillProgress } = require("./shopify-recon-agreements");
       const p = getBackfillProgress(String(req.params.job_id));
@@ -3168,7 +3179,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // PR #97 read-back. Returns the agreements + sales we have stored
   // locally for one order, for comparison against the live-GraphQL
   // endpoint at /agreements (which fetches from Shopify in real time).
-  app.get("/api/recon/finance/debug/orders/by-name/:name/agreements-ledger", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/orders/by-name/:name/agreements-ledger", authMiddleware, requireFinanceView(), (req, res) => {
     const { sqlite } = require("./storage");
     const raw = String(req.params.name || "").trim();
     if (!raw) return res.status(400).json({ message: "name required" });
@@ -3232,7 +3243,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // without nesting under agreements. Useful for cross-month edit debugging:
   // an order that spans Jan + Apr will show its Jan rows and Apr rows in one
   // chronological list with computed columns ready to sum.
-  app.get("/api/recon/finance/debug/orders/by-name/:name/sales-ledger", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/orders/by-name/:name/sales-ledger", authMiddleware, requireFinanceView(), (req, res) => {
     const { sqlite } = require("./storage");
     const raw = String(req.params.name || "").trim();
     if (!raw) return res.status(400).json({ message: "name required" });
@@ -3433,7 +3444,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   (c) RETURN rows where line_type != PRODUCT — the smoking-gun list for
   //       a returns-column gap (matches PR #109's smoking-gun pattern, this
   //       time on the RETURN side instead of the ORDER side).
-  app.get("/api/recon/finance/debug/sales-combo-matrix/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/sales-combo-matrix/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -3540,7 +3551,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/recon/finance/debug/v2-vs-shopifyql/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/v2-vs-shopifyql/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -3804,7 +3815,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // PR — for now non-POS revenue (online orders, etc.) does not appear in
   // any store's roll-up. Use /v2-vs-shopifyql for the channel-agnostic
   // grand total.
-  app.get("/api/recon/finance/by-store-pos/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/by-store-pos/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -4018,7 +4029,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Same 9-metric shape as /by-store-pos: gross_sales, discounts, returns,
   // return_fees, net_sales_gift_cards, shipping_charges, taxes, net_sales,
   // total_sales. Pennies, no rounding.
-  app.get("/api/recon/finance/by-store/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/by-store/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -5066,7 +5077,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   created_at, processed_at, cancelled_at, financial_status, fulfillment_status,
   //   created_month, sales_rows_in_month, action_type x line_type breakdown of
   //   (count, sum(total_amount-total_tax)), and a 'reason' classification.
-  app.get("/api/recon/finance/debug/orders-gap/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/orders-gap/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -5306,7 +5317,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   diffs: [{ name, v2_gross, ql_gross, diff_v2_minus_ql,
   //              created_at, processed_at, cancelled_at,
   //              financial_status, source_name }]
-  app.get("/api/recon/finance/debug/per-order-gross-diff/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/per-order-gross-diff/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -5495,7 +5506,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //                      order's bucketing month = :month (mirrors by-entity)
   //   diff = sales_tax - tax_lines_tax  (sorted by |diff| desc, top N)
   // ===================================================================
-  app.get("/api/recon/finance/debug/per-order-tax-diff/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/per-order-tax-diff/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -5662,7 +5673,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // GET /api/recon/finance/debug/tax-component-diff/:month?entity_id=N
   // ===================================================================
-  app.get("/api/recon/finance/debug/tax-component-diff/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/tax-component-diff/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -5875,7 +5886,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // GET /api/recon/finance/debug/order-tax-truth/:order_id
   // ===================================================================
-  app.get("/api/recon/finance/debug/order-tax-truth/:order_id", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/order-tax-truth/:order_id", authMiddleware, requireFinanceView(), async (req, res) => {
     const orderId = String(req.params.order_id);
     if (!/^[0-9]+$/.test(orderId)) {
       return res.status(400).json({ message: "order_id must be numeric" });
@@ -6058,7 +6069,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   when sorted by ABS(delta) DESC.
   // GET /api/recon/finance/debug/refund-tax-per-order/:month?entity_id=N
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/refund-tax-per-order/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/refund-tax-per-order/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -6232,7 +6243,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   actually works.
   // GET /api/recon/finance/debug/refund-tax-per-order-v2/:month?entity_id=N
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/refund-tax-per-order-v2/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/refund-tax-per-order-v2/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -6448,7 +6459,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // GET /api/recon/finance/debug/line-tax-truth/:month?entity_id=N
   // ===================================================================
-  app.get("/api/recon/finance/debug/line-tax-truth/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/finance/debug/line-tax-truth/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -7043,11 +7054,368 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return row?.location ?? null;
   };
 
+  // ===================================================================
+  // SALES TAX (PR #165) — backend foundation. UI lands in PR #166/#167.
+  //
+  // Per-store/month sales-tax figures, all in integer cents:
+  //   gross_sales_cents     Σ line_subtotal (pre-tax) over attributed lines
+  //   taxable_sales_cents   Σ line_subtotal where the line carried tax
+  //   exempt_sales_cents    gross - taxable
+  //   tax_collected_cents   forward LINE tax + forward SHIPPING tax (engine)
+  //   refund_tax_in_period_cents  refund LINE tax + refund SHIPPING tax (engine,
+  //                          already ABS-wrapped — sign-convention trap handled)
+  //   net_tax_cents         tax_collected - refund_tax (== engine net per entity)
+  //
+  // Net tax is sourced from computeAttributionForMonth (the same canonical
+  // v_attributed_sales engine /by-store uses), so the parts (3 stores +
+  // Unallocated) sum to the engine grand total by construction — that's the
+  // invariant the response asserts. Gross/taxable/exempt are line-subtotal
+  // tallies attributed via the identical pickEntity cascade. Jurisdiction
+  // facts (county/rate/closed) come from STORE_TAX_MAPPING, never per-line.
+  // -------------------------------------------------------------------
+
+  type SalesTaxStoreRow = {
+    store_id: string;
+    name: string;
+    entity_id: number;
+    county: string;
+    state: string;
+    rate_bps: number;
+    closed: boolean;
+    unexpected_activity: boolean;
+    gross_sales_cents: number;
+    taxable_sales_cents: number;
+    exempt_sales_cents: number;
+    tax_collected_cents: number;
+    refund_tax_in_period_cents: number;
+    net_tax_cents: number;
+  };
+
+  type SalesTaxMonth = {
+    month: string;
+    filing_mode: "month" | "quarter";
+    quarter_key: string | null;
+    stores: SalesTaxStoreRow[];
+    totals: {
+      gross_sales_cents: number;
+      taxable_sales_cents: number;
+      tax_collected_cents: number;
+      net_tax_cents: number;
+    };
+    invariant: {
+      ok: boolean;
+      per_entity_sum_cents: number;
+      view_total_cents: number;
+      delta_cents: number;
+    };
+  };
+
+  // NY ST-810: the quarter-end months require the full ST-810 schedule.
+  // NY sales-tax year is March–February, so quarters are:
+  //   Q1 Dec/Jan/Feb (end Feb), Q2 Mar/Apr/May (end May),
+  //   Q3 Jun/Jul/Aug (end Aug), Q4 Sep/Oct/Nov (end Nov).
+  const QUARTER_END_MONTHS = new Set([2, 5, 8, 11]);
+  const quarterKeyForMonth = (month: string): string => {
+    const [yStr, mStr] = month.split("-");
+    const y = Number(yStr);
+    const m = Number(mStr);
+    // Map a calendar month to its NY ST-810 quarter + that quarter's year label.
+    // Quarter year = the year of the quarter's FIRST month per quarterToMonths:
+    //   Q1 starts Mar, Q2 Jun, Q3 Sep, Q4 Dec. Dec/Jan/Feb belong to Q1 whose
+    //   label year is the Dec year (so Jan/Feb 2026 → 2025-Q1).
+    if (m === 12) return `${y}-Q1`;
+    if (m === 1 || m === 2) return `${y - 1}-Q1`;
+    if (m >= 3 && m <= 5) return `${y}-Q2`;
+    if (m >= 6 && m <= 8) return `${y}-Q3`;
+    return `${y}-Q4`; // Sep/Oct/Nov
+  };
+
+  // Per-month sales-tax computation. Pure read. Returns the SalesTaxMonth shape
+  // minus the filing block (callers attach filing state).
+  const computeSalesTaxForMonth = (month: string): SalesTaxMonth => {
+    const { sqlite } = require("./storage");
+    const attribution = computeAttributionForMonth(month);
+    const posEntitySet: Set<number> = attribution.posEntitySet;
+
+    // pickEntity cascade, identical to the engine, applied to gross lines.
+    const pickEntity = (
+      posEid: number | null,
+      perLineEid: number | null,
+      orderEid: number | null,
+      dominantEid: number | null,
+    ): number => {
+      if (posEid != null && posEntitySet.has(Number(posEid))) return Number(posEid);
+      if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
+      if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
+      if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
+      return 0;
+    };
+
+    // Gross / taxable lines from the view joined to line_items for the pre-tax
+    // subtotal + per-line tax total. Share-weighted to match the tax engine.
+    const grossRows = sqlite.prepare(`
+      SELECT
+        v.line_item_id,
+        v.per_line_entity_id,
+        v.per_line_share,
+        v.order_entity_id,
+        v.dominant_entity_id,
+        li.line_subtotal AS line_subtotal,
+        li.line_tax_total AS line_tax_total,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos' AND pl.active = 1
+          WHERE s.order_id = v.order_id
+            AND s.line_item_id = v.line_item_id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id
+      FROM v_attributed_sales v
+      JOIN recon_line_items li ON li.id = v.line_item_id AND li.order_id = v.order_id
+      WHERE v.happened_month = ?
+    `).all(month) as any[];
+
+    const grossByEntity = new Map<number, number>();
+    const taxableByEntity = new Map<number, number>();
+    for (const r of grossRows) {
+      const eid = pickEntity(
+        r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+      );
+      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
+      const subtotalCents = Math.round(Math.abs(Number(r.line_subtotal || 0)) * 100 * share);
+      const lineTaxCents = Math.round(Math.abs(Number(r.line_tax_total || 0)) * 100);
+      grossByEntity.set(eid, (grossByEntity.get(eid) || 0) + subtotalCents);
+      if (lineTaxCents > 0) {
+        taxableByEntity.set(eid, (taxableByEntity.get(eid) || 0) + subtotalCents);
+      }
+    }
+
+    const netTaxOf = (eid: number) =>
+      (attribution.fwdByEntity.get(eid) || 0)
+      - (attribution.refByEntity.get(eid) || 0)
+      + (attribution.shipByEntity.get(eid) || 0)
+      - (attribution.shipRefByEntity.get(eid) || 0);
+    const taxCollectedOf = (eid: number) =>
+      (attribution.fwdByEntity.get(eid) || 0)
+      + (attribution.shipByEntity.get(eid) || 0);
+    const refundTaxOf = (eid: number) =>
+      (attribution.refByEntity.get(eid) || 0)
+      + (attribution.shipRefByEntity.get(eid) || 0);
+
+    const stores: SalesTaxStoreRow[] = STORE_TAX_MAPPING.map((m) => {
+      const eid = m.entity_id;
+      const closed = isStoreClosedForMonth(m, month);
+      const gross = grossByEntity.get(eid) || 0;
+      const taxable = taxableByEntity.get(eid) || 0;
+      const netTax = netTaxOf(eid);
+      // A closed store with any activity in the period is a data-quality
+      // signal — surface it via a flag rather than hiding the store.
+      const unexpected = closed && (gross !== 0 || netTax !== 0);
+      return {
+        store_id: m.store_id,
+        name: m.name,
+        entity_id: eid,
+        county: m.county,
+        state: m.state,
+        rate_bps: m.rate_bps,
+        closed,
+        unexpected_activity: unexpected,
+        gross_sales_cents: gross,
+        taxable_sales_cents: taxable,
+        exempt_sales_cents: gross - taxable,
+        tax_collected_cents: taxCollectedOf(eid),
+        refund_tax_in_period_cents: refundTaxOf(eid),
+        net_tax_cents: netTax,
+      };
+    });
+
+    const totals = stores.reduce(
+      (acc, s) => ({
+        gross_sales_cents: acc.gross_sales_cents + s.gross_sales_cents,
+        taxable_sales_cents: acc.taxable_sales_cents + s.taxable_sales_cents,
+        tax_collected_cents: acc.tax_collected_cents + s.tax_collected_cents,
+        net_tax_cents: acc.net_tax_cents + s.net_tax_cents,
+      }),
+      { gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0, net_tax_cents: 0 },
+    );
+
+    // Invariant: Σ net tax over ALL entities the engine saw (every store +
+    // Unallocated + any non-POS bucket) must equal the engine grand total. We
+    // compare the 3-store sum against the engine total; the difference is the
+    // Unallocated/non-POS remainder, which the assertion folds in so delta=0.
+    let viewTotal = 0;
+    Array.from(attribution.allEntities).forEach((eid) => { viewTotal += netTaxOf(eid); });
+    const perEntitySum = stores.reduce((a, s) => a + s.net_tax_cents, 0)
+      + netTaxOf(0); // include Unallocated so the parts tie to the engine total
+    const delta = perEntitySum - viewTotal;
+
+    const [, mStr] = month.split("-");
+    const filingMode: "month" | "quarter" = QUARTER_END_MONTHS.has(Number(mStr)) ? "quarter" : "month";
+
+    return {
+      month,
+      filing_mode: filingMode,
+      quarter_key: quarterKeyForMonth(month),
+      stores,
+      totals,
+      invariant: {
+        ok: delta === 0,
+        per_entity_sum_cents: perEntitySum,
+        view_total_cents: viewTotal,
+        delta_cents: delta,
+      },
+    };
+  };
+
+  const filingBlockFor = (periodKey: string) =>
+    getFiling(periodKey) ?? openFilingPlaceholder(periodKey);
+
+  // 1. GET /api/recon/finance/sales-tax/:month — composite monthly payload.
+  app.get(
+    "/api/recon/finance/sales-tax/:month",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req, res) => {
+      const month = String(req.params.month);
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "Month must be YYYY-MM" });
+      }
+      try {
+        const base = computeSalesTaxForMonth(month);
+        res.json({ ...base, filing: filingBlockFor(month) });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "sales-tax compute failed" });
+      }
+    },
+  );
+
+  // 2. GET /api/recon/finance/sales-tax/quarter/:quarterKey — 3-month ST-810 rollup.
+  app.get(
+    "/api/recon/finance/sales-tax/quarter/:quarterKey",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req, res) => {
+      const quarterKey = String(req.params.quarterKey);
+      if (!/^\d{4}-Q[1-4]$/.test(quarterKey)) {
+        return res.status(400).json({ message: "quarterKey must be YYYY-QN" });
+      }
+      try {
+        const { months } = quarterToMonths(quarterKey);
+        const perMonth = months.map((m) => ({
+          ...computeSalesTaxForMonth(m),
+          filing: filingBlockFor(m),
+        }));
+        const quarterTotals = perMonth.reduce(
+          (acc, mm) => ({
+            gross_sales_cents: acc.gross_sales_cents + mm.totals.gross_sales_cents,
+            taxable_sales_cents: acc.taxable_sales_cents + mm.totals.taxable_sales_cents,
+            tax_collected_cents: acc.tax_collected_cents + mm.totals.tax_collected_cents,
+            net_tax_cents: acc.net_tax_cents + mm.totals.net_tax_cents,
+          }),
+          { gross_sales_cents: 0, taxable_sales_cents: 0, tax_collected_cents: 0, net_tax_cents: 0 },
+        );
+        const perEntitySum = perMonth.reduce((a, mm) => a + mm.invariant.per_entity_sum_cents, 0);
+        const viewTotal = perMonth.reduce((a, mm) => a + mm.invariant.view_total_cents, 0);
+        const delta = perEntitySum - viewTotal;
+        res.json({
+          quarter_key: quarterKey,
+          months,
+          per_month: perMonth,
+          quarter_totals: quarterTotals,
+          quarter_invariant: {
+            ok: delta === 0 && perMonth.every((mm) => mm.invariant.ok),
+            per_entity_sum_cents: perEntitySum,
+            view_total_cents: viewTotal,
+            delta_cents: delta,
+          },
+          filing: filingBlockFor(quarterKey),
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "quarter compute failed" });
+      }
+    },
+  );
+
+  // 3. POST /api/recon/finance/sales-tax/filings/:periodKey — upsert filing state.
+  app.post(
+    "/api/recon/finance/sales-tax/filings/:periodKey",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    (req: any, res) => {
+      const periodKey = String(req.params.periodKey);
+      if (!/^\d{4}-(\d{2}|Q[1-4])$/.test(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      const body = req.body || {};
+      const status = body.status as FilingStatus | undefined;
+      if (status !== undefined && !["open", "filed", "amended"].includes(status)) {
+        return res.status(400).json({ message: "status must be open|filed|amended" });
+      }
+      try {
+        const row = upsertFiling(periodKey, {
+          status,
+          filed_at: body.filed_at ?? null,
+          confirmation_number: body.confirmation_number ?? null,
+          notes: body.notes ?? null,
+          filed_by_user_id: req.userId ?? null,
+        });
+        res.json(row);
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "filing upsert failed" });
+      }
+    },
+  );
+
+  // 4. GET /api/recon/finance/sales-tax/filings — checklist rows in range.
+  app.get(
+    "/api/recon/finance/sales-tax/filings",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req, res) => {
+      const from = req.query.from ? String(req.query.from) : undefined;
+      const to = req.query.to ? String(req.query.to) : undefined;
+      try {
+        res.json({ filings: listFilings(from, to) });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "list filings failed" });
+      }
+    },
+  );
+
+  // 5. Export endpoints — registered + auth-gated, body lands in PR #167.
+  const exportNotImplemented = (format: string) => (req: any, res: any) => {
+    res.status(501).json({
+      message: `Sales-tax ${format.toUpperCase()} export not implemented yet`,
+      detail: "Implemented in PR #167",
+      period_key: String(req.params.periodKey),
+      format,
+    });
+  };
+  app.get(
+    "/api/recon/finance/sales-tax/export/:periodKey/csv",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    exportNotImplemented("csv"),
+  );
+  app.get(
+    "/api/recon/finance/sales-tax/export/:periodKey/pdf",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    exportNotImplemented("pdf"),
+  );
+  app.get(
+    "/api/recon/finance/sales-tax/export/:periodKey/xlsx",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    exportNotImplemented("xlsx"),
+  );
+
   // -------------------------------------------------------------------
   // (a) GET /api/recon/finance/debug/attributed-sales-truth/:month?entity_id=N
   //     One entity's tax breakdown derived from v_attributed_sales.
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/attributed-sales-truth/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/attributed-sales-truth/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -7090,7 +7458,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // (b) GET /api/recon/finance/debug/attribution-invariant/:month
   //     The headline assertion: Σ per_entity == grand_total.
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/attribution-invariant/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/attribution-invariant/:month", authMiddleware, requireFinanceView(), (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -7147,7 +7515,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // (c) GET /api/recon/finance/debug/attributed-sales-truth-by-line/:order_id
   //     Per-order drill-down: every (line × entity) row + shipping attribution.
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/attributed-sales-truth-by-line/:order_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/attributed-sales-truth-by-line/:order_id", authMiddleware, requireFinanceView(), (req, res) => {
     const orderId = String(req.params.order_id);
     if (!orderId) {
       return res.status(400).json({ message: "order_id required" });
@@ -7359,7 +7727,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // GET /api/recon/finance/debug/verify-web-fulfillment-backfill
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/verify-web-fulfillment-backfill", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+  app.get("/api/recon/finance/debug/verify-web-fulfillment-backfill", authMiddleware, requireFinanceView(), (_req, res) => {
     const { sqlite } = require("./storage");
     try {
       // Per-order allocation read-back: entity_id, share, line count.
@@ -7434,7 +7802,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Body: { scope: 'all' } | { scope: 'order', orderId: string }
   // Synchronously runs the V2 projector. Wipes target scope, re-emits
   // from recon_shopify_sales. Returns counts + by_type + by_reason.
-  app.post("/api/recon/finance/debug/projector-v2/project", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+  app.post("/api/recon/finance/debug/projector-v2/project", authMiddleware, requireFinanceView(), (req: any, res) => {
     try {
       const {
         projectRevenueEventsV2,
@@ -7469,7 +7837,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //   - v2 totals (from aggregateRevenueEventsV2ByMonth)
   //   - delta = v2 - legacy for each column
   //   - per-order discrepancies where the two projectors disagree
-  app.get("/api/recon/finance/debug/projector-compare/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/projector-compare/:month", authMiddleware, requireFinanceView(), (req, res) => {
     try {
       const month = String(req.params.month || "").trim();
       if (!/^\d{4}-\d{2}$/.test(month)) {
@@ -7576,7 +7944,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Side-by-side diff of legacy and V2 events for a single order. Useful
   // when projector-compare/:month surfaces a discrepant order and you
   // want to drill into which specific events differ.
-  app.get("/api/recon/finance/debug/projector-compare/order/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/projector-compare/order/:name", authMiddleware, requireFinanceView(), (req, res) => {
     try {
       const { sqlite } = require("./storage");
       const raw = String(req.params.name || "").trim();
@@ -7630,7 +7998,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // GET /api/recon/finance/debug/projector-v2/orders/by-name/:name
   // List V2 events for a single order. Mirrors the legacy /events endpoint
   // for direct inspection of the V2 projector output.
-  app.get("/api/recon/finance/debug/projector-v2/orders/by-name/:name", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/projector-v2/orders/by-name/:name", authMiddleware, requireFinanceView(), (req, res) => {
     try {
       const { sqlite } = require("./storage");
       const raw = String(req.params.name || "").trim();
@@ -7679,7 +8047,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // This is the check that should have gated PR #97. Running it now to
   // diagnose why the V2 projector totals are short.
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/shopify-ground-truth/:month", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.get("/api/recon/finance/debug/shopify-ground-truth/:month", authMiddleware, requireFinanceView(), async (req: any, res) => {
     try {
       const month = String(req.params.month || "").trim();
       if (!/^\d{4}-\d{2}$/.test(month)) {
@@ -7912,7 +8280,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // /shopify-ground-truth/:month, pick the worst order, run this. No
   // need for a separate DevTools script per drill-down.
   // -------------------------------------------------------------------
-  app.get("/api/recon/finance/debug/diagnose-order/:name", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.get("/api/recon/finance/debug/diagnose-order/:name", authMiddleware, requireFinanceView(), async (req: any, res) => {
     try {
       const { sqlite } = require("./storage");
       const raw = String(req.params.name || "").trim();
@@ -8095,7 +8463,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Read-only. Used to validate the Path B attribution formula on 5-10
   // Bug 3 candidates from the 522-order blast radius before committing
   // it to the real fix in PR #86.
-  app.post("/api/recon/finance/debug/orders/graphql-totals-batch", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.post("/api/recon/finance/debug/orders/graphql-totals-batch", authMiddleware, requireFinanceView(), async (req: any, res) => {
     const { sqlite } = require("./storage");
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
@@ -8248,7 +8616,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //     scanned_count, edited_count }
   //
   // Read-only. payroll.view permission.
-  app.post("/api/recon/finance/debug/orders/enumerate-edited", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.post("/api/recon/finance/debug/orders/enumerate-edited", authMiddleware, requireFinanceView(), async (req: any, res) => {
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
 
@@ -8423,7 +8791,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //            page_info: {has_next_page, end_cursor}, ledger_total }
   //
   // Read-only impact on the reconciler. payroll.view permission.
-  app.post("/api/recon/finance/debug/orders/populate-edits", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.post("/api/recon/finance/debug/orders/populate-edits", authMiddleware, requireFinanceView(), async (req: any, res) => {
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
 
@@ -8555,7 +8923,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Read-only.
   //
   // POST body: { order_id?: string, order_name?: string }   // one or other
-  app.post("/api/recon/finance/debug/orders/local-vs-shopify", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.post("/api/recon/finance/debug/orders/local-vs-shopify", authMiddleware, requireFinanceView(), async (req: any, res) => {
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
     const { sqlite } = require("./storage");
@@ -8696,7 +9064,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // PR #86a — read-only listing of recon_order_edits for operator inspection.
   // GET so it's easy to spot-check from the browser.
-  app.get("/api/recon/finance/debug/orders/list-edits", authMiddleware, requirePermission("payroll.view"), async (_req: any, res) => {
+  app.get("/api/recon/finance/debug/orders/list-edits", authMiddleware, requireFinanceView(), async (_req: any, res) => {
     const { ensureOrderEditsSchema, listAllOrderEdits } = require("./shopify-recon-order-edits");
     ensureOrderEditsSchema();
     const rows = listAllOrderEdits();
@@ -8710,7 +9078,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // null for some other reason. Read-only.
   //
   // POST body: { order_id: string }   // numeric Shopify order id
-  app.post("/api/recon/finance/debug/orders/probe-edit-detector", authMiddleware, requirePermission("payroll.view"), async (req: any, res) => {
+  app.post("/api/recon/finance/debug/orders/probe-edit-detector", authMiddleware, requireFinanceView(), async (req: any, res) => {
     const cfg = getShopifyReconConfig();
     if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
     const orderId = String(req.body?.order_id || "").trim();
@@ -8811,7 +9179,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/recon/finance/debug/events/monthly/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/events/monthly/:month", authMiddleware, requireFinanceView(), (req, res) => {
     try {
       const {
         aggregateRevenueEventsByMonth,
@@ -8827,7 +9195,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/recon/finance/debug/events/order/:order_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+  app.get("/api/recon/finance/debug/events/order/:order_id", authMiddleware, requireFinanceView(), (req, res) => {
     try {
       const {
         listEventsForOrder,
@@ -8843,7 +9211,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/recon/finance/debug/events/warnings", authMiddleware, requirePermission("payroll.view"), (req: any, res) => {
+  app.get("/api/recon/finance/debug/events/warnings", authMiddleware, requireFinanceView(), (req: any, res) => {
     try {
       const {
         listRecentEventWarnings,
@@ -8856,7 +9224,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/recon/finance/debug/events/health", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+  app.get("/api/recon/finance/debug/events/health", authMiddleware, requireFinanceView(), (_req, res) => {
     try {
       const { sqlite } = require("./storage");
       const {
@@ -8999,7 +9367,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // List recent snapshots — last 36 months for the UI's history dropdown.
-  app.get("/api/recon/finance/snapshots", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
+  app.get("/api/recon/finance/snapshots", authMiddleware, requireFinanceView(), (_req, res) => {
     const { listShopifySnapshots } = require("./shopify-finance-diff");
     res.json({ snapshots: listShopifySnapshots(36) });
   });

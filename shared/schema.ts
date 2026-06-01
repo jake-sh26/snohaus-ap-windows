@@ -797,7 +797,7 @@ export type UserRole = typeof userRoles.$inferSelect;
 // Adding a new permission? Append it here AND in the migration in storage.ts.
 export const PERMISSION_CATALOG: Array<{
   key: string;
-  module: "ap" | "payroll" | "users" | "system";
+  module: "ap" | "payroll" | "users" | "system" | "finance";
   label: string;
   description: string;
 }> = [
@@ -815,6 +815,15 @@ export const PERMISSION_CATALOG: Array<{
   { key: "payroll.edit_employees", module: "payroll", label: "Manage employees", description: "Add, edit, or deactivate employees within scoped entities." },
   { key: "payroll.edit_rules", module: "payroll", label: "Edit commission/SPIF rules", description: "Change commission rates, SPIF rules, and processing fees." },
   { key: "payroll.run_sync", module: "payroll", label: "Trigger sync", description: "Manually trigger Shopify / Easyrent / Shift4 ingestion runs." },
+
+  // ----- Finance (PR #165) -----
+  // finance.view replaces payroll.view on /api/recon/finance/* routes (with a
+  // graceful payroll.view fallback during cutover). The two sales_tax keys gate
+  // the Sales Tax module: .view for reading data, .export for downloads AND for
+  // marking a period filed.
+  { key: "finance.view", module: "finance", label: "View Finance", description: "See the Finance section: reconciler finance reports, by-store totals, and sales tax." },
+  { key: "finance.sales_tax.view", module: "finance", label: "View Sales Tax", description: "See sales-tax summaries, jurisdiction breakdowns, and filing status." },
+  { key: "finance.sales_tax.export", module: "finance", label: "Export / file Sales Tax", description: "Download sales-tax exports (CSV/PDF/XLSX) and mark a period as filed." },
 
   // ----- Users / RBAC -----
   { key: "users.view", module: "users", label: "View users", description: "See the users list and their assigned roles." },
