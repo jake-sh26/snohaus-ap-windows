@@ -9,7 +9,7 @@
  * to register/reset webhook subscriptions on the Shopify side and the manual
  * sync trigger (which is also automated on boot + every 6h).
  */
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type ReactNode } from "react";
 import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -447,7 +447,15 @@ function shortTime(iso: string | null | undefined): string {
 }
 
 // =============================================================================
-export default function ReconcilerTest() {
+/**
+ * Which Finance sub-page is rendering this shared console (PR #166).
+ *   monthly-summary — Reconcile content only (no tab bar)
+ *   per-store-sales — By-store breakdown only (no tab bar)
+ *   options         — Sync · Mapping · Setup as inner pill tabs
+ */
+export type FinanceView = "monthly-summary" | "per-store-sales" | "options";
+
+export default function ReconcilerTest({ view = "options" }: { view?: FinanceView }) {
   const qc = useQueryClient();
   const [lastAction, setLastAction] = useState<string | null>(null);
 
@@ -1201,16 +1209,27 @@ export default function ReconcilerTest() {
   // uses wouter+useHashLocation so this reads/writes the query portion of the
   // hash route (e.g. #/recon?tab=sync).
   // ---------------------------------------------------------------------------
-  const VALID_TABS = ["reconcile", "bystore", "sync", "mapping", "setup"] as const;
-  type TabKey = (typeof VALID_TABS)[number];
+  type TabKey = "reconcile" | "bystore" | "sync" | "mapping" | "setup";
+
+  // Each Finance view (PR #166) owns a fixed slice of the original 5 tabs.
+  // Monthly Summary / Per Store Sales are single-content (no tab bar); Finance
+  // Options keeps Sync/Mapping/Setup as inner pill tabs with ?tab= state.
+  const VIEW_TABS: Record<FinanceView, readonly TabKey[]> = {
+    "monthly-summary": ["reconcile"],
+    "per-store-sales": ["bystore"],
+    options: ["sync", "mapping", "setup"],
+  };
+  const validTabs = VIEW_TABS[view];
+  const defaultTab = validTabs[0];
+  const showTabBar = validTabs.length > 1;
 
   const [location, setLocation] = useLocation();
   const readTab = (): TabKey => {
     const qIdx = location.indexOf("?");
-    if (qIdx < 0) return "reconcile";
+    if (qIdx < 0) return defaultTab;
     const params = new URLSearchParams(location.slice(qIdx + 1));
     const t = params.get("tab") as TabKey | null;
-    return t && (VALID_TABS as readonly string[]).includes(t) ? t : "reconcile";
+    return t && (validTabs as readonly string[]).includes(t) ? t : defaultTab;
   };
   const [activeTab, setActiveTab] = useState<TabKey>(readTab);
 
@@ -1222,7 +1241,7 @@ export default function ReconcilerTest() {
   }, [location]);
 
   const onTabChange = (next: string) => {
-    const t = (VALID_TABS as readonly string[]).includes(next) ? (next as TabKey) : "reconcile";
+    const t = (validTabs as readonly string[]).includes(next) ? (next as TabKey) : defaultTab;
     setActiveTab(t);
     const qIdx = location.indexOf("?");
     const base = qIdx < 0 ? location : location.slice(0, qIdx);
@@ -1231,26 +1250,45 @@ export default function ReconcilerTest() {
     setLocation(`${base}?${params.toString()}`, { replace: true });
   };
 
+  // Per-view page header (H1 + subtitle + optional read-only badge).
+  const HEADER: Record<FinanceView, { h1: string; subtitle: ReactNode; badge: boolean }> = {
+    "monthly-summary": {
+      h1: "Monthly Summary",
+      subtitle:
+        "Finance Reconciliation — read-only validation for the multi-entity Shopify reconciler. No QBO posting, no allocation — that lands in Phase 2.",
+      badge: true,
+    },
+    "per-store-sales": {
+      h1: "Per Store Sales",
+      subtitle: "Per-store breakdown of allocated vs POS sales and tax for the selected month.",
+      badge: false,
+    },
+    options: {
+      h1: "Finance Options",
+      subtitle: "Sync, mapping, and setup for the Finance module.",
+      badge: false,
+    },
+  };
+  const header = HEADER[view];
+
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Finance Reconciliation</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            Read-only validation for the multi-entity Shopify reconciler. No QBO posting, no allocation — that lands in Phase 2.
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">{header.h1}</h1>
+          <p className="text-sm text-muted-foreground mt-1">{header.subtitle}</p>
         </div>
-        <Badge variant="outline" className="gap-1.5">Read-only</Badge>
+        {header.badge && <Badge variant="outline" className="gap-1.5">Read-only</Badge>}
       </div>
 
       <Tabs value={activeTab} onValueChange={onTabChange} className="space-y-6">
-        <TabsList className="sticky top-0 z-10 h-auto flex-wrap">
-          <TabsTrigger value="reconcile">Reconcile</TabsTrigger>
-          <TabsTrigger value="bystore">By store</TabsTrigger>
-          <TabsTrigger value="sync">Sync</TabsTrigger>
-          <TabsTrigger value="mapping">Mapping</TabsTrigger>
-          <TabsTrigger value="setup">Setup</TabsTrigger>
-        </TabsList>
+        {showTabBar && (
+          <TabsList className="sticky top-0 z-10 h-auto flex-wrap">
+            <TabsTrigger value="sync">Sync</TabsTrigger>
+            <TabsTrigger value="mapping">Mapping</TabsTrigger>
+            <TabsTrigger value="setup">Setup</TabsTrigger>
+          </TabsList>
+        )}
 
         {/* =================== BY STORE TAB =================== */}
         <TabsContent value="bystore" className="space-y-6 mt-0">
