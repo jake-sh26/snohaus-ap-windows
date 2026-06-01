@@ -108,6 +108,12 @@ type OrderRow = {
   total_shipping: number | null;
   total_discounts: number | null;
   total_price: number | null;
+  // PR #162 — full Shopify order payload. For WEB orders Shopify never sets
+  // the order-level location_id and the separate recon_order_fulfillments /
+  // recon_fulfillment_orders ingest can lag behind (or never ran), so the
+  // ONLY routing signal we have is raw_json.fulfillments[].location_id. We
+  // parse this lazily as a last-resort per-line fallback.
+  raw_json: string | null;
 };
 
 type LineItemRow = {
@@ -241,6 +247,56 @@ function findFulfillmentForLine(
   return matches[matches.length - 1];
 }
 
+// PR #162 — Last-resort fulfillment source: parse the order's raw_json
+// payload for fulfillments[]. WEB orders have a null order-level location_id
+// (Shopify only sets it for POS), and for some historical web orders the
+// dedicated recon_order_fulfillments / recon_fulfillment_orders tables were
+// never populated (the orders ingest captured raw_json, but the fulfillment
+// sub-ingest lagged behind or never ran). In that case the embedded
+// raw_json.fulfillments[] is the ONLY routing signal we have. Returns the
+// same FulfillmentRow shape as listSuccessfulFulfillments so the per-line
+// matching logic (findFulfillmentForLine) is reused unchanged.
+//
+// Shopify shape: raw_json.fulfillments[] = [{ id, status, location_id,
+// created_at, line_items: [{ id, ... }] }]. We map line_items[].id into
+// line_item_ids[] so findFulfillmentForLine can match our lines[].id.
+function listSuccessfulFulfillmentsFromRawJson(rawJson: string | null): FulfillmentRow[] {
+  if (!rawJson) return [];
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    return [];
+  }
+  const fulfillments = parsed?.fulfillments;
+  if (!Array.isArray(fulfillments)) return [];
+  const successful = fulfillments.filter((f: any) => f?.status === "success");
+  // Chronological sort — same key as listSuccessfulFulfillments (nulls last,
+  // created_at ASC, id ASC tiebreak) so findFulfillmentForLine's "most recent
+  // ship wins" semantics match the DB-backed path.
+  successful.sort((a: any, b: any) => {
+    const aNull = a?.created_at == null;
+    const bNull = b?.created_at == null;
+    if (aNull !== bNull) return aNull ? 1 : -1;
+    const ac = a?.created_at ?? "";
+    const bc = b?.created_at ?? "";
+    if (ac !== bc) return ac < bc ? -1 : 1;
+    const ai = String(a?.id ?? "");
+    const bi = String(b?.id ?? "");
+    return ai < bi ? -1 : ai > bi ? 1 : 0;
+  });
+  return successful.map((f: any) => ({
+    id: String(f?.id ?? ""),
+    location_id: f?.location_id != null ? String(f.location_id) : null,
+    status: f?.status != null ? String(f.status) : null,
+    line_item_ids: Array.isArray(f?.line_items)
+      ? f.line_items
+          .map((li: any) => (li?.id != null ? String(li.id) : null))
+          .filter((id: string | null): id is string => id != null)
+      : [],
+  }));
+}
+
 // PR #R4d — fulfillment_order lookup. Distinct from fulfillments[]: a FO is
 // the routed *intent* (created at order time), whereas fulfillments[] only
 // appears once the merchant ships. For Locally orders and unshipped online
@@ -309,6 +365,9 @@ function allocateLineItem(
     sdEntityId: number | null;
     fulfillments: FulfillmentRow[];
     fulfillmentOrders: FulfillmentOrderRow[];
+    // PR #162 — fulfillments parsed from order.raw_json. Last-resort source
+    // for WEB orders whose recon_order_fulfillments rows were never ingested.
+    rawJsonFulfillments: FulfillmentRow[];
   },
 ): AllocationRow[] {
   const gross =
@@ -510,6 +569,46 @@ function allocateLineItem(
     }];
   }
 
+  // (b2) PR #162 — raw_json.fulfillments[] fallback. The dedicated
+  // recon_order_fulfillments table is empty for some historical WEB orders
+  // (the orders ingest captured raw_json but the fulfillment sub-ingest never
+  // ran), so branch (b) above found nothing. The order payload still carries
+  // fulfillments[] with the real ship-from location_id, matched to our line
+  // by raw_json.fulfillments[].line_items[].id. This is the fix for the May
+  // 2026 Unallocated web orders (#38144 → Greenvale, #38175 → Huntington).
+  const rawFulfillment = findFulfillmentForLine(ctx.rawJsonFulfillments, line.id);
+  if (rawFulfillment && rawFulfillment.location_id) {
+    const hit = ctx.locationMap.get(rawFulfillment.location_id);
+    if (hit) {
+      const method: AllocationMethod = hit.kind === "warehouse" ? "warehouse_rollup" : "fulfillment_location";
+      return [{
+        order_id: order.id,
+        line_item_id: line.id,
+        entity_id: hit.entity_id,
+        share: 1,
+        gross_amount: gross,
+        tax_amount: tax,
+        method,
+        reason: `Online → raw_json fulfillment ${rawFulfillment.id} @ location ${rawFulfillment.location_id} (${hit.kind}) [recon_order_fulfillments empty — raw_json fallback]`,
+        auto_method: method,
+        auto_entity_id: hit.entity_id,
+      }];
+    }
+    // raw_json fulfillment points at an unmapped location — flag for review.
+    return [{
+      order_id: order.id,
+      line_item_id: line.id,
+      entity_id: ctx.sdEntityId ?? 0,
+      share: 1,
+      gross_amount: gross,
+      tax_amount: tax,
+      method: "needs_review",
+      reason: `Online → raw_json fulfillment @ unmapped location ${rawFulfillment.location_id}`,
+      auto_method: "needs_review",
+      auto_entity_id: null,
+    }];
+  }
+
   // (c) PR #R4d — Fulfillment_order routing. The FO is created at order
   // placement, before any ship event, with assigned_location_id pointing at
   // the routed store. This is what catches Locally orders and unshipped
@@ -637,7 +736,7 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
     .prepare(
       `SELECT id, created_at, source_name, location_id, customer_id, customer_email,
               shipping_zip, billing_zip, has_gift_card, cancelled_at, subtotal,
-              total_tax, total_shipping, total_discounts, total_price
+              total_tax, total_shipping, total_discounts, total_price, raw_json
        FROM recon_orders
        WHERE created_at >= ? AND created_at < ?
        ORDER BY created_at ASC`
@@ -770,7 +869,13 @@ export function runAllocationEngine(month: string): AllocationRunSummary {
       const t0_fo = Date.now();
       const fulfillmentOrders = listFulfillmentOrders(o.id);
       t_fulfillment_orders_query += Date.now() - t0_fo;
-      const lineCtx = { ...ctx, fulfillments, fulfillmentOrders };
+      // PR #162 — parse raw_json.fulfillments[] once per order for the
+      // last-resort web-order fallback (branch b2 in allocateLineItem). POS
+      // orders short-circuit before branch b2, so skip the JSON.parse for them
+      // (matches the allocator's existing per-order JSON.parse avoidance).
+      const isPos = (o.source_name || "").toLowerCase() === "pos" && !!o.location_id;
+      const rawJsonFulfillments = isPos ? [] : listSuccessfulFulfillmentsFromRawJson(o.raw_json);
+      const lineCtx = { ...ctx, fulfillments, fulfillmentOrders, rawJsonFulfillments };
 
       let orderHasReview = false;
       for (const line of lines) {
