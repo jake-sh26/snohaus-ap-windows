@@ -296,6 +296,67 @@ app.use((req, res, next) => {
       // Polling safety net every 6 hours (webhooks are the primary path for orders).
       setInterval(runShopifyOrdersSync, 6 * 60 * 60 * 1000);
 
+      // PR #157 — agreements-ledger safety-net cron.
+      //
+      // recon_orders / recon_line_items stay current via webhooks + the 6h
+      // orders sync above, but recon_shopify_sales (read by the reconcile /
+      // by-store UI tabs) is ONLY populated by ingestAgreementsForOrder, which
+      // today is triggered exclusively by manual hits to
+      // POST /api/recon/finance/debug/agreements-ledger/backfill. So new orders
+      // land but the UI looks frozen until someone kicks the backfill by hand.
+      //
+      // This hourly cron calls the SAME function that route uses
+      // (startAgreementsBackfill, scope=missing) so the missing sale rows get
+      // filled in automatically. The proper fix — wiring ingestAgreementsForOrder
+      // into the webhook + orders-sync hot path — is deferred to a follow-up PR.
+      //
+      // Gated by AGREEMENTS_SAFETY_NET_CRON_ENABLED (default on; set to 'false'
+      // to kill it without a redeploy). Non-overlapping via an in-memory flag,
+      // and does NOT run on boot — first execution is the next top-of-hour tick.
+      let agreementsSafetyNetRunning = false;
+      const runAgreementsSafetyNet = async () => {
+        if (process.env.AGREEMENTS_SAFETY_NET_CRON_ENABLED === "false") return;
+        if (agreementsSafetyNetRunning) {
+          console.warn("[agreements-ledger-safety-net] previous run still in progress — skipping this tick");
+          return;
+        }
+        agreementsSafetyNetRunning = true;
+        const startedAt = Date.now();
+        console.log("[agreements-ledger-safety-net] start (scope=missing)");
+        try {
+          const { getShopifyReconConfig } = await import("./shopify-recon");
+          const cfg = getShopifyReconConfig();
+          if (!cfg) {
+            console.log("[agreements-ledger-safety-net] Shopify reconciler not configured — skipping");
+            return;
+          }
+          const { startAgreementsBackfill } = await import("./shopify-recon-agreements");
+          const progress = startAgreementsBackfill(cfg, { kind: "missing" });
+          console.log(`[agreements-ledger-safety-net] backfill job started: job_id=${progress.job_id} total_orders=${progress.total_orders}`);
+        } catch (e: any) {
+          console.error(`[agreements-ledger-safety-net] failed: ${e?.message ?? e}`);
+        } finally {
+          agreementsSafetyNetRunning = false;
+          console.log(`[agreements-ledger-safety-net] end (${Date.now() - startedAt}ms)`);
+        }
+      };
+      // Every hour at the top of the hour. No immediate boot run (intentional —
+      // deploys shouldn't surprise the user; the manual backfill endpoint is
+      // still available for an on-demand kick). Align the first tick to the next
+      // :00 so subsequent hourly ticks land on the clock hour instead of drifting
+      // off boot time.
+      {
+        const now = new Date();
+        const msToTopOfHour =
+          (60 - now.getMinutes()) * 60 * 1000 -
+          now.getSeconds() * 1000 -
+          now.getMilliseconds();
+        setTimeout(() => {
+          runAgreementsSafetyNet();
+          setInterval(runAgreementsSafetyNet, 60 * 60 * 1000);
+        }, msToTopOfHour);
+      }
+
       // Start backup scheduler (hourly local, daily Drive, weekly full)
       setTimeout(() => {
         try {
