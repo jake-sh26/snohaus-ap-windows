@@ -4169,6 +4169,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               ELSE 0
             END
           ), 0) AS shipping_charges,
+          -- PR #160: this taxes SUM is SUPERSEDED in the response by the
+          -- canonical v_attributed_sales engine (see finalize() taxCentsOverride
+          -- and computeAttributionForMonth). It is kept here only so the column
+          -- still exists for the legacy shape / any diagnostic readers; the
+          -- value emitted to clients comes from the view, not this SUM. The two
+          -- are penny-identical for production months (invariant-asserted at
+          -- /api/recon/finance/debug/attribution-invariant).
           COALESCE(SUM(
             CASE
               WHEN a.line_type != 'GIFT_CARD'
@@ -4185,8 +4192,32 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         WHERE ${filterClause}
       `;
 
+      // PR #160: tax now comes from the canonical v_attributed_sales engine
+      // (computeAttributionForMonth), NOT from this endpoint's own SUM over
+      // recon_shopify_sales.total_tax. Migrated to v_attributed_sales view in
+      // PR #160 for canonical attribution; see invariant assertion at
+      // /api/recon/finance/debug/attribution-invariant. The engine returns
+      // per-entity NET line-level tax in integer cents
+      // (forward_line - refund_line + forward_shipping - refund_shipping),
+      // keyed by entity_id with 0 = Unallocated. Picks outside the POS set
+      // collapse to 0, identical to this endpoint's unallocated bucket. This
+      // is a numerical no-op vs. the old CTE tax column (verified penny-exact
+      // for 2025-12, 2026-04, 2026-05); only the source of truth changed so
+      // by-store tax can never drift from ST-810 / grand totals again.
+      const attribution = computeAttributionForMonth(month);
+      const netTaxCentsForEntity = (eid: number): number =>
+        (attribution.fwdByEntity.get(eid) || 0)
+        - (attribution.refByEntity.get(eid) || 0)
+        + (attribution.shipByEntity.get(eid) || 0)
+        - (attribution.shipRefByEntity.get(eid) || 0);
+
       const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
-      const finalize = (row: any) => {
+      // taxCentsOverride (when provided) replaces the legacy SUM(total_tax)
+      // for this bucket with the engine's net cents. total_sales is then
+      // recomputed from the same overridden tax so the row stays internally
+      // consistent. Every non-tax column is untouched (this PR is scoped to
+      // the tax migration only — gross/discounts/returns/shipping unchanged).
+      const finalize = (row: any, taxCentsOverride?: number) => {
         const gross = r2(row.gross_sales);
         // PR #133: surface discounts & returns as POSITIVE magnitudes to
         // match Shopify Admin Finance Summary + the V2 /finance/diff
@@ -4199,7 +4230,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const rf = r2(row.return_fees);
         const gc = r2(row.net_sales_gift_cards);
         const ship = r2(row.shipping_charges);
-        const tax = r2(row.taxes);
+        const tax = taxCentsOverride !== undefined
+          ? Math.round(Number(taxCentsOverride)) / 100
+          : r2(row.taxes);
         const netSales = r2(gross - disc - ret);
         const totalSales = r2(netSales + ship + rf + tax);
         return {
@@ -4224,7 +4257,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           entity_id: loc.entity_id,
           entity_location: loc.entity_location,
           location_id: loc.location_id,
-          ...finalize(row),
+          ...finalize(row, netTaxCentsForEntity(loc.entity_id)),
         });
       }
 
@@ -4235,7 +4268,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const unallocRow = sqlite.prepare(
         metricExpr(`(a.attributed_entity_id IS NULL OR a.attributed_entity_id NOT IN (${posIdList}))`)
       ).get(month) as any;
-      const unallocated = finalize(unallocRow);
+      // Unallocated tax = engine entity 0. The engine collapses every pick
+      // that is NULL or outside the POS set into entity 0, exactly mirroring
+      // this bucket's NULL-or-not-in-POS filter, so the parts (3 stores + 0)
+      // sum to the engine grand total — the same invariant #159 asserts.
+      const unallocated = finalize(unallocRow, netTaxCentsForEntity(0));
 
       // Aggregate totals across {3 stores + unallocated} — these should
       // tie to the V2 overall monthly total to the penny.
@@ -4322,8 +4359,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         totals,
         unallocated_orders,
         unallocated_order_count,
-        note: "PR #131: per-line POS attribution (pos_location_id) UNION allocator output (recon_allocations) bucketed into {Greenvale, Huntington, Hempstead, Unallocated}. Sum across all 4 buckets = V2 overall monthly total to the penny. Unallocated should be ~$0 in steady state; when non-zero, drill into unallocated_orders to diagnose.",
-        build_id: "pr131",
+        note: "PR #131: per-line POS attribution (pos_location_id) UNION allocator output (recon_allocations) bucketed into {Greenvale, Huntington, Hempstead, Unallocated}. Sum across all 4 buckets = V2 overall monthly total to the penny. Unallocated should be ~$0 in steady state; when non-zero, drill into unallocated_orders to diagnose. PR #160: the taxes column (and tax's contribution to total_sales) is now sourced from the canonical v_attributed_sales engine (computeAttributionForMonth) instead of this endpoint's own SUM over recon_shopify_sales.total_tax — a numerical no-op verified penny-exact, so by-store tax can never drift from ST-810 / grand totals; see /api/recon/finance/debug/attribution-invariant.",
+        build_id: "pr160",
       });
     } catch (e: any) {
       res.status(500).json({ message: "by-store failed", error: String(e?.message || e) });
