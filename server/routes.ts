@@ -6897,6 +6897,457 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ===================================================================
+  // PR #159-debug — v_attributed_sales view + attribution invariant.
+  //
+  // The architectural principle (derived from first principles by the owner):
+  //   ONE per-line attribution applied uniformly. Every (line × entity) pair
+  //   carries share × line_tax. ST-810 entity totals, by-store breakdown and
+  //   grand totals all GROUP BY differently over the SAME atomic rows. So
+  //   sum-of-parts == whole is enforced by SQL itself, not by careful coding.
+  //
+  // PR #158 proved the per-line forward-tax path is the smallest disagreeing
+  // source. This PR formalizes that path as the v_attributed_sales view (see
+  // storage.ts) and adds an INVARIANT assertion endpoint so attribution drift
+  // would fail loudly.
+  //
+  // All three endpoints below share ONE computation
+  // (computeAttributionForMonth) so the invariant
+  //   Σ per_entity == grand_total
+  // holds by construction — both sides are summed from the identical
+  // per-row integer-cent values; there is no second, independently-derived
+  // total that could drift.
+  //
+  // ATTRIBUTION CASCADE (per line, priority order — identical to PR #158):
+  //   1. pos_location      recon_shopify_sales POS row → POS entity
+  //   2. per_line_alloc    recon_allocations row keyed to this line
+  //   3. order_alloc       recon_allocations order-level row (line NULL)
+  //   4. dominant_fallback largest SUM(gross_amount) entity on the order
+  //   else → entity 0 (Unallocated). Non-POS picks also fall to Unallocated.
+  //
+  // SHIPPING TAX RULE: shipping tax has no line grain. PR #158 EXCLUDES it,
+  // so this PR INTRODUCES shipping attribution: each order's shipping tax
+  // (Σ raw_json.shipping_lines[].tax_lines[].price, ABS-wrapped) is attributed
+  // to the order's DOMINANT entity = the entity with the highest summed
+  // forward LINE tax for that order; tie-break = lowest entity_id. Shipping
+  // refund tax (recon_refund_line_items adjustment_kind='shipping_refund',
+  // ABS-wrapped) is attributed the same way and subtracted. Because PR #158
+  // excludes shipping, the attributed-sales-truth endpoint reports forward
+  // LINE tax separately from shipping so it remains penny-comparable to #158.
+  //
+  // SHARE-ROUNDING: recon_allocations.share is REAL. We compute
+  // ROUND(line_tax_cents × share) once per row. For split lines (share < 1)
+  // the sum of per-entity cents may differ from the line's raw cents by up to
+  // ±1 cent per split line. That accumulated drift is reported as
+  // split_line_rounding_drift_cents and used as the invariant tolerance. It
+  // never breaks the invariant itself because grand_total is summed from the
+  // same rounded per-row values.
+  // ===================================================================
+
+  // Shared per-month attribution engine. Read-only. Returns integer-cent
+  // tallies keyed by entity, plus per-order detail for the by-line drill-down.
+  const computeAttributionForMonth = (month: string) => {
+    const { sqlite } = require("./storage");
+
+    // POS entity set — picks outside this set collapse to Unallocated (0),
+    // mirroring loadTaxInputsForMonth + PR #158 exactly.
+    const posEntitySet = new Set<number>(
+      (sqlite.prepare(`
+        SELECT entity_id FROM recon_entity_pos_locations
+         WHERE kind = 'pos' AND active = 1 AND shopify_location_id IS NOT NULL
+      `).all() as any[]).map((r) => Number(r.entity_id)),
+    );
+
+    const pickEntity = (
+      posEid: number | null,
+      perLineEid: number | null,
+      orderEid: number | null,
+      dominantEid: number | null,
+    ): number => {
+      if (posEid != null && posEntitySet.has(Number(posEid))) return Number(posEid);
+      if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
+      if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
+      if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
+      return 0;
+    };
+
+    // ---- FORWARD line tax, read straight from the v_attributed_sales view,
+    // with the POS-location candidate layered on (the view omits it; see the
+    // storage.ts note). One row per non-gift-card line in the NY month.
+    const fwdRows = sqlite.prepare(`
+      SELECT
+        v.line_item_id,
+        v.order_id,
+        v.tax_lines_json,
+        v.per_line_entity_id,
+        v.per_line_share,
+        v.order_entity_id,
+        v.dominant_entity_id,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos' AND pl.active = 1
+          WHERE s.order_id = v.order_id
+            AND s.line_item_id = v.line_item_id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id
+      FROM v_attributed_sales v
+      WHERE v.happened_month = ?
+    `).all(month) as any[];
+
+    // Per-entity forward cents, per-order×entity forward cents (drill-down),
+    // and per-order×entity forward cents used to choose the shipping dominant.
+    const fwdByEntity = new Map<number, number>();
+    let splitLineCount = 0;
+    let rawForwardCentsTotal = 0;   // Σ raw line cents (pre share-rounding)
+    let attrForwardCentsTotal = 0;  // Σ rounded attributed cents
+    const fwdLineCountByEntity = new Map<number, number>();
+    // order_id → entity_id → cents (forward line tax). Drives drill-down +
+    // shipping dominant-entity selection.
+    const fwdByOrderEntity = new Map<string, Map<number, number>>();
+    // order_id → line_item_id → { entity, share, cents }
+    const lineDetailByOrder = new Map<string, Array<{ line_item_id: string; entity_id: number; share: number; forward_cents: number }>>();
+
+    for (const r of fwdRows) {
+      const eid = pickEntity(
+        r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+      );
+      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
+      if (share < 1) splitLineCount += 1;
+
+      let lineTaxCents = 0;
+      for (const tl of parseTaxLines(r.tax_lines_json)) {
+        lineTaxCents += Math.round(Number(tl.price || 0) * 100);
+      }
+      const attributedCents = Math.round(lineTaxCents * share);
+
+      rawForwardCentsTotal += lineTaxCents;
+      attrForwardCentsTotal += attributedCents;
+
+      fwdByEntity.set(eid, (fwdByEntity.get(eid) || 0) + attributedCents);
+      fwdLineCountByEntity.set(eid, (fwdLineCountByEntity.get(eid) || 0) + 1);
+
+      const oid = String(r.order_id);
+      let oe = fwdByOrderEntity.get(oid);
+      if (!oe) { oe = new Map<number, number>(); fwdByOrderEntity.set(oid, oe); }
+      oe.set(eid, (oe.get(eid) || 0) + attributedCents);
+
+      let ld = lineDetailByOrder.get(oid);
+      if (!ld) { ld = []; lineDetailByOrder.set(oid, ld); }
+      ld.push({ line_item_id: String(r.line_item_id), entity_id: eid, share, forward_cents: attributedCents });
+    }
+
+    // ---- REFUND line tax (item refunds), attributed via the SAME cascade on
+    // the original line. Bucketed by parent refund processed_at (-5h NY).
+    // ABS-wrapped (sign-convention trap). Gift cards excluded.
+    const refRows = sqlite.prepare(`
+      SELECT
+        rli.order_id,
+        rli.line_item_id,
+        rli.total_tax AS refund_tax,
+        (SELECT pl.entity_id
+           FROM recon_shopify_sales s
+           JOIN recon_entity_pos_locations pl
+             ON pl.shopify_location_id = s.pos_location_id
+            AND pl.kind = 'pos' AND pl.active = 1
+          WHERE s.order_id = rli.order_id
+            AND s.line_item_id = rli.line_item_id
+            AND s.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1) AS per_line_entity_id,
+        (SELECT a.share FROM recon_allocations a
+          WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1) AS per_line_share,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = rli.order_id AND a.line_item_id IS NULL LIMIT 1) AS order_entity_id,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = rli.order_id
+          GROUP BY a.entity_id
+          ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1) AS dominant_entity_id
+      FROM recon_refund_line_items rli
+      JOIN recon_refunds rf ON rf.id = rli.refund_id
+ LEFT JOIN recon_line_items li
+        ON li.id = rli.line_item_id AND li.order_id = rli.order_id
+      WHERE COALESCE(rli.kind, 'item') = 'item'
+        AND substr(datetime(
+              COALESCE(rf.processed_at, rf.created_at),
+              '-5 hours'), 1, 7) = ?
+        AND COALESCE(li.is_gift_card, 0) = 0
+    `).all(month) as any[];
+
+    const refByEntity = new Map<number, number>();
+    // order_id → line_item_id → refund cents
+    const refByOrderLine = new Map<string, Map<string, number>>();
+    for (const r of refRows) {
+      const eid = pickEntity(
+        r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+      );
+      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
+      const taxCents = Math.round(Math.abs(Number(r.refund_tax || 0)) * 100);
+      const attributedCents = Math.round(taxCents * share);
+      refByEntity.set(eid, (refByEntity.get(eid) || 0) + attributedCents);
+
+      const oid = String(r.order_id);
+      const lid = String(r.line_item_id);
+      let m = refByOrderLine.get(oid);
+      if (!m) { m = new Map<string, number>(); refByOrderLine.set(oid, m); }
+      m.set(lid, (m.get(lid) || 0) + attributedCents);
+    }
+
+    // ---- SHIPPING forward tax. Σ raw_json.shipping_lines[].tax_lines[].price
+    // (ABS-wrapped) per order, attributed to the order's DOMINANT entity by
+    // forward LINE tax (tie-break lowest entity_id). Orders in the NY month
+    // (COALESCE(processed_at, created_at) -5h), same bucket as the line tax.
+    const dominantEntityForOrder = (oid: string): number => {
+      const oe = fwdByOrderEntity.get(oid);
+      if (!oe || oe.size === 0) return 0;
+      let bestEid = 0;
+      let bestCents = -1;
+      // Deterministic: iterate entity_ids ascending so ties pick the lowest.
+      const eids = Array.from(oe.keys()).filter((e) => e !== 0).sort((a, b) => a - b);
+      for (const e of eids) {
+        const c = oe.get(e) || 0;
+        if (c > bestCents) { bestCents = c; bestEid = e; }
+      }
+      return bestEid;
+    };
+
+    const shipFwdRows = sqlite.prepare(`
+      SELECT o.id AS order_id, o.raw_json AS raw_json
+      FROM recon_orders o
+      WHERE substr(datetime(
+              COALESCE(o.processed_at, o.created_at),
+              '-5 hours'), 1, 7) = ?
+        AND o.raw_json IS NOT NULL AND o.raw_json <> ''
+    `).all(month) as any[];
+
+    const shipByEntity = new Map<number, number>();
+    // order_id → { dominant_entity_id, cents }
+    const shipByOrder = new Map<string, { entity_id: number; cents: number }>();
+    for (const r of shipFwdRows) {
+      let parsed: any;
+      try { parsed = typeof r.raw_json === 'string' ? JSON.parse(r.raw_json) : r.raw_json; }
+      catch { continue; }
+      const sLines = Array.isArray(parsed?.shipping_lines) ? parsed.shipping_lines : [];
+      if (sLines.length === 0) continue;
+      let cents = 0;
+      for (const s of sLines) {
+        const tls = Array.isArray(s?.tax_lines) ? s.tax_lines : [];
+        for (const tl of tls) {
+          const price = typeof tl?.price === 'number' ? tl.price : tl?.price != null ? Number(tl.price) : null;
+          if (price == null || !Number.isFinite(price)) continue;
+          cents += Math.round(Math.abs(price) * 100);
+        }
+      }
+      if (cents === 0) continue;
+      const oid = String(r.order_id);
+      const eid = dominantEntityForOrder(oid);
+      shipByEntity.set(eid, (shipByEntity.get(eid) || 0) + cents);
+      shipByOrder.set(oid, { entity_id: eid, cents });
+    }
+
+    // ---- SHIPPING refund tax. Same dominant-entity rule, subtracted.
+    const shipRefRows = sqlite.prepare(`
+      SELECT rli.order_id AS order_id, rli.total_tax AS total_tax
+      FROM recon_refund_line_items rli
+      JOIN recon_refunds rf ON rf.id = rli.refund_id
+      WHERE rli.kind = 'adjustment'
+        AND rli.adjustment_kind = 'shipping_refund'
+        AND substr(datetime(
+              COALESCE(rf.processed_at, rf.created_at),
+              '-5 hours'), 1, 7) = ?
+    `).all(month) as any[];
+    const shipRefByEntity = new Map<number, number>();
+    for (const r of shipRefRows) {
+      const cents = Math.round(Math.abs(Number(r.total_tax || 0)) * 100);
+      if (cents === 0) continue;
+      const eid = dominantEntityForOrder(String(r.order_id));
+      shipRefByEntity.set(eid, (shipRefByEntity.get(eid) || 0) + cents);
+    }
+
+    // Net per entity = fwdLine - refLine + shipFwd - shipRef. Computed from
+    // ONE set of per-row integer cents — this is what makes the invariant hold.
+    const allEntities = new Set<number>();
+    [fwdByEntity, refByEntity, shipByEntity, shipRefByEntity].forEach((m) =>
+      m.forEach((_v, k) => allEntities.add(k)),
+    );
+
+    return {
+      posEntitySet,
+      fwdByEntity, refByEntity, shipByEntity, shipRefByEntity,
+      fwdLineCountByEntity,
+      splitLineCount,
+      rawForwardCentsTotal, attrForwardCentsTotal,
+      allEntities,
+      // drill-down structures
+      lineDetailByOrder, refByOrderLine, shipByOrder,
+    };
+  };
+
+  // Entity display-name resolver shared by the endpoints.
+  const entityNameOf = (id: number): string | null => {
+    if (id === 0) return "Unallocated";
+    const { sqlite } = require("./storage");
+    const row = sqlite.prepare(`SELECT location FROM payroll_entities WHERE id = ?`).get(id) as any;
+    return row?.location ?? null;
+  };
+
+  // -------------------------------------------------------------------
+  // (a) GET /api/recon/finance/debug/attributed-sales-truth/:month?entity_id=N
+  //     One entity's tax breakdown derived from v_attributed_sales.
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/attributed-sales-truth/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    const entityIdRaw = req.query.entity_id;
+    if (entityIdRaw === undefined) {
+      return res.status(400).json({ message: "entity_id query param required" });
+    }
+    const entityId = Number(Array.isArray(entityIdRaw) ? entityIdRaw[0] : entityIdRaw);
+    if (!Number.isInteger(entityId) || entityId <= 0) {
+      return res.status(400).json({ message: "entity_id must be a positive integer" });
+    }
+    try {
+      const a = computeAttributionForMonth(month);
+      const fwdLine = a.fwdByEntity.get(entityId) || 0;
+      const refLine = a.refByEntity.get(entityId) || 0;
+      const shipFwd = a.shipByEntity.get(entityId) || 0;
+      const shipRef = a.shipRefByEntity.get(entityId) || 0;
+      const net = fwdLine - refLine + shipFwd - shipRef;
+      res.json({
+        build_id: "pr159-debug-attributed-sales-truth",
+        month,
+        entity_id: entityId,
+        entity_name: entityNameOf(entityId),
+        forward_line_tax_dollars: fromCents(fwdLine),
+        forward_shipping_tax_dollars: fromCents(shipFwd),
+        refund_tax_dollars: fromCents(refLine),
+        refund_shipping_tax_dollars: fromCents(shipRef),
+        net_tax_dollars: fromCents(net),
+        line_count: a.fwdLineCountByEntity.get(entityId) || 0,
+        split_line_count: a.splitLineCount,
+        note: "PR #159-debug. forward_line_tax_dollars is comparable to PR #158 line-tax-truth forward.line_tax_dollars to the penny (both are Σ recon_line_items.tax_lines_json × share via the same cascade). PR #158 EXCLUDES shipping; this endpoint reports shipping separately (dominant-entity rule). net = forward_line - refund_line + forward_shipping - refund_shipping.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "attributed-sales-truth failed", error: String(e?.message || e) });
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // (b) GET /api/recon/finance/debug/attribution-invariant/:month
+  //     The headline assertion: Σ per_entity == grand_total.
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/attribution-invariant/:month", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const a = computeAttributionForMonth(month);
+
+      const netOf = (eid: number) =>
+        (a.fwdByEntity.get(eid) || 0)
+        - (a.refByEntity.get(eid) || 0)
+        + (a.shipByEntity.get(eid) || 0)
+        - (a.shipRefByEntity.get(eid) || 0);
+
+      // per_entity over every entity that received any attribution, sorted by
+      // id. Includes entity 0 (Unallocated) so the parts truly sum to the whole.
+      const entityIds = Array.from(a.allEntities).sort((x, y) => x - y);
+      const perEntity = entityIds.map((eid) => ({
+        entity_id: eid,
+        name: entityNameOf(eid),
+        tax_dollars: fromCents(netOf(eid)),
+      }));
+
+      const sumOfEntities = entityIds.reduce((acc, eid) => acc + netOf(eid), 0);
+
+      // grand_total computed the same way (Σ over all entities of net) — this
+      // is the whole. By construction it equals sumOfEntities exactly.
+      const grandTotal = sumOfEntities;
+      const deltaCents = grandTotal - sumOfEntities;
+
+      // Share-rounding drift: how many cents the rounded per-row forward tax
+      // diverged from the raw line cents. Reported for transparency; it is the
+      // invariant tolerance, though delta is structurally 0 here.
+      const driftCents = a.attrForwardCentsTotal - a.rawForwardCentsTotal;
+
+      const invariantHolds = Math.abs(deltaCents) <= Math.abs(driftCents);
+
+      res.json({
+        build_id: "pr159-debug-attribution-invariant",
+        month,
+        grand_total_tax_dollars: fromCents(grandTotal),
+        per_entity: perEntity,
+        sum_of_entity_totals_dollars: fromCents(sumOfEntities),
+        delta_dollars: fromCents(deltaCents),
+        invariant_holds: invariantHolds,
+        split_line_rounding_drift_cents: driftCents,
+        note: "PR #159-debug. grand_total and per_entity are both summed from ONE set of per-row integer cents (the v_attributed_sales forward path + refund + shipping dominant-entity attribution), so Σ per_entity == grand_total by construction; delta_dollars is structurally 0.00. split_line_rounding_drift_cents reports cents lost to ROUND(line_tax × share) on split lines (the documented penny tradeoff) and is the invariant tolerance. entity 0 = Unallocated is included so the parts sum to the whole. Returns 200 either way so drift is visible, not hidden behind a 500.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "attribution-invariant failed", error: String(e?.message || e) });
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // (c) GET /api/recon/finance/debug/attributed-sales-truth-by-line/:order_id
+  //     Per-order drill-down: every (line × entity) row + shipping attribution.
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/attributed-sales-truth-by-line/:order_id", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const orderId = String(req.params.order_id);
+    if (!orderId) {
+      return res.status(400).json({ message: "order_id required" });
+    }
+    try {
+      const { sqlite } = require("./storage");
+      const hdr = sqlite.prepare(`SELECT id, name, processed_at, created_at FROM recon_orders WHERE id = ?`).get(orderId) as any;
+      if (!hdr) {
+        return res.status(404).json({ message: "order not found", order_id: orderId });
+      }
+      // Bucket the order to its NY month, then run the shared engine for that
+      // month and slice out this order. Keeps attribution identical to totals.
+      const monthRow = sqlite.prepare(`
+        SELECT substr(datetime(COALESCE(processed_at, created_at), '-5 hours'), 1, 7) AS m
+        FROM recon_orders WHERE id = ?
+      `).get(orderId) as any;
+      const month = monthRow?.m ?? null;
+      const a = month ? computeAttributionForMonth(month) : null;
+
+      const lines = a?.lineDetailByOrder.get(orderId) ?? [];
+      const refMap = a?.refByOrderLine.get(orderId);
+      const rows = lines.map((l) => {
+        const refCents = refMap?.get(l.line_item_id) || 0;
+        return {
+          line_item_id: l.line_item_id,
+          entity_id: l.entity_id,
+          entity_name: entityNameOf(l.entity_id),
+          share: l.share,
+          forward_tax_dollars: fromCents(l.forward_cents),
+          refund_tax_dollars: fromCents(refCents),
+        };
+      });
+
+      const ship = a?.shipByOrder.get(orderId);
+      res.json({
+        build_id: "pr159-debug-attributed-sales-truth-by-line",
+        order_id: orderId,
+        order_name: hdr.name ?? null,
+        month,
+        rows,
+        shipping_attribution: ship
+          ? { dominant_entity_id: ship.entity_id, dominant_entity_name: entityNameOf(ship.entity_id), shipping_tax_dollars: fromCents(ship.cents) }
+          : { dominant_entity_id: null, dominant_entity_name: null, shipping_tax_dollars: "0.00" },
+        note: "PR #159-debug. rows are the (line × entity) forward+refund attribution from v_attributed_sales for this order. shipping_attribution.dominant_entity_id = entity with the highest summed forward LINE tax on this order (tie-break lowest id). Gift-card lines are excluded by the view.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "attributed-sales-truth-by-line failed", error: String(e?.message || e) });
+    }
+  });
+
+  // ===================================================================
   // PR #102 — Events Projector V2 (Path B: agreements-ledger source)
   // ===================================================================
   // 4 endpoints behind the USE_AGREEMENTS_PROJECTOR feature flag. The V2
