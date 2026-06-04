@@ -376,9 +376,15 @@ function buildQboBillPayload(invoice: any, lineItems: any[]): any {
       }
     }
   } else if (invoice.routing_mode === "line_item_split") {
-    // Group line items by store_assignment
+    // Group line items by store_assignment.
+    // PR #R4l: Exclude is_freight lines from the inventory totals — freight is
+    // added separately as a pro-rata pass below using invoice.freight. Including
+    // freight lines here caused the QBO bill total to equal
+    // (total + freight + freight) on invoices whose LLM extraction put the
+    // freight charge into line_items (e.g. Royal Teak "A1 Shippings - LTL").
     const storeTotals: Record<string, number> = {};
     for (const li of lineItems) {
+      if (li.is_freight) continue;
       const store = li.store_assignment || routing.default_store || invoice.ship_to_store || "greenvale";
       const amt = li.amount || 0;
       storeTotals[store] = (storeTotals[store] || 0) + amt;
@@ -441,9 +447,11 @@ function buildQboBillPayload(invoice: any, lineItems: any[]): any {
           });
         }
       } else if (invoice.routing_mode === "line_item_split") {
-        // Same pro-rata weighting as the positive lines.
+        // Same pro-rata weighting as the positive lines. PR #R4l: also excludes
+        // is_freight lines so the discount base matches the inventory subtotal.
         const storeTotals: Record<string, number> = {};
         for (const li of lineItems) {
+          if (li.is_freight) continue;
           const store = li.store_assignment || routing.default_store || invoice.ship_to_store || "greenvale";
           storeTotals[store] = (storeTotals[store] || 0) + (li.amount || 0);
         }
@@ -10832,6 +10840,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       line_items_json: JSON.stringify(llmResult.line_items || []),
       bill_kind: llmResult.bill_kind || null,
       is_credit: llmResult.is_credit ? 1 : 0,
+      // PR #R4k — always reflect the latest parse for payment_terms. The first
+      // ingest never wrote this column, so any pre-fix invoice has null here;
+      // reparse should overwrite. Safe because user can't edit it from the UI.
+      payment_terms: llmResult.payment_terms ?? null,
     };
     // Only fill in fields that were missing — never overwrite user-edited values.
     if (!inv.vendor_raw_name && llmResult.vendor_raw_name) patch.vendor_raw_name = llmResult.vendor_raw_name;

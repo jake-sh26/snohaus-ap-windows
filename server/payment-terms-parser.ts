@@ -145,8 +145,10 @@ export function parsePaymentTermsFallback(
     return out;
   }
 
-  // ---- Prepaid ----
-  if (/(?:^|\W)(prepaid|pre[\s-]?paid)(?:$|\W)/i.test(t)) {
+  // ---- Prepaid / Pre-Pay ----
+  // PR #R4k — Royal Teak prints "Pre-Pay" (no trailing 'd'). Previous regex
+  // only matched "Prepaid" / "Pre-Paid" / "Pre Paid", missing this vendor.
+  if (/(?:^|\W)(prepaid|pre[\s-]?paid|pre[\s-]?pay)(?:$|\W)/i.test(t)) {
     out.net_days = 0;
     if (invoiceDate) out.due_date = invoiceDate;
     return out;

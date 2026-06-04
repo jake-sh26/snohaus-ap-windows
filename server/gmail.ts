@@ -22,7 +22,7 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, type LLMParsedInvoice } from "./llm-parser";
-import { smartMatchVendor, resolveShipToStore, learnVendorAlias } from "./storage";
+import { smartMatchVendor, resolveShipToStore, learnVendorAlias, replaceInvoiceLineItems } from "./storage";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { getQboStatus, searchBills, searchPayments } from "./qbo";
 
@@ -63,6 +63,11 @@ function getDb() {
     try { _db.exec("ALTER TABLE invoices ADD COLUMN line_items_json TEXT"); } catch {}
     try { _db.exec("ALTER TABLE invoices ADD COLUMN bill_kind TEXT"); } catch {}
     try { _db.exec("ALTER TABLE invoices ADD COLUMN parse_failure_reason TEXT"); } catch {}
+    // PR #R4k — payment_terms was extracted by the LLM and used in-memory for
+    // discount/due-date regex fallbacks, but never persisted. That made reparse
+    // the only way to re-derive due_date and prevented the UI from showing the
+    // verbatim terms phrase. Now stored on every ingest + reparse.
+    try { _db.exec("ALTER TABLE invoices ADD COLUMN payment_terms TEXT"); } catch {}
   }
   return _db;
 }
@@ -700,6 +705,7 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               low_confidence: boolean;
               freight: number;
               is_credit: boolean;
+              payment_terms: string | null;
             };
             if (llmResult) {
               parsed_data = {
@@ -710,11 +716,12 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
                 low_confidence: llmResult.parse_confidence === "low",
                 freight: llmResult.freight ?? 0,
                 is_credit: llmResult.is_credit,
+                payment_terms: llmResult.payment_terms ?? null,
               };
             } else {
               const text = await extractTextFromPdf(attachment.content);
               const regex = parseInvoiceText(text, filename);
-              parsed_data = { ...regex, freight: 0, is_credit: false };
+              parsed_data = { ...regex, freight: 0, is_credit: false, payment_terms: null };
             }
 
             // Create invoice record
@@ -797,8 +804,9 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
                 invoice_number, invoice_date, total, freight, is_credit,
                 ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
                 created_at, updated_at,
-                document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
+                payment_terms
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             `).run(
               invoiceId,
               `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
@@ -828,8 +836,19 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               llmResult?.notes || null,
               llmResult?.already_paid ? 1 : 0,
               llmResult ? JSON.stringify(llmResult.line_items) : null,
-              llmResult?.bill_kind || null
+              llmResult?.bill_kind || null,
+              parsed_data.payment_terms
             );
+
+            // PR #R4k — mirror the pipeline's line-item persistence so the gmail
+            // path doesn't depend on the 8-sec boot-time backfill in storage.ts.
+            try {
+              if (Array.isArray(llmResult?.line_items) && llmResult.line_items.length > 0) {
+                replaceInvoiceLineItems(invoiceId, llmResult.line_items as any);
+              }
+            } catch (e) {
+              console.error(`[Gmail] line-item persist failed for ${invoiceId}:`, (e as Error).message);
+            }
 
             console.log(`[Gmail] Ingested ${invoiceId}: vendor="${parsed_data.vendor_raw_name}" → ${vendorMatchStatus}${vendorQboName ? ` (${vendorQboName})` : ""}, store=${shipToStore || "unknown"}`);
 

@@ -277,6 +277,9 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
     low_confidence: llmResult.parse_confidence === "low",
     freight: llmResult.freight ?? 0,
     is_credit: llmResult.is_credit,
+    // PR #R4k — verbatim terms phrase ("Net 30", "Pre-Pay", "2% 10 Net 30"). Was
+    // previously consumed in-memory by the fallback regexes and discarded.
+    payment_terms: llmResult.payment_terms ?? null,
   } : {
     vendor_raw_name: null,
     invoice_number: null,
@@ -286,6 +289,7 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
     low_confidence: true,
     freight: 0,
     is_credit: false,
+    payment_terms: null,
   };
 
   // ---- Vendor matching: local first, then Claude fallback ----
@@ -405,8 +409,9 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
       created_at, updated_at,
       document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
       parse_failure_reason, source_type, fuzzy_dup_hint,
-      discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
+      payment_terms
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     invoiceId,
     `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
@@ -446,17 +451,30 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
     llmResult?.discount_due_date ?? null,
     llmResult?.discount_kind ?? null,
     llmResult?.discount_warning ?? null,
-    discountAppliedInitial
+    discountAppliedInitial,
+    parsed_data.payment_terms
   );
 
   // ---- Persist parsed line items into invoice_line_items so the Routing
   // "Line items" tab is enabled in the drawer.
+  // PR #R4k — previously a silent console.warn. Royal Teak INV-01482 had 6
+  // line items in line_items_json but 0 rows in invoice_line_items, with no
+  // log evidence. Now we error-log AND surface to the UI via
+  // parse_failure_reason so the orange banner shows up.
   try {
     if (Array.isArray(llmResult?.line_items) && llmResult!.line_items.length > 0) {
       replaceInvoiceLineItems(invoiceId, llmResult!.line_items as any);
     }
   } catch (e) {
-    console.warn(`[pipeline] line-item persist failed for ${invoiceId}:`, (e as Error).message);
+    const msg = (e as Error).message;
+    console.error(`[pipeline] line-item persist FAILED for ${invoiceId}: ${msg}`);
+    try {
+      db.prepare(
+        `UPDATE invoices SET parse_failure_reason = COALESCE(parse_failure_reason || ' | ', '') || ? WHERE id = ?`
+      ).run(`line-item persist failed: ${msg}`, invoiceId);
+    } catch (inner) {
+      console.error(`[pipeline] failed to record line-item persist failure: ${(inner as Error).message}`);
+    }
   }
 
   // ---- Audit log: every LLM parse attempt (success or failure) ----
@@ -476,7 +494,12 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
       db.prepare(`INSERT INTO audit_log (invoice_id, action, before, after, user_email, created_at) VALUES (?,?,?,?,?,?)`)
         .run(invoiceId, "llm_parse", null, parseAfter, "system@parser", now);
     }
-  } catch {}
+  } catch (e) {
+    // PR #R4k — was previously a silent `catch {}`. Royal Teak INV-01482 had 0
+    // llm_parse audit rows despite a successful parse — we want this to be
+    // visible in the logs so we can find the schema constraint that's tripping.
+    console.error(`[pipeline] audit_log llm_parse write failed for ${invoiceId}: ${(e as Error).message}`);
+  }
 
   // Audit log entry recording the source
   try {
@@ -486,7 +509,9 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
         JSON.stringify({ source: input.source, originalFilename: input.originalFilename }),
         "system@ingest",
         now);
-  } catch {}
+  } catch (e) {
+    console.error(`[pipeline] audit_log ingest write failed for ${invoiceId}: ${(e as Error).message}`);
+  }
 
   // ---- Auto QBO duplicate check ----
   let finalStatus: PipelineResult["status"] = "ingested";

@@ -656,9 +656,12 @@ export function computeDueDateFromTerms(
   const t = String(termsRaw).toLowerCase().trim();
   if (!t) return null;
 
-  // Due-on-receipt / COD / Prepaid → same day
+  // Due-on-receipt / COD / Prepaid / Pre-Pay → same day
+  // PR #R4k — added "pre[\s-]?paid" and "pre[\s-]?pay" to catch Royal Teak's
+  // "Pre-Pay" (no trailing 'd'). Previous version only matched the joined word
+  // "prepaid", so any vendor using a hyphen + present tense slipped through.
   if (
-    /\b(due\s*(on|upon)?\s*receipt|upon\s*receipt|on\s*receipt|cod\b|c\.o\.d\.|cash\s*on\s*delivery|prepaid|paid\s*in\s*advance|due\s*now)\b/.test(t)
+    /\b(due\s*(on|upon)?\s*receipt|upon\s*receipt|on\s*receipt|cod\b|c\.o\.d\.|cash\s*on\s*delivery|prepaid|pre[\s-]?paid|pre[\s-]?pay|paid\s*in\s*advance|due\s*now)\b/.test(t)
   ) {
     return invoiceDateISO.slice(0, 10);
   }

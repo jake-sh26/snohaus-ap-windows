@@ -1064,8 +1064,11 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                     <TabsList className="grid grid-cols-3 w-full">
                       <TabsTrigger value="single_store" data-testid="tab-single-store">Single store</TabsTrigger>
                       <TabsTrigger value="percent_split" data-testid="tab-percent-split">Percent split</TabsTrigger>
-                      <TabsTrigger value="line_item_split" disabled={!inv.line_items?.length} data-testid="tab-line-items">
-                        Line items {!inv.line_items?.length ? "(no lines)" : `(${inv.line_items.length})`}
+                      <TabsTrigger value="line_item_split" disabled={!(inv.line_items || []).some((li: any) => !li.is_freight)} data-testid="tab-line-items">
+                        Line items {(() => {
+                          const routable = (inv.line_items || []).filter((li: any) => !li.is_freight);
+                          return !routable.length ? "(no lines)" : `(${routable.length})`;
+                        })()}
                       </TabsTrigger>
                     </TabsList>
                     <TabsContent value="single_store" className="pt-4 space-y-2">
@@ -1102,14 +1105,22 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                       )}
                     </TabsContent>
                     <TabsContent value="line_item_split" className="pt-4">
-                      {inv.line_items?.length ? (
+                      {(() => {
+                        // PR #R4l: separate routable inventory lines from freight lines.
+                        // Freight lines (is_freight=1) are pro-rated automatically by the
+                        // server using invoice.freight — they should not be independently
+                        // assigned to a store or summed into the inventory totals, which
+                        // previously double-counted freight on the QBO post.
+                        const routableLines = (inv.line_items || []).filter((li: any) => !li.is_freight);
+                        const freightLines = (inv.line_items || []).filter((li: any) => li.is_freight);
+                        return routableLines.length ? (
                         <div className="space-y-3">
                           {/* Quick action: assign all unassigned lines to one store */}
                           <div className="flex items-center gap-2 text-xs">
                             <span className="text-muted-foreground">Assign all to:</span>
                             <Select value="" onValueChange={(v) => {
                               const next: Record<number, StoreKey> = {};
-                              for (const li of (inv.line_items || [])) next[li.id] = v as StoreKey;
+                              for (const li of routableLines) next[li.id] = v as StoreKey;
                               setLineAssignments(next);
                             }}>
                               <SelectTrigger className="h-7 text-xs w-32" data-testid="select-bulk-line-store">
@@ -1129,7 +1140,7 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                             </button>
                           </div>
                           <div className="space-y-1 max-h-[260px] overflow-y-auto pr-1">
-                            {inv.line_items.map((li: any) => (
+                            {routableLines.map((li: any) => (
                               <div key={li.id} className="grid grid-cols-[1fr,auto,140px] gap-2 items-center text-xs py-1 border-b border-border last:border-0">
                                 <div className="min-w-0">
                                   <div className="font-mono text-[11px] text-muted-foreground">{li.sku || "—"}{li.qty ? ` · qty ${li.qty}` : ""}</div>
@@ -1144,13 +1155,23 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                                 </Select>
                               </div>
                             ))}
+                            {freightLines.map((li: any) => (
+                              <div key={li.id} className="grid grid-cols-[1fr,auto,140px] gap-2 items-center text-xs py-1 border-b border-border last:border-0 opacity-70">
+                                <div className="min-w-0">
+                                  <div className="font-mono text-[11px] text-muted-foreground">{li.sku || "—"} · freight</div>
+                                  <div className="truncate" title={li.description}>{li.description}</div>
+                                </div>
+                                <div className="font-mono tabular-nums whitespace-nowrap">{fmtMoney(li.amount)}</div>
+                                <div className="text-[11px] text-muted-foreground italic text-right pr-2">Pro-rata</div>
+                              </div>
+                            ))}
                           </div>
                           {/* Per-store totals preview */}
                           {(() => {
                             const totals: Record<string, { amt: number; count: number }> = {};
                             let unassigned = 0;
                             let unassignedCount = 0;
-                            for (const li of (inv.line_items || [])) {
+                            for (const li of routableLines) {
                               const s = lineAssignments[li.id];
                               if (s) {
                                 totals[s] = totals[s] || { amt: 0, count: 0 };
@@ -1187,12 +1208,13 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                             Default store (for unassigned lines): {STORE_LABELS[singleStore]}
                           </div>
                         </div>
-                      ) : (
+                        ) : (
                         <div className="text-sm text-muted-foreground py-4 text-center space-y-2">
                           <div>No line items parsed for this invoice.</div>
                           <div className="text-xs">Try Re-parse to extract them, or use Single store / Percent split.</div>
                         </div>
-                      )}
+                        );
+                      })()}
                     </TabsContent>
                   </Tabs>
                 </Card>
