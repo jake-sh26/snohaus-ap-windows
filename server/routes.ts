@@ -376,9 +376,15 @@ function buildQboBillPayload(invoice: any, lineItems: any[]): any {
       }
     }
   } else if (invoice.routing_mode === "line_item_split") {
-    // Group line items by store_assignment
+    // Group line items by store_assignment.
+    // PR #R4l: Exclude is_freight lines from the inventory totals — freight is
+    // added separately as a pro-rata pass below using invoice.freight. Including
+    // freight lines here caused the QBO bill total to equal
+    // (total + freight + freight) on invoices whose LLM extraction put the
+    // freight charge into line_items (e.g. Royal Teak "A1 Shippings - LTL").
     const storeTotals: Record<string, number> = {};
     for (const li of lineItems) {
+      if (li.is_freight) continue;
       const store = li.store_assignment || routing.default_store || invoice.ship_to_store || "greenvale";
       const amt = li.amount || 0;
       storeTotals[store] = (storeTotals[store] || 0) + amt;
@@ -441,9 +447,11 @@ function buildQboBillPayload(invoice: any, lineItems: any[]): any {
           });
         }
       } else if (invoice.routing_mode === "line_item_split") {
-        // Same pro-rata weighting as the positive lines.
+        // Same pro-rata weighting as the positive lines. PR #R4l: also excludes
+        // is_freight lines so the discount base matches the inventory subtotal.
         const storeTotals: Record<string, number> = {};
         for (const li of lineItems) {
+          if (li.is_freight) continue;
           const store = li.store_assignment || routing.default_store || invoice.ship_to_store || "greenvale";
           storeTotals[store] = (storeTotals[store] || 0) + (li.amount || 0);
         }
