@@ -47,6 +47,10 @@ export const invoices = sqliteTable("invoices", {
   discount_kind: text("discount_kind"), // 'early_pay' | 'net_with_discount' | null
   discount_warning: text("discount_warning"),
   discount_applied: integer("discount_applied").default(0),
+  // PR #R4k — verbatim terms phrase as printed on the invoice ("Net 30",
+  // "Pre-Pay", "2% 10 Net 30"). Used by the discount/due-date fallback regexes
+  // and surfaced in the AP drawer so users can sanity-check the parse.
+  payment_terms: text("payment_terms"),
 });
 
 export const invoiceLineItems = sqliteTable("invoice_line_items", {

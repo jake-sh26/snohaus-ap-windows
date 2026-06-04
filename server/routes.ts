@@ -10832,6 +10832,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       line_items_json: JSON.stringify(llmResult.line_items || []),
       bill_kind: llmResult.bill_kind || null,
       is_credit: llmResult.is_credit ? 1 : 0,
+      // PR #R4k — always reflect the latest parse for payment_terms. The first
+      // ingest never wrote this column, so any pre-fix invoice has null here;
+      // reparse should overwrite. Safe because user can't edit it from the UI.
+      payment_terms: llmResult.payment_terms ?? null,
     };
     // Only fill in fields that were missing — never overwrite user-edited values.
     if (!inv.vendor_raw_name && llmResult.vendor_raw_name) patch.vendor_raw_name = llmResult.vendor_raw_name;
