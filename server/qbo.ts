@@ -312,10 +312,14 @@ export async function searchVendorCredits(docNumbers: string[]): Promise<any[]> 
   const results: any[] = [];
   for (const chunk of chunks) {
     const nums = chunk.map((n) => `'${n.replace(/'/g, "''")}'`).join(", ");
-    // VendorCredit has no Balance column (that's a Bill-only field) — querying it
-    // returns 400 "Property Balance not found for Entity VendorCredit". We compute
-    // remaining balance below from LinkedTxn.
-    const query = `select Id, DocNumber, TxnDate, TotalAmt, VendorRef, LinkedTxn from VendorCredit where DocNumber in (${nums})`;
+    // VendorCredit query gotchas:
+    //   - Balance is a Bill-only column — 400 if selected.
+    //   - LinkedTxn is also not selectable via QBO query — 400 if selected; it's
+    //     only returned on a direct GET /vendorcredit/<id>. So we can't tell from
+    //     this query alone whether the credit has been applied.
+    // We just return the basic identifying columns and report applied state as
+    // unknown to the caller.
+    const query = `select Id, DocNumber, TxnDate, TotalAmt, VendorRef from VendorCredit where DocNumber in (${nums})`;
     try {
       const data = await qboFetch(`/query?query=${encodeURIComponent(query)}&minorversion=65`);
       const rows = data?.QueryResponse?.VendorCredit || [];

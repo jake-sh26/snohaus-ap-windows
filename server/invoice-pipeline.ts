@@ -560,16 +560,9 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
           const firstCredit = vendorCredits[0];
           const creditId = firstCredit?.Id || null;
           const creditTotal = Number(firstCredit?.TotalAmt || 0);
-          // VendorCredit has no Balance field in QBO; LinkedTxn tells us whether the
-          // credit has been applied (per-link Amount isn't reliably populated, so we
-          // report applied/unapplied only).
-          const creditLinks = Array.isArray(firstCredit?.LinkedTxn) ? firstCredit.LinkedTxn : [];
-          let creditLabel = "";
-          if (firstCredit) {
-            creditLabel = creditLinks.length > 0
-              ? ` — $${creditTotal.toFixed(2)} (applied to ${creditLinks.length} txn${creditLinks.length === 1 ? "" : "s"})`
-              : ` — $${creditTotal.toFixed(2)} (unapplied)`;
-          }
+          // QBO's query language doesn't expose Balance or LinkedTxn on VendorCredit
+          // (both return 400). Report total only.
+          const creditLabel = firstCredit ? ` — $${creditTotal.toFixed(2)}` : "";
           const paymentId = payments[0]?.Id || null;
           const note = [
             bills.length > 0 ? `Auto-skipped at ingest: Bill #${billId} already in QBO${paymentLabel}` : null,
