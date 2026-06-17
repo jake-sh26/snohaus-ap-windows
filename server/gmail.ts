@@ -21,10 +21,11 @@ import Database from "better-sqlite3";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, type LLMParsedInvoice } from "./llm-parser";
+import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms, type LLMParsedInvoice } from "./llm-parser";
+import { normalizeDueDate } from "./invoice-pipeline";
 import { smartMatchVendor, resolveShipToStore, learnVendorAlias, replaceInvoiceLineItems } from "./storage";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
-import { getQboStatus, searchBills, searchPayments } from "./qbo";
+import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "./qbo";
 
 // Types from imapflow / mailparser are loaded dynamically so they don't crash
 // if not installed (graceful degradation when env vars are missing).
@@ -697,10 +698,18 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
             }
 
             // Build parsed_data from LLM if available, otherwise fall back to regex
+            //
+            // PR #R4m — the Gmail poller previously omitted due_date entirely from
+            // parsed_data and the INSERT, so every Gmail-ingested invoice landed
+            // with NULL due_date and required a manual reparse to populate it.
+            // Compute it here using the same two-stage fallback the reparse path
+            // uses: normalizeDueDate first, then computeDueDateFromTerms when the
+            // LLM left due_date empty but gave us a terms string like "Net 30".
             let parsed_data: {
               vendor_raw_name: string | null;
               invoice_number: string | null;
               invoice_date: string | null;
+              due_date: string | null;
               total: number | null;
               low_confidence: boolean;
               freight: number;
@@ -708,10 +717,18 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               payment_terms: string | null;
             };
             if (llmResult) {
+              const normalizedDue = normalizeDueDate(llmResult.due_date, llmResult.invoice_date);
+              const fallbackDue = !normalizedDue && llmResult.invoice_date
+                ? computeDueDateFromTerms(
+                    llmResult.invoice_date,
+                    llmResult.payment_terms || llmResult.payment_method || null,
+                  )
+                : null;
               parsed_data = {
                 vendor_raw_name: llmResult.vendor_raw_name,
                 invoice_number: llmResult.invoice_number,
                 invoice_date: llmResult.invoice_date,
+                due_date: normalizedDue || fallbackDue,
                 total: llmResult.total,
                 low_confidence: llmResult.parse_confidence === "low",
                 freight: llmResult.freight ?? 0,
@@ -721,7 +738,7 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
             } else {
               const text = await extractTextFromPdf(attachment.content);
               const regex = parseInvoiceText(text, filename);
-              parsed_data = { ...regex, freight: 0, is_credit: false, payment_terms: null };
+              parsed_data = { ...regex, due_date: null, freight: 0, is_credit: false, payment_terms: null };
             }
 
             // Create invoice record
@@ -797,16 +814,18 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               console.error(`[Gmail] dedup check failed (continuing): ${dedupErr.message}`);
             }
 
+            // PR #R4m — added due_date column to the INSERT (was missing entirely
+            // before this fix).
             db.prepare(`
               INSERT OR IGNORE INTO invoices (
                 id, source_file, email_id, email_date, email_from, email_subject,
                 pdf_url, vendor_raw_name, vendor_match_status, vendor_qbo_id, vendor_qbo_name,
-                invoice_number, invoice_date, total, freight, is_credit,
+                invoice_number, invoice_date, due_date, total, freight, is_credit,
                 ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
                 created_at, updated_at,
                 document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
                 payment_terms
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             `).run(
               invoiceId,
               `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
@@ -821,6 +840,7 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               vendorQboName,
               parsed_data.invoice_number,
               parsed_data.invoice_date,
+              parsed_data.due_date,
               parsed_data.total,
               parsed_data.freight,
               parsed_data.is_credit ? 1 : 0,
@@ -860,9 +880,14 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               try {
                 const qboState = getQboStatus();
                 if (qboState.connected) {
-                  const bills = await searchBills([parsed_data.invoice_number]);
-                  const payments = await searchPayments([parsed_data.invoice_number]);
-                  if (bills.length > 0 || payments.length > 0) {
+                  // PR #R4m — also check VendorCredits at ingest. Credit invoices may not
+                  // have is_credit set yet at this stage, so we always check both entities.
+                  const [bills, vendorCredits, payments] = await Promise.all([
+                    searchBills([parsed_data.invoice_number]),
+                    searchVendorCredits([parsed_data.invoice_number]),
+                    searchPayments([parsed_data.invoice_number]),
+                  ]);
+                  if (bills.length > 0 || vendorCredits.length > 0 || payments.length > 0) {
                     const firstBill = bills[0];
                     const billId = firstBill?.Id || null;
                     const billTotal = Number(firstBill?.TotalAmt || 0);
@@ -873,20 +898,34 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
                       else if (billBalance < billTotal) paymentLabel = ` — partially paid ($${billBalance.toFixed(2)} open)`;
                       else paymentLabel = " — unpaid";
                     }
+                    const firstCredit = vendorCredits[0];
+                    const creditId = firstCredit?.Id || null;
+                    const creditTotal = Number(firstCredit?.TotalAmt || 0);
+                    const creditBalance = Number(firstCredit?.Balance ?? creditTotal);
+                    let creditLabel = "";
+                    if (firstCredit) {
+                      if (creditBalance <= 0.005) creditLabel = " — fully applied";
+                      else if (creditBalance < creditTotal) creditLabel = ` — partially applied ($${creditBalance.toFixed(2)} remaining)`;
+                      else creditLabel = " — unapplied";
+                    }
                     const paymentId = payments[0]?.Id || null;
                     const note = [
                       bills.length > 0 ? `Auto-skipped at ingest: Bill #${billId} already in QBO${paymentLabel}` : null,
+                      vendorCredits.length > 0 ? `Auto-skipped at ingest: VendorCredit #${creditId} already in QBO${creditLabel}` : null,
                       payments.length > 0 ? `BillPayment #${paymentId} found` : null,
                     ].filter(Boolean).join("; ");
+                    // Link to the Bill if present; otherwise fall back to the VendorCredit id
+                    // so the ERP still has a QBO linkage to surface in the inbox.
+                    const linkedQboId = billId || creditId;
                     db.prepare(`UPDATE invoices SET status = ?, duplicate_check_status = ?, duplicate_check_at = ?, qbo_bill_id = ?, notes = ?, updated_at = ? WHERE id = ?`)
-                      .run("posted_qbo", "duplicate_found", new Date().toISOString(), billId, note, new Date().toISOString(), invoiceId);
+                      .run("posted_qbo", "duplicate_found", new Date().toISOString(), linkedQboId, note, new Date().toISOString(), invoiceId);
                     db.prepare(`INSERT INTO audit_log (invoice_id, action, before, after, user_email, created_at) VALUES (?,?,?,?,?,?)`)
                       .run(invoiceId, "auto_skip_existing_qbo_bill",
                         JSON.stringify({ status: "pending_review" }),
-                        JSON.stringify({ status: "posted_qbo", qbo_bill_id: billId, note }),
+                        JSON.stringify({ status: "posted_qbo", qbo_bill_id: linkedQboId, note }),
                         "system@ingest",
                         new Date().toISOString());
-                    console.log(`[Gmail] Auto-skipped ${invoiceId} — already posted to QBO as Bill #${billId}${paymentLabel}`);
+                    console.log(`[Gmail] Auto-skipped ${invoiceId} — already in QBO as ${billId ? `Bill #${billId}${paymentLabel}` : `VendorCredit #${creditId}${creditLabel}`}`);
                   } else {
                     // QBO clean — mark so user doesn't have to click Recheck in the drawer.
                     db.prepare(`UPDATE invoices SET duplicate_check_status = ?, duplicate_check_at = ?, updated_at = ? WHERE id = ?`)

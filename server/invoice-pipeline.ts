@@ -13,10 +13,10 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
-import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, type LLMParsedInvoice } from "./llm-parser";
+import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms, type LLMParsedInvoice } from "./llm-parser";
 import { smartMatchVendor, resolveShipToStore, learnVendorAlias, checkSkipSender, recordSkipLog, replaceInvoiceLineItems, recordSkippedUpload } from "./storage";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
-import { getQboStatus, searchBills, searchPayments } from "./qbo";
+import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "./qbo";
 import { findDuplicateInvoice } from "./dup-detector";
 import { parsePaymentTermsFallback } from "./payment-terms-parser";
 
@@ -266,13 +266,32 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
   }
 
   // Build parsed_data
+  //
+  // PR #R4m — due_date fill-in on first ingest. Previously the initial pipeline
+  // only ran normalizeDueDate(llmResult.due_date), which returns null if the LLM
+  // left the field empty. The reparse path (routes.ts) additionally calls
+  // computeDueDateFromTerms(invoice_date, payment_terms) as a second fallback,
+  // which is why hitting Reparse populated the due date for invoices the first
+  // ingest left blank. Mirror that same two-stage fallback here so we don't
+  // require a manual reparse to populate Net-N / Pre-Pay / Due-on-receipt
+  // invoices.
+  const computedDueDate = llmResult ? (() => {
+    const normalized = normalizeDueDate(llmResult.due_date, llmResult.invoice_date);
+    if (normalized) return normalized;
+    if (!llmResult.invoice_date) return null;
+    return computeDueDateFromTerms(
+      llmResult.invoice_date,
+      llmResult.payment_terms || llmResult.payment_method || null,
+    );
+  })() : null;
   const parsed_data = llmResult ? {
     vendor_raw_name: llmResult.vendor_raw_name,
     invoice_number: llmResult.invoice_number,
     invoice_date: llmResult.invoice_date,
     // v8.1: due_date — separate from invoice_date (document date). Drives the
     // Inbox "Due" column and is sent to QBO as Bill.DueDate at posting time.
-    due_date: normalizeDueDate(llmResult.due_date, llmResult.invoice_date),
+    // PR #R4m — two-stage fallback (normalizeDueDate then computeDueDateFromTerms).
+    due_date: computedDueDate,
     total: llmResult.total,
     low_confidence: llmResult.parse_confidence === "low",
     freight: llmResult.freight ?? 0,
@@ -519,9 +538,15 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
     try {
       const qboState = getQboStatus();
       if (qboState.connected) {
-        const bills = await searchBills([parsed_data.invoice_number]);
-        const payments = await searchPayments([parsed_data.invoice_number]);
-        if (bills.length > 0 || payments.length > 0) {
+        // PR #R4m — check Bills, VendorCredits, and BillPayments in parallel. VendorCredits
+        // are a separate QBO entity from Bills; the app DB may not yet flag the row as a
+        // credit at ingest, so we always check both entities.
+        const [bills, vendorCredits, payments] = await Promise.all([
+          searchBills([parsed_data.invoice_number]),
+          searchVendorCredits([parsed_data.invoice_number]),
+          searchPayments([parsed_data.invoice_number]),
+        ]);
+        if (bills.length > 0 || vendorCredits.length > 0 || payments.length > 0) {
           const firstBill = bills[0];
           const billId = firstBill?.Id || null;
           const billTotal = Number(firstBill?.TotalAmt || 0);
@@ -532,17 +557,31 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
             else if (billBalance < billTotal) paymentLabel = ` — partially paid ($${billBalance.toFixed(2)} open)`;
             else paymentLabel = " — unpaid";
           }
+          const firstCredit = vendorCredits[0];
+          const creditId = firstCredit?.Id || null;
+          const creditTotal = Number(firstCredit?.TotalAmt || 0);
+          const creditBalance = Number(firstCredit?.Balance ?? creditTotal);
+          let creditLabel = "";
+          if (firstCredit) {
+            if (creditBalance <= 0.005) creditLabel = " — fully applied";
+            else if (creditBalance < creditTotal) creditLabel = ` — partially applied ($${creditBalance.toFixed(2)} remaining)`;
+            else creditLabel = " — unapplied";
+          }
           const paymentId = payments[0]?.Id || null;
           const note = [
             bills.length > 0 ? `Auto-skipped at ingest: Bill #${billId} already in QBO${paymentLabel}` : null,
+            vendorCredits.length > 0 ? `Auto-skipped at ingest: VendorCredit #${creditId} already in QBO${creditLabel}` : null,
             payments.length > 0 ? `BillPayment #${paymentId} found` : null,
           ].filter(Boolean).join("; ");
+          // Link to the Bill if present; otherwise fall back to the VendorCredit id so the
+          // ERP still has a QBO linkage to surface in the inbox.
+          const linkedQboId = billId || creditId;
           db.prepare(`UPDATE invoices SET status = ?, duplicate_check_status = ?, duplicate_check_at = ?, qbo_bill_id = ?, notes = ?, updated_at = ? WHERE id = ?`)
-            .run("posted_qbo", "duplicate_found", new Date().toISOString(), billId, note, new Date().toISOString(), invoiceId);
+            .run("posted_qbo", "duplicate_found", new Date().toISOString(), linkedQboId, note, new Date().toISOString(), invoiceId);
           db.prepare(`INSERT INTO audit_log (invoice_id, action, before, after, user_email, created_at) VALUES (?,?,?,?,?,?)`)
             .run(invoiceId, "auto_skip_existing_qbo_bill",
               JSON.stringify({ status: "pending_review" }),
-              JSON.stringify({ status: "posted_qbo", qbo_bill_id: billId, note }),
+              JSON.stringify({ status: "posted_qbo", qbo_bill_id: linkedQboId, note }),
               "system@ingest",
               new Date().toISOString());
           finalStatus = "duplicate_qbo";

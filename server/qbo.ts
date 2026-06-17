@@ -296,6 +296,36 @@ export async function searchBills(docNumbers: string[]): Promise<any[]> {
 }
 
 /**
+ * Search QBO Vendor Credits by DocNumber. PR #R4m — the existing
+ * `searchBills` only queries the Bill entity, but vendor credits (e.g. RMA
+ * credits, return-merchandise refunds) post to QBO under the VendorCredit
+ * entity at /vendorcredit, not /bill. Without this, the duplicate check on a
+ * credit memo invoice never flagged the existing QBO record. Same DocNumber-IN
+ * shape as searchBills so callers can union the results.
+ */
+export async function searchVendorCredits(docNumbers: string[]): Promise<any[]> {
+  if (!docNumbers.length) return [];
+  const chunks: string[][] = [];
+  for (let i = 0; i < docNumbers.length; i += 20) {
+    chunks.push(docNumbers.slice(i, i + 20));
+  }
+  const results: any[] = [];
+  for (const chunk of chunks) {
+    const nums = chunk.map((n) => `'${n.replace(/'/g, "''")}'`).join(", ");
+    const query = `select Id, DocNumber, TxnDate, TotalAmt, Balance, VendorRef from VendorCredit where DocNumber in (${nums})`;
+    try {
+      const data = await qboFetch(`/query?query=${encodeURIComponent(query)}&minorversion=65`);
+      const rows = data?.QueryResponse?.VendorCredit || [];
+      results.push(...rows);
+    } catch (err: any) {
+      console.warn(`[QBO] VendorCredit query failed (non-fatal): ${err.message}`);
+      qboWarn("vendorcredit", `VendorCredit query failed (non-fatal): ${err.message}`);
+    }
+  }
+  return results;
+}
+
+/**
  * Search QBO Payments by PaymentRefNum (a.k.a. "Reference no." / check number on a bill payment).
  * NOTE: QBO Payment entities apply to AR (customer) Payments, not bill payments. AP bill payments
  * live as BillPayment entities. We try BillPayment first — falls back to empty if not searchable.
