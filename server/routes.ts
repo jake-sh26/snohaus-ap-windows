@@ -558,12 +558,16 @@ async function runDuplicateCheck(invoiceId: string, actorEmail: string): Promise
       const firstCredit = vendorCredits[0];
       const creditId = firstCredit?.Id || null;
       const creditTotal = Number(firstCredit?.TotalAmt || 0);
-      const creditBalance = Number(firstCredit?.Balance ?? creditTotal);
+      // VendorCredit has no Balance field in QBO (querying it returns 400). LinkedTxn
+      // tells us if/where the credit has been applied; per-link Amount isn't always
+      // present, so we report "applied to N txns" vs "unapplied" rather than a
+      // dollar-remaining figure. That's enough for the user to know to investigate.
+      const creditLinks = Array.isArray(firstCredit?.LinkedTxn) ? firstCredit.LinkedTxn : [];
       let creditLabel = "";
       if (firstCredit) {
-        if (creditBalance <= 0.005) creditLabel = " \u2014 fully applied";
-        else if (creditBalance < creditTotal) creditLabel = ` \u2014 partially applied ($${creditBalance.toFixed(2)} remaining)`;
-        else creditLabel = " \u2014 unapplied";
+        creditLabel = creditLinks.length > 0
+          ? ` \u2014 $${creditTotal.toFixed(2)} (applied to ${creditLinks.length} txn${creditLinks.length === 1 ? "" : "s"})`
+          : ` \u2014 $${creditTotal.toFixed(2)} (unapplied)`;
       }
       const paymentId = payments[0]?.Id || null;
       const vendorMismatch =
@@ -11583,6 +11587,49 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/gmail/clear-error-log", authMiddleware, (_req, res) => {
     clearGmailErrorLog();
     res.json({ ok: true });
+  });
+
+  // PR #R4m+ — diagnostic: run searchVendorCredits directly so we can see what QBO
+  // returns for a given DocNumber. Useful when the UI says "no duplicates found" but
+  // the credit clearly exists in QBO.
+  // Usage: GET /api/qbo/diagnose-vendor-credit?doc=12345
+  app.get("/api/qbo/diagnose-vendor-credit", authMiddleware, async (req, res) => {
+    const doc = String(req.query.doc || "").trim();
+    if (!doc) return res.status(400).json({ error: "provide ?doc=<invoice_number>" });
+    try {
+      // Three queries, in parallel:
+      //   1) exact DocNumber IN  — the actual production query
+      //   2) DocNumber LIKE       — catches trailing whitespace / case / prefix drift
+      //   3) Bill exact           — sanity check that QBO connectivity works for this run
+      const exactQuery = `select Id, DocNumber, TxnDate, TotalAmt, Balance, VendorRef from VendorCredit where DocNumber = '${doc.replace(/'/g, "''")}'`;
+      const likeQuery  = `select Id, DocNumber, TxnDate, TotalAmt, Balance, VendorRef from VendorCredit where DocNumber LIKE '%${doc.replace(/'/g, "''")}%' MAXRESULTS 20`;
+      const billQuery  = `select Id, DocNumber, TxnDate, TotalAmt, Balance, VendorRef from Bill where DocNumber = '${doc.replace(/'/g, "''")}'`;
+      const { getQboStatus } = await import("./qbo");
+      const status = getQboStatus();
+      if (!status.connected) return res.json({ connected: false });
+      // Use the same internal fetch as searchBills/searchVendorCredits.
+      const qboModule = await import("./qbo");
+      const qboFetch = (qboModule as any).qboFetchExposed || null;
+      // Fallback: call searchVendorCredits and searchBills helpers.
+      const [credits, bills] = await Promise.all([
+        (qboModule as any).searchVendorCredits([doc]).catch((e: any) => ({ error: e?.message || String(e) })),
+        (qboModule as any).searchBills([doc]).catch((e: any) => ({ error: e?.message || String(e) })),
+      ]);
+      res.json({
+        connected: true,
+        query_doc: doc,
+        exact_query: exactQuery,
+        like_query: likeQuery,
+        bill_query: billQuery,
+        vendor_credits_found: Array.isArray(credits) ? credits.length : 0,
+        vendor_credits: credits,
+        bills_found: Array.isArray(bills) ? bills.length : 0,
+        bills: bills,
+        qbo_error_log: (await import("./qbo")).getQboErrorLog(20),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || String(err) });
+    }
   });
 
   // PR #R4m — diagnostic: look up rows in ingested_emails by sender substring.

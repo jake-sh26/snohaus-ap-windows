@@ -901,12 +901,15 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
                     const firstCredit = vendorCredits[0];
                     const creditId = firstCredit?.Id || null;
                     const creditTotal = Number(firstCredit?.TotalAmt || 0);
-                    const creditBalance = Number(firstCredit?.Balance ?? creditTotal);
+                    // VendorCredit has no Balance field in QBO; LinkedTxn tells us
+                    // whether the credit has been applied (per-link Amount isn't
+                    // reliably populated, so we report applied/unapplied only).
+                    const creditLinks = Array.isArray(firstCredit?.LinkedTxn) ? firstCredit.LinkedTxn : [];
                     let creditLabel = "";
                     if (firstCredit) {
-                      if (creditBalance <= 0.005) creditLabel = " — fully applied";
-                      else if (creditBalance < creditTotal) creditLabel = ` — partially applied ($${creditBalance.toFixed(2)} remaining)`;
-                      else creditLabel = " — unapplied";
+                      creditLabel = creditLinks.length > 0
+                        ? ` — $${creditTotal.toFixed(2)} (applied to ${creditLinks.length} txn${creditLinks.length === 1 ? "" : "s"})`
+                        : ` — $${creditTotal.toFixed(2)} (unapplied)`;
                     }
                     const paymentId = payments[0]?.Id || null;
                     const note = [
