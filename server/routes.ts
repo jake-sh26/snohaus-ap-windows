@@ -267,7 +267,7 @@ const uploadHandler = multer({
   //   - drag-and-drop variations across Chrome / Edge / Firefox
 });
 import { ALLOWED_EMAILS, STORES } from "@shared/schema";
-import { getQboStatus, getAuthUrl, exchangeCode, disconnectQbo, searchBills, searchPayments, createBill, createVendorCredit, syncQboVendorsFromApi, lastVendorSyncAge, getQboErrorLog, clearQboErrorLog } from "./qbo";
+import { getQboStatus, getAuthUrl, exchangeCode, disconnectQbo, searchBills, searchVendorCredits, searchPayments, createBill, createVendorCredit, syncQboVendorsFromApi, lastVendorSyncAge, getQboErrorLog, clearQboErrorLog } from "./qbo";
 import { getGmailStatus, pollNow, pollWithRetry, testGmailConnection, clearGmailErrorLog, reingestEmails } from "./gmail";
 import { registerReconStagingRoutes } from "./recon-staging/routes";
 
@@ -536,9 +536,15 @@ async function runDuplicateCheck(invoiceId: string, actorEmail: string): Promise
       });
       return { invoice: updated, found: false, bill: null, payment_id: null, note: null, reason: !status.connected ? "qbo not connected" : "no invoice number" };
     }
-    const bills = await searchBills([inv.invoice_number]);
-    const payments = await searchPayments([inv.invoice_number]);
-    if (bills.length > 0 || payments.length > 0) {
+    // Search QBO Bills, VendorCredits, and BillPayments in parallel. VendorCredits live in a
+    // separate entity from Bills in QBO; the app DB may or may not flag a row as a credit
+    // (is_credit can be missing on older ingests), so we always check both.
+    const [bills, vendorCredits, payments] = await Promise.all([
+      searchBills([inv.invoice_number]),
+      searchVendorCredits([inv.invoice_number]),
+      searchPayments([inv.invoice_number]),
+    ]);
+    if (bills.length > 0 || vendorCredits.length > 0 || payments.length > 0) {
       const firstBill = bills[0];
       const billId = firstBill?.Id || null;
       const total = Number(firstBill?.TotalAmt || 0);
@@ -549,13 +555,25 @@ async function runDuplicateCheck(invoiceId: string, actorEmail: string): Promise
         else if (balance < total) paidLabel = ` \u2014 partially paid ($${balance.toFixed(2)} open)`;
         else paidLabel = " \u2014 unpaid";
       }
+      const firstCredit = vendorCredits[0];
+      const creditId = firstCredit?.Id || null;
+      const creditTotal = Number(firstCredit?.TotalAmt || 0);
+      const creditBalance = Number(firstCredit?.Balance ?? creditTotal);
+      let creditLabel = "";
+      if (firstCredit) {
+        if (creditBalance <= 0.005) creditLabel = " \u2014 fully applied";
+        else if (creditBalance < creditTotal) creditLabel = ` \u2014 partially applied ($${creditBalance.toFixed(2)} remaining)`;
+        else creditLabel = " \u2014 unapplied";
+      }
       const paymentId = payments[0]?.Id || null;
       const vendorMismatch =
         inv.vendor_qbo_id &&
         ((bills.length > 0 && !bills.some((b: any) => b.VendorRef?.value === inv.vendor_qbo_id)) ||
+          (vendorCredits.length > 0 && !vendorCredits.some((c: any) => c.VendorRef?.value === inv.vendor_qbo_id)) ||
           (payments.length > 0 && !payments.some((p: any) => p.EntityRef?.value === inv.vendor_qbo_id)));
       const note = [
         bills.length > 0 ? `Bill #${billId} exists in QBO${paidLabel}` : null,
+        vendorCredits.length > 0 ? `VendorCredit #${creditId} exists in QBO${creditLabel}` : null,
         payments.length > 0 ? `BillPayment #${paymentId} found` : null,
         vendorMismatch ? "(vendor ID differs \u2014 verify manually)" : null,
       ].filter(Boolean).join("; ");
@@ -11565,6 +11583,45 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/gmail/clear-error-log", authMiddleware, (_req, res) => {
     clearGmailErrorLog();
     res.json({ ok: true });
+  });
+
+  // PR #R4m — diagnostic: look up rows in ingested_emails by sender substring.
+  // Used to figure out why a specific vendor's email didn't ingest (Stage 1 skip,
+  // attachment error, etc). Returns the raw row including skip_reasons JSON.
+  // Usage: GET /api/gmail/diagnose-ingested?from=kingsleybate&limit=20
+  app.get("/api/gmail/diagnose-ingested", authMiddleware, (req, res) => {
+    const fromQ = String(req.query.from || "").trim();
+    const subjectQ = String(req.query.subject || "").trim();
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "50"), 10) || 50, 1), 500);
+    if (!fromQ && !subjectQ) {
+      return res.status(400).json({ error: "provide ?from=<substring> and/or ?subject=<substring>" });
+    }
+    const db = (require("./storage") as any).getDbDirect ? (require("./storage") as any).getDbDirect() : null;
+    // Fall back to opening the DB directly if the storage module doesn't expose it.
+    let database: any = db;
+    try {
+      if (!database) {
+        const Database = require("better-sqlite3");
+        const { getDbPath } = require("./db-path");
+        database = new Database(getDbPath());
+      }
+      const where: string[] = [];
+      const params: any[] = [];
+      if (fromQ) { where.push("LOWER(from_address) LIKE ?"); params.push(`%${fromQ.toLowerCase()}%`); }
+      if (subjectQ) { where.push("LOWER(subject) LIKE ?"); params.push(`%${subjectQ.toLowerCase()}%`); }
+      params.push(limit);
+      const rows = database.prepare(
+        `SELECT message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids,
+                ingested_at, skipped_count, skip_reasons
+         FROM ingested_emails
+         WHERE ${where.join(" AND ")}
+         ORDER BY ingested_at DESC
+         LIMIT ?`
+      ).all(...params);
+      res.json({ count: rows.length, rows });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || String(err) });
+    }
   });
 
   // ---- Digest (with bucket counts) ----
