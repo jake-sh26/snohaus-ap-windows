@@ -558,17 +558,9 @@ async function runDuplicateCheck(invoiceId: string, actorEmail: string): Promise
       const firstCredit = vendorCredits[0];
       const creditId = firstCredit?.Id || null;
       const creditTotal = Number(firstCredit?.TotalAmt || 0);
-      // VendorCredit has no Balance field in QBO (querying it returns 400). LinkedTxn
-      // tells us if/where the credit has been applied; per-link Amount isn't always
-      // present, so we report "applied to N txns" vs "unapplied" rather than a
-      // dollar-remaining figure. That's enough for the user to know to investigate.
-      const creditLinks = Array.isArray(firstCredit?.LinkedTxn) ? firstCredit.LinkedTxn : [];
-      let creditLabel = "";
-      if (firstCredit) {
-        creditLabel = creditLinks.length > 0
-          ? ` \u2014 $${creditTotal.toFixed(2)} (applied to ${creditLinks.length} txn${creditLinks.length === 1 ? "" : "s"})`
-          : ` \u2014 $${creditTotal.toFixed(2)} (unapplied)`;
-      }
+      // QBO's query language doesn't expose Balance or LinkedTxn on VendorCredit
+      // (both return 400). We just report total; user can check applied state in QBO.
+      const creditLabel = firstCredit ? ` \u2014 $${creditTotal.toFixed(2)}` : "";
       const paymentId = payments[0]?.Id || null;
       const vendorMismatch =
         inv.vendor_qbo_id &&
