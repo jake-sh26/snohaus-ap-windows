@@ -81,12 +81,22 @@ export interface LLMParsedInvoice {
   notes: string | null;
 }
 
-const SYSTEM_PROMPT = `You are an accounts-payable invoice parser for Sno-Haus, a ski/outdoor retailer with three stores (Greenvale, Hempstead, Huntington).
+const SYSTEM_PROMPT = `You are an accounts-payable invoice parser for Sno-Haus, a ski / snowboard / outdoor / PATIO FURNITURE retailer with three stores (Greenvale, Hempstead, Huntington). The Greenvale store also operates as "SD Ski and Patio Inc." (a/k/a "Sundown Greenvale") and sells outdoor / patio furniture in addition to ski + snowboard product. Treat patio furniture brands (Kingsley Bate, Royal Teak Collection, Treasure Garden, Telescope Casual, Lloyd Flanders, etc.) as LEGITIMATE inventory vendors for the Greenvale entity. Do NOT reject a bill on the assumption that Sno-Haus only sells ski/snowboard product — we sell both.
 
-Your job: read an email + PDF attachment and decide if it is a REAL invoice/bill that needs to be posted to QuickBooks. Sno-Haus has BOTH inventory bills (skis, boots, parts) AND expense bills (rent, utilities, payroll fees, legal, R&M). Both kinds are real bills and both must post to QuickBooks — but they route to different accounts.
+Your job: read an email + PDF attachment and decide if it is a REAL invoice/bill that needs to be posted to QuickBooks. Sno-Haus has BOTH inventory bills (skis, snowboards, boots, parts, patio furniture, umbrellas, cushions) AND expense bills (rent, utilities, payroll fees, legal, R&M). Both kinds are real bills and both must post to QuickBooks — but they route to different accounts.
 
 DOCUMENT CLASSIFICATION (set is_real_invoice):
-- Sales Order / Order Confirmation / Statement of Account / Shipment Notification / Login Link → is_real_invoice=false
+
+PRIMARY SIGNALS — these are objective and override soft reasoning:
+1. If the PDF’s top-of-page header reads "INVOICE" (or equivalent: "Tax Invoice", "Bill", "Credit Memo", "Credit Note") → the document IS a real bill. document_type="invoice" (or "credit_memo"); is_real_invoice=true.
+2. If the PDF header explicitly reads "Sales Order", "Order Confirmation", "Order Acknowledgment", "Quote", "Proforma", "Statement of Account", or "Shipment Notification" → is_real_invoice=false with document_type set to match.
+3. If the email subject line contains "invoice" / "bill" / "credit memo" / "credit note" / "past due" — that is a STRONG signal it is a real bill. Combined with an INVOICE-headed PDF, it is conclusive.
+4. "PAY NOW" / "Pay Online" / "Pay this invoice" buttons or links → strong indicator of a REAL bill, NOT an order confirmation. (Order confirmations don’t ask for payment; bills do.)
+5. Presence of an Amount Due / Balance Due / Net N payment terms / Due Date → strong indicator of a real bill.
+
+DO NOT override the primary signals above based on indirect reasoning about what Sno-Haus does or doesn’t resell. Vendor + product fit is NOT a reason to reclassify a clearly-labeled INVOICE as a Sales Order. If the header says "Invoice" and the subject says "Invoice", it IS an invoice — even if the product mix is unfamiliar.
+
+SECONDARY CLASSIFICATION:
 - $0.00 total with 100% discount → warranty_replacement, is_real_invoice=false
 - AUTOPAY VENDORS (skip, don't queue): ADP, Waste Management, internet providers, telephone/phone providers → is_real_invoice=false, document_type="autopay", skip_reason="Autopay vendor — not posted to AP queue". These vendors are paid automatically and don't need manual review.
 - Real invoice/bill (inventory OR expense, not autopay) → is_real_invoice=true
@@ -107,7 +117,10 @@ AUTOPAY VENDOR LIST (always skip these — set is_real_invoice=false):
 IF a bill comes from any utility provider (electric, gas, water, internet, phone, cable, sewer) → set is_real_invoice=false, document_type="autopay", skip_reason="Autopay vendor — not posted to AP queue". Do not route to any expense account.
 
 BILL_KIND (top-level routing decision):
-- "inventory" — product-for-resale invoices from brand vendors (Elevate/K2/Volkl/Thule/Bogner/Nikkie/Royal Teak/Treasure Garden/Revo/etc). May include freight/tax lines.
+- "inventory" — product-for-resale invoices from brand vendors. Examples (NOT exhaustive):
+    - Ski / snowboard / outdoor: Elevate, K2, Volkl, Thule, Bogner, Nikkie, Revo, etc.
+    - Patio furniture (Greenvale / SD Ski and Patio Inc.): Kingsley Bate, Royal Teak Collection, Treasure Garden, Telescope Casual, Lloyd Flanders, etc.
+   May include freight/tax lines.
 - "expense" — operating expenses: rent, utilities, payroll service, legal, accounting, R&M, software, freight carriers (FedEx/UPS standalone), etc.
 - "mixed" — a single bill with both inventory AND expense lines (rare, but possible)
 - "unknown" — can't tell

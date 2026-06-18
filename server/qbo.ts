@@ -410,6 +410,7 @@ export async function syncQboVendorsFromApi(): Promise<{ total: number; new: num
       id TEXT PRIMARY KEY,
       display_name TEXT NOT NULL,
       company_name TEXT,
+      primary_email TEXT,
       active INTEGER DEFAULT 1,
       last_seen_at TEXT,
       inactive_at TEXT,
@@ -417,6 +418,8 @@ export async function syncQboVendorsFromApi(): Promise<{ total: number; new: num
     );
     CREATE INDEX IF NOT EXISTS idx_qbo_vendors_cache_name_lower ON qbo_vendors_cache(LOWER(display_name));
   `);
+  // PR #R4p: add primary_email column on existing installs (sqlite tolerates duplicate column errors).
+  try { db.exec("ALTER TABLE qbo_vendors_cache ADD COLUMN primary_email TEXT"); } catch {}
 
   const now = new Date().toISOString();
   const seen = new Set<string>();
@@ -427,17 +430,21 @@ export async function syncQboVendorsFromApi(): Promise<{ total: number; new: num
 
   // Fetch ALL vendors (active + inactive) so we mirror QBO state.
   // QBO query language: STARTPOSITION starts at 1.
+  // PR #R4p: also pull PrimaryEmailAddr so Stage 1 of the Gmail poller can match
+  // incoming emails against known vendor domains (orders@kingsleybate.com matches
+  // a vendor whose primary email is sales@kingsleybate.com via shared domain).
   while (true) {
-    const q = `select Id, DisplayName, CompanyName, Active from Vendor STARTPOSITION ${pageStart} MAXRESULTS ${pageSize}`;
+    const q = `select Id, DisplayName, CompanyName, PrimaryEmailAddr, Active from Vendor STARTPOSITION ${pageStart} MAXRESULTS ${pageSize}`;
     const data = await qboFetch(`/query?query=${encodeURIComponent(q)}&minorversion=65`);
     const rows: any[] = data?.QueryResponse?.Vendor || [];
     if (rows.length === 0) break;
     const upsert = db.prepare(`
-      INSERT INTO qbo_vendors_cache (id, display_name, company_name, active, last_seen_at, inactive_at, created_at)
-      VALUES (?, ?, ?, ?, ?, NULL, ?)
+      INSERT INTO qbo_vendors_cache (id, display_name, company_name, primary_email, active, last_seen_at, inactive_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
       ON CONFLICT(id) DO UPDATE SET
         display_name = excluded.display_name,
         company_name = excluded.company_name,
+        primary_email = excluded.primary_email,
         active = excluded.active,
         last_seen_at = excluded.last_seen_at,
         inactive_at = NULL
@@ -447,10 +454,15 @@ export async function syncQboVendorsFromApi(): Promise<{ total: number; new: num
         if (!v.Id || !v.DisplayName) continue;
         seen.add(String(v.Id));
         const before = db.prepare("SELECT id FROM qbo_vendors_cache WHERE id = ?").get(String(v.Id));
+        // QBO returns PrimaryEmailAddr as { Address: "..." } or omits it entirely.
+        const primaryEmail = v?.PrimaryEmailAddr?.Address
+          ? String(v.PrimaryEmailAddr.Address).trim().toLowerCase()
+          : null;
         upsert.run(
           String(v.Id),
           String(v.DisplayName),
           v.CompanyName ? String(v.CompanyName) : null,
+          primaryEmail,
           v.Active === false ? 0 : 1,
           now,
           now,

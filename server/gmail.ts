@@ -105,8 +105,13 @@ const INVOICE_KEYWORDS = [
 // v8.3: pull QBO vendor names + email domains so a PDF from a known vendor
 // auto-passes Stage 1 even if the keyword list misses (e.g. "Order confirmation"
 // from a real vendor that turns out to include an attached invoice).
-let _vendorAllowlistCache: { domains: Set<string>; names: Set<string>; loadedAt: number } | null = null;
-function getVendorAllowlist(): { domains: Set<string>; names: Set<string> } {
+// PR #R4p: nameSlugs contains vendor names normalized to lowercase alphanumeric
+// ("Kingsley Bate" -> "kingsleybate"), used to match emails like
+// orders@kingsleybate.com whose local-part "orders" is uninformative but whose
+// domain contains the vendor name. This catches vendors whose PrimaryEmailAddr
+// isn't set in QBO.
+let _vendorAllowlistCache: { domains: Set<string>; names: Set<string>; nameSlugs: Set<string>; loadedAt: number } | null = null;
+function getVendorAllowlist(): { domains: Set<string>; names: Set<string>; nameSlugs: Set<string> } {
   // Refresh every 10 minutes
   if (_vendorAllowlistCache && Date.now() - _vendorAllowlistCache.loadedAt < 10 * 60 * 1000) {
     return _vendorAllowlistCache;
@@ -114,15 +119,32 @@ function getVendorAllowlist(): { domains: Set<string>; names: Set<string> } {
   const db = getDb();
   const domains = new Set<string>();
   const names = new Set<string>();
+  const nameSlugs = new Set<string>();
+  const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
   try {
-    const rows = db.prepare(
-      "SELECT display_name, company_name FROM qbo_vendors_cache WHERE active = 1"
-    ).all() as { display_name: string | null; company_name: string | null }[];
+    // PR #R4p: primary_email column was added in this PR; older installs may not
+    // have it yet (the sync hasn't run on the new schema). LEFT-fall-back to NULL.
+    let rows: { display_name: string | null; company_name: string | null; primary_email: string | null }[] = [];
+    try {
+      rows = db.prepare(
+        "SELECT display_name, company_name, primary_email FROM qbo_vendors_cache WHERE active = 1"
+      ).all() as any[];
+    } catch {
+      rows = (db.prepare(
+        "SELECT display_name, company_name FROM qbo_vendors_cache WHERE active = 1"
+      ).all() as any[]).map((r: any) => ({ ...r, primary_email: null }));
+    }
     for (const r of rows) {
       const n1 = (r.display_name || "").toLowerCase().trim();
       const n2 = (r.company_name || "").toLowerCase().trim();
-      if (n1) names.add(n1);
-      if (n2) names.add(n2);
+      if (n1) { names.add(n1); const s = slugify(n1); if (s.length >= 5) nameSlugs.add(s); }
+      if (n2) { names.add(n2); const s = slugify(n2); if (s.length >= 5) nameSlugs.add(s); }
+      // Pull the domain off the QBO PrimaryEmailAddr so e.g. a vendor whose
+      // primary email is sales@kingsleybate.com matches incoming mail from
+      // orders@kingsleybate.com.
+      const email = (r.primary_email || "").trim();
+      const m = email.match(/@([a-z0-9.-]+\.[a-z]{2,})/i);
+      if (m) domains.add(m[1].toLowerCase());
     }
   } catch {}
   // Also include vendor_aliases which capture common sender forms like "sales@vendor.com"
@@ -137,7 +159,7 @@ function getVendorAllowlist(): { domains: Set<string>; names: Set<string> } {
       else names.add(a);
     }
   } catch {}
-  _vendorAllowlistCache = { domains, names, loadedAt: Date.now() };
+  _vendorAllowlistCache = { domains, names, nameSlugs, loadedAt: Date.now() };
   return _vendorAllowlistCache;
 }
 export function invalidateVendorAllowlistCache() {
@@ -195,6 +217,21 @@ function shouldSendToLlm(opts: { subject: string; from: string; hasPdfAttachment
   const fromName = extractFromName(opts.from);
   if (fromDomain && allow.domains.has(fromDomain)) {
     return { ok: true, reason: "vendor-domain", matchedVendor: fromDomain };
+  }
+  // PR #R4p: domain-slug match — "orders@kingsleybate.com" should match a vendor
+  // named "Kingsley Bate" even when the QBO PrimaryEmailAddr field is empty.
+  // We compare the from-domain's slug ("kingsleybatecom" minus the TLD) against
+  // each vendor name slug. Only fires when the vendor name is >=5 chars to avoid
+  // false positives.
+  if (fromDomain) {
+    const domainCore = fromDomain.replace(/\.[a-z]{2,}$/i, "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+    const slugs = Array.from(allow.nameSlugs);
+    for (let i = 0; i < slugs.length; i++) {
+      const slug = slugs[i];
+      if (domainCore.includes(slug) || slug.includes(domainCore)) {
+        return { ok: true, reason: "vendor-name-in-domain", matchedVendor: slug };
+      }
+    }
   }
   if (fromName) {
     const trimmed = fromName.replace(/\b(inc|llc|corp|co|company|ltd|the)\b\.?/g, "").replace(/\s+/g, " ").trim();
