@@ -22,6 +22,8 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 import { startGmailPolling } from "./gmail";
+// R4q: Gmail API parallel-run service. Gated by GMAIL_API_ENABLED env flag.
+import { startGmailApiService } from "./gmail-api";
 import { syncQboVendorsFromApi, getQboStatus } from "./qbo";
 import { backfillVendorAliasesFromPostedInvoices, backfillLineItemsFromJson } from "./storage";
 import { runAcumaticaPullNow, scheduleAcumaticaDailyPull } from "./acumatica";
@@ -153,8 +155,10 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
-      // Start Gmail polling if configured
+      // Start Gmail polling if configured (IMAP path — original)
       startGmailPolling();
+      // R4q: Start Gmail API path in parallel (no-op if GMAIL_API_ENABLED!=true)
+      startGmailApiService();
       // Background QBO vendor sync — once at startup (if connected) and every 24h.
       const runVendorSync = async () => {
         try {

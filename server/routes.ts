@@ -268,7 +268,23 @@ const uploadHandler = multer({
 });
 import { ALLOWED_EMAILS, STORES } from "@shared/schema";
 import { getQboStatus, getAuthUrl, exchangeCode, disconnectQbo, searchBills, searchVendorCredits, searchPayments, createBill, createVendorCredit, syncQboVendorsFromApi, lastVendorSyncAge, getQboErrorLog, clearQboErrorLog } from "./qbo";
-import { getGmailStatus, pollNow, pollWithRetry, testGmailConnection, clearGmailErrorLog, reingestEmails } from "./gmail";
+import { getGmailStatus, pollNow, pollWithRetry, testGmailConnection, clearGmailErrorLog, reingestEmails, invalidateVendorAllowlistCache } from "./gmail";
+// R4q: Gmail API parallel-run module — lives alongside the IMAP path above.
+import {
+  getGmailIngestStatus as getGmailApiIngestStatus,
+  pollNowApi,
+  processHistoryPush,
+  reingestEmailsApi,
+  testGmailApiConnection,
+  clearGmailApiErrorLog,
+  getGmailAuthUrl,
+  setGmailTokens,
+  clearGmailTokens,
+  stopGmailWatch,
+  startGmailWatch,
+  isGmailApiEnabled,
+  invalidateGmailApiVendorAllowlistCache,
+} from "./gmail-api";
 import { registerReconStagingRoutes } from "./recon-staging/routes";
 
 declare global {
@@ -11517,6 +11533,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/qbo/vendors/sync", authMiddleware, async (_req, res) => {
     try {
       const r = await syncQboVendorsFromApi();
+      // R4q backlog fix: bust both Gmail allowlist caches so a freshly-added
+      // vendor (with no primary_email but a matching domain slug) gets picked
+      // up on the very next poll instead of waiting for the 10-minute TTL.
+      try { invalidateVendorAllowlistCache(); } catch {}
+      try { invalidateGmailApiVendorAllowlistCache(); } catch {}
       res.json({ ok: true, ...r });
     } catch (err: any) {
       console.error("[/api/qbo/vendors/sync] failed:", err.message);
@@ -11527,6 +11548,65 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---- Gmail ----
   app.get("/api/gmail/status", authMiddleware, (_req, res) => {
     res.json(getGmailStatus());
+  });
+
+  // R4q: Pub/Sub push webhook for Gmail watch notifications.
+  // Pub/Sub POSTs an envelope { message: { data: <base64 JSON>, messageId, publishTime, attributes }, subscription }.
+  // We decode the data field (which contains {emailAddress, historyId}) and
+  // hand off to processHistoryPush() which walks history.list since the last
+  // saved historyId, fetches any new INBOX messages, and runs them through
+  // the same Stage 1 → LLM → dedup → QBO pipeline as the IMAP path.
+  //
+  // PUBLIC — no auth middleware (Pub/Sub doesn't send Bearer tokens).
+  // We always ACK with 204 to prevent Pub/Sub retry storms; real errors are
+  // logged to the rolling error log and surfaced in the Gmail API status panel.
+  //
+  // Gated by isGmailApiEnabled(): if the feature flag is off, we log + ACK
+  // without doing any processing (IMAP-only mode).
+  app.post("/api/gmail/push", async (req, res) => {
+    // ACK immediately so Pub/Sub doesn't time out waiting for processing.
+    // The actual work continues in the background.
+    res.status(204).end();
+
+    try {
+      const env = req.body || {};
+      const msg = env.message || {};
+      let decoded: { emailAddress?: string; historyId?: string } = {};
+      if (msg.data) {
+        try {
+          decoded = JSON.parse(Buffer.from(msg.data, "base64").toString("utf8"));
+        } catch (e) {
+          console.error("[gmail-push] failed to decode data field:", (e as Error).message);
+          return;
+        }
+      }
+
+      console.log(
+        `[gmail-push] received emailAddress=${decoded.emailAddress} historyId=${decoded.historyId} ` +
+        `messageId=${msg.messageId || msg.message_id}`,
+      );
+
+      if (!isGmailApiEnabled()) {
+        console.log("[gmail-push] GMAIL_API_ENABLED=false — dropping push (IMAP-only mode)");
+        return;
+      }
+
+      if (!decoded.historyId) {
+        console.warn("[gmail-push] no historyId in payload — ignoring");
+        return;
+      }
+
+      // Fire-and-forget; errors are recorded inside processHistoryPush()
+      processHistoryPush(decoded.historyId).then((r) => {
+        if (r.new_invoices > 0 || r.errors.length > 0) {
+          console.log(`[gmail-push] processed — new_invoices=${r.new_invoices} errors=${r.errors.length}`);
+        }
+      }).catch((e) => {
+        console.error("[gmail-push] processHistoryPush threw:", e?.message || String(e));
+      });
+    } catch (err: any) {
+      console.error("[gmail-push] handler error:", err.message);
+    }
   });
 
   app.post("/api/gmail/poll-now", authMiddleware, async (_req, res) => {
@@ -12192,6 +12272,195 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/auth/drive/status", authMiddleware, (req, res) => {
     const status = getDriveStatus();
     res.json({ ...status, configured: isGoogleConfigured() });
+  });
+
+
+  // ===== R4q: Gmail API OAuth + status routes (parallel-run alongside IMAP) =====
+  // Same shape/conventions as Drive routes above. Uses separate token storage
+  // (purpose=gmail_service in google_oauth table) and its own scopes
+  // (gmail.modify). Available only when GMAIL_API_ENABLED=true, but the
+  // routes themselves register unconditionally so the UI can show a
+  // 'disabled' state cleanly.
+
+  app.get("/api/auth/gmail/connect", (req, res) => {
+    const tParam = String(req.query.t || "");
+    let authed = false;
+    let isAdmin = false;
+    if (tParam) {
+      const sess = getSession(tParam);
+      if (sess) {
+        try {
+          const appUser = getAppUserByEmail(sess.email);
+          isAdmin = (appUser?.role || 'admin') === 'admin';
+        } catch { isAdmin = true; }
+        authed = true;
+      }
+    } else {
+      const auth = req.headers.authorization;
+      if (auth?.startsWith("Bearer ")) {
+        const sess = getSession(auth.slice(7));
+        if (sess) {
+          try {
+            const appUser = getAppUserByEmail(sess.email);
+            isAdmin = (appUser?.role || 'admin') === 'admin';
+          } catch { isAdmin = true; }
+          authed = true;
+        }
+      }
+    }
+    if (!authed) return res.status(401).json({ message: "Unauthorized" });
+    if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
+    if (!isGoogleConfigured()) {
+      return res.status(503).json({ message: "Google OAuth not configured" });
+    }
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI_PROD || process.env.GOOGLE_REDIRECT_URI_LOCAL || `http://localhost:${process.env.PORT || 5000}/api/auth/google/callback`;
+    const gmailRedirectUri = redirectUri.replace("/auth/google/callback", "/auth/gmail/callback");
+    const state = generateOAuthState("gmail");
+    const url = getGmailAuthUrl(gmailRedirectUri, state);
+    res.redirect(url);
+  });
+
+  app.get("/api/auth/gmail/callback", async (req, res) => {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+    const error = String(req.query.error || "");
+
+    if (error) {
+      return res.redirect("/settings?error=gmail_denied&tab=integrations");
+    }
+    if (!verifyOAuthState(state, "gmail")) {
+      return res.redirect("/settings?error=invalid_state&tab=integrations");
+    }
+    if (!code) {
+      return res.redirect("/settings?error=no_code&tab=integrations");
+    }
+
+    try {
+      const redirectUri = process.env.GOOGLE_REDIRECT_URI_PROD || process.env.GOOGLE_REDIRECT_URI_LOCAL || `http://localhost:${process.env.PORT || 5000}/api/auth/google/callback`;
+      const gmailRedirectUri = redirectUri.replace("/auth/google/callback", "/auth/gmail/callback");
+      const tokens = await exchangeCodeForTokens(code, gmailRedirectUri);
+
+      let grantedEmail: string | undefined;
+      try {
+        const { google } = await import("googleapis");
+        const oauth2 = (await import("./google-oauth")).getOAuth2Client(gmailRedirectUri);
+        oauth2.setCredentials(tokens as any);
+        const people = google.oauth2({ version: "v2", auth: oauth2 });
+        const info = await people.userinfo.get();
+        grantedEmail = info.data.email || undefined;
+      } catch {}
+
+      setGmailTokens(tokens, grantedEmail);
+      console.log(`[AUTH] Gmail API connected for ${grantedEmail || "unknown"}`);
+
+      // Auto-register watch so push starts flowing immediately. Best-effort
+      // — if it fails the user can retry from Settings (/api/gmail-api/start-watch).
+      try {
+        const watchResult = await startGmailWatch();
+        console.log(`[AUTH] Gmail watch registered — expires=${new Date(Number(watchResult.expiration)).toISOString()} historyId=${watchResult.historyId}`);
+      } catch (we: any) {
+        console.error("[AUTH] Gmail watch registration failed (non-fatal):", we.message);
+      }
+
+      res.redirect("/settings?gmail_connected=1&tab=integrations");
+    } catch (e: any) {
+      console.error("[AUTH] Gmail API callback error:", e.message);
+      res.redirect("/settings?error=gmail_failed&tab=integrations");
+    }
+  });
+
+  app.post("/api/auth/gmail/disconnect", adminMiddleware, async (_req, res) => {
+    try {
+      try { await stopGmailWatch(); } catch (e: any) {
+        console.warn("[AUTH] stopGmailWatch on disconnect failed (non-fatal):", e.message);
+      }
+      clearGmailTokens();
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.get("/api/auth/gmail/status", authMiddleware, (_req, res) => {
+    res.json({
+      ...getGmailApiIngestStatus(),
+      configured: isGoogleConfigured(),
+      enabled: isGmailApiEnabled(),
+    });
+  });
+
+  // ===== R4q: Gmail API ingest endpoints (parallel-run; do not replace /api/gmail/*) =====
+
+  app.get("/api/gmail-api/status", authMiddleware, (_req, res) => {
+    res.json({
+      ...getGmailApiIngestStatus(),
+      configured: isGoogleConfigured(),
+      enabled: isGmailApiEnabled(),
+    });
+  });
+
+  app.post("/api/gmail-api/poll-now", authMiddleware, async (_req, res) => {
+    try {
+      if (!isGmailApiEnabled()) {
+        return res.status(409).json({ message: "Gmail API path is disabled (set GMAIL_API_ENABLED=true)" });
+      }
+      const result = await pollNowApi();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/gmail-api/test-connection", authMiddleware, async (_req, res) => {
+    try {
+      const r = await testGmailApiConnection();
+      res.json(r);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/gmail-api/clear-error-log", authMiddleware, (_req, res) => {
+    clearGmailApiErrorLog();
+    res.json({ ok: true });
+  });
+
+  app.post("/api/gmail-api/reingest", adminMiddleware, async (req, res) => {
+    try {
+      if (!isGmailApiEnabled()) {
+        return res.status(409).json({ message: "Gmail API path is disabled (set GMAIL_API_ENABLED=true)" });
+      }
+      const { from, subject, since, dryRun } = req.body || {};
+      const r = await reingestEmailsApi({ from, subject, since, dryRun: !!dryRun });
+      res.json(r);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/gmail-api/start-watch", adminMiddleware, async (_req, res) => {
+    try {
+      if (!isGmailApiEnabled()) {
+        return res.status(409).json({ message: "Gmail API path is disabled (set GMAIL_API_ENABLED=true)" });
+      }
+      const r = await startGmailWatch();
+      res.json({
+        ok: true,
+        historyId: r.historyId,
+        expiration: new Date(Number(r.expiration)).toISOString(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/gmail-api/stop-watch", adminMiddleware, async (_req, res) => {
+    try {
+      await stopGmailWatch();
+      res.json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
   });
 
   // ===== v8: In-app log viewer (admin only) =====

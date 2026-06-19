@@ -462,7 +462,9 @@ function getVendorAllowlist(): { domains: Set<string>; names: Set<string>; nameS
   return _vendorAllowlistCache;
 }
 
-export function invalidateVendorAllowlistCache() {
+// R4q parallel-run: shares the *concept* with gmail.ts but each module caches
+// its own allowlist. The QBO sync endpoint must invalidate both.
+export function invalidateGmailApiVendorAllowlistCache() {
   _vendorAllowlistCache = null;
 }
 
@@ -591,7 +593,7 @@ function recordError(scope: string, message: string) {
     lastErrorAt = at;
   }
 }
-export function clearGmailErrorLog() {
+export function clearGmailApiErrorLog() {
   errorLog.length = 0;
 }
 
@@ -601,10 +603,12 @@ function updateCount() {
   ingestedCount = row.c;
 }
 
-// Re-export the public status surface gmail.ts had so routes.ts keeps working.
-// The shape mirrors getGmailStatus() but with API-era fields (last_push_at)
-// and IMAP-era fields removed (user/label become informational).
-export function getGmailStatus() {
+// R4q parallel-run: this function lives alongside gmail.ts getGmailStatus().
+// Routes.ts will expose this at /api/gmail-api/status while keeping the
+// existing /api/gmail/status pointing at the IMAP path. Once API is proven
+// reliable in R4r, the IMAP version goes away and this gets renamed.
+// (Renamed below to avoid name collision when both modules are imported.)
+function getGmailStatusInternal() {
   ensureStatusLoaded();
   updateCount();
   const conn = getGmailApiConnectedStatus();
@@ -647,11 +651,9 @@ export function getGmailStatus() {
   };
 }
 
-// Legacy alias for the IMAP-era test endpoint. Now calls the Gmail API profile check.
-export async function testGmailConnection(): Promise<{ ok: boolean; error?: string; user?: string; mailboxes?: string[] }> {
-  const r = await testGmailApiConnection();
-  return { ok: r.ok, error: r.error, user: r.user, mailboxes: r.ok ? ["INBOX"] : undefined };
-}
+// Detailed status for the parallel-run UI / debug. Same shape as the IMAP
+// getGmailStatus() so the Settings panel can render either with one component.
+export const getGmailIngestStatus = getGmailStatusInternal;
 
 // ===== Helpers: parse Gmail message → invoice-like envelope =====
 
@@ -1107,7 +1109,7 @@ async function processOneGmailMessage(
  *
  * Uses Gmail's `q=newer_than:Nd in:inbox` search instead of IMAP SINCE.
  */
-export async function pollNow(): Promise<{ new_invoices: number; errors: string[] }> {
+export async function pollNowApi(): Promise<{ new_invoices: number; errors: string[] }> {
   if (pollRunning) {
     return { new_invoices: 0, errors: ["Poll already in progress"] };
   }
@@ -1176,12 +1178,7 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
   return { new_invoices: newInvoices, errors };
 }
 
-// pollWithRetry kept for routes.ts compatibility — the Gmail API doesn't have
-// IMAP's transient connection drops, so we just call pollNow once.
-export async function pollWithRetry(): Promise<{ new_invoices: number; errors: string[]; retried?: boolean }> {
-  const r = await pollNow();
-  return { ...r, retried: false };
-}
+
 
 // ===== Public: Pub/Sub push handler =====
 //
@@ -1275,12 +1272,18 @@ export async function processHistoryPush(historyId: string): Promise<{ new_invoi
 // ===== Boot wiring =====
 
 /**
- * Call once on server boot. Registers the Gmail watch if connected, then
- * sets a 6-day timer to renew it (Gmail watches expire after 7 days).
- * Also runs a backfill poll on boot to catch anything missed while the
- * server was down or the watch was expired.
+ * Call once on server boot. Gated by GMAIL_API_ENABLED env flag so the
+ * parallel-run path can be toggled off without code changes. Registers the
+ * Gmail watch if connected, then sets a 6-day timer to renew it (Gmail
+ * watches expire after 7 days). Also runs a backfill poll on boot to catch
+ * anything missed while the server was down or the watch was expired.
  */
 export function startGmailApiService() {
+  const flag = (process.env.GMAIL_API_ENABLED || "").toLowerCase();
+  if (flag !== "true" && flag !== "1" && flag !== "yes") {
+    console.log("[gmail-api] GMAIL_API_ENABLED is not set — Gmail API parallel-run path disabled (IMAP-only mode)");
+    return;
+  }
   ensureStatusLoaded();
   if (!isGoogleConfigured()) {
     console.log("[gmail-api] GOOGLE_CLIENT_ID/SECRET not set — Gmail API service disabled");
@@ -1292,7 +1295,7 @@ export function startGmailApiService() {
   }
 
   // Backfill poll on boot
-  pollNow().catch((e) => console.error("[gmail-api] boot poll failed:", e.message));
+  pollNowApi().catch((e) => console.error("[gmail-api] boot poll failed:", e.message));
 
   // Register watch + renewal timer
   startWatchRenewalTimer();
@@ -1300,14 +1303,16 @@ export function startGmailApiService() {
   // Safety-net periodic poll (rare; mostly to catch a missed push during a Pub/Sub outage)
   const cfg = getConfig();
   setInterval(() => {
-    pollNow().catch((e) => console.error("[gmail-api] periodic poll failed:", e.message));
+    pollNowApi().catch((e) => console.error("[gmail-api] periodic poll failed:", e.message));
   }, Math.max(15, cfg.pollIntervalMinutes) * 60 * 1000);
 
-  console.log(`[gmail-api] Service started. Push topic: ${PUBSUB_TOPIC}`);
+  console.log(`[gmail-api] Service started (parallel-run mode — IMAP still active). Push topic: ${PUBSUB_TOPIC}`);
 }
 
-// Legacy name compatibility for index.ts boot wiring
-export const startGmailPolling = startGmailApiService;
+export function isGmailApiEnabled(): boolean {
+  const flag = (process.env.GMAIL_API_ENABLED || "").toLowerCase();
+  return flag === "true" || flag === "1" || flag === "yes";
+}
 
 // ===== Reingest (UI: "Reingest from inbox") =====
 //
@@ -1315,7 +1320,7 @@ export const startGmailPolling = startGmailApiService;
 // then re-runs pollNow so they re-evaluate against the current Stage 1 / LLM rules.
 // Mirrors gmail.ts reingestEmails() so the existing routes endpoint keeps working.
 
-export async function reingestEmails(opts: {
+export async function reingestEmailsApi(opts: {
   from?: string;
   subject?: string;
   since?: string; // ISO date
