@@ -72,6 +72,31 @@ Low-confidence parses (scanned PDFs, unusual formats) will be flagged — fill i
 
 ---
 
+## 3b. Gmail API Migration (R4q — parallel run)
+
+The IMAP path above is the original ingest method but has had reliability issues ("Connection not available" errors, polls failing silently). PR #R4q introduces a Gmail REST API path with Pub/Sub push notifications that runs **in parallel** with IMAP while we verify reliability. Both paths share the `ingested_emails` dedup table so no duplicate invoices are ever created.
+
+**To enable the parallel run after merging R4q:**
+
+1. **GCP setup** (one-time, already done for the production server):
+   - GCP project `sno-haus-ap`, Gmail API + Cloud Pub/Sub API enabled
+   - OAuth client "Sno-Haus AP Server" with `/api/auth/gmail/callback` added to authorized redirect URIs (local + ngrok)
+   - Pub/Sub topic `gmail-notification` with `gmail-api-push@system.gserviceaccount.com` granted Pub/Sub Publisher
+   - Pub/Sub push subscription `gmail-notification-push` with endpoint `https://<your-ngrok>/api/gmail/push`, ack deadline 60s, no auth
+2. **`.env` change:** set `GMAIL_API_ENABLED=true` (default is `false` so merging the PR alone does nothing).
+3. **Restart server**, then go to **Settings → Integrations → Connect Gmail** and authorize. Watch is auto-registered on connect and renewed every 6 days.
+4. **Verify both paths are running** — server logs should show both `[gmail]` (IMAP) and `[gmail-api]` lines. The first push delivery logs `[gmail-push] received emailAddress=... historyId=...`.
+5. **Compare for a week or two**: any new invoice should appear once. If IMAP wins the race, you'll see `[gmail-api] dedup: skipping` on the API side (and vice versa). LLM cost is **not** doubled because the early `ingested_emails` check runs before the LLM call in both paths.
+6. **R4r cutover** (later PR): once Jake confirms the API path is reliable, R4r deletes the IMAP module and `GMAIL_API_ENABLED` becomes the only path.
+
+**Endpoints added by R4q:**
+- `POST /api/gmail/push` — public Pub/Sub webhook (always live; no-op when flag is off)
+- `GET /api/auth/gmail/{connect,callback,status}` + `POST /api/auth/gmail/disconnect`
+- `GET /api/gmail-api/status` — mirrors `/api/gmail/status` shape but for the API path
+- `POST /api/gmail-api/{poll-now,test-connection,clear-error-log,reingest,start-watch,stop-watch}`
+
+---
+
 ## 4. Daily Use
 
 1. Open a browser to [http://localhost:5000](http://localhost:5000) (or double-click `start.bat`)
