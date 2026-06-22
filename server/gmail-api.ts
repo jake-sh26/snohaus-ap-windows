@@ -53,8 +53,12 @@ import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "
 // ===== Constants =====
 
 // Gmail scopes we request — mirrors what was added in the OAuth consent screen.
+// R4q.1: added userinfo.email so the OAuth callback can capture which Gmail
+// account was authorized (surfaced in status as granted_email/user).
 export const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify", // read + label (we'll label processed messages)
+  "https://www.googleapis.com/auth/userinfo.email",
+  "openid",
 ];
 
 const PURPOSE = "gmail_service";
@@ -1249,15 +1253,30 @@ export async function processHistoryPush(historyId: string): Promise<{ new_invoi
     }
 
     console.log(`[gmail-api] push: processing ${addedIds.size} new message(s)`);
+    let skippedNotFound = 0;
     for (const id of Array.from(addedIds)) {
       try {
         const parsed = await fetchAndParseMessage(gmail, id);
         newInvoices += await processOneGmailMessage(parsed, errors);
       } catch (msgErr: any) {
-        const mMsg = `Push message ${id} error: ${msgErr?.message || String(msgErr)}`;
+        const errCode = msgErr?.code;
+        const errMsg = msgErr?.message || String(msgErr);
+        // R4q: "Requested entity was not found" is common and benign — it
+        // happens when Gmail filters/auto-archive/spam move the message out
+        // of INBOX between the history event and our messages.get() call.
+        // Treat as info, not an error, so the error log only shows real problems.
+        const isNotFound = errCode === 404 || /not found|requested entity was not found/i.test(errMsg);
+        if (isNotFound) {
+          skippedNotFound++;
+          continue;
+        }
+        const mMsg = `Push message ${id} error: ${errMsg}`;
         errors.push(mMsg);
         recordError("message", mMsg);
       }
+    }
+    if (skippedNotFound > 0) {
+      console.log(`[gmail-api] push: skipped ${skippedNotFound} message(s) that were filtered/moved/deleted before fetch (normal)`);
     }
   } catch (err: any) {
     const eMsg = err?.message || String(err);
