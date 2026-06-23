@@ -7901,7 +7901,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             (jurType === "STATE" && (nameU === "NY" || nameU === "NEW YORK"));
           const isMCTD = jurType === "SPECIAL" ||
             nameU.includes("MCTD") || nameU.includes("METROPOLITAN") || nameU.includes("MTA");
-          const isLocalityAnchor = !!dtf && !isNYState && !isMCTD;
+          // R6f: tighten anchor detection. The R6d token matcher resolves Nassau
+          // for BOTH "NASSAU COUNTY TAX" (true anchor) and "NASSAU CO TRANSIT
+          // DISTRICT" (locality component). Without this guard both rows added
+          // their taxable_sales to the Nassau bucket, doubling locality taxable
+          // vs the entity's actual taxable. Anchor requires either jurType=COUNTY,
+          // or NYC city-tax name pattern (NEW YORK CITY CITY TAX). Other rows
+          // that token-resolve to a locality (transit districts, NYC city tax)
+          // route to the otherComponentByCode path for tax-only contribution.
+          const isNycCityTax = nameU === "NEW YORK CITY CITY TAX" ||
+            nameU.includes("NEW YORK CITY");
+          const isCountyAnchor = jurType === "COUNTY";
+          const isLocalityAnchor = !!dtf && !isNYState && !isMCTD &&
+            (isCountyAnchor || isNycCityTax);
 
           if (isLocalityAnchor) {
             const existing = locByCode.get(dtf.code);
@@ -7964,7 +7976,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
         const localityRows: ExportLocalityRow[] = [];
         for (const loc of Array.from(locByCode.values())) {
-          const combinedTaxCents = Math.round((loc.taxable_cents * loc.combined_rate_bps) / 10000);
+          // R6f: rate_basis_points stores 8625 for 8.625%, so the decimal
+          // conversion is /100000 (not /10000). The /10000 form produced
+          // tax_due 10x too high on every locality row.
+          const combinedTaxCents = Math.round((loc.taxable_cents * loc.combined_rate_bps) / 100000);
           let stateShare = 0;
           let mctdShare = 0;
           let stateMktShare = 0;
@@ -7986,7 +8001,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             entity_legal_name: legal,
             locality_name: loc.locality_name,
             dtf_code: loc.dtf_code,
-            combined_rate: loc.combined_rate_bps / 10000,
+            combined_rate: loc.combined_rate_bps / 100000,
             rate_display: loc.rate_display,
             taxable_sales_cents: loc.taxable_cents,
             tax_due_cents: combinedTaxCents,
