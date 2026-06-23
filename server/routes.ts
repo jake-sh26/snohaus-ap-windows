@@ -8092,6 +8092,207 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   );
 
+  // R6d-prep — Read-only debug endpoint. Walks each taxable line in the month,
+  // parses tax_lines_json to find each line's ship-to NY locality (the COUNTY-typed
+  // jurisdiction row, or NY OTHER-typed locality variant), and sums line_tax_total
+  // by (entity, locality). Lets us verify penny-exact attribution BEFORE changing
+  // any export logic. No mutations.
+  app.get(
+    "/api/recon/debug/locality-probe/:month",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req, res) => {
+      const month = String(req.params.month);
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "month must be YYYY-MM" });
+      }
+      try {
+        const attribution = computeAttributionForMonth(month);
+        const posEntitySet: Set<number> = attribution.posEntitySet;
+        const pickEntity = (
+          posEid: number | null, perLineEid: number | null,
+          orderEid: number | null, dominantEid: number | null,
+        ): number => {
+          if (posEid != null && posEntitySet.has(Number(posEid))) return Number(posEid);
+          if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
+          if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
+          if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
+          return 0;
+        };
+
+        const rows = (require("./storage").sqlite as any).prepare(`
+          SELECT
+            o.name AS order_name,
+            v.per_line_entity_id, v.per_line_share, v.order_entity_id, v.dominant_entity_id,
+            li.line_subtotal AS line_subtotal,
+            li.line_tax_total AS line_tax_total,
+            li.tax_lines_json AS tax_lines_json,
+            li.tax_channel_liable AS tax_channel_liable,
+            (SELECT pl.entity_id
+               FROM recon_shopify_sales s
+               JOIN recon_entity_pos_locations pl
+                 ON pl.shopify_location_id = s.pos_location_id
+                AND pl.kind = 'pos' AND pl.active = 1
+              WHERE s.order_id = v.order_id AND s.line_item_id = v.line_item_id
+                AND s.pos_location_id IS NOT NULL
+              LIMIT 1) AS pos_entity_id
+          FROM v_attributed_sales v
+          JOIN recon_line_items li ON li.id = v.line_item_id AND li.order_id = v.order_id
+          JOIN recon_orders o ON o.id = v.order_id
+          WHERE v.happened_month = ?
+            AND COALESCE(li.line_tax_total, 0) <> 0
+          ORDER BY o.name ASC
+        `).all(month) as any[];
+
+        type LocBucket = {
+          locality_name: string;
+          dtf_code: string;
+          rate_display: string;
+          taxable_cents: number;
+          tax_cents: number;
+          lines: number;
+        };
+        type EntBucket = {
+          entity_id: number;
+          entity_legal_name: string;
+          home_county: string;
+          gross_sales_cents: number;        // ALL lines incl marketplace + out-of-state
+          ny_taxable_sales_cents: number;   // non-marketplace NY only
+          tax_due_cents: number;            // ny taxable sum of line_tax_total
+          marketplace_sales_cents: number;
+          out_of_state_sales_cents: number;
+          unattributed_ny_cents: number;    // NY tax line with no county anchor found
+          localities: Map<string, LocBucket>;
+        };
+        const byEntity = new Map<number, EntBucket>();
+
+        let unattributedSamples: any[] = [];
+        let totalLines = 0;
+
+        for (const r of rows) {
+          totalLines++;
+          const eid = pickEntity(r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id);
+          const m = mappingByEntityId(eid);
+          const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
+          const subC = Math.round(Math.abs(Number(r.line_subtotal || 0)) * 100 * share);
+          const taxC = Math.round(Math.abs(Number(r.line_tax_total || 0)) * 100 * share);
+          const isMarketplace = Boolean(r.tax_channel_liable);
+
+          let bucket = byEntity.get(eid);
+          if (!bucket) {
+            bucket = {
+              entity_id: eid,
+              entity_legal_name: legalNameFor(eid) || `Entity ${eid}`,
+              home_county: m?.county ?? "",
+              gross_sales_cents: 0,
+              ny_taxable_sales_cents: 0,
+              tax_due_cents: 0,
+              marketplace_sales_cents: 0,
+              out_of_state_sales_cents: 0,
+              unattributed_ny_cents: 0,
+              localities: new Map(),
+            };
+            byEntity.set(eid, bucket);
+          }
+
+          bucket.gross_sales_cents += subC;
+          if (isMarketplace) bucket.marketplace_sales_cents += subC;
+
+          // Parse tax_lines_json to find this line's ship-to NY locality.
+          let txLines: any[] = [];
+          try { txLines = JSON.parse(r.tax_lines_json || "[]"); } catch { txLines = []; }
+
+          let isNY = false;
+          let locDtf: { code: string; name: string; rate_display: string } | undefined;
+          for (const tl of txLines) {
+            const nm = String(tl.jurisdiction_name || tl.title || "").toUpperCase();
+            const ty = String(tl.jurisdiction_type || "").toUpperCase();
+            if (nm.includes("NEW YORK STATE") || nm.includes("MCTD") || nm.includes("METROPOLITAN")) {
+              isNY = true;
+            }
+            // Find the LOCALITY anchor (county or NYC variant). Prefer COUNTY-type.
+            if (!locDtf) {
+              const dtf = dtfByName(nm);
+              if (dtf) {
+                locDtf = { code: dtf.code, name: dtf.name, rate_display: dtf.rate_display };
+                isNY = true;
+              }
+            }
+          }
+
+          if (isMarketplace) {
+            // Marketplace sales: count in gross (already counted) but NOT in NY taxable / tax_due.
+            continue;
+          }
+          if (!isNY) {
+            // Out-of-state, non-marketplace: gross only, not in NY taxable.
+            bucket.out_of_state_sales_cents += subC;
+            continue;
+          }
+          // NY non-marketplace sale.
+          bucket.ny_taxable_sales_cents += subC;
+          bucket.tax_due_cents += taxC;
+
+          if (!locDtf) {
+            // NY sale with no county anchor — surface for investigation.
+            bucket.unattributed_ny_cents += taxC;
+            if (unattributedSamples.length < 10) {
+              unattributedSamples.push({
+                order: r.order_name, entity: eid, tax_cents: taxC,
+                tax_lines: txLines.map(t => ({ name: t.jurisdiction_name, type: t.jurisdiction_type, price: t.price })),
+              });
+            }
+            continue;
+          }
+
+          let lb = bucket.localities.get(locDtf.code);
+          if (!lb) {
+            lb = {
+              locality_name: locDtf.name,
+              dtf_code: locDtf.code,
+              rate_display: locDtf.rate_display,
+              taxable_cents: 0,
+              tax_cents: 0,
+              lines: 0,
+            };
+            bucket.localities.set(locDtf.code, lb);
+          }
+          lb.taxable_cents += subC;
+          lb.tax_cents += taxC;
+          lb.lines += 1;
+        }
+
+        const out = {
+          month,
+          total_lines_walked: totalLines,
+          unattributed_samples: unattributedSamples,
+          entities: Array.from(byEntity.values()).map(e => ({
+            entity_id: e.entity_id,
+            entity_legal_name: e.entity_legal_name,
+            home_county: e.home_county,
+            gross_sales: (e.gross_sales_cents / 100).toFixed(2),
+            ny_taxable_sales: (e.ny_taxable_sales_cents / 100).toFixed(2),
+            tax_due: (e.tax_due_cents / 100).toFixed(2),
+            marketplace_sales: (e.marketplace_sales_cents / 100).toFixed(2),
+            out_of_state_sales: (e.out_of_state_sales_cents / 100).toFixed(2),
+            unattributed_ny: (e.unattributed_ny_cents / 100).toFixed(2),
+            localities: Array.from(e.localities.values()).map(l => ({
+              locality: l.locality_name,
+              dtf_code: l.dtf_code,
+              rate: l.rate_display,
+              taxable: (l.taxable_cents / 100).toFixed(2),
+              tax_collected: (l.tax_cents / 100).toFixed(2),
+              lines: l.lines,
+            })),
+          })),
+        };
+        res.json(out);
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "locality-probe failed" });
+      }
+    },
+  );
+
   // 3. POST /api/recon/finance/sales-tax/filings/:periodKey — upsert filing state.
   app.post(
     "/api/recon/finance/sales-tax/filings/:periodKey",
