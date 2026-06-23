@@ -2173,15 +2173,28 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
                 </thead>
                 <tbody>
                   {financeDiffQ.data.lines.map((line) => {
-                    // R5c: Shopify column is now driven live by /drift/:month
+                    // R5c: Shopify column is driven live by /drift/:month
                     // (same source as the drift banner). Map UI field key to
                     // the drift endpoint's line key (mostly identical except
                     // shipping -> shipping_charges).
                     const driftKey = line.field === "shipping" ? "shipping_charges" : line.field;
                     const driftLine = (driftQ.data?.lines as any)?.[driftKey];
+                    // R5d: Shopify's Finance Summary shows discounts + returns
+                    // as NEGATIVE numbers (money flowing out). Our legacy /diff
+                    // endpoint reports them as positive magnitudes. The drift
+                    // sentinel's backend math handles both correctly (banner is
+                    // green) but the side-by-side display mixed conventions.
+                    // Fix: display both columns with Shopify's signed
+                    // convention so the table mirrors what Jake sees in
+                    // Shopify Admin and the diff visually nets to $0.
+                    const SIGNED_NEGATIVE = line.field === "discounts" || line.field === "returns";
+                    const oursDisplay: number = SIGNED_NEGATIVE
+                      ? -Math.abs(Number(line.ours))
+                      : Number(line.ours);
                     const shopifyVal: number | null = driftLine?.shopifyql ?? null;
+                    // Diff is always (ours - shopify) in matched signs.
                     const diffVal: number | null =
-                      shopifyVal == null ? null : Number((Number(line.ours) - shopifyVal).toFixed(2));
+                      shopifyVal == null ? null : Number((oursDisplay - shopifyVal).toFixed(2));
                     const ok: boolean | null =
                       diffVal == null ? null : Math.abs(diffVal) <= 0.01;
                     return (
@@ -2193,7 +2206,7 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
                         data-testid={`row-finance-${line.field}`}
                       >
                         <td className="px-3 py-1.5 font-medium">{prettyFinanceField(line.field)}</td>
-                        <td className="px-3 py-1.5 text-right tabular-nums">{money(line.ours)}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{money(oursDisplay)}</td>
                         <td className="px-3 py-1.5 text-right tabular-nums">
                           {shopifyVal == null ? (
                             <span
