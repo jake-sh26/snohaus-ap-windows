@@ -7759,161 +7759,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return out;
   };
 
-  // R6e: per-line ship-to-county walker. Same algorithm as the locality-probe
-  // debug endpoint (verified penny-exact against tax_due on 2026-02). Returns
-  // one bucket per (entity, locality) plus per-entity OOS + marketplace totals.
-  //
-  // Inputs are the months in the export period (1 month for ST-809, 3 for
-  // ST-810 quarter). Buckets accumulate across months so a quarter export is
-  // just one walk over the union.
-  //
-  // Locality keying mirrors the probe: parse tax_lines_json on each line, find
-  // the first COUNTY/NYC anchor that dtfByName resolves (R6d matcher handles
-  // Shopify's title-only tax_line names), bucket the line's full taxable +
-  // line_tax_total under that locality. Marketplace lines and OOS lines are
-  // counted in gross/marketplace/oos but NOT in any locality bucket.
-  type LocalityBucket = {
-    locality_name: string;
-    dtf_code: string;
-    combined_rate_bps: number;
-    rate_display: string;
-    taxable_cents: number;
-    tax_cents: number;
-    lines: number;
-  };
-  type EntityLocalityRollup = {
-    entity_id: number;
-    gross_sales_cents: number;
-    ny_taxable_sales_cents: number;
-    tax_due_cents: number;
-    marketplace_sales_cents: number;
-    out_of_state_sales_cents: number;
-    unattributed_ny_cents: number;
-    localities: Map<string, LocalityBucket>;
-  };
-  const walkLocalitiesForMonths = (months: string[]): Map<number, EntityLocalityRollup> => {
-    const { sqlite } = require("./storage");
-    const byEntity = new Map<number, EntityLocalityRollup>();
-    if (months.length === 0) return byEntity;
-
-    for (const month of months) {
-      const attribution = computeAttributionForMonth(month);
-      const posEntitySet: Set<number> = attribution.posEntitySet;
-      const pickEntity = (
-        posEid: number | null, perLineEid: number | null,
-        orderEid: number | null, dominantEid: number | null,
-      ): number => {
-        if (posEid != null && posEntitySet.has(Number(posEid))) return Number(posEid);
-        if (perLineEid != null && posEntitySet.has(Number(perLineEid))) return Number(perLineEid);
-        if (orderEid != null && posEntitySet.has(Number(orderEid))) return Number(orderEid);
-        if (dominantEid != null && posEntitySet.has(Number(dominantEid))) return Number(dominantEid);
-        return 0;
-      };
-
-      // R6e NOTE: probe filters line_tax_total <> 0 to keep its sample minimal,
-      // but for the export we need ALL lines so gross + OOS are complete. Drop
-      // the filter here.
-      const rows = sqlite.prepare(`
-        SELECT
-          v.per_line_entity_id, v.per_line_share, v.order_entity_id, v.dominant_entity_id,
-          li.line_subtotal AS line_subtotal,
-          li.line_tax_total AS line_tax_total,
-          li.tax_lines_json AS tax_lines_json,
-          li.tax_channel_liable AS tax_channel_liable,
-          (SELECT pl.entity_id
-             FROM recon_shopify_sales s
-             JOIN recon_entity_pos_locations pl
-               ON pl.shopify_location_id = s.pos_location_id
-              AND pl.kind = 'pos' AND pl.active = 1
-            WHERE s.order_id = v.order_id AND s.line_item_id = v.line_item_id
-              AND s.pos_location_id IS NOT NULL
-            LIMIT 1) AS pos_entity_id
-        FROM v_attributed_sales v
-        JOIN recon_line_items li ON li.id = v.line_item_id AND li.order_id = v.order_id
-        WHERE v.happened_month = ?
-      `).all(month) as any[];
-
-      for (const r of rows) {
-        const eid = pickEntity(r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id);
-        const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
-        const subC = Math.round(Math.abs(Number(r.line_subtotal || 0)) * 100 * share);
-        const taxC = Math.round(Math.abs(Number(r.line_tax_total || 0)) * 100 * share);
-        const isMarketplace = Boolean(r.tax_channel_liable);
-
-        let bucket = byEntity.get(eid);
-        if (!bucket) {
-          bucket = {
-            entity_id: eid,
-            gross_sales_cents: 0,
-            ny_taxable_sales_cents: 0,
-            tax_due_cents: 0,
-            marketplace_sales_cents: 0,
-            out_of_state_sales_cents: 0,
-            unattributed_ny_cents: 0,
-            localities: new Map(),
-          };
-          byEntity.set(eid, bucket);
-        }
-
-        bucket.gross_sales_cents += subC;
-        if (isMarketplace) bucket.marketplace_sales_cents += subC;
-
-        let txLines: any[] = [];
-        try { txLines = JSON.parse(r.tax_lines_json || "[]"); } catch { txLines = []; }
-
-        let isNY = false;
-        let locDtf: { code: string; name: string; rate_display: string; rate_basis_points: number } | undefined;
-        for (const tl of txLines) {
-          const nm = String(tl.jurisdiction_name || tl.title || "").toUpperCase();
-          if (nm.includes("NEW YORK STATE") || nm.includes("MCTD") || nm.includes("METROPOLITAN")) {
-            isNY = true;
-          }
-          if (!locDtf) {
-            const dtf = dtfByName(nm);
-            if (dtf) {
-              locDtf = {
-                code: dtf.code, name: dtf.name,
-                rate_display: dtf.rate_display,
-                rate_basis_points: dtf.rate_basis_points,
-              };
-              isNY = true;
-            }
-          }
-        }
-
-        if (isMarketplace) continue;
-        if (!isNY) {
-          bucket.out_of_state_sales_cents += subC;
-          continue;
-        }
-        bucket.ny_taxable_sales_cents += subC;
-        bucket.tax_due_cents += taxC;
-        if (!locDtf) {
-          bucket.unattributed_ny_cents += taxC;
-          continue;
-        }
-
-        let lb = bucket.localities.get(locDtf.code);
-        if (!lb) {
-          lb = {
-            locality_name: locDtf.name,
-            dtf_code: locDtf.code,
-            combined_rate_bps: locDtf.rate_basis_points,
-            rate_display: locDtf.rate_display,
-            taxable_cents: 0,
-            tax_cents: 0,
-            lines: 0,
-          };
-          bucket.localities.set(locDtf.code, lb);
-        }
-        lb.taxable_cents += subC;
-        lb.tax_cents += taxC;
-        lb.lines += 1;
-      }
-    }
-    return byEntity;
-  };
-
   // Assemble the full ExportPayload for either a month or a quarter period key.
   const buildExportPayload = (periodKey: string): ExportPayload => {
     const isQuarter = /^\d{4}-Q[1-4]$/.test(periodKey);
@@ -7944,12 +7789,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const viewTotal = monthPayloads.reduce((a, mm) => a + mm.invariant.view_total_cents, 0);
     const delta = perEntitySum - viewTotal;
 
-    // R6e: per-line ship-to-county walker runs once per export. Used below to
-    // derive (a) per-entity out_of_state_sales_cents and (b) the NY locality
-    // rollup (replaces the aggregateByJurisdiction-derived localities so the
-    // PDF/XLSX match the locality-probe debug output to the penny).
-    const walked = walkLocalitiesForMonths(months);
-
     // Per-entity filing rows: sum each entity's store rows across the period.
     const tinByEntity = getEntitySettings();
     const entities = ENTITY_FILING_INFO.map((info) => {
@@ -7963,7 +7802,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         taxDue += s.net_tax_cents;
         mktTax += s.marketplace_tax_cents;
       }
-      const walkedEntity = walked.get(info.entity_id);
       return {
         entity_id: info.entity_id,
         legal_name: info.legal_name,
@@ -7975,7 +7813,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         taxable_sales_cents: taxable,
         tax_due_cents: taxDue,
         marketplace_tax_cents: mktTax,
-        out_of_state_sales_cents: walkedEntity?.out_of_state_sales_cents ?? 0,
       };
     });
 
@@ -8122,33 +7959,44 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           }
         }
 
-        // R6e: replace the audit-trail locality build (above) with the per-line
-        // ship-to-county walker output. The audit jurisdictions[] and
-        // marketplaceProviders[] arrays already populated above are unaffected;
-        // we only swap what gets pushed into localities[] for the filing summary.
-        // Walker is verified penny-exact against tax_due on 2026-02 (see probe).
-        const walkedForEntity = walked.get(ent.entity_id);
+        const totalLocalityTaxable = Array.from(locByCode.values())
+          .reduce((acc, l) => acc + l.taxable_cents, 0);
+
         const localityRows: ExportLocalityRow[] = [];
-        if (walkedForEntity) {
-          for (const bucket of Array.from(walkedForEntity.localities.values())) {
-            localityRows.push({
-              entity_id: ent.entity_id,
-              entity_legal_name: legal,
-              locality_name: bucket.locality_name,
-              dtf_code: bucket.dtf_code,
-              combined_rate: bucket.combined_rate_bps / 10000,
-              rate_display: bucket.rate_display,
-              taxable_sales_cents: bucket.taxable_cents,
-              tax_due_cents: bucket.tax_cents,
-              // Walker tax is the authoritative per-line sum; components tie by definition.
-              tax_components_cents: bucket.tax_cents,
-              audit_delta_cents: 0,
-              // Marketplace is non-locality (entity-level only); leave 0 on locality rows.
-              marketplace_taxable_cents: 0,
-              marketplace_tax_cents: 0,
-            });
+        for (const loc of Array.from(locByCode.values())) {
+          const combinedTaxCents = Math.round((loc.taxable_cents * loc.combined_rate_bps) / 10000);
+          let stateShare = 0;
+          let mctdShare = 0;
+          let stateMktShare = 0;
+          let mctdMktShare = 0;
+          if (totalLocalityTaxable > 0) {
+            stateShare = Math.round((stateTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+            mctdShare = Math.round((mctdTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+            stateMktShare = Math.round((stateMktTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+            mctdMktShare = Math.round((mctdMktTaxCents * loc.taxable_cents) / totalLocalityTaxable);
           }
+          // R6c: add NY OTHER-typed component contributions (e.g. Nassau CO Transit)
+          // attributed to THIS locality.
+          const otherForLoc = otherComponentByCode.get(loc.dtf_code);
+          const otherTaxCents = otherForLoc?.tax ?? 0;
+          const otherMktTaxCents = otherForLoc?.mktTax ?? 0;
+          const componentSum = loc.county_tax_cents + stateShare + mctdShare + otherTaxCents;
+          localityRows.push({
+            entity_id: ent.entity_id,
+            entity_legal_name: legal,
+            locality_name: loc.locality_name,
+            dtf_code: loc.dtf_code,
+            combined_rate: loc.combined_rate_bps / 10000,
+            rate_display: loc.rate_display,
+            taxable_sales_cents: loc.taxable_cents,
+            tax_due_cents: combinedTaxCents,
+            tax_components_cents: componentSum,
+            audit_delta_cents: combinedTaxCents - componentSum,
+            marketplace_taxable_cents: loc.mkt_taxable_cents,
+            marketplace_tax_cents: loc.mkt_tax_cents + stateMktShare + mctdMktShare + otherMktTaxCents,
+          });
         }
+        localityRows.sort((a, b) => b.tax_due_cents - a.tax_due_cents);
         localities.push(...localityRows);
       }
     }
