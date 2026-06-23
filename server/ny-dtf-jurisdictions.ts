@@ -162,6 +162,36 @@ export function dtfByName(name: string): NyDtfJurisdiction | undefined {
   return nameIndex().get(normalizeName(name));
 }
 
+/**
+ * R6c — Recognize NY-locality component rows that arrive with `jurisdiction_type=OTHER`
+ * and a name that embeds a county/borough (e.g. "NASSAU CO TRANSIT DISTRICT" is the
+ * Nassau MTA piece; "NEW YORK CITY CITY TAX" is the NYC local portion). These ARE NY
+ * locality components — not out-of-state marketplace lines — and must roll up into the
+ * matching locality's tax_components_cents for audit-delta to be meaningful.
+ *
+ * Returns the DTF jurisdiction this component belongs to, or undefined if the OTHER row
+ * doesn't look like an NY locality component (genuinely out-of-state / marketplace).
+ */
+export function dtfForNyOtherComponent(name: string): NyDtfJurisdiction | undefined {
+  const n = normalizeName(name);
+  // Each NY DTF name (county or NYC alias) — if the OTHER row's normalized name
+  // CONTAINS that locality token, attribute the OTHER row to that locality.
+  // Use the longest match wins to avoid "NEW YORK" matching before "NEW YORK CITY".
+  const idx = nameIndex();
+  let best: NyDtfJurisdiction | undefined;
+  let bestLen = 0;
+  for (const [key, j] of Array.from(idx.entries())) {
+    if (key.length <= bestLen) continue;
+    // Token-boundary contains: surround both with spaces so "ERIE" doesn't match
+    // "WERIES". normalizeName already collapses whitespace.
+    if ((" " + n + " ").includes(" " + key + " ")) {
+      best = j;
+      bestLen = key.length;
+    }
+  }
+  return best;
+}
+
 /** All seeded jurisdictions (deduped by code, NYC aliases collapsed). */
 export function allDtf(): NyDtfJurisdiction[] {
   const seen = new Set<string>();

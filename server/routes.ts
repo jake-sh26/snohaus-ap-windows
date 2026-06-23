@@ -184,7 +184,7 @@ import {
   filingInfoFor,
   ENTITY_FILING_INFO,
 } from "./entity-settings";
-import { dtfByName, NyDtfJurisdiction } from "./ny-dtf-jurisdictions";
+import { dtfByName, dtfForNyOtherComponent, NyDtfJurisdiction } from "./ny-dtf-jurisdictions";
 import { formatRateAsFraction } from "@shared/format-rate";
 import { replaceForPeriod as replaceFilingTotals, listAll as listFilingTotals } from "./sales-tax-filing-totals";
 import {
@@ -7864,6 +7864,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           county_tax_cents: number;
         };
         const locByCode = new Map<string, LocAccum>();
+        // R6c: NY OTHER-typed rows (e.g. "Nassau CO Transit District", "NEW YORK CITY CITY TAX")
+        // are locality COMPONENTS, not out-of-state marketplace lines. Bucket their tax_due
+        // by parent locality DTF code so we can fold into tax_components_cents during rollup.
+        const otherComponentByCode = new Map<string, { tax: number; mktTax: number }>();
         let stateTaxCents = 0;
         let mctdTaxCents = 0;
         let stateMktTaxCents = 0;
@@ -7925,18 +7929,32 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             mctdTaxCents += taxDueCents;
             mctdMktTaxCents += mktTaxCents;
           } else {
-            // Non-NY jurisdiction (out-of-state marketplace) -> providers.
-            if (mktTaxableCents !== 0 || mktTaxCents !== 0) {
-              marketplaceProviders.push({
-                entity_id: ent.entity_id,
-                entity_legal_name: legal,
-                jurisdiction_name: j.jurisdiction_name,
-                jurisdiction_type: jurType || "OTHER",
-                rate: rateNum,
-                rate_display: dtf?.rate_display ?? formatRateAsFraction(rateNum),
-                marketplace_taxable_cents: mktTaxableCents,
-                marketplace_tax_cents: mktTaxCents,
-              });
+            // R6c: try to attribute OTHER-typed NY component rows to their parent
+            // locality (Nassau CO Transit -> Nassau; NYC City Tax -> NYC). Falls back
+            // to marketplaceProviders only if nothing matches (truly non-NY).
+            const nyParent = jurType === "OTHER" ? dtfForNyOtherComponent(j.jurisdiction_name) : undefined;
+            if (nyParent) {
+              const existing = otherComponentByCode.get(nyParent.code);
+              if (existing) {
+                existing.tax += taxDueCents;
+                existing.mktTax += mktTaxCents;
+              } else {
+                otherComponentByCode.set(nyParent.code, { tax: taxDueCents, mktTax: mktTaxCents });
+              }
+            } else {
+              // Non-NY jurisdiction (out-of-state marketplace) -> providers.
+              if (mktTaxableCents !== 0 || mktTaxCents !== 0) {
+                marketplaceProviders.push({
+                  entity_id: ent.entity_id,
+                  entity_legal_name: legal,
+                  jurisdiction_name: j.jurisdiction_name,
+                  jurisdiction_type: jurType || "OTHER",
+                  rate: rateNum,
+                  rate_display: dtf?.rate_display ?? formatRateAsFraction(rateNum),
+                  marketplace_taxable_cents: mktTaxableCents,
+                  marketplace_tax_cents: mktTaxCents,
+                });
+              }
             }
           }
         }
@@ -7957,7 +7975,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             stateMktShare = Math.round((stateMktTaxCents * loc.taxable_cents) / totalLocalityTaxable);
             mctdMktShare = Math.round((mctdMktTaxCents * loc.taxable_cents) / totalLocalityTaxable);
           }
-          const componentSum = loc.county_tax_cents + stateShare + mctdShare;
+          // R6c: add NY OTHER-typed component contributions (e.g. Nassau CO Transit)
+          // attributed to THIS locality.
+          const otherForLoc = otherComponentByCode.get(loc.dtf_code);
+          const otherTaxCents = otherForLoc?.tax ?? 0;
+          const otherMktTaxCents = otherForLoc?.mktTax ?? 0;
+          const componentSum = loc.county_tax_cents + stateShare + mctdShare + otherTaxCents;
           localityRows.push({
             entity_id: ent.entity_id,
             entity_legal_name: legal,
@@ -7970,7 +7993,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             tax_components_cents: componentSum,
             audit_delta_cents: combinedTaxCents - componentSum,
             marketplace_taxable_cents: loc.mkt_taxable_cents,
-            marketplace_tax_cents: loc.mkt_tax_cents + stateMktShare + mctdMktShare,
+            marketplace_tax_cents: loc.mkt_tax_cents + stateMktShare + mctdMktShare + otherMktTaxCents,
           });
         }
         localityRows.sort((a, b) => b.tax_due_cents - a.tax_due_cents);
