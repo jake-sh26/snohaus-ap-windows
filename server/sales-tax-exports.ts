@@ -95,6 +95,10 @@ export interface ExportEntityRow {
   tax_due_cents: number;
   /** R6b: marketplace tax Shopify already remitted (not your liability). */
   marketplace_tax_cents: number;
+  /** R6e: non-NY, non-marketplace sales (no nexus, no tax collected). Info-only;
+   *  already included in gross_sales_cents but surfaced separately so the
+   *  filing operator can see how much of gross is OOS revenue. */
+  out_of_state_sales_cents: number;
 }
 
 /**
@@ -275,7 +279,8 @@ export function buildSalesTaxCsv(payload: ExportPayload): string {
   // marketplace-facilitated lines. Excluded from tax_due (merchant liability).
   lines.push(csvRow([
     "section", "entity_id", "legal_name", "tin", "county", "dtf_code",
-    "gross_sales", "marketplace_sales", "marketplace_tax", "taxable_sales", "tax_due",
+    "gross_sales", "marketplace_sales", "marketplace_tax",
+    "out_of_state_sales", "taxable_sales", "tax_due",
   ]));
   for (const e of payload.entities) {
     lines.push(csvRow([
@@ -288,6 +293,7 @@ export function buildSalesTaxCsv(payload: ExportPayload): string {
       centsToFixed(e.gross_sales_cents),
       centsToFixed(e.marketplace_sales_cents),
       centsToFixed(e.marketplace_tax_cents),
+      centsToFixed(e.out_of_state_sales_cents),
       centsToFixed(e.taxable_sales_cents),
       centsToFixed(e.tax_due_cents),
     ]));
@@ -406,11 +412,14 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
     { header: "Gross Sales", key: "gross_sales", width: 14 },
     { header: "Marketplace Sales", key: "marketplace_sales", width: 16 },
     { header: "Marketplace Tax", key: "marketplace_tax", width: 14 },
+    { header: "Out-of-State Sales", key: "oos_sales", width: 16 },
     { header: "Taxable Sales", key: "taxable_sales", width: 14 },
     { header: "Tax Due", key: "tax_due", width: 14 },
   ];
-  const entityMoneyCols = ["gross_sales", "marketplace_sales", "marketplace_tax", "taxable_sales", "tax_due"];
+  const entityMoneyCols = ["gross_sales", "marketplace_sales", "marketplace_tax", "oos_sales", "taxable_sales", "tax_due"];
+  let totalOosCents = 0;
   for (const e of payload.entities) {
+    totalOosCents += e.out_of_state_sales_cents;
     summary.addRow({
       entity_id: e.entity_id,
       legal_name: e.legal_name,
@@ -420,6 +429,7 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
       gross_sales: e.gross_sales_cents / 100,
       marketplace_sales: e.marketplace_sales_cents / 100,
       marketplace_tax: e.marketplace_tax_cents / 100,
+      oos_sales: e.out_of_state_sales_cents / 100,
       taxable_sales: e.taxable_sales_cents / 100,
       tax_due: e.tax_due_cents / 100,
     });
@@ -430,6 +440,7 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
     gross_sales: et.gross_sales_cents / 100,
     marketplace_sales: et.marketplace_sales_cents / 100,
     marketplace_tax: et.marketplace_tax_cents / 100,
+    oos_sales: totalOosCents / 100,
     taxable_sales: et.taxable_sales_cents / 100,
     tax_due: et.net_tax_cents / 100,
   });
@@ -696,6 +707,7 @@ function drawEntityPage(
     ["Gross sales", centsToDisplay(e.gross_sales_cents)],
     ["Marketplace sales (Shopify-remitted)", centsToDisplay(e.marketplace_sales_cents)],
     ["Marketplace tax (Shopify already remitted)", centsToDisplay(e.marketplace_tax_cents)],
+    ["Out-of-state sales (no nexus, info-only)", centsToDisplay(e.out_of_state_sales_cents)],
     ["Taxable sales", centsToDisplay(e.taxable_sales_cents)],
     ["Tax due (you owe)", centsToDisplay(e.tax_due_cents)],
   ];
