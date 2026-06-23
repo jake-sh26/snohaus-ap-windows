@@ -3815,6 +3815,182 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ---- R5b: drift sentinel ------------------------------------------------
+  //
+  // GET /api/recon/finance/drift/:month
+  //
+  // Thin user-facing wrapper over the debug v2-vs-shopifyql compute. The
+  // Finance UI hits this in the background and renders a red banner when
+  // any reconcilable line has a non-zero diff, so the operator sees drift
+  // the moment it appears (instead of discovering it next time they paste
+  // a console snippet).
+  //
+  // Tolerance: $0.01. net_sales_gift_cards is excluded from grading because
+  // ShopifyQL's `sales` dataset has no gift-card column.
+  app.get(
+    "/api/recon/finance/drift/:month",
+    authMiddleware,
+    requireFinanceView(),
+    async (req, res) => {
+      const month = String(req.params.month);
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "Month must be YYYY-MM" });
+      }
+      try {
+        const { sqlite } = require("./storage");
+        const { pullFinanceSummary } = require("./shopify-shopifyql");
+
+        // Same window math as /v2-vs-shopifyql -- UNTIL is inclusive.
+        const [yy, mm] = month.split("-").map(Number);
+        const startDate = `${month}-01`;
+        const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+        const endDate = `${month}-${String(lastDay).padStart(2, "0")}`;
+
+        const ql: any = await pullFinanceSummary(startDate, endDate, "processed_at");
+
+        // Same SQL as /v2-vs-shopifyql (PR #110/113/114/117/118/121). Kept
+        // inline so formula changes there continue to apply here verbatim.
+        const v2Row: any = sqlite.prepare(`
+          SELECT
+            COALESCE(SUM(CASE WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
+                          THEN s.total_amount + s.total_discount_before_taxes - s.total_tax ELSE 0 END), 0) AS gross_sales,
+            COALESCE(SUM(CASE WHEN s.action_type IN ('ORDER','UPDATE') AND s.line_type = 'PRODUCT'
+                          THEN -s.total_discount_before_taxes ELSE 0 END), 0) AS discounts,
+            COALESCE(SUM(CASE WHEN s.action_type = 'RETURN' AND s.line_type IN ('PRODUCT','ADJUSTMENT')
+                          THEN (s.total_amount - s.total_tax) ELSE 0 END), 0) AS returns,
+            COALESCE(SUM(CASE WHEN s.action_type = 'ORDER' AND s.line_type = 'FEE'
+                          THEN s.total_amount - s.total_tax ELSE 0 END), 0) AS return_fees,
+            COALESCE(SUM(CASE WHEN s.line_type = 'GIFT_CARD'
+                          THEN s.total_amount - s.total_tax ELSE 0 END), 0) AS net_sales_gift_cards,
+            COALESCE(SUM(CASE WHEN s.line_type = 'SHIPPING'
+                          THEN s.total_amount - s.total_tax ELSE 0 END), 0) AS shipping_charges,
+            COALESCE(SUM(CASE WHEN s.line_type != 'GIFT_CARD' THEN s.total_tax ELSE 0 END), 0) AS taxes,
+            (
+              SELECT COUNT(*)
+                FROM recon_orders o
+               WHERE substr(datetime(COALESCE(o.processed_at, o.created_at), '-5 hours'), 1, 7) = ?
+                 AND EXISTS (
+                   SELECT 1 FROM recon_shopify_sales ss
+                    WHERE ss.order_id = o.id
+                      AND ss.happened_month = ?
+                      AND ((ss.action_type = 'ORDER' AND ss.line_type = 'PRODUCT')
+                        OR (ss.action_type = 'RETURN' AND ss.line_type IN ('PRODUCT','ADJUSTMENT')))
+                 )
+            ) AS orders
+          FROM recon_shopify_sales s
+          JOIN recon_shopify_agreements a ON a.id = s.agreement_id
+          WHERE s.happened_month = ?
+        `).get(month, month, month) as any;
+
+        const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
+        const v2 = {
+          gross_sales: r2(v2Row.gross_sales),
+          discounts: r2(v2Row.discounts),
+          returns: r2(v2Row.returns),
+          return_fees: r2(v2Row.return_fees),
+          net_sales_gift_cards: r2(v2Row.net_sales_gift_cards),
+          shipping_charges: r2(v2Row.shipping_charges),
+          taxes: r2(v2Row.taxes),
+          orders: Number(v2Row.orders) || 0,
+        };
+        const net_sales = r2(v2.gross_sales + v2.discounts + v2.returns);
+        const total_sales = r2(net_sales + v2.shipping_charges + v2.return_fees + v2.taxes);
+
+        const cmp = (qlVal: any, v2Val: number) => {
+          const a = r2(qlVal);
+          const b = r2(v2Val);
+          return { shopifyql: a, v2: b, diff: r2(a - b) };
+        };
+
+        const lines: Record<string, { shopifyql: number | null; v2: number; diff: number | null }> = {
+          gross_sales: cmp(ql.gross_sales, v2.gross_sales),
+          discounts: cmp(ql.discounts, v2.discounts),
+          returns: cmp(ql.returns, v2.returns),
+          net_sales: cmp(ql.net_sales, net_sales),
+          shipping_charges: cmp(ql.shipping, v2.shipping_charges),
+          taxes: cmp(ql.taxes, v2.taxes),
+          total_sales: cmp(ql.total_sales, total_sales),
+          orders: {
+            shopifyql: Number(r2(ql.orders)),
+            v2: v2.orders,
+            diff: r2(Number(ql.orders) - v2.orders),
+          },
+          return_fees: cmp(ql.return_fees, v2.return_fees),
+          net_sales_gift_cards: { shopifyql: null, v2: v2.net_sales_gift_cards, diff: null },
+        };
+
+        // Lines we actually grade against. net_sales_gift_cards is excluded
+        // (no ShopifyQL parallel column).
+        const TOLERANCE = 0.01;
+        const GRADED_LINES = [
+          "gross_sales", "discounts", "returns", "net_sales",
+          "shipping_charges", "taxes", "total_sales", "orders", "return_fees",
+        ];
+        const drifted_lines = GRADED_LINES
+          .filter((k) => {
+            const d = lines[k]?.diff;
+            return d != null && Math.abs(Number(d)) > TOLERANCE;
+          })
+          .map((k) => ({ line: k, ...lines[k] }));
+
+        res.json({
+          month,
+          all_ok: drifted_lines.length === 0,
+          orders_match: r2(Number(ql.orders) - v2.orders) === 0,
+          drifted_lines,
+          lines,
+          v2_raw: { ...v2, net_sales, total_sales },
+          shopifyql_window: { start: startDate, end: endDate },
+          as_of: new Date().toISOString(),
+          note:
+            "R5b drift sentinel. Same compute as /api/recon/finance/debug/v2-vs-shopifyql/:month, " +
+            "reduced to an all_ok boolean + drifted_lines for the Finance UI banner. " +
+            "Tolerance $0.01. net_sales_gift_cards is excluded (no ShopifyQL parallel column).",
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: "drift sentinel failed", error: String(e?.message || e) });
+      }
+    },
+  );
+
+  // ---- R5b: on-demand month refresh --------------------------------------
+  //
+  // POST /api/recon/finance/agreements/refresh-month
+  //   Body: { month: "YYYY-MM" }
+  //
+  // Thin wrapper over /api/recon/finance/debug/agreements-ledger/backfill
+  // with scope=month. Powers the "Refresh" button on the Monthly Summary /
+  // Per Store Sales tabs. Idempotent (re-runs bump ingest_version, no
+  // duplicate rows). Returns a job_id the client can poll via the existing
+  // /agreements-ledger/backfill/:job_id endpoint.
+  app.post(
+    "/api/recon/finance/agreements/refresh-month",
+    authMiddleware,
+    requireFinanceView(),
+    (req: any, res) => {
+      const month = String(req.body?.month ?? "").trim();
+      if (!/^\d{4}-\d{2}$/.test(month)) {
+        return res.status(400).json({ message: "body.month required as 'YYYY-MM'" });
+      }
+      const cfg = getShopifyReconConfig();
+      if (!cfg) return res.status(400).json({ message: "Shopify reconciler not configured" });
+      try {
+        const { startAgreementsBackfill } = require("./shopify-recon-agreements");
+        const progress = startAgreementsBackfill(cfg, { kind: "month", month });
+        res.json({
+          ok: true,
+          job_id: progress.job_id,
+          total_orders: progress.total_orders,
+          status: progress.status,
+          poll_url: `/api/recon/finance/debug/agreements-ledger/backfill/${progress.job_id}`,
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: "refresh-month failed", error: String(e?.message || e) });
+      }
+    },
+  );
+
+
   // PR #124 — POS-only by-store finance summary.
   //
   // Goal: prove POS attribution is correct by reconciling our V2 totals,

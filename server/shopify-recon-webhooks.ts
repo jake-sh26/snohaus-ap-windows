@@ -23,6 +23,7 @@ import crypto from "node:crypto";
 import type { Request, Response } from "express";
 import { getShopifyReconConfig, shopifyRestCall } from "./shopify-recon";
 import { upsertOrderFromShopify } from "./shopify-recon-orders";
+import { ingestAgreementsForOrder } from "./shopify-recon-agreements";
 import { startReconSync, finishReconSync } from "./storage";
 import { recordIntegrationError, recordIntegrationWarn } from "./error-log";
 
@@ -31,10 +32,17 @@ function whWarn(scope: string, msg: string) { recordIntegrationWarn("shopify-rec
 
 // Topics we care about (kept as an exported const so the registration code
 // and the handler stay in lockstep).
+// R5b added orders/edited + refunds/create so the agreements ledger
+// (recon_shopify_sales) stays current inside a live month without waiting
+// for the hourly safety-net cron. The cron uses scope=missing which skips
+// orders that already have any rows, so edits/refunds on previously
+// ingested orders fall through the gap.
 export const SHOPIFY_RECON_WEBHOOK_TOPICS = [
   "orders/create",
   "orders/updated",
   "orders/cancelled",
+  "orders/edited",
+  "refunds/create",
 ] as const;
 export type ShopifyReconWebhookTopic = typeof SHOPIFY_RECON_WEBHOOK_TOPICS[number];
 
@@ -109,19 +117,71 @@ export async function handleShopifyWebhook(req: Request, res: Response): Promise
   // Log every webhook to the sync log for testing visibility.
   const logId = startReconSync(`webhook:${topic}`, `shopify:${webhookId || "unknown"}`, null);
 
+  // R5b: fire-and-forget agreements re-ingest for a given order id. Best
+  // effort — never throws to the webhook handler. Shopify gives us 5s to
+  // ACK and we already finished the synchronous DB upsert; this kicks the
+  // GraphQL agreements pull on the next tick so the response goes back
+  // promptly. Errors land in the integration error log instead of 500'ing
+  // the webhook (Shopify retries on 5xx, which would loop endlessly on a
+  // transient GraphQL failure).
+  const reingestAgreements = (orderId: string, scope: string) => {
+    setImmediate(async () => {
+      try {
+        await ingestAgreementsForOrder(cfg, orderId);
+      } catch (e: any) {
+        whWarn(
+          "webhook-agreements-reingest",
+          `${scope} order=${orderId} failed: ${e?.message ?? e}`,
+        );
+      }
+    });
+  };
+
   try {
     if (
       topic === "orders/create" ||
       topic === "orders/updated" ||
-      topic === "orders/cancelled"
+      topic === "orders/cancelled" ||
+      topic === "orders/edited"
     ) {
       const { orderId, outcome, lineCount } = upsertOrderFromShopify(body);
+      // R5b — re-ingest the agreements ledger for this order. Same
+      // idempotent function the hourly safety-net cron uses. Fixes the
+      // live-month gross/discounts/returns drift that the missing-only
+      // cron can't catch (it skips orders that already have any rows).
+      reingestAgreements(String(orderId), topic);
       finishReconSync(logId, {
         status: "success",
         rows_ingested: 1,
         cursor: `${topic}:${orderId}:${outcome}:lines=${lineCount}`,
       });
       res.status(200).json({ ok: true, orderId, outcome, lineCount });
+      return;
+    }
+
+    // refunds/create — the payload's `order_id` is the parent order. We
+    // don't upsert recon_orders here (the matching orders/updated webhook
+    // handles that); we only re-ingest agreements so the new RETURN rows
+    // land immediately.
+    if (topic === "refunds/create") {
+      const refundOrderId = body?.order_id != null ? String(body.order_id) : null;
+      if (!refundOrderId) {
+        whWarn("webhook", `refunds/create with no order_id (refund id=${body?.id ?? "?"})`);
+        finishReconSync(logId, {
+          status: "success",
+          rows_ingested: 0,
+          cursor: `${topic}:no_order_id`,
+        });
+        res.status(200).json({ ok: true, ignored: true, reason: "no order_id" });
+        return;
+      }
+      reingestAgreements(refundOrderId, topic);
+      finishReconSync(logId, {
+        status: "success",
+        rows_ingested: 0,
+        cursor: `${topic}:${refundOrderId}:reingest_queued`,
+      });
+      res.status(200).json({ ok: true, orderId: refundOrderId, reingest: "queued" });
       return;
     }
 
