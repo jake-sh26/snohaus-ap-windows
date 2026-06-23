@@ -81,16 +81,22 @@ function monthOptions(): string[] {
   return out;
 }
 
-/** Months a quarter covers, derived from the selected month's calendar quarter. */
+/** Months a quarter covers, derived from the selected month's NY tax quarter. */
 function quarterCoverageLabel(data: SalesTaxMonth): string {
-  // NY ST-810 quarters: Q1 Dec-Feb, Q2 Mar-May, Q3 Jun-Aug, Q4 Sep-Nov.
-  const m = Number(data.month.split("-")[1]);
-  const endMonthByQuarterEnd: Record<number, number[]> = {
-    2: [12, 1, 2], 5: [3, 4, 5], 8: [6, 7, 8], 11: [9, 10, 11],
-  };
-  const set = endMonthByQuarterEnd[m] ?? [m];
-  const yr = data.month.split("-")[0];
-  return `${set.map((mm) => MONTH_NAMES[mm - 1]).join(" / ")} ${yr}`;
+  // R6a: NY ST-810 quarters per Pub 718-Q (tax year is March-February):
+  //   Q1 Mar/Apr/May (end May), Q2 Jun/Jul/Aug (end Aug),
+  //   Q3 Sep/Oct/Nov (end Nov), Q4 Dec/Jan/Feb (end Feb, spans year).
+  // Previously labeled the wrong months for every quarter.
+  const [yStr, mStr] = data.month.split("-");
+  const yr = Number(yStr);
+  const m = Number(mStr);
+  // Map the selected quarter-end month -> [months, label-year-list].
+  if (m === 5)  return `${MONTH_NAMES[2]} / ${MONTH_NAMES[3]} / ${MONTH_NAMES[4]} ${yr}`;        // Mar/Apr/May
+  if (m === 8)  return `${MONTH_NAMES[5]} / ${MONTH_NAMES[6]} / ${MONTH_NAMES[7]} ${yr}`;        // Jun/Jul/Aug
+  if (m === 11) return `${MONTH_NAMES[8]} / ${MONTH_NAMES[9]} / ${MONTH_NAMES[10]} ${yr}`;       // Sep/Oct/Nov
+  if (m === 2)  return `${MONTH_NAMES[11]} ${yr - 1} / ${MONTH_NAMES[0]} / ${MONTH_NAMES[1]} ${yr}`; // Dec prev-yr + Jan/Feb
+  // Non-quarter-end month (shouldn't render this label, but be safe).
+  return `${MONTH_NAMES[m - 1]} ${yr}`;
 }
 
 const STATUS_BADGE: Record<FilingStatus, { label: string; cls: string }> = {

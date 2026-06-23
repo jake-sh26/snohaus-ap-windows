@@ -7533,24 +7533,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     };
   };
 
-  // NY ST-810: the quarter-end months require the full ST-810 schedule.
-  // NY sales-tax year is March–February, so quarters are:
-  //   Q1 Dec/Jan/Feb (end Feb), Q2 Mar/Apr/May (end May),
-  //   Q3 Jun/Jul/Aug (end Aug), Q4 Sep/Oct/Nov (end Nov).
-  const QUARTER_END_MONTHS = new Set([2, 5, 8, 11]);
+  // R6a: NY ST-810 quarter calendar.
+  // NY sales-tax year is March-February. Quarters per NY DTF Pub 718-Q:
+  //   Q1 Mar/Apr/May  (end May, file by Jun 20)
+  //   Q2 Jun/Jul/Aug  (end Aug, file by Sep 20)
+  //   Q3 Sep/Oct/Nov  (end Nov, file by Dec 20)
+  //   Q4 Dec/Jan/Feb  (end Feb, file by Mar 20; spans year boundary)
+  // Quarter year-label = year of the quarter's FIRST month (matches
+  // quarterToMonths in shopify-tax-aggregation.ts):
+  //   2026-Q1 = Mar/Apr/May 2026, 2026-Q4 = Dec 2026 + Jan/Feb 2027.
+  // Jan/Feb belong to the previous calendar year's Q4.
+  //
+  // Previously this function returned the OFFSET-BY-ONE convention
+  // (Dec/Jan/Feb -> Q1), which disagreed with quarterToMonths and caused
+  // the UI to pull the wrong 3 months into the ST-810 rollup.
+  const QUARTER_END_MONTHS = new Set([5, 8, 11, 2]);
   const quarterKeyForMonth = (month: string): string => {
     const [yStr, mStr] = month.split("-");
     const y = Number(yStr);
     const m = Number(mStr);
-    // Map a calendar month to its NY ST-810 quarter + that quarter's year label.
-    // Quarter year = the year of the quarter's FIRST month per quarterToMonths:
-    //   Q1 starts Mar, Q2 Jun, Q3 Sep, Q4 Dec. Dec/Jan/Feb belong to Q1 whose
-    //   label year is the Dec year (so Jan/Feb 2026 → 2025-Q1).
-    if (m === 12) return `${y}-Q1`;
-    if (m === 1 || m === 2) return `${y - 1}-Q1`;
-    if (m >= 3 && m <= 5) return `${y}-Q2`;
-    if (m >= 6 && m <= 8) return `${y}-Q3`;
-    return `${y}-Q4`; // Sep/Oct/Nov
+    if (m >= 3 && m <= 5) return `${y}-Q1`;
+    if (m >= 6 && m <= 8) return `${y}-Q2`;
+    if (m >= 9 && m <= 11) return `${y}-Q3`;
+    if (m === 12) return `${y}-Q4`;
+    // Jan/Feb -> previous calendar year's Q4 (the Q that started last Dec).
+    return `${y - 1}-Q4`;
   };
 
   // Per-month sales-tax computation. Pure read. Returns the SalesTaxMonth shape
