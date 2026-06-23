@@ -74,7 +74,15 @@ const NAV_SECTIONS: NavSection[] = [
       { href: "/", label: "Inbox", icon: Inbox, countKey: "inbox_count", toneIfPositive: "amber" },
       { href: "/receiving", label: "In Receiving", icon: PackageOpen, countKey: "receiving_count" },
       { href: "/problem", label: "Problem invoices", icon: AlertTriangle, countKey: "problem_count", toneIfPositive: "red" },
-      { href: "/skipped", label: "Skipped", icon: FileX, countKey: "skipped_count" },
+      // R4s: Skipped page hidden from sidebar — feature was broken (email
+      // ingest paths never called recordSkippedUpload) and Jake hasn't used
+      // it. Server routes (/api/skipped/*), DB table (skipped_uploads),
+      // and page component (pages/Skipped.tsx + /skipped route) are all
+      // intact and still reachable by direct URL. To restore: uncomment
+      // the line below. To fully fix the underlying feature, see TODO in
+      // gmail.ts/gmail-api.ts: needs recordSkippedUpload() call where
+      // is_real_invoice=false instead of fs.unlinkSync(filePath).
+      // { href: "/skipped", label: "Skipped", icon: FileX, countKey: "skipped_count" },
       { href: "/all-invoices", label: "All Invoices", icon: FolderOpen },
       { href: "/posted", label: "History", icon: History },
       { href: "/rules", label: "Vendor Rules", icon: BookOpen },
