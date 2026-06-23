@@ -8168,6 +8168,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
         let unattributedSamples: any[] = [];
         let totalLines = 0;
+        let sampleTitles: any[] = [];
 
         for (const r of rows) {
           totalLines++;
@@ -8201,10 +8202,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           // Parse tax_lines_json to find this line's ship-to NY locality.
           let txLines: any[] = [];
           try { txLines = JSON.parse(r.tax_lines_json || "[]"); } catch { txLines = []; }
+          if (sampleTitles.length < 5 && txLines.length > 0) {
+            sampleTitles.push({
+              order: r.order_name,
+              raw: txLines,
+            });
+          }
 
           let isNY = false;
           let locDtf: { code: string; name: string; rate_display: string } | undefined;
           for (const tl of txLines) {
+            // tl.title is the fallback when Shopify didn't populate jurisdiction_name
+            // (the aggregator uses the same fallback).
             const nm = String(tl.jurisdiction_name || tl.title || "").toUpperCase();
             const ty = String(tl.jurisdiction_type || "").toUpperCase();
             if (nm.includes("NEW YORK STATE") || nm.includes("MCTD") || nm.includes("METROPOLITAN")) {
@@ -8239,7 +8248,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             if (unattributedSamples.length < 10) {
               unattributedSamples.push({
                 order: r.order_name, entity: eid, tax_cents: taxC,
-                tax_lines: txLines.map(t => ({ name: t.jurisdiction_name, type: t.jurisdiction_type, price: t.price })),
+                tax_lines: txLines.map(t => ({
+                  name: t.jurisdiction_name,
+                  type: t.jurisdiction_type,
+                  title: t.title,
+                  rate: t.rate,
+                  price: t.price,
+                  dtf_lookup: dtfByName(String(t.jurisdiction_name || t.title || ""))?.code || null,
+                })),
               });
             }
             continue;
@@ -8265,6 +8281,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const out = {
           month,
           total_lines_walked: totalLines,
+          sample_raw_tax_lines: sampleTitles,
           unattributed_samples: unattributedSamples,
           entities: Array.from(byEntity.values()).map(e => ({
             entity_id: e.entity_id,
