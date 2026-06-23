@@ -93,6 +93,8 @@ export interface ExportEntityRow {
   marketplace_sales_cents: number;
   taxable_sales_cents: number;
   tax_due_cents: number;
+  /** R6b: marketplace tax Shopify already remitted (not your liability). */
+  marketplace_tax_cents: number;
 }
 
 /**
@@ -108,6 +110,61 @@ export interface ExportJurisdictionRow {
   rate_display: string;
   taxable_sales_cents: number;
   tax_due_cents: number;
+  /** R6b: marketplace-facilitated taxable/tax for this jurisdiction (info-only). */
+  marketplace_taxable_cents: number;
+  marketplace_tax_cents: number;
+}
+
+/**
+ * R6b — NY locality rollup row (ST-810 only). One row per (entity, NY locality).
+ *
+ * NY DTF files ST-810 by COMBINED locality rate (Nassau 8 5/8%, Suffolk 8 3/4%,
+ * NYC 8 7/8%) — not by component (state + county + MCTD broken out). This row
+ * combines the components into a single locality total so the operator can fill
+ * out the form one line per locality, matching DTF's mental model.
+ *
+ * Derivation: for each entity, take the COUNTY-type jurisdiction row's
+ * taxable_sales as the locality's taxable base (one row per county in the
+ * per-jurisdiction breakdown). Combined tax = taxable × DTF combined rate.
+ * Component sum (state + county + MCTD) is also surfaced as `tax_components_cents`
+ * so the operator can audit-tie the derived combined tax against the actual
+ * components from the source-of-truth aggregator.
+ */
+export interface ExportLocalityRow {
+  entity_id: number;
+  entity_legal_name: string;
+  locality_name: string;          // e.g. "Nassau", "Suffolk", "New York City"
+  dtf_code: string;               // e.g. "NA 2811"
+  combined_rate: number;          // decimal, e.g. 0.08625
+  rate_display: string;           // NY fraction, e.g. "8 5/8%"
+  taxable_sales_cents: number;    // taxable base for this locality
+  /** Combined tax = taxable × combined_rate (the value to file on ST-810). */
+  tax_due_cents: number;
+  /** Audit-only: sum of state + county + MCTD components from the aggregator. */
+  tax_components_cents: number;
+  /** tax_due − tax_components; non-zero means component-vs-rate drift. */
+  audit_delta_cents: number;
+  /** R6b: marketplace-facilitated taxable/tax under this locality (info-only). */
+  marketplace_taxable_cents: number;
+  marketplace_tax_cents: number;
+}
+
+/**
+ * R6b — Marketplace Provider Sales row (info-only, not filed by merchant).
+ *
+ * Out-of-state and NY-marketplace lines where Shopify (or another facilitator)
+ * collected and remitted the tax directly. Shown for audit / reconciliation
+ * against the Shopify Tax Liability report. NOT included in ST-810 totals.
+ */
+export interface ExportMarketplaceProviderRow {
+  entity_id: number;
+  entity_legal_name: string;
+  jurisdiction_name: string;
+  jurisdiction_type: string;
+  rate: number;
+  rate_display: string;
+  marketplace_taxable_cents: number;
+  marketplace_tax_cents: number;
 }
 
 /**
@@ -126,8 +183,12 @@ export interface ExportPayload {
   lineDetail: ExportLineDetail[];
   /** Per-entity filing rows (always present; all 3 entities). */
   entities: ExportEntityRow[];
-  /** Per-jurisdiction rows (ST-810 only; empty for ST-809). */
+  /** Per-jurisdiction rows (ST-810 only; empty for ST-809). Audit/component-level. */
   jurisdictions: ExportJurisdictionRow[];
+  /** R6b: NY locality rollup rows (ST-810 only). The primary filing view. */
+  localities: ExportLocalityRow[];
+  /** R6b: marketplace-remitted sales (info-only, not filed). */
+  marketplaceProviders: ExportMarketplaceProviderRow[];
   /** Any jurisdiction name lacking a DTF code (ST-810 warning). */
   unmappedJurisdictions: string[];
   generatedAtET: string;
@@ -209,10 +270,12 @@ export function buildSalesTaxCsv(payload: ExportPayload): string {
   lines.push(csvRow([`period`, payload.periodKey]));
   lines.push("");
 
-  // Entity summary section.
+  // ===== Entity summary section =====
+  // R6b: marketplace_tax column added — the tax Shopify already remitted on
+  // marketplace-facilitated lines. Excluded from tax_due (merchant liability).
   lines.push(csvRow([
     "section", "entity_id", "legal_name", "tin", "county", "dtf_code",
-    "gross_sales", "marketplace_sales", "taxable_sales", "tax_due",
+    "gross_sales", "marketplace_sales", "marketplace_tax", "taxable_sales", "tax_due",
   ]));
   for (const e of payload.entities) {
     lines.push(csvRow([
@@ -224,17 +287,51 @@ export function buildSalesTaxCsv(payload: ExportPayload): string {
       e.dtf_code,
       centsToFixed(e.gross_sales_cents),
       centsToFixed(e.marketplace_sales_cents),
+      centsToFixed(e.marketplace_tax_cents),
       centsToFixed(e.taxable_sales_cents),
       centsToFixed(e.tax_due_cents),
     ]));
   }
 
-  // Jurisdiction detail section (ST-810 only).
+  // ===== R6b: NY Locality Rollup (PRIMARY filing view, ST-810 only) =====
+  // One row per (entity, locality). Combined rate (state + county + MCTD merged).
+  // tax_due here is the value to enter on each ST-810 jurisdiction line.
+  if (payload.formType === "ST-810" && payload.localities.length > 0) {
+    lines.push("");
+    lines.push(csvRow([
+      "section", "entity_id", "entity_legal_name", "locality", "dtf_code",
+      "combined_rate", "rate_display", "taxable_sales", "tax_due",
+      "tax_components_sum", "audit_delta",
+      "marketplace_taxable", "marketplace_tax",
+    ]));
+    for (const l of payload.localities) {
+      lines.push(csvRow([
+        "LOCALITY",
+        l.entity_id,
+        l.entity_legal_name,
+        l.locality_name,
+        l.dtf_code,
+        l.combined_rate.toFixed(5),
+        l.rate_display,
+        centsToFixed(l.taxable_sales_cents),
+        centsToFixed(l.tax_due_cents),
+        centsToFixed(l.tax_components_cents),
+        centsToFixed(l.audit_delta_cents),
+        centsToFixed(l.marketplace_taxable_cents),
+        centsToFixed(l.marketplace_tax_cents),
+      ]));
+    }
+  }
+
+  // ===== Jurisdiction component detail (ST-810; audit trail) =====
+  // Original per-component breakdown. State + county + MCTD broken out. R6b adds
+  // marketplace_taxable + marketplace_tax for parity with the locality view.
   if (payload.formType === "ST-810" && payload.jurisdictions.length > 0) {
     lines.push("");
     lines.push(csvRow([
       "section", "entity_id", "entity_legal_name", "jurisdiction", "dtf_code",
       "rate_decimal", "taxable_sales", "tax_due",
+      "marketplace_taxable", "marketplace_tax",
     ]));
     for (const j of payload.jurisdictions) {
       lines.push(csvRow([
@@ -246,6 +343,32 @@ export function buildSalesTaxCsv(payload: ExportPayload): string {
         j.rate.toFixed(5),
         centsToFixed(j.taxable_sales_cents),
         centsToFixed(j.tax_due_cents),
+        centsToFixed(j.marketplace_taxable_cents),
+        centsToFixed(j.marketplace_tax_cents),
+      ]));
+    }
+  }
+
+  // ===== R6b: Marketplace Provider Sales (info-only, not filed) =====
+  // Out-of-state lines where Shopify (or another facilitator) collected and
+  // remitted the tax. Audit trail for reconciling against Shopify's report.
+  if (payload.formType === "ST-810" && payload.marketplaceProviders.length > 0) {
+    lines.push("");
+    lines.push(csvRow([
+      "section", "entity_id", "entity_legal_name", "jurisdiction", "jurisdiction_type",
+      "rate_decimal", "rate_display", "marketplace_taxable", "marketplace_tax",
+    ]));
+    for (const m of payload.marketplaceProviders) {
+      lines.push(csvRow([
+        "MARKETPLACE_PROVIDER",
+        m.entity_id,
+        m.entity_legal_name,
+        m.jurisdiction_name,
+        m.jurisdiction_type,
+        m.rate.toFixed(5),
+        m.rate_display,
+        centsToFixed(m.marketplace_taxable_cents),
+        centsToFixed(m.marketplace_tax_cents),
       ]));
     }
   }
@@ -271,8 +394,9 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
   wb.creator = "Sno-Haus AP";
   wb.created = new Date();
 
-  // ----- Sheet: Entity Summary -----
-  const summary = wb.addWorksheet("Entity Summary");
+  // ----- Sheet: Filing Summary (entity totals) -----
+  // R6b: tab renamed from "Entity Summary" → "Filing Summary" + marketplace_tax col.
+  const summary = wb.addWorksheet("Filing Summary");
   summary.columns = [
     { header: "Entity", key: "entity_id", width: 8 },
     { header: "Legal Name", key: "legal_name", width: 24 },
@@ -281,10 +405,11 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
     { header: "DTF Code", key: "dtf_code", width: 12 },
     { header: "Gross Sales", key: "gross_sales", width: 14 },
     { header: "Marketplace Sales", key: "marketplace_sales", width: 16 },
+    { header: "Marketplace Tax", key: "marketplace_tax", width: 14 },
     { header: "Taxable Sales", key: "taxable_sales", width: 14 },
     { header: "Tax Due", key: "tax_due", width: 14 },
   ];
-  const entityMoneyCols = ["gross_sales", "marketplace_sales", "taxable_sales", "tax_due"];
+  const entityMoneyCols = ["gross_sales", "marketplace_sales", "marketplace_tax", "taxable_sales", "tax_due"];
   for (const e of payload.entities) {
     summary.addRow({
       entity_id: e.entity_id,
@@ -294,6 +419,7 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
       dtf_code: e.dtf_code,
       gross_sales: e.gross_sales_cents / 100,
       marketplace_sales: e.marketplace_sales_cents / 100,
+      marketplace_tax: e.marketplace_tax_cents / 100,
       taxable_sales: e.taxable_sales_cents / 100,
       tax_due: e.tax_due_cents / 100,
     });
@@ -303,6 +429,7 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
     entity_id: "TOTAL",
     gross_sales: et.gross_sales_cents / 100,
     marketplace_sales: et.marketplace_sales_cents / 100,
+    marketplace_tax: et.marketplace_tax_cents / 100,
     taxable_sales: et.taxable_sales_cents / 100,
     tax_due: et.net_tax_cents / 100,
   });
@@ -314,17 +441,92 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
     col.alignment = { horizontal: "right" };
   }
 
-  // ----- Sheet: Jurisdiction Detail (ST-810 only) -----
+  // ----- R6b: Sheet: NY Locality Rollup (ST-810 only) -----
+  // PRIMARY filing view. One row per (entity, locality) with combined NY rate.
+  // The Tax Due column is what to enter on each ST-810 jurisdiction line.
   if (payload.formType === "ST-810") {
-    const jur = wb.addWorksheet("Jurisdiction Detail");
+    const loc = wb.addWorksheet("NY Locality Rollup");
+    loc.columns = [
+      { header: "Entity", key: "entity_id", width: 8 },
+      { header: "Legal Name", key: "legal_name", width: 24 },
+      { header: "Locality", key: "locality_name", width: 18 },
+      { header: "DTF Code", key: "dtf_code", width: 10 },
+      { header: "Rate", key: "rate_display", width: 9 },
+      { header: "Taxable Sales", key: "taxable_sales", width: 14 },
+      { header: "Tax Due", key: "tax_due", width: 14 },
+      { header: "Components Sum", key: "components", width: 16 },
+      { header: "Audit Delta", key: "audit_delta", width: 12 },
+      { header: "Marketplace Taxable", key: "mkt_taxable", width: 18 },
+      { header: "Marketplace Tax", key: "mkt_tax", width: 16 },
+    ];
+    for (const l of payload.localities) {
+      loc.addRow({
+        entity_id: l.entity_id,
+        legal_name: l.entity_legal_name,
+        locality_name: l.locality_name,
+        dtf_code: l.dtf_code,
+        rate_display: l.rate_display,
+        taxable_sales: l.taxable_sales_cents / 100,
+        tax_due: l.tax_due_cents / 100,
+        components: l.tax_components_cents / 100,
+        audit_delta: l.audit_delta_cents / 100,
+        mkt_taxable: l.marketplace_taxable_cents / 100,
+        mkt_tax: l.marketplace_tax_cents / 100,
+      });
+    }
+    loc.getRow(1).font = { bold: true };
+    for (const key of ["taxable_sales", "tax_due", "components", "audit_delta", "mkt_taxable", "mkt_tax"]) {
+      const col = loc.getColumn(key);
+      col.numFmt = MONEY_FMT;
+      col.alignment = { horizontal: "right" };
+    }
+
+    // ----- R6b: Sheet: Marketplace Providers (info-only) -----
+    // Out-of-state marketplace-facilitator sales. NOT filed by merchant.
+    if (payload.marketplaceProviders.length > 0) {
+      const mp = wb.addWorksheet("Marketplace Providers");
+      mp.columns = [
+        { header: "Entity", key: "entity_id", width: 8 },
+        { header: "Legal Name", key: "legal_name", width: 24 },
+        { header: "Jurisdiction", key: "jurisdiction", width: 28 },
+        { header: "Type", key: "type", width: 10 },
+        { header: "Rate", key: "rate_display", width: 9 },
+        { header: "Marketplace Taxable", key: "mkt_taxable", width: 18 },
+        { header: "Marketplace Tax", key: "mkt_tax", width: 16 },
+      ];
+      for (const m of payload.marketplaceProviders) {
+        mp.addRow({
+          entity_id: m.entity_id,
+          legal_name: m.entity_legal_name,
+          jurisdiction: m.jurisdiction_name,
+          type: m.jurisdiction_type,
+          rate_display: m.rate_display,
+          mkt_taxable: m.marketplace_taxable_cents / 100,
+          mkt_tax: m.marketplace_tax_cents / 100,
+        });
+      }
+      mp.getRow(1).font = { bold: true };
+      for (const key of ["mkt_taxable", "mkt_tax"]) {
+        const col = mp.getColumn(key);
+        col.numFmt = MONEY_FMT;
+        col.alignment = { horizontal: "right" };
+      }
+    }
+
+    // ----- Sheet: Jurisdiction Components (audit detail) -----
+    // R6b: renamed from "Jurisdiction Detail" → "Jurisdiction Components" so it's
+    // clear this is the audit-level component breakdown. Filing view = locality tab.
+    const jur = wb.addWorksheet("Jurisdiction Components");
     jur.columns = [
       { header: "Entity", key: "entity_id", width: 8 },
       { header: "Legal Name", key: "legal_name", width: 24 },
-      { header: "Jurisdiction", key: "jurisdiction", width: 18 },
+      { header: "Jurisdiction", key: "jurisdiction", width: 22 },
       { header: "DTF Code", key: "dtf_code", width: 12 },
       { header: "Rate", key: "rate_display", width: 10 },
       { header: "Taxable Sales", key: "taxable_sales", width: 14 },
       { header: "Tax Due", key: "tax_due", width: 14 },
+      { header: "Marketplace Taxable", key: "mkt_taxable", width: 18 },
+      { header: "Marketplace Tax", key: "mkt_tax", width: 16 },
     ];
     for (const j of payload.jurisdictions) {
       jur.addRow({
@@ -335,10 +537,12 @@ export async function buildSalesTaxXlsx(payload: ExportPayload): Promise<Buffer>
         rate_display: j.rate_display,
         taxable_sales: j.taxable_sales_cents / 100,
         tax_due: j.tax_due_cents / 100,
+        mkt_taxable: j.marketplace_taxable_cents / 100,
+        mkt_tax: j.marketplace_tax_cents / 100,
       });
     }
     jur.getRow(1).font = { bold: true };
-    for (const key of ["taxable_sales", "tax_due"]) {
+    for (const key of ["taxable_sales", "tax_due", "mkt_taxable", "mkt_tax"]) {
       const col = jur.getColumn(key);
       col.numFmt = MONEY_FMT;
       col.alignment = { horizontal: "right" };
@@ -491,6 +695,7 @@ function drawEntityPage(
   const rows: [string, string][] = [
     ["Gross sales", centsToDisplay(e.gross_sales_cents)],
     ["Marketplace sales (Shopify-remitted)", centsToDisplay(e.marketplace_sales_cents)],
+    ["Marketplace tax (Shopify already remitted)", centsToDisplay(e.marketplace_tax_cents)],
     ["Taxable sales", centsToDisplay(e.taxable_sales_cents)],
     ["Tax due (you owe)", centsToDisplay(e.tax_due_cents)],
   ];
@@ -503,12 +708,53 @@ function drawEntityPage(
   }
   doc.y = y + 6;
 
-  // ST-810: jurisdiction summary table for this entity.
+  // ST-810: R6b — NY Locality Rollup (filing view, primary). Components table
+  // is on subsequent pages as audit detail.
   if (payload.formType === "ST-810") {
+    const lrows = payload.localities.filter((l) => l.entity_id === e.entity_id);
+    if (lrows.length > 0) {
+      doc.moveDown(0.6);
+      doc.font("Helvetica-Bold").fontSize(11).text("NY Locality rollup (file this on ST-810)");
+      doc.moveDown(0.2);
+      doc.font("Helvetica").fontSize(8).fillColor("#444")
+        .text("Combined NY rate per locality (state + county + MCTD merged). Enter Tax Due on the matching ST-810 line.");
+      doc.fillColor("#000").moveDown(0.4);
+      const lcols = [
+        { label: "Locality", x: left, w: 120, money: false },
+        { label: "DTF Code", x: left + 124, w: 60, money: false },
+        { label: "Rate", x: left + 186, w: 50, money: false },
+        { label: "Taxable", x: left + 238, w: 100, money: true },
+        { label: "Tax Due", x: left + 340, w: 110, money: true },
+      ];
+      let ly = doc.y;
+      for (const c of lcols) {
+        doc.font("Helvetica-Bold").fontSize(8)
+          .text(c.label, c.x, ly, { width: c.w, align: c.money ? "right" : "left" });
+      }
+      ly += 14;
+      for (const l of lrows) {
+        if (ly > doc.page.height - doc.page.margins.bottom - 40) {
+          doc.addPage();
+          ly = doc.page.margins.top;
+        }
+        doc.font("Helvetica").fontSize(8).text(l.locality_name, lcols[0].x, ly, { width: lcols[0].w });
+        doc.font("Helvetica").fontSize(8).text(l.dtf_code, lcols[1].x, ly, { width: lcols[1].w });
+        doc.font("Helvetica").fontSize(8).text(l.rate_display, lcols[2].x, ly, { width: lcols[2].w });
+        doc.font("Courier").fontSize(8).text(centsToDisplay(l.taxable_sales_cents), lcols[3].x, ly, { width: lcols[3].w, align: "right" });
+        doc.font("Courier").fontSize(9).text(centsToDisplay(l.tax_due_cents), lcols[4].x, ly, { width: lcols[4].w, align: "right" });
+        ly += 13;
+      }
+      doc.y = ly + 10;
+    }
+
+    // Audit-detail component breakdown.
     const jrows = payload.jurisdictions.filter((j) => j.entity_id === e.entity_id);
     doc.moveDown(0.6);
-    doc.font("Helvetica-Bold").fontSize(11).text("Jurisdiction summary (ST-810)");
-    doc.moveDown(0.4);
+    doc.font("Helvetica-Bold").fontSize(10).text("Component detail (audit only)");
+    doc.moveDown(0.2);
+    doc.font("Helvetica").fontSize(8).fillColor("#444")
+      .text("State + County + MCTD broken out. For audit; not used for filing.");
+    doc.fillColor("#000").moveDown(0.4);
     const cols = [
       { label: "Jurisdiction", x: left, w: 120, money: false },
       { label: "DTF Code", x: left + 124, w: 70, money: false },
