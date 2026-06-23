@@ -941,6 +941,61 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
     queryFn: () => jsonGet(`/api/recon/finance/diff/${encodeURIComponent(financeMonth)}`),
     enabled: /^\d{4}-\d{2}$/.test(financeMonth),
   });
+
+  // R5b: drift sentinel - live v2-vs-shopifyql diff. Backed by
+  // /api/recon/finance/drift/:month which round-trips to Shopify's
+  // ShopifyQL Finance Summary and compares to our local v2 aggregate.
+  // Refreshes every 5 minutes (live month is what the operator cares
+  // about; staler months won't change unless an edit/refund webhook
+  // re-ingests). Disabled on Options tab where it'd be noise.
+  const driftQ = useQuery<{
+    month: string;
+    all_ok: boolean;
+    orders_match: boolean;
+    drifted_lines: Array<{ line: string; shopifyql: number | null; v2: number; diff: number | null }>;
+    as_of: string;
+  }>({
+    queryKey: ["/api/recon/finance/drift", financeMonth],
+    queryFn: () => jsonGet(`/api/recon/finance/drift/${encodeURIComponent(financeMonth)}`),
+    enabled: /^\d{4}-\d{2}$/.test(financeMonth) && view !== "options",
+    refetchInterval: 5 * 60 * 1000,
+    refetchOnWindowFocus: true,
+    retry: 1,
+  });
+
+  // R5b: on-demand month refresh. Fires the scope=month agreements
+  // backfill (idempotent), polls the job, then invalidates the diff +
+  // drift queries so the UI re-renders against fresh data.
+  const refreshMonthMut = useMutation<
+    { ok: boolean; job_id: string; total_orders: number; poll_url: string },
+    Error,
+    { month: string }
+  >({
+    mutationFn: ({ month }) =>
+      jsonPost("/api/recon/finance/agreements/refresh-month", { month }),
+    onSuccess: async (kick, vars) => {
+      setLastAction(`Refreshing ${monthLabel(vars.month)} (${kick.total_orders} orders)...`);
+      // Poll until done (or 5 min ceiling).
+      const deadline = Date.now() + 5 * 60 * 1000;
+      let final: any = kick;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 4000));
+        try {
+          final = await jsonGet<any>(kick.poll_url);
+        } catch { /* keep polling - transient */ }
+        const s = String(final?.status ?? "");
+        if (s === "completed" || s === "done" || s === "error" || s === "cancelled") break;
+      }
+      setLastAction(
+        `Refresh ${vars.month}: ${final?.status ?? "unknown"} - processed ${final?.processed_orders ?? "?"}/${final?.total_orders ?? "?"} - ${final?.errors_count ?? 0} errors`,
+      );
+      qc.invalidateQueries({ queryKey: ["/api/recon/finance/diff", vars.month] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/finance/drift", vars.month] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/finance/by-store", vars.month] });
+      qc.invalidateQueries({ queryKey: ["/api/recon/finance/by-store-pos", vars.month] });
+    },
+    onError: (e: any) => setLastAction(`Refresh failed: ${e?.message ?? e}`),
+  });
   // When the diff loads with an existing snapshot, hydrate the draft so the
   // operator sees what was saved last time (and can edit + re-save).
   useEffect(() => {
@@ -1378,8 +1433,71 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
           <h1 className="text-2xl font-semibold tracking-tight">{header.h1}</h1>
           <p className="text-sm text-muted-foreground mt-1">{header.subtitle}</p>
         </div>
-        {header.badge && <Badge variant="outline" className="gap-1.5">Read-only</Badge>}
+        <div className="flex items-center gap-2">
+          {/* R5b: on-demand month refresh - Monthly Summary + Per Store Sales only */}
+          {(view === "monthly-summary" || view === "per-store-sales") && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => refreshMonthMut.mutate({ month: financeMonth })}
+              disabled={refreshMonthMut.isPending}
+              data-testid="button-finance-refresh-month"
+              title={`Re-ingest agreements ledger for ${monthLabel(financeMonth)}. Idempotent.`}
+            >
+              <RefreshCw className={`size-3.5 mr-1.5 ${refreshMonthMut.isPending ? "animate-spin" : ""}`} />
+              {refreshMonthMut.isPending ? "Refreshing..." : "Refresh month"}
+            </Button>
+          )}
+          {header.badge && <Badge variant="outline" className="gap-1.5">Read-only</Badge>}
+        </div>
       </div>
+
+      {/* R5b: drift sentinel banner - surfaces any Shopify-vs-local diff
+          the moment it appears, without the operator having to dig. */}
+      {(view === "monthly-summary" || view === "per-store-sales") && driftQ.data && !driftQ.data.all_ok && (
+        <div
+          className="rounded-md border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900"
+          data-testid="banner-finance-drift"
+        >
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="size-4 mt-0.5 flex-shrink-0" />
+            <div className="flex-1">
+              <div className="font-semibold">
+                Local totals don't match Shopify for {monthLabel(driftQ.data.month)}
+              </div>
+              <div className="mt-1 text-xs">
+                {driftQ.data.drifted_lines.length} line{driftQ.data.drifted_lines.length === 1 ? "" : "s"} drifted:{" "}
+                {driftQ.data.drifted_lines.map((d, i) => (
+                  <span key={d.line} className="font-mono">
+                    {i > 0 ? ", " : ""}
+                    {d.line} {d.diff != null && Number(d.diff) > 0 ? "+" : ""}
+                    {d.diff != null ? Number(d.diff).toFixed(2) : "?"}
+                  </span>
+                ))}
+              </div>
+              <div className="mt-2 text-xs text-red-800">
+                Click <span className="font-semibold">Refresh month</span> above to re-ingest the agreements
+                ledger. If drift persists after refresh, there's a real aggregator bug to investigate.
+              </div>
+            </div>
+            <div className="text-[10px] text-red-700/70 whitespace-nowrap">
+              checked {new Date(driftQ.data.as_of).toLocaleTimeString()}
+            </div>
+          </div>
+        </div>
+      )}
+      {(view === "monthly-summary" || view === "per-store-sales") && driftQ.data?.all_ok && (
+        <div
+          className="rounded-md border border-green-300 bg-green-50 px-4 py-2 text-xs text-green-900 flex items-center gap-2"
+          data-testid="banner-finance-drift-ok"
+        >
+          <CheckCircle2 className="size-3.5" />
+          <span>Matches Shopify for {monthLabel(driftQ.data.month)} - every line within $0.01.</span>
+          <span className="ml-auto text-[10px] text-green-700/70">
+            checked {new Date(driftQ.data.as_of).toLocaleTimeString()}
+          </span>
+        </div>
+      )}
 
       <Tabs value={activeTab} onValueChange={onTabChange} className="space-y-6">
         {showTabBar && (
