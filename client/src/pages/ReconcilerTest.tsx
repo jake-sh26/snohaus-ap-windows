@@ -917,25 +917,15 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
   // diff. The premise (per user): same inputs + same formulas = same outputs.
   // Any non-zero diff is a bug in our ingest/formula — not a judgment call.
   // Plan B (future R5b): pull Shopify's numbers directly via ShopifyQL GraphQL.
+  // R5c: default to current month (live operator view) for both Monthly
+  // Summary and Per Store Sales. Was previously last completed month, which
+  // hid the very drift the new sentinel is meant to surface.
   const [financeMonth, setFinanceMonth] = useState<string>(() => {
-    // Default: last completed month (today minus ~15 days, formatted YYYY-MM)
     const d = new Date();
-    d.setDate(1);
-    d.setMonth(d.getMonth() - 1);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   });
-  // Draft inputs (string so empty stays empty; parsed at save time).
-  const [shopifyDraft, setShopifyDraft] = useState<Record<string, string>>({
-    gross_sales: "",
-    discounts: "",
-    returns: "",
-    net_sales: "",
-    shipping: "",
-    return_fees: "",
-    taxes: "",
-    total_sales: "",
-    net_sales_gift_cards: "",
-  });
+  // R5c: manual paste draft + snapshot mutation removed - Shopify values
+  // are now pulled live from ShopifyQL via /drift/:month.
   const financeDiffQ = useQuery<FinanceDiffResult>({
     queryKey: ["/api/recon/finance/diff", financeMonth],
     queryFn: () => jsonGet(`/api/recon/finance/diff/${encodeURIComponent(financeMonth)}`),
@@ -953,6 +943,9 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
     all_ok: boolean;
     orders_match: boolean;
     drifted_lines: Array<{ line: string; shopifyql: number | null; v2: number; diff: number | null }>;
+    // R5c: also expose the full per-line dictionary so the Monthly Summary
+    // diff table can pull Shopify values straight from drift (no paste form).
+    lines: Record<string, { shopifyql: number | null; v2: number; diff: number | null }>;
     as_of: string;
   }>({
     queryKey: ["/api/recon/finance/drift", financeMonth],
@@ -995,42 +988,6 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
       qc.invalidateQueries({ queryKey: ["/api/recon/finance/by-store-pos", vars.month] });
     },
     onError: (e: any) => setLastAction(`Refresh failed: ${e?.message ?? e}`),
-  });
-  // When the diff loads with an existing snapshot, hydrate the draft so the
-  // operator sees what was saved last time (and can edit + re-save).
-  useEffect(() => {
-    const snap = financeDiffQ.data?.shopify;
-    if (!snap) {
-      setShopifyDraft({
-        gross_sales: "", discounts: "", returns: "", net_sales: "",
-        shipping: "", return_fees: "", taxes: "", total_sales: "", net_sales_gift_cards: "",
-      });
-      return;
-    }
-    setShopifyDraft({
-      gross_sales: snap.gross_sales == null ? "" : String(snap.gross_sales),
-      discounts: snap.discounts == null ? "" : String(snap.discounts),
-      returns: snap.returns == null ? "" : String(snap.returns),
-      net_sales: snap.net_sales == null ? "" : String(snap.net_sales),
-      shipping: snap.shipping == null ? "" : String(snap.shipping),
-      return_fees: snap.return_fees == null ? "" : String(snap.return_fees),
-      taxes: snap.taxes == null ? "" : String(snap.taxes),
-      total_sales: snap.total_sales == null ? "" : String(snap.total_sales),
-      net_sales_gift_cards: snap.net_sales_gift_cards == null ? "" : String(snap.net_sales_gift_cards),
-    });
-  }, [financeMonth, financeDiffQ.data?.shopify]);
-  const financeSnapshotMut = useMutation<
-    { ok: boolean; month: string },
-    Error,
-    { month: string; values: Record<string, number | null> }
-  >({
-    mutationFn: ({ month, values }) =>
-      jsonPost("/api/recon/finance/snapshot", { month, ...values, source_label: "manual_entry" }),
-    onSuccess: (r) => {
-      setLastAction(`Saved Shopify Finance Summary for ${monthLabel(r.month)}`);
-      qc.invalidateQueries({ queryKey: ["/api/recon/finance/diff", r.month] });
-    },
-    onError: (e: any) => setLastAction(`Snapshot save failed: ${e?.message ?? e}`),
   });
 
   // --- Payouts (PR #R3) ---
@@ -1510,7 +1467,7 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
 
         {/* =================== BY STORE TAB =================== */}
         <TabsContent value="bystore" className="space-y-6 mt-0">
-          <ByStoreBreakdown />
+          <ByStoreBreakdown month={financeMonth} setMonth={setFinanceMonth} />
         </TabsContent>
 
         {/* =================== SETUP TAB =================== */}
@@ -2209,126 +2166,85 @@ export default function ReconcilerTest({ view = "options" }: { view?: FinanceVie
                   <tr>
                     <th className="text-left px-3 py-1.5 font-medium w-1/3">Line</th>
                     <th className="text-right px-3 py-1.5 font-medium">Ours</th>
-                    <th className="text-right px-3 py-1.5 font-medium">Shopify (paste below)</th>
+                    <th className="text-right px-3 py-1.5 font-medium">Shopify Finance Actual</th>
                     <th className="text-right px-3 py-1.5 font-medium">Diff</th>
                     <th className="text-center px-3 py-1.5 font-medium w-12">OK</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {financeDiffQ.data.lines.map((line) => (
-                    <tr
-                      key={line.field}
-                      className={`border-t ${
-                        line.ok === false ? "bg-red-50 dark:bg-red-950/30" : ""
-                      }`}
-                      data-testid={`row-finance-${line.field}`}
-                    >
-                      <td className="px-3 py-1.5 font-medium">{prettyFinanceField(line.field)}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums">{money(line.ours)}</td>
-                      <td className="px-3 py-1.5 text-right tabular-nums">
-                        {line.shopify == null ? (
-                          <span className="text-muted-foreground">—</span>
-                        ) : (
-                          money(line.shopify)
-                        )}
-                      </td>
-                      <td
-                        className={`px-3 py-1.5 text-right tabular-nums ${
-                          line.ok === false ? "font-semibold text-red-700 dark:text-red-400" : ""
+                  {financeDiffQ.data.lines.map((line) => {
+                    // R5c: Shopify column is now driven live by /drift/:month
+                    // (same source as the drift banner). Map UI field key to
+                    // the drift endpoint's line key (mostly identical except
+                    // shipping -> shipping_charges).
+                    const driftKey = line.field === "shipping" ? "shipping_charges" : line.field;
+                    const driftLine = (driftQ.data?.lines as any)?.[driftKey];
+                    const shopifyVal: number | null = driftLine?.shopifyql ?? null;
+                    const diffVal: number | null =
+                      shopifyVal == null ? null : Number((Number(line.ours) - shopifyVal).toFixed(2));
+                    const ok: boolean | null =
+                      diffVal == null ? null : Math.abs(diffVal) <= 0.01;
+                    return (
+                      <tr
+                        key={line.field}
+                        className={`border-t ${
+                          ok === false ? "bg-red-50 dark:bg-red-950/30" : ""
                         }`}
+                        data-testid={`row-finance-${line.field}`}
                       >
-                        {line.diff == null ? (
-                          <span className="text-muted-foreground">—</span>
-                        ) : (
-                          money(line.diff)
-                        )}
-                      </td>
-                      <td className="px-3 py-1.5 text-center">
-                        {line.ok === true ? (
-                          <CheckCircle2 className="size-4 text-green-600 inline" />
-                        ) : line.ok === false ? (
-                          <XCircle className="size-4 text-red-600 inline" />
-                        ) : (
-                          <span className="text-muted-foreground text-xs">—</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                        <td className="px-3 py-1.5 font-medium">{prettyFinanceField(line.field)}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{money(line.ours)}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">
+                          {shopifyVal == null ? (
+                            <span
+                              className="text-muted-foreground"
+                              title="No parallel column in Shopify's ShopifyQL Finance Summary (e.g. net sales from gift cards)."
+                            >
+                              —
+                            </span>
+                          ) : (
+                            money(shopifyVal)
+                          )}
+                        </td>
+                        <td
+                          className={`px-3 py-1.5 text-right tabular-nums ${
+                            ok === false ? "font-semibold text-red-700 dark:text-red-400" : ""
+                          }`}
+                        >
+                          {diffVal == null ? (
+                            <span className="text-muted-foreground">—</span>
+                          ) : (
+                            money(diffVal)
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-center">
+                          {ok === true ? (
+                            <CheckCircle2 className="size-4 text-green-600 inline" />
+                          ) : ok === false ? (
+                            <XCircle className="size-4 text-red-600 inline" />
+                          ) : (
+                            <span className="text-muted-foreground text-xs">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           )}
 
-          {/* Paste-from-Shopify input grid */}
-          <details className="border rounded-md" open={!financeDiffQ.data?.shopify}>
-            <summary className="cursor-pointer px-3 py-2 text-sm font-medium bg-muted/30 hover:bg-muted/50">
-              {financeDiffQ.data?.shopify
-                ? "Edit Shopify values (last saved: " +
-                  (financeDiffQ.data.shopify.captured_at
-                    ? shortDate(financeDiffQ.data.shopify.captured_at)
-                    : "—") +
-                  ")"
-                : "Paste Shopify Finance Summary values"}
-            </summary>
-            <div className="p-3 space-y-3">
-              <div className="text-xs text-muted-foreground">
-                In Shopify Admin go to <strong>Analytics → Reports → Finance summary</strong>,
-                set the date range to the full month, and confirm channel = <em>All channels</em>.
-                Paste the dollar amounts below (no $ or commas required, but accepted).
-              </div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                {FINANCE_FIELDS.map((f) => (
-                  <div key={f.key}>
-                    <label className="text-xs text-muted-foreground block mb-1">
-                      {f.label}
-                    </label>
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      placeholder="0.00"
-                      className="border rounded-md px-2 py-1 text-sm w-full font-mono"
-                      value={shopifyDraft[f.key]}
-                      onChange={(e) =>
-                        setShopifyDraft({ ...shopifyDraft, [f.key]: e.target.value })
-                      }
-                      data-testid={`input-shopify-${f.key}`}
-                    />
-                  </div>
-                ))}
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  onClick={() => {
-                    const values: Record<string, number | null> = {};
-                    for (const f of FINANCE_FIELDS) {
-                      const raw = shopifyDraft[f.key].replace(/[$,\s]/g, "");
-                      if (raw === "") {
-                        values[f.key] = null;
-                      } else {
-                        const n = Number(raw);
-                        values[f.key] = Number.isFinite(n) ? n : null;
-                      }
-                    }
-                    financeSnapshotMut.mutate({ month: financeMonth, values });
-                  }}
-                  disabled={financeSnapshotMut.isPending}
-                  data-testid="button-save-shopify-snapshot"
-                >
-                  <Save className="size-3 mr-1" />
-                  {financeSnapshotMut.isPending ? "Saving…" : "Save Shopify values"}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => financeDiffQ.refetch()}
-                  data-testid="button-refresh-finance-diff"
-                >
-                  <RefreshCw className="size-3 mr-1" /> Refresh
-                </Button>
-              </div>
-            </div>
-          </details>
+          {/* R5c: paste-values form removed - the Shopify column above is now
+              driven live by /api/recon/finance/drift/:month (same source as
+              the drift banner). No manual paste needed. */}
+          <div className="text-xs text-muted-foreground border rounded-md px-3 py-2 bg-muted/20">
+            Shopify column pulled live from ShopifyQL Finance Summary.
+            {driftQ.data?.as_of && (
+              <span className="ml-1 text-[10px] opacity-70">
+                (checked {new Date(driftQ.data.as_of).toLocaleTimeString()})
+              </span>
+            )}
+          </div>
         </CardContent>
       </Card>
 
@@ -4074,13 +3990,16 @@ const BY_STORE_METRICS: Array<{
   { label: "Net sales (gift cards)", storeKey: "net_sales_gift_cards", v2Key: "net_sales_gift_cards" },
 ];
 
-function ByStoreBreakdown() {
-  const [month, setMonth] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(1);
-    d.setMonth(d.getMonth() - 1);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  });
+// R5c: month is now controlled by the parent (ReconcilerTest) so that
+// switching tabs and coming back preserves the selection. Previously this
+// component owned its own month state, which reset every remount.
+function ByStoreBreakdown({
+  month,
+  setMonth,
+}: {
+  month: string;
+  setMonth: (m: string) => void;
+}) {
   const [showBreakdown, setShowBreakdown] = useState<boolean>(false);
   const valid = /^\d{4}-\d{2}$/.test(month);
 
