@@ -174,6 +174,7 @@ import {
   buildSalesTaxPdf,
   type ExportPayload,
   type ExportLineDetail,
+  type ExportLocalityRow,
 } from "./sales-tax-exports";
 import { mappingByEntityId } from "./sales-tax-mapping";
 import {
@@ -7791,7 +7792,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // Per-entity filing rows: sum each entity's store rows across the period.
     const tinByEntity = getEntitySettings();
     const entities = ENTITY_FILING_INFO.map((info) => {
-      let gross = 0, mkt = 0, taxable = 0, taxDue = 0;
+      let gross = 0, mkt = 0, taxable = 0, taxDue = 0, mktTax = 0;
       for (const mm of monthPayloads) {
         const s = mm.stores.find((st) => st.entity_id === info.entity_id);
         if (!s) continue;
@@ -7799,6 +7800,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         mkt += s.marketplace_sales_cents;
         taxable += s.taxable_sales_cents;
         taxDue += s.net_tax_cents;
+        mktTax += s.marketplace_tax_cents;
       }
       return {
         entity_id: info.entity_id,
@@ -7810,12 +7812,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         marketplace_sales_cents: mkt,
         taxable_sales_cents: taxable,
         tax_due_cents: taxDue,
+        marketplace_tax_cents: mktTax,
       };
     });
 
     // Per-jurisdiction rows (ST-810 only): run aggregateByJurisdiction across
     // the period union + enrich with DTF code + fractional rate.
+    // R6b: also derive NY locality rollup + marketplace-provider rows from the
+    // same breakdown (single pass, no parallel aggregator).
     const jurisdictions: ExportPayload["jurisdictions"] = [];
+    const localities: ExportPayload["localities"] = [];
+    const marketplaceProviders: ExportPayload["marketplaceProviders"] = [];
     const unmappedSet = new Set<string>();
     if (formType === "ST-810") {
       const all: AggregatorInput[] = [];
@@ -7836,10 +7843,41 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const breakdown = aggregateByJurisdiction(all, names, allRefunds, allShipFwd, allShipRef, allUnverified);
       for (const ent of breakdown) {
         const legal = legalNameFor(ent.entity_id);
+        // R6b: per-entity locality + component accumulators. Walk this entity's
+        // jurisdictions ONCE, populating both the per-jurisdiction (audit) rows
+        // AND aggregating into NY localities for the filing summary.
+        // NY locality keying:
+        //   COUNTY/NYC-anchor row (maps to DTF code, not bare state, not MCTD) ->
+        //     its taxable_sales is the locality's taxable base.
+        //   STATE/SPECIAL(MCTD) rows -> contribute to tax_components_cents only.
+        //     The 4% state + 0.375% MCTD components attach to lines that ALSO
+        //     have a county anchor, so component-sum vs combined-rate*taxable
+        //     should tie to the penny absent edge cases.
+        type LocAccum = {
+          locality_name: string;
+          dtf_code: string;
+          combined_rate_bps: number;
+          rate_display: string;
+          taxable_cents: number;
+          mkt_taxable_cents: number;
+          mkt_tax_cents: number;
+          county_tax_cents: number;
+        };
+        const locByCode = new Map<string, LocAccum>();
+        let stateTaxCents = 0;
+        let mctdTaxCents = 0;
+        let stateMktTaxCents = 0;
+        let mctdMktTaxCents = 0;
+
         for (const j of ent.jurisdictions) {
           const dtf = dtfByName(j.jurisdiction_name);
           if (!dtf) unmappedSet.add(j.jurisdiction_name);
           const rateNum = Number(j.rate);
+          const taxableCents = toCents(Number(j.taxable_sales));
+          const taxDueCents = toCents(Number(j.tax_due));
+          const mktTaxableCents = toCents(Number(j.marketplace_taxable));
+          const mktTaxCents = toCents(Number(j.marketplace_tax));
+
           jurisdictions.push({
             entity_id: ent.entity_id,
             entity_legal_name: legal,
@@ -7847,10 +7885,96 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             dtf_code: dtf?.code ?? null,
             rate: rateNum,
             rate_display: dtf?.rate_display ?? formatRateAsFraction(rateNum),
-            taxable_sales_cents: toCents(Number(j.taxable_sales)),
-            tax_due_cents: toCents(Number(j.tax_due)),
+            taxable_sales_cents: taxableCents,
+            tax_due_cents: taxDueCents,
+            marketplace_taxable_cents: mktTaxableCents,
+            marketplace_tax_cents: mktTaxCents,
+          });
+
+          const jurType = String(j.jurisdiction_type || "").toUpperCase();
+          const nameU = j.jurisdiction_name.toUpperCase();
+          const isNYState = nameU === "NEW YORK STATE TAX" ||
+            (jurType === "STATE" && (nameU === "NY" || nameU === "NEW YORK"));
+          const isMCTD = jurType === "SPECIAL" ||
+            nameU.includes("MCTD") || nameU.includes("METROPOLITAN") || nameU.includes("MTA");
+          const isLocalityAnchor = !!dtf && !isNYState && !isMCTD;
+
+          if (isLocalityAnchor) {
+            const existing = locByCode.get(dtf.code);
+            if (existing) {
+              existing.taxable_cents += taxableCents;
+              existing.county_tax_cents += taxDueCents;
+              existing.mkt_taxable_cents += mktTaxableCents;
+              existing.mkt_tax_cents += mktTaxCents;
+            } else {
+              locByCode.set(dtf.code, {
+                locality_name: dtf.name,
+                dtf_code: dtf.code,
+                combined_rate_bps: dtf.rate_basis_points,
+                rate_display: dtf.rate_display,
+                taxable_cents: taxableCents,
+                mkt_taxable_cents: mktTaxableCents,
+                mkt_tax_cents: mktTaxCents,
+                county_tax_cents: taxDueCents,
+              });
+            }
+          } else if (isNYState) {
+            stateTaxCents += taxDueCents;
+            stateMktTaxCents += mktTaxCents;
+          } else if (isMCTD) {
+            mctdTaxCents += taxDueCents;
+            mctdMktTaxCents += mktTaxCents;
+          } else {
+            // Non-NY jurisdiction (out-of-state marketplace) -> providers.
+            if (mktTaxableCents !== 0 || mktTaxCents !== 0) {
+              marketplaceProviders.push({
+                entity_id: ent.entity_id,
+                entity_legal_name: legal,
+                jurisdiction_name: j.jurisdiction_name,
+                jurisdiction_type: jurType || "OTHER",
+                rate: rateNum,
+                rate_display: dtf?.rate_display ?? formatRateAsFraction(rateNum),
+                marketplace_taxable_cents: mktTaxableCents,
+                marketplace_tax_cents: mktTaxCents,
+              });
+            }
+          }
+        }
+
+        const totalLocalityTaxable = Array.from(locByCode.values())
+          .reduce((acc, l) => acc + l.taxable_cents, 0);
+
+        const localityRows: ExportLocalityRow[] = [];
+        for (const loc of Array.from(locByCode.values())) {
+          const combinedTaxCents = Math.round((loc.taxable_cents * loc.combined_rate_bps) / 10000);
+          let stateShare = 0;
+          let mctdShare = 0;
+          let stateMktShare = 0;
+          let mctdMktShare = 0;
+          if (totalLocalityTaxable > 0) {
+            stateShare = Math.round((stateTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+            mctdShare = Math.round((mctdTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+            stateMktShare = Math.round((stateMktTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+            mctdMktShare = Math.round((mctdMktTaxCents * loc.taxable_cents) / totalLocalityTaxable);
+          }
+          const componentSum = loc.county_tax_cents + stateShare + mctdShare;
+          localityRows.push({
+            entity_id: ent.entity_id,
+            entity_legal_name: legal,
+            locality_name: loc.locality_name,
+            dtf_code: loc.dtf_code,
+            combined_rate: loc.combined_rate_bps / 10000,
+            rate_display: loc.rate_display,
+            taxable_sales_cents: loc.taxable_cents,
+            tax_due_cents: combinedTaxCents,
+            tax_components_cents: componentSum,
+            audit_delta_cents: combinedTaxCents - componentSum,
+            marketplace_taxable_cents: loc.mkt_taxable_cents,
+            marketplace_tax_cents: loc.mkt_tax_cents + stateMktShare + mctdMktShare,
           });
         }
+        localityRows.sort((a, b) => b.tax_due_cents - a.tax_due_cents);
+        localities.push(...localityRows);
       }
     }
 
@@ -7872,6 +7996,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       lineDetail,
       entities,
       jurisdictions,
+      localities,
+      marketplaceProviders,
       unmappedJurisdictions: Array.from(unmappedSet).sort(),
       generatedAtET,
     };
