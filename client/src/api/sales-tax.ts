@@ -157,8 +157,10 @@ export interface St810Payload {
 export interface EntitySetting {
   entity_id: number;
   legal_name: string;
-  county: string;
-  dtf_code: string;
+  /** PR #198 (ST5) — NULL for newly-created entities until ops fills it in. */
+  county: string | null;
+  /** PR #198 (ST5) — NULL for newly-created entities until ops fills it in. */
+  dtf_code: string | null;
   tin: string | null;
 }
 

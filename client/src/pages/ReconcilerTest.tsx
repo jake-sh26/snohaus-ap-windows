@@ -511,7 +511,7 @@ function EntitySettingsCard() {
                 <div className="min-w-[200px]">
                   <div className="text-sm font-medium">{e.legal_name}</div>
                   <div className="text-xs text-muted-foreground">
-                    Entity {e.entity_id} · {e.county} · DTF {e.dtf_code}
+                    Entity {e.entity_id} · {e.county ?? "(no county)"} · DTF {e.dtf_code ?? "(unset)"}
                     {!e.tin && <span className="ml-1 text-amber-700">· TIN not set</span>}
                   </div>
                 </div>

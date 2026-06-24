@@ -48,10 +48,10 @@ import {
 // `ENTITY_LEGAL_NAMES` const lived here and had silently drifted from the
 // DB (missing "Inc" on entities 2 + 3) — it was removed in PR #194.
 //
-// Server-side, `server/entity-settings.ts` still has its own
-// `ENTITY_FILING_INFO` constant that drives the actual ST-810 PDF/CSV math.
-// Migrating that to the DB is tracked separately — it has 8+ callsites in
-// routes.ts and needs its own PR.
+// Server-side, `server/entity-settings.ts` previously held an
+// `ENTITY_FILING_INFO` array constant that drove ST-810 PDF/CSV math — that
+// was migrated to read from `payroll_entities` (PR #198, ST5) so the DB is
+// the single source of truth across modules.
 
 const MONTH_NAMES = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
