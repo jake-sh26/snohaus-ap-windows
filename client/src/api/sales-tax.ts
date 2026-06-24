@@ -17,6 +17,8 @@ export type PeriodType = "month" | "quarter";
 /** A single sales-tax filing row (mirrors server SalesTaxFilingRow). */
 export interface SalesTaxFiling {
   period_key: string;
+  /** PR #191: 0 = legacy aggregate row; 1, 2, 3 = per-entity rows. */
+  entity_id: number;
   period_type: PeriodType;
   status: FilingStatus;
   filed_at: string | null;
@@ -25,6 +27,19 @@ export interface SalesTaxFiling {
   notes: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Metadata for an attached PDF on a per-entity filing. */
+export interface SalesTaxFilingAttachment {
+  id: number;
+  period_key: string;
+  entity_id: number;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string | null;
+  uploaded_by_email: string | null;
+  uploaded_at: string;
 }
 
 /** Per-store sales-tax figures for a month (all money in integer cents). */
@@ -81,7 +96,10 @@ export interface SalesTaxMonth {
   totals: SalesTaxTotals;
   warehouse_anomalies: WarehouseAnomaly[];
   invariant: SalesTaxInvariant;
+  /** Legacy aggregate filing row (entity_id = 0). Kept for backward compat. */
   filing: SalesTaxFiling;
+  /** PR #191: per-entity filing rows, ordered by entity_id (1, 2, 3). */
+  filings_by_entity: SalesTaxFiling[];
 }
 
 // ----- PR #168: ST-809 / ST-810 form payloads + entity settings -----
@@ -157,10 +175,15 @@ export interface SalesTaxQuarter {
   per_month: SalesTaxMonth[];
   quarter_totals: SalesTaxTotals;
   quarter_invariant: SalesTaxInvariant;
+  /** Legacy aggregate quarter filing row (entity_id = 0). */
   filing: SalesTaxFiling;
+  /** PR #191: per-entity quarter filing rows. */
+  filings_by_entity: SalesTaxFiling[];
 }
 
 export interface UpsertFilingInput {
+  /** PR #191: defaults to 0 (legacy aggregate) when omitted. */
+  entity_id?: number;
   status?: FilingStatus;
   filed_at?: string | null;
   confirmation_number?: string | null;
@@ -300,4 +323,93 @@ export async function createSalesTaxNote(periodKey: string, text: string): Promi
     { text },
   );
   return (await res.json()) as SalesTaxNote;
+}
+
+// ---------------------------------------------------------------------------
+// PR #191 — Per-entity filing attachments (PDF copies of filed returns).
+// ---------------------------------------------------------------------------
+
+/**
+ * List attachments for a (period_key, entity_id) filing. Returns [] if none.
+ */
+export async function listFilingAttachments(
+  periodKey: string,
+  entityId: number,
+): Promise<SalesTaxFilingAttachment[]> {
+  const res = await apiRequest(
+    "GET",
+    `${BASE}/filings/${encodeURIComponent(periodKey)}/${entityId}/attachments`,
+  );
+  const data = await res.json();
+  return (data?.attachments ?? []) as SalesTaxFilingAttachment[];
+}
+
+/**
+ * Upload a PDF attachment for a (period_key, entity_id) filing. Backend
+ * validates magic bytes (%PDF-) and enforces a 25MB cap.
+ *
+ * Uses a direct fetch (not apiRequest) because apiRequest always forces
+ * Content-Type: application/json when a body is present, which would break
+ * the multipart boundary the browser sets automatically for FormData.
+ */
+export async function uploadFilingAttachment(
+  periodKey: string,
+  entityId: number,
+  file: File,
+): Promise<SalesTaxFilingAttachment> {
+  const fd = new FormData();
+  fd.append("file", file);
+
+  const token = (() => {
+    try {
+      return typeof localStorage !== "undefined" ? localStorage.getItem("snohaus_token") : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  // NOTE: do NOT set Content-Type — the browser must add the multipart boundary.
+
+  const res = await fetch(
+    `${BASE}/filings/${encodeURIComponent(periodKey)}/${entityId}/attachments`,
+    { method: "POST", headers, body: fd },
+  );
+  if (!res.ok) {
+    const text = (await res.text()) || res.statusText;
+    throw new Error(`${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  return data?.attachment as SalesTaxFilingAttachment;
+}
+
+/**
+ * Download an attachment by id, attaching the Bearer token (endpoint is
+ * permission-gated). Mirrors downloadSalesTaxExport.
+ */
+export async function downloadFilingAttachment(
+  id: number,
+  fallbackFilename: string,
+): Promise<void> {
+  const res = await apiRequest("GET", `${BASE}/filings/attachment/${id}`);
+  const blob = await res.blob();
+
+  const cd = res.headers.get("Content-Disposition") || "";
+  const match = /filename="?([^"]+)"?/.exec(cd);
+  const filename = match?.[1] ?? fallbackFilename;
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** Delete an attachment by id. */
+export async function deleteFilingAttachment(id: number): Promise<void> {
+  await apiRequest("DELETE", `${BASE}/filings/attachment/${id}`);
 }

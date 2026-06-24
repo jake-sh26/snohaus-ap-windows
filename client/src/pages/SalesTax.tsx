@@ -10,6 +10,7 @@
  * All money arrives as integer cents from the backend and is formatted once via
  * formatCents. Export + mark-filed actions are gated by finance.sales_tax.export.
  */
+import type React from "react";
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,9 +28,13 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/lib/auth";
 import {
-  getSalesTaxMonth, upsertSalesTaxFiling, downloadSalesTaxExport,
+  getSalesTaxMonth, getSalesTaxQuarter, upsertSalesTaxFiling, downloadSalesTaxExport,
   listSalesTaxNotes, createSalesTaxNote,
-  type SalesTaxMonth, type SalesTaxStoreRow, type FilingStatus, type ExportFormat,
+  listFilingAttachments, uploadFilingAttachment,
+  downloadFilingAttachment, deleteFilingAttachment,
+  type SalesTaxMonth, type SalesTaxQuarter, type SalesTaxStoreRow,
+  type SalesTaxFiling, type SalesTaxFilingAttachment,
+  type FilingStatus, type ExportFormat,
   type SalesTaxNote,
 } from "@/api/sales-tax";
 
@@ -61,6 +66,16 @@ function bpsToPct(bps: number): string {
 function monthLong(month: string): string {
   const [y, m] = month.split("-");
   return `${MONTH_NAMES[Number(m) - 1]} ${y}`;
+}
+
+/**
+ * PR #191 — NY tax-year quarter-end months. Returns true when the YYYY-MM
+ * key falls on Feb (Q4 end), May (Q1), Aug (Q2), or Nov (Q3). We trigger the
+ * cumulative quarter section in the monthly view on these months.
+ */
+function isQuarterEndMonth(monthKey: string): boolean {
+  const mm = monthKey.slice(5);
+  return mm === "02" || mm === "05" || mm === "08" || mm === "11";
 }
 
 /** Previous calendar month as YYYY-MM (today June 1 2026 -> "2026-05"). */
@@ -182,6 +197,12 @@ export default function SalesTax() {
             onChanged={() => qc.invalidateQueries({ queryKey: ["/api/recon/finance/sales-tax", month] })}
             toast={toast}
           />
+          {/* PR #191 — on quarter-end months (Feb/May/Aug/Nov in NY tax-year
+              calendar), show the cumulative quarter rollup so the filer can
+              cross-check the ST-810 totals. */}
+          {!isQuarter && data.quarter_key && isQuarterEndMonth(data.month) && (
+            <QuarterlyCumulativeSection quarterKey={data.quarter_key} />
+          )}
           {canExport && (
             <ExportButtons periodKey={periodKey} toast={toast} />
           )}
@@ -500,8 +521,82 @@ function FilingChecklist({
   onChanged: () => void;
   toast: ToastFn;
 }) {
-  const filing = data.filing;
-  const status = filing.status;
+  // PR #191 â each entity (1=Greenvale, 2=Huntington, 3=Hempstead) files
+  // its own ST-810/ST-809 return. Render 3 cards. The legacy aggregate row
+  // (entity_id 0) is intentionally NOT shown; it remains in the backend only
+  // for backward compatibility with old per-period exports.
+  const filings = data.filings_by_entity ?? [];
+  const filingFor = (eid: number): SalesTaxFiling | undefined =>
+    filings.find((f) => f.entity_id === eid);
+
+  // Tax-due per entity for display in the card header (sums net_tax_cents
+  // across the entity’s stores in this period).
+  const taxDueByEntity = new Map<number, number>();
+  for (const s of data.stores) {
+    taxDueByEntity.set(
+      s.entity_id,
+      (taxDueByEntity.get(s.entity_id) ?? 0) + s.net_tax_cents,
+    );
+  }
+
+  const entityIds = [1, 2, 3];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          Filing checklist
+          <span className="text-xs font-normal text-muted-foreground">period {periodKey}</span>
+        </CardTitle>
+        <p className="text-xs text-muted-foreground mt-1">
+          Each entity files its own return. Mark each card filed individually and
+          attach the official confirmation PDF for the audit trail.
+        </p>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-4 md:grid-cols-3">
+          {entityIds.map((eid) => (
+            <EntityFilingCard
+              key={eid}
+              entityId={eid}
+              periodKey={periodKey}
+              filing={filingFor(eid)}
+              taxDueCents={taxDueByEntity.get(eid) ?? 0}
+              canExport={canExport}
+              currentUser={currentUser}
+              onChanged={onChanged}
+              toast={toast}
+            />
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * One filing card for one entity. Owns its own modal + attachments query.
+ *
+ * Per-entity attachments are scoped to (period_key, entity_id) on the server.
+ * Uploading a PDF here records who uploaded it and stores the blob in SQLite
+ * so it follows the database backup/restore cycle (no separate file store).
+ */
+function EntityFilingCard({
+  entityId, periodKey, filing, taxDueCents,
+  canExport, currentUser, onChanged, toast,
+}: {
+  entityId: number;
+  periodKey: string;
+  filing: SalesTaxFiling | undefined;
+  taxDueCents: number;
+  canExport: boolean;
+  currentUser: { user_id: number | null; name: string | null; email: string | null };
+  onChanged: () => void;
+  toast: ToastFn;
+}) {
+  const qc = useQueryClient();
+  const legal = ENTITY_LEGAL_NAMES[entityId] ?? `Entity ${entityId}`;
+  const status: FilingStatus = filing?.status ?? "open";
   const badge = STATUS_BADGE[status];
 
   const [open, setOpen] = useState(false);
@@ -511,28 +606,39 @@ function FilingChecklist({
   const [notes, setNotes] = useState<string>("");
 
   const mut = useMutation({
-    mutationFn: (input: { status: FilingStatus; filed_at: string | null; confirmation_number: string; notes: string }) =>
-      upsertSalesTaxFiling(periodKey, input),
+    mutationFn: (input: {
+      status: FilingStatus;
+      filed_at: string | null;
+      confirmation_number: string;
+      notes: string;
+    }) =>
+      upsertSalesTaxFiling(periodKey, {
+        entity_id: entityId,
+        ...input,
+      }),
     onSuccess: () => {
       setOpen(false);
-      toast({ title: "Filing updated", description: `${periodKey} marked ${amendMode ? "amended" : "filed"}.` });
+      toast({
+        title: "Filing updated",
+        description: `${legal} — ${periodKey} marked ${amendMode ? "amended" : "filed"}.`,
+      });
       onChanged();
     },
-    onError: (e: any) => toast({ title: "Update failed", description: String(e?.message ?? e), variant: "destructive" }),
+    onError: (e: any) =>
+      toast({ title: "Update failed", description: String(e?.message ?? e), variant: "destructive" }),
   });
 
   function openModal(amend: boolean) {
     setAmendMode(amend);
-    // Default filed_at to now (local, formatted for datetime-local input).
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     setFiledAt(
-      filing.filed_at
+      filing?.filed_at
         ? filing.filed_at.slice(0, 16)
         : `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`,
     );
-    setConfirmation(filing.confirmation_number ?? "");
-    setNotes(filing.notes ?? "");
+    setConfirmation(filing?.confirmation_number ?? "");
+    setNotes(filing?.notes ?? "");
     setOpen(true);
   }
 
@@ -545,98 +651,417 @@ function FilingChecklist({
     });
   }
 
+  // -- Attachments --------------------------------------------------------
+  const attachmentsKey = ["/api/recon/finance/sales-tax/filings", periodKey, entityId, "attachments"];
+  const attachmentsQ = useQuery<SalesTaxFilingAttachment[]>({
+    queryKey: attachmentsKey,
+    queryFn: () => listFilingAttachments(periodKey, entityId),
+  });
+
+  const uploadMut = useMutation({
+    mutationFn: (file: File) => uploadFilingAttachment(periodKey, entityId, file),
+    onSuccess: () => {
+      toast({ title: "Attachment uploaded", description: `${legal} — ${periodKey}` });
+      qc.invalidateQueries({ queryKey: attachmentsKey });
+    },
+    onError: (e: any) =>
+      toast({ title: "Upload failed", description: String(e?.message ?? e), variant: "destructive" }),
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: (id: number) => deleteFilingAttachment(id),
+    onSuccess: () => {
+      toast({ title: "Attachment removed" });
+      qc.invalidateQueries({ queryKey: attachmentsKey });
+    },
+    onError: (e: any) =>
+      toast({ title: "Delete failed", description: String(e?.message ?? e), variant: "destructive" }),
+  });
+
+  function handlePickFile(ev: React.ChangeEvent<HTMLInputElement>) {
+    const f = ev.target.files?.[0];
+    ev.target.value = ""; // allow re-uploading the same filename later
+    if (!f) return;
+    if (!f.name.toLowerCase().endsWith(".pdf")) {
+      toast({ title: "PDF only", description: "Only .pdf files are accepted.", variant: "destructive" });
+      return;
+    }
+    if (f.size > 25 * 1024 * 1024) {
+      toast({ title: "Too large", description: "Max 25 MB per attachment.", variant: "destructive" });
+      return;
+    }
+    uploadMut.mutate(f);
+  }
+
+  async function handleDownload(att: SalesTaxFilingAttachment) {
+    try {
+      await downloadFilingAttachment(att.id, att.filename);
+    } catch (e: any) {
+      toast({ title: "Download failed", description: String(e?.message ?? e), variant: "destructive" });
+    }
+  }
+
   const filedByLabel = (() => {
-    if (filing.filed_by_user_id == null) return "—";
-    if (filing.filed_by_user_id === currentUser.user_id) return currentUser.name || currentUser.email || `User ${filing.filed_by_user_id}`;
+    if (!filing || filing.filed_by_user_id == null) return "—";
+    if (filing.filed_by_user_id === currentUser.user_id)
+      return currentUser.name || currentUser.email || `User ${filing.filed_by_user_id}`;
     return `User ${filing.filed_by_user_id}`;
   })();
 
+  const attachments = attachmentsQ.data ?? [];
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base flex items-center gap-2">
-          Filing checklist
-          <Badge className={badge.cls} data-testid="badge-filing-status">{badge.label}</Badge>
-          <span className="text-xs font-normal text-muted-foreground">period {periodKey}</span>
-        </CardTitle>
+    <Card data-testid={`card-filing-${entityId}`}>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-sm">{legal}</CardTitle>
+          <Badge className={badge.cls} data-testid={`badge-filing-${entityId}-status`}>
+            {badge.label}
+          </Badge>
+        </div>
+        <div className="flex justify-between text-xs text-muted-foreground mt-1">
+          <span>Entity {entityId}</span>
+          <span className="tabular-nums" data-testid={`text-filing-${entityId}-tax-due`}>
+            Tax due {formatCents(taxDueCents)}
+          </span>
+        </div>
       </CardHeader>
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-3 text-sm">
         {status === "open" ? (
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-muted-foreground">This period has not been filed.</span>
+          <div className="text-muted-foreground text-xs">Not yet filed.</div>
+        ) : (
+          <div className="space-y-1 text-xs">
+            <div className="flex justify-between gap-2">
+              <span className="text-muted-foreground">Filed at</span>
+              <span className="tabular-nums">{filing?.filed_at ?? "—"}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-muted-foreground">Confirmation #</span>
+              <span className="font-mono">{filing?.confirmation_number || "—"}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span className="text-muted-foreground">Filed by</span>
+              <span className="truncate" title={filedByLabel}>{filedByLabel}</span>
+            </div>
+            {filing?.notes ? (
+              <div className="text-muted-foreground whitespace-pre-wrap break-words pt-1">
+                {filing.notes}
+              </div>
+            ) : null}
+          </div>
+        )}
+
+        <div className="flex gap-2 pt-1">
+          {status === "open" ? (
             <Button
               size="sm"
               disabled={!canExport}
               onClick={() => openModal(false)}
-              data-testid="button-mark-filed"
+              data-testid={`button-mark-filed-${entityId}`}
               title={canExport ? undefined : "Requires finance.sales_tax.export"}
             >
               Mark as Filed
             </Button>
-          </div>
-        ) : (
-          <div className="space-y-2 text-sm">
-            <div className="grid grid-cols-2 gap-x-6 gap-y-1 max-w-xl">
-              <div className="font-medium">Filed at</div>
-              <div className="tabular-nums">{filing.filed_at ?? "—"}</div>
-              <div className="font-medium">Confirmation #</div>
-              <div className="font-mono text-xs">{filing.confirmation_number || "—"}</div>
-              <div className="font-medium">Filed by</div>
-              <div>{filedByLabel}</div>
-              <div className="font-medium">Notes</div>
-              <div className="whitespace-pre-wrap">{filing.notes || "—"}</div>
-            </div>
+          ) : (
             <Button
               size="sm"
               variant="outline"
               disabled={!canExport}
               onClick={() => openModal(true)}
-              data-testid="button-amend-filing"
+              data-testid={`button-amend-filing-${entityId}`}
               title={canExport ? undefined : "Requires finance.sales_tax.export"}
             >
               Amend
             </Button>
+          )}
+        </div>
+
+        {/* Attachments */}
+        <div className="border-t pt-2 space-y-1.5">
+          <div className="text-xs font-medium text-muted-foreground">
+            Filing PDFs ({attachments.length})
           </div>
-        )}
+          {attachmentsQ.isLoading && (
+            <div className="text-xs text-muted-foreground">Loading…</div>
+          )}
+          {attachments.length === 0 && !attachmentsQ.isLoading && (
+            <div className="text-xs text-muted-foreground italic">No PDFs attached.</div>
+          )}
+          {attachments.map((att) => (
+            <div
+              key={att.id}
+              className="flex items-center justify-between gap-2 rounded border px-2 py-1.5 text-xs"
+              data-testid={`row-attachment-${att.id}`}
+            >
+              <button
+                type="button"
+                onClick={() => handleDownload(att)}
+                className="text-left truncate text-blue-600 dark:text-blue-400 hover:underline flex-1"
+                title={att.filename}
+                data-testid={`button-download-attachment-${att.id}`}
+              >
+                {att.filename}
+              </button>
+              <span className="text-muted-foreground tabular-nums shrink-0">
+                {formatBytes(att.size_bytes)}
+              </span>
+              {canExport && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.confirm(`Delete ${att.filename}?`)) {
+                      deleteMut.mutate(att.id);
+                    }
+                  }}
+                  className="text-red-600 hover:underline shrink-0"
+                  data-testid={`button-delete-attachment-${att.id}`}
+                >
+                  Delete
+                </button>
+              )}
+            </div>
+          ))}
+          {canExport && (
+            <label className="inline-flex items-center gap-2 text-xs cursor-pointer mt-1">
+              <input
+                type="file"
+                accept="application/pdf,.pdf"
+                onChange={handlePickFile}
+                disabled={uploadMut.isPending}
+                className="hidden"
+                data-testid={`input-upload-${entityId}`}
+              />
+              <span className="rounded border border-dashed border-border px-2 py-1 hover:bg-muted">
+                {uploadMut.isPending ? "Uploading…" : "+ Attach PDF"}
+              </span>
+            </label>
+          )}
+        </div>
       </CardContent>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{amendMode ? "Amend filing" : "Mark as Filed"} — {periodKey}</DialogTitle>
+            <DialogTitle>
+              {amendMode ? "Amend filing" : "Mark as Filed"} — {legal} — {periodKey}
+            </DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
-              <Label htmlFor="filed-at">Filed at</Label>
+              <Label htmlFor={`filed-at-${entityId}`}>Filed at</Label>
               <Input
-                id="filed-at" type="datetime-local" value={filedAt}
-                onChange={(e) => setFiledAt(e.target.value)} data-testid="input-filed-at"
+                id={`filed-at-${entityId}`} type="datetime-local" value={filedAt}
+                onChange={(e) => setFiledAt(e.target.value)}
+                data-testid={`input-filed-at-${entityId}`}
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="confirmation">Confirmation number</Label>
+              <Label htmlFor={`confirmation-${entityId}`}>Confirmation number</Label>
               <Input
-                id="confirmation" value={confirmation}
+                id={`confirmation-${entityId}`} value={confirmation}
                 onChange={(e) => setConfirmation(e.target.value)}
-                placeholder="NY portal confirmation #" data-testid="input-confirmation"
+                placeholder="NY portal confirmation #"
+                data-testid={`input-confirmation-${entityId}`}
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="notes">Notes</Label>
+              <Label htmlFor={`notes-${entityId}`}>Notes</Label>
               <Textarea
-                id="notes" value={notes} rows={3}
-                onChange={(e) => setNotes(e.target.value)} data-testid="input-notes"
+                id={`notes-${entityId}`} value={notes} rows={3}
+                onChange={(e) => setNotes(e.target.value)}
+                data-testid={`input-notes-${entityId}`}
               />
             </div>
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={mut.isPending} data-testid="button-submit-filing">
+            <Button
+              onClick={submit}
+              disabled={mut.isPending}
+              data-testid={`button-submit-filing-${entityId}`}
+            >
               {mut.isPending ? "Saving…" : amendMode ? "Save amendment" : "Confirm filed"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </Card>
+  );
+}
+
+/** Pretty-print a byte count: 12345 -> "12.1 KB". */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Quarter-end months also show a cumulative quarter rollup so the filer can
+ * verify the ST-810 quarter totals before submitting. Renders only when the
+ * selected month is the NY-tax-year quarter end (Feb, May, Aug, Nov).
+ *
+ * Each entity card here is collapsible (closed by default) so the page stays
+ * compact for the common case where the filer is just reviewing the month.
+ */
+function QuarterlyCumulativeSection({
+  quarterKey,
+}: {
+  quarterKey: string;
+}) {
+  const quarterQ = useQuery<SalesTaxQuarter>({
+    queryKey: ["/api/recon/finance/sales-tax/quarter", quarterKey],
+    queryFn: () => getSalesTaxQuarter(quarterKey),
+  });
+
+  const data = quarterQ.data;
+
+  // Cumulative per-entity totals across the 3 months in the quarter.
+  // We sum store-level cents (filtered by entity_id) across per_month entries.
+  const cumulative = (() => {
+    const out = new Map<number, { gross: number; taxable: number; tax: number; marketplace: number }>();
+    if (!data) return out;
+    for (const month of data.per_month) {
+      for (const s of month.stores) {
+        const cur = out.get(s.entity_id) ?? { gross: 0, taxable: 0, tax: 0, marketplace: 0 };
+        cur.gross += s.gross_sales_cents;
+        cur.taxable += s.taxable_sales_cents;
+        cur.tax += s.net_tax_cents;
+        cur.marketplace += s.marketplace_sales_cents;
+        out.set(s.entity_id, cur);
+      }
+    }
+    return out;
+  })();
+
+  const entityIds = [1, 2, 3];
+
+  return (
+    <Card data-testid="card-quarter-cumulative">
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          Quarterly cumulative — {quarterKey}
+          <Badge variant="outline" className="font-normal text-xs">Quarter end</Badge>
+        </CardTitle>
+        <p className="text-xs text-muted-foreground mt-1">
+          Running totals for the 3 months in this quarter. Use these to verify
+          your ST-810 quarter return matches the per-month numbers above.
+        </p>
+      </CardHeader>
+      <CardContent>
+        {quarterQ.isLoading && (
+          <div className="text-sm text-muted-foreground">Loading quarter rollup…</div>
+        )}
+        {quarterQ.error && (
+          <div className="text-sm text-red-600">
+            Failed to load quarter: {String((quarterQ.error as any)?.message ?? quarterQ.error)}
+          </div>
+        )}
+        {data && (
+          <div className="grid gap-4 md:grid-cols-3">
+            {entityIds.map((eid) => (
+              <QuarterEntityCard
+                key={eid}
+                entityId={eid}
+                gross={cumulative.get(eid)?.gross ?? 0}
+                marketplace={cumulative.get(eid)?.marketplace ?? 0}
+                taxable={cumulative.get(eid)?.taxable ?? 0}
+                taxDue={cumulative.get(eid)?.tax ?? 0}
+                perMonth={data.per_month}
+              />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function QuarterEntityCard({
+  entityId, gross, marketplace, taxable, taxDue, perMonth,
+}: {
+  entityId: number;
+  gross: number;
+  marketplace: number;
+  taxable: number;
+  taxDue: number;
+  perMonth: SalesTaxMonth[];
+}) {
+  const [open, setOpen] = useState(false);
+  const legal = ENTITY_LEGAL_NAMES[entityId] ?? `Entity ${entityId}`;
+
+  // Per-month breakdown for this entity.
+  const rows = perMonth.map((m) => {
+    let g = 0, t = 0, x = 0;
+    for (const s of m.stores) {
+      if (s.entity_id !== entityId) continue;
+      g += s.gross_sales_cents;
+      t += s.taxable_sales_cents;
+      x += s.net_tax_cents;
+    }
+    return { month: m.month, gross: g, taxable: t, taxDue: x };
+  });
+
+  return (
+    <Card data-testid={`card-quarter-entity-${entityId}`} className="border-blue-500/30">
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm">{legal}</CardTitle>
+        <span className="text-xs text-muted-foreground">Quarter cumulative</span>
+      </CardHeader>
+      <CardContent className="space-y-1.5 text-sm">
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Gross</span>
+          <span className="tabular-nums">{formatCents(gross)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Marketplace</span>
+          <span className="tabular-nums">{formatCents(marketplace)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Taxable</span>
+          <span className="tabular-nums">{formatCents(taxable)}</span>
+        </div>
+        <div className="flex justify-between font-medium border-t pt-1.5 mt-1.5">
+          <span>Tax due (quarter)</span>
+          <span
+            className="tabular-nums"
+            data-testid={`text-quarter-entity-${entityId}-tax-due`}
+          >
+            {formatCents(taxDue)}
+          </span>
+        </div>
+        <div className="pt-2">
+          <button
+            type="button"
+            className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+            onClick={() => setOpen((v) => !v)}
+            data-testid={`button-quarter-entity-${entityId}-breakdown`}
+          >
+            {open ? "Hide" : "Show"} per-month breakdown
+          </button>
+          {open && (
+            <div className="mt-2 space-y-1.5">
+              {rows.map((r) => (
+                <div key={r.month} className="rounded border px-2 py-1.5 text-xs">
+                  <div className="font-medium">{monthLong(r.month)}</div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Gross</span>
+                    <span className="tabular-nums">{formatCents(r.gross)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Taxable</span>
+                    <span className="tabular-nums">{formatCents(r.taxable)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Tax due</span>
+                    <span className="tabular-nums">{formatCents(r.taxDue)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </CardContent>
     </Card>
   );
 }

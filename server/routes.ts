@@ -165,9 +165,14 @@ import {
 } from "./sales-tax-mapping";
 import {
   getFiling,
+  getFilingsByPeriod,
   upsertFiling,
   listFilings,
   openFilingPlaceholder,
+  listFilingAttachments,
+  getFilingAttachment,
+  createFilingAttachment,
+  deleteFilingAttachment,
   type FilingStatus,
 } from "./sales-tax-filings";
 import {
@@ -7700,8 +7705,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     };
   };
 
+  // Legacy aggregate filing block (entity_id = 0). Kept so the existing
+  // payload shape stays stable while we roll out per-entity filings.
   const filingBlockFor = (periodKey: string) =>
-    getFiling(periodKey) ?? openFilingPlaceholder(periodKey);
+    getFiling(periodKey, 0) ?? openFilingPlaceholder(periodKey, 0);
+
+  // Per-entity filing rows for entity_ids 1, 2, 3. Falls back to an "open"
+  // placeholder for any entity that hasn't been touched yet, so the UI can
+  // always render three checklist cards.
+  const filingsByEntityFor = (periodKey: string) => {
+    const rows = new Map<number, ReturnType<typeof getFiling>>();
+    for (const r of getFilingsByPeriod(periodKey)) {
+      rows.set(r.entity_id, r);
+    }
+    return [1, 2, 3].map((eid) => rows.get(eid) ?? openFilingPlaceholder(periodKey, eid));
+  };
 
   // -------------------------------------------------------------------
   // Export support (PR #167). Per-line taxable detail for the XLSX "Line
@@ -8072,7 +8090,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       try {
         const base = computeSalesTaxForMonth(month);
-        res.json({ ...base, filing: filingBlockFor(month) });
+        res.json({
+          ...base,
+          filing: filingBlockFor(month),
+          filings_by_entity: filingsByEntityFor(month),
+        });
       } catch (e: any) {
         res.status(500).json({ message: e?.message || "sales-tax compute failed" });
       }
@@ -8094,6 +8116,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const perMonth = months.map((m) => ({
           ...computeSalesTaxForMonth(m),
           filing: filingBlockFor(m),
+          filings_by_entity: filingsByEntityFor(m),
         }));
         const quarterTotals = perMonth.reduce(
           (acc, mm) => ({
@@ -8119,6 +8142,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             delta_cents: delta,
           },
           filing: filingBlockFor(quarterKey),
+          filings_by_entity: filingsByEntityFor(quarterKey),
         });
       } catch (e: any) {
         res.status(500).json({ message: e?.message || "quarter compute failed" });
@@ -8359,8 +8383,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (status !== undefined && !["open", "filed", "amended"].includes(status)) {
         return res.status(400).json({ message: "status must be open|filed|amended" });
       }
+      // PR #191: per-entity filings. entity_id defaults to 0 (legacy aggregate)
+      // to keep older clients working. New UI flows always pass 1, 2, or 3.
+      const rawEntity = body.entity_id;
+      const entityId = rawEntity === undefined || rawEntity === null
+        ? 0
+        : Number(rawEntity);
+      if (!Number.isInteger(entityId) || ![0, 1, 2, 3].includes(entityId)) {
+        return res.status(400).json({ message: "entity_id must be 0, 1, 2, or 3" });
+      }
       try {
         const row = upsertFiling(periodKey, {
+          entity_id: entityId,
           status,
           filed_at: body.filed_at ?? null,
           confirmation_number: body.confirmation_number ?? null,
@@ -8431,6 +8465,124 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         res.json(note);
       } catch (e: any) {
         res.status(500).json({ message: e?.message || "create note failed" });
+      }
+    },
+  );
+
+  // 4c. Filing attachments (PR #191). Stores the filed-confirmation PDF (or
+  // any supporting doc) per (periodKey, entityId). Append/list/download/delete.
+  //   GET    /api/recon/finance/sales-tax/filings/:periodKey/:entityId/attachments
+  //   POST   /api/recon/finance/sales-tax/filings/:periodKey/:entityId/attachments  (multipart "file")
+  //   GET    /api/recon/finance/sales-tax/filings/attachment/:id  -> binary download
+  //   DELETE /api/recon/finance/sales-tax/filings/attachment/:id
+  // entityId must be 1, 2, or 3 (per-entity filing). Read requires
+  // finance.sales_tax.view; write/delete require finance.sales_tax.export.
+  const isValidEntityId = (n: number) => [1, 2, 3].includes(n);
+
+  app.get(
+    "/api/recon/finance/sales-tax/filings/:periodKey/:entityId/attachments",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req: any, res) => {
+      const periodKey = String(req.params.periodKey);
+      const entityId = Number(req.params.entityId);
+      if (!/^\d{4}-(\d{2}|Q[1-4])$/.test(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      if (!isValidEntityId(entityId)) {
+        return res.status(400).json({ message: "entity_id must be 1, 2, or 3" });
+      }
+      try {
+        res.json({ attachments: listFilingAttachments(periodKey, entityId) });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "list attachments failed" });
+      }
+    },
+  );
+
+  app.post(
+    "/api/recon/finance/sales-tax/filings/:periodKey/:entityId/attachments",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    uploadHandler.single("file"),
+    (req: any, res) => {
+      const periodKey = String(req.params.periodKey);
+      const entityId = Number(req.params.entityId);
+      if (!/^\d{4}-(\d{2}|Q[1-4])$/.test(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      if (!isValidEntityId(entityId)) {
+        return res.status(400).json({ message: "entity_id must be 1, 2, or 3" });
+      }
+      const file = req.file;
+      if (!file || !file.buffer || file.size === 0) {
+        return res.status(400).json({ message: "file is required (multipart field name: 'file')" });
+      }
+      // Defense in depth: only accept PDFs (sniff %PDF- magic), max 25 MB.
+      // Anything bigger is almost certainly not a NYS confirmation PDF.
+      if (file.size > 25 * 1024 * 1024) {
+        return res.status(400).json({ message: "file too large (max 25 MB)" });
+      }
+      const head = file.buffer.subarray(0, 5).toString("latin1");
+      if (head !== "%PDF-") {
+        return res.status(400).json({ message: "file must be a PDF" });
+      }
+      const sha256 = crypto.createHash("sha256").update(file.buffer).digest("hex");
+      try {
+        const meta = createFilingAttachment({
+          periodKey,
+          entityId,
+          filename: String(file.originalname || "filing.pdf").slice(0, 255),
+          contentType: "application/pdf",
+          blob: file.buffer,
+          sha256,
+          uploadedByEmail: req.email || null,
+        });
+        res.json(meta);
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "attachment create failed" });
+      }
+    },
+  );
+
+  app.get(
+    "/api/recon/finance/sales-tax/filings/attachment/:id",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ message: "id must be a positive integer" });
+      }
+      try {
+        const att = getFilingAttachment(id);
+        if (!att) return res.status(404).json({ message: "attachment not found" });
+        const safeName = att.filename.replace(/["\\]/g, "_");
+        res.setHeader("Content-Type", att.content_type || "application/pdf");
+        res.setHeader("Content-Length", String(att.size_bytes));
+        res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
+        res.end(att.blob);
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "attachment fetch failed" });
+      }
+    },
+  );
+
+  app.delete(
+    "/api/recon/finance/sales-tax/filings/attachment/:id",
+    authMiddleware,
+    requirePermission("finance.sales_tax.export"),
+    (req, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ message: "id must be a positive integer" });
+      }
+      try {
+        const ok = deleteFilingAttachment(id);
+        if (!ok) return res.status(404).json({ message: "attachment not found" });
+        res.json({ ok: true });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "attachment delete failed" });
       }
     },
   );
