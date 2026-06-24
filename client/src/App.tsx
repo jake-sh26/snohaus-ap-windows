@@ -10,14 +10,13 @@ import { ThemeProvider } from "@/lib/theme";
 import { Layout } from "@/components/Layout";
 import Login from "@/pages/Login";
 import Inbox from "@/pages/Inbox";
-import Rules from "@/pages/Rules";
-import Aliases from "@/pages/Aliases";
 import Posted from "@/pages/Posted";
 import AllInvoices from "@/pages/AllInvoices";
 import Receiving from "@/pages/Receiving";
 import Problem from "@/pages/Problem";
 import Skipped from "@/pages/Skipped";
 import Settings from "@/pages/Settings";
+import ApSettings from "@/pages/accounts-payable/ApSettings";
 import Payroll from "@/pages/Payroll";
 import PayrollEntities from "@/pages/PayrollEntities";
 import PayrollEmployees from "@/pages/PayrollEmployees";
@@ -46,6 +45,21 @@ function ReconcilerRedirect() {
     }
     navigate(target, { replace: true });
   }, [location, navigate]);
+  return null;
+}
+
+/**
+ * Backward-compat redirect for the legacy flat AP routes /rules and /aliases.
+ *
+ * They moved into the AP Settings hub at /accounts-payable/settings/* and now
+ * share a single sidebar entry. Anyone with a bookmark to the old URL lands
+ * on the matching hub tab; the back button still works because we `replace`.
+ */
+function ApLegacyRedirect({ tab }: { tab: "rules" | "aliases" }) {
+  const [, navigate] = useLocation();
+  useEffect(() => {
+    navigate(`/accounts-payable/settings/${tab}`, { replace: true });
+  }, [tab, navigate]);
   return null;
 }
 
@@ -79,8 +93,23 @@ function ProtectedRoutes() {
         <Route path="/skipped" component={Skipped} />
         <Route path="/all-invoices" component={AllInvoices} />
         <Route path="/posted" component={Posted} />
-        <Route path="/rules" component={Rules} />
-        <Route path="/aliases" component={Aliases} />
+        {/* AP Settings hub — module-local settings for Accounts Payable.
+            Default landing tab is Rules (most-frequent operator workflow). */}
+        <Route path="/accounts-payable/settings">
+          {() => <ApSettings tab="rules" />}
+        </Route>
+        <Route path="/accounts-payable/settings/rules">
+          {() => <ApSettings tab="rules" />}
+        </Route>
+        <Route path="/accounts-payable/settings/aliases">
+          {() => <ApSettings tab="aliases" />}
+        </Route>
+        <Route path="/accounts-payable/settings/vendor-groups">
+          {() => <ApSettings tab="vendor-groups" />}
+        </Route>
+        {/* Backward-compat: legacy flat /rules + /aliases URLs. */}
+        <Route path="/rules">{() => <ApLegacyRedirect tab="rules" />}</Route>
+        <Route path="/aliases">{() => <ApLegacyRedirect tab="aliases" />}</Route>
         <Route path="/settings" component={Settings} />
         <Route path="/payroll" component={Payroll} />
         <Route path="/payroll/entities" component={PayrollEntities} />
