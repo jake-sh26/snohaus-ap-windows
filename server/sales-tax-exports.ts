@@ -191,6 +191,13 @@ export interface ExportPayload {
   marketplaceProviders: ExportMarketplaceProviderRow[];
   /** Any jurisdiction name lacking a DTF code (ST-810 warning). */
   unmappedJurisdictions: string[];
+  /**
+   * PR #198 (ST5) — entities skipped from this export because they're missing
+   * jurisdiction config (county / rate_bps / dtf_code) required by ST-810.
+   * Always [] for ST-809. The Sales Tax UI surfaces this as a banner so the
+   * operator can fix the entity before re-running the export.
+   */
+  excludedEntities?: Array<{ entity_id: number; legal_name: string; missing: string[] }>;
   generatedAtET: string;
 }
 

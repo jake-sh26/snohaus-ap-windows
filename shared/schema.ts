@@ -206,8 +206,9 @@ export const payrollEntities = sqliteTable("payroll_entities", {
   // lives in one row.
   tin: text("tin"),
   // Filing-jurisdiction facts (used by ST-810/ST-809 PDF + jurisdiction
-  // enrichment). PR #192: pulled from the hardcoded ENTITY_FILING_INFO
-  // const in server/entity-settings.ts so the user can edit them.
+  // enrichment). PR #192 lifted them out of the hardcoded ENTITY_FILING_INFO
+  // const so the user can edit them; PR #198 (ST5) made this the only
+  // source — the constant is gone and entity-settings.ts reads from here.
   county: text("county"),
   rate_bps: integer("rate_bps"),
   dtf_code: text("dtf_code"),

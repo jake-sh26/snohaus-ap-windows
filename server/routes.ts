@@ -190,7 +190,10 @@ import {
   upsertTin,
   legalNameFor,
   filingInfoFor,
-  ENTITY_FILING_INFO,
+  loadFilingEntities,
+  isFilingComplete,
+  filingEntityExists,
+  type EntityFilingInfo,
 } from "./entity-settings";
 import { dtfByName, dtfForNyOtherComponent, NyDtfJurisdiction } from "./ny-dtf-jurisdictions";
 import { formatRateAsFraction } from "@shared/format-rate";
@@ -5382,7 +5385,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       for (const s of summaries) byEntity.set(s.entity_id, s);
       const tinByEntity = getEntitySettings();
 
-      const entities = ENTITY_FILING_INFO.map((info) => {
+      // PR #198 (ST5) — entity facts come from `payroll_entities`. Smart-middle
+      // rule: include active entities + any inactive ones that had sales in
+      // this period (so back-period filings for a since-closed store still
+      // resolve). ST-809 doesn't need jurisdiction config to render — all
+      // three optional fields (county / rate_bps / dtf_code) are nullable here.
+      const periodEntityIds = new Set<number>(summaries.map((s) => s.entity_id));
+      const filingEntities = loadFilingEntities({ entitiesWithSalesInPeriod: periodEntityIds });
+      const entities = filingEntities.map((info) => {
         const s = byEntity.get(info.entity_id);
         return {
           entity_id: info.entity_id,
@@ -5403,8 +5413,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         formType: "ST-809",
         method: "long",
         entities,
-        note: "PR #168: ST-809 long-method monthly filing. Per-entity only (no jurisdiction breakdown). tax_due is marketplace-carved (aggregateByEntity.tax_owed). All 3 entities always present.",
-        build_id: "pr168",
+        note: "PR #168 + #198: ST-809 long-method monthly filing. Per-entity only (no jurisdiction breakdown). tax_due is marketplace-carved (aggregateByEntity.tax_owed). PR #198 (ST5): entity list now reads from payroll_entities; inactive entities are included only when they had attributed sales in the requested period.",
+        build_id: "pr198",
       });
     } catch (e: any) {
       res.status(500).json({ message: "tax st809 failed", error: String(e?.message || e) });
@@ -5471,15 +5481,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // entities with legal name + current TIN (null if unset).
   app.get("/api/recon/tax/entity-settings", authMiddleware, requirePermission("finance.sales_tax.view"), async (_req, res) => {
     try {
+      // PR #198 (ST5) — read entity facts from payroll_entities (SoT) instead
+      // of a hardcoded constant. The admin settings surface still wants to
+      // show ACTIVE entities only — inactive entities don't get new TIN edits.
+      // (Back-period filings still resolve via the smart-middle rule above.)
       const settings = getEntitySettings();
-      const entities = ENTITY_FILING_INFO.map((info) => ({
+      const filingEntities = loadFilingEntities(); // active-only
+      const entities = filingEntities.map((info) => ({
         entity_id: info.entity_id,
         legal_name: info.legal_name,
         county: info.county,
         dtf_code: info.dtf_code,
         tin: settings.get(String(info.entity_id))?.tin ?? null,
       }));
-      res.json({ entities, build_id: "pr168" });
+      res.json({ entities, build_id: "pr198" });
     } catch (e: any) {
       res.status(500).json({ message: "entity-settings read failed", error: String(e?.message || e) });
     }
@@ -5487,7 +5502,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.put("/api/recon/tax/entity-settings/:entityId", authMiddleware, requirePermission("finance.entity_settings.edit"), async (req, res) => {
     const entityId = String(req.params.entityId);
-    if (!ENTITY_FILING_INFO.some((e) => String(e.entity_id) === entityId)) {
+    // PR #198 (ST5) — existence check against payroll_entities. Allows TIN
+    // updates on inactive entities too (operator may need to file a back-
+    // period return for a since-closed store).
+    if (!filingEntityExists(entityId)) {
       return res.status(400).json({ message: `Unknown entity ${entityId}` });
     }
     try {
@@ -7907,8 +7925,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const delta = perEntitySum - viewTotal;
 
     // Per-entity filing rows: sum each entity's store rows across the period.
+    //
+    // PR #198 (ST5) — entity facts come from `payroll_entities`. Smart-middle
+    // rule: include active entities + any inactive ones that had sales in any
+    // month of the period (so an entity deactivated mid-period still appears).
+    // For ST-810 we additionally drop entities missing jurisdiction config
+    // (county / rate_bps / dtf_code) per the "silently skip but flag in the
+    // payload" decision — surfaced via `excluded_entities` below.
     const tinByEntity = getEntitySettings();
-    const entities = ENTITY_FILING_INFO.map((info) => {
+    const periodEntityIds = new Set<number>();
+    for (const mm of monthPayloads) for (const s of mm.stores) periodEntityIds.add(s.entity_id);
+    const candidateFilingEntities = loadFilingEntities({ entitiesWithSalesInPeriod: periodEntityIds });
+    const excludedEntities: Array<{ entity_id: number; legal_name: string; missing: string[] }> = [];
+    const filingEntities: EntityFilingInfo[] = [];
+    for (const info of candidateFilingEntities) {
+      if (formType === "ST-810" && !isFilingComplete(info)) {
+        const missing: string[] = [];
+        if (!info.county) missing.push("county");
+        if (info.rate_bps === null) missing.push("rate_bps");
+        if (!info.dtf_code) missing.push("dtf_code");
+        excludedEntities.push({ entity_id: info.entity_id, legal_name: info.legal_name, missing });
+        continue;
+      }
+      filingEntities.push(info);
+    }
+    const entities = filingEntities.map((info) => {
       let gross = 0, mkt = 0, taxable = 0, taxDue = 0, mktTax = 0;
       for (const mm of monthPayloads) {
         const s = mm.stores.find((st) => st.entity_id === info.entity_id);
@@ -7923,8 +7964,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         entity_id: info.entity_id,
         legal_name: info.legal_name,
         tin: tinByEntity.get(String(info.entity_id))?.tin ?? null,
-        county: info.county,
-        dtf_code: info.dtf_code,
+        // PR #198 — county/dtf_code are NULL-able in payroll_entities; coerce
+        // to "" at the export boundary so CSV/XLSX/PDF formatters keep their
+        // current string contract. ST-810 entities are pre-filtered above to
+        // require non-null jurisdiction config, so empty strings here only
+        // ever appear on ST-809 rows (where these fields are informational).
+        county: info.county ?? "",
+        dtf_code: info.dtf_code ?? "",
         gross_sales_cents: gross,
         marketplace_sales_cents: mkt,
         taxable_sales_cents: taxable,
@@ -8164,6 +8210,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       localities,
       marketplaceProviders,
       unmappedJurisdictions: Array.from(unmappedSet).sort(),
+      excludedEntities,
       generatedAtET,
     };
   };
