@@ -3664,6 +3664,67 @@ export function getPayrollEntityById(id: number): PayrollEntityRow | null {
 }
 
 /**
+ * Insert a new payroll entity. Used by the Add Entity dialog in the
+ * Settings → Entities admin page (PR: entity CRUD). Returns the freshly
+ * inserted row.
+ *
+ * Only `location`, `legal_name`, and `cadence` are required — everything
+ * else uses sensible defaults (all payroll-module toggles off, active=1,
+ * no jurisdiction info). The operator finishes filling in TIN/county/
+ * rate/DTF code in the card after the row is created.
+ *
+ * Throws on duplicate `location` (the table has a UNIQUE index on it).
+ */
+export function insertPayrollEntity(input: {
+  location: string;
+  short_name?: string | null;
+  legal_name: string;
+  display_name?: string | null;
+  dba?: string | null;
+  slug?: string | null;
+  cadence: "weekly" | "biweekly";
+  adp_company_code?: string | null;
+  tin?: string | null;
+  county?: string | null;
+  rate_bps?: number | null;
+  dtf_code?: string | null;
+  qbo_inventory_account_id?: string | null;
+  qbo_inventory_account_name?: string | null;
+}): PayrollEntityRow {
+  const now = new Date().toISOString();
+  const result = sqlite.prepare(`
+    INSERT INTO payroll_entities
+      (location, short_name, legal_name, display_name, dba, slug, cadence,
+       adp_company_code, tin, county, rate_bps, dtf_code,
+       qbo_inventory_account_id, qbo_inventory_account_name,
+       commissions_enabled, pms_enabled, tips_enabled,
+       easyrent_enabled, spif_enabled, active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 1, ?, ?)
+  `).run(
+    input.location,
+    input.short_name ?? null,
+    input.legal_name,
+    input.display_name ?? null,
+    input.dba ?? null,
+    input.slug ?? null,
+    input.cadence,
+    input.adp_company_code ?? null,
+    input.tin ?? null,
+    input.county ?? null,
+    input.rate_bps ?? null,
+    input.dtf_code ?? null,
+    input.qbo_inventory_account_id ?? null,
+    input.qbo_inventory_account_name ?? null,
+    now,
+    now,
+  );
+  const id = Number(result.lastInsertRowid);
+  const row = getPayrollEntityById(id);
+  if (!row) throw new Error(`insertPayrollEntity: row ${id} not found after insert`);
+  return row;
+}
+
+/**
  * Partial update of a payroll entity. Only whitelisted fields are accepted to
  * avoid surprise overwrites of bookkeeping columns (id, created_at, etc).
  * Returns the fresh row.

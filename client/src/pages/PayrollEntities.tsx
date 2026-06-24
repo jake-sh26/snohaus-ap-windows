@@ -84,14 +84,26 @@ export default function PayrollEntities() {
   const canEdit = hasPermission("payroll.edit_employees");
   const entitiesQ = useQuery<EntityRow[]>({ queryKey: ["/api/payroll/entities"] });
   const entities = entitiesQ.data || [];
+  const [addOpen, setAddOpen] = useState(false);
 
   return (
     <div className="px-8 pt-6 pb-12 max-w-[1100px] mx-auto">
       <div className="flex items-center justify-between mb-1">
         <h1 className="text-xl font-semibold tracking-tight">Entities</h1>
-        {!canEdit && (
-          <Badge variant="outline" className="text-[11px]">View only</Badge>
-        )}
+        <div className="flex items-center gap-2">
+          {!canEdit && (
+            <Badge variant="outline" className="text-[11px]">View only</Badge>
+          )}
+          {canEdit && (
+            <Button
+              size="sm"
+              onClick={() => setAddOpen(true)}
+              data-testid="button-add-entity"
+            >
+              <Plus className="size-3.5 mr-1.5" /> Add entity
+            </Button>
+          )}
+        </div>
       </div>
       <p className="text-sm text-muted-foreground mb-6">
         The legal entities payroll runs against. Toggle which payroll modules
@@ -110,6 +122,10 @@ export default function PayrollEntities() {
           <EntityCard key={e.id} entity={e} canEdit={canEdit} />
         ))}
       </div>
+
+      {addOpen && (
+        <AddEntityDialog onClose={() => setAddOpen(false)} />
+      )}
     </div>
   );
 }
@@ -147,6 +163,7 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
   const [active, setActive] = useState(entity.active === 1);
   const [feeDialogOpen, setFeeDialogOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [deactivateConfirmOpen, setDeactivateConfirmOpen] = useState(false);
 
   // Parse rate input "8.625" → 8625 bps. Empty / NaN means "don't change".
   // We keep the string form as the form's SoT so the user's typing isn't
@@ -501,7 +518,16 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
         </div>
         <Switch
           checked={active}
-          onCheckedChange={setActive}
+          onCheckedChange={(v) => {
+            // PR #197 — guard the OFF transition for a currently-active entity
+            // with a confirm dialog, because deactivating hides the entity from
+            // payroll runs and reports across every module.
+            if (!v && entity.active === 1) {
+              setDeactivateConfirmOpen(true);
+              return;
+            }
+            setActive(v);
+          }}
           disabled={!canEdit}
           data-testid={`toggle-active-${entity.id}`}
         />
@@ -549,6 +575,16 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
         <FeeHistoryDialog
           entity={entity}
           onClose={() => setHistoryOpen(false)}
+        />
+      )}
+      {deactivateConfirmOpen && (
+        <DeactivateConfirmDialog
+          entity={entity}
+          onCancel={() => setDeactivateConfirmOpen(false)}
+          onConfirm={() => {
+            setActive(false);
+            setDeactivateConfirmOpen(false);
+          }}
         />
       )}
     </Card>
@@ -738,6 +774,327 @@ function FeeHistoryDialog({ entity, onClose }: { entity: EntityRow; onClose: () 
             Current rate is above 10% — double-check before payroll runs.
           </div>
         )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ============================================================================
+// PR #197 — Add Entity dialog
+// ----------------------------------------------------------------------------
+// Required server fields (POST /api/payroll/entities): location, legal_name,
+// cadence. Everything else is optional and follows the canonical
+// short_name / display_name / dba / slug / tin / county / rate_bps / dtf_code
+// model locked in PR #194. The server enforces the unique-by-location 409 so
+// the UI doesn't need to pre-check.
+// ============================================================================
+function AddEntityDialog({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+
+  // Required
+  const [location, setLocation] = useState("");
+  const [legalName, setLegalName] = useState("");
+  const [cadence, setCadence] = useState<"weekly" | "biweekly">("biweekly");
+
+  // Optional — jurisdiction + branding
+  const [shortName, setShortName] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [dba, setDba] = useState("");
+  const [slug, setSlug] = useState("");
+  const [tin, setTin] = useState("");
+  const [county, setCounty] = useState("");
+  const [rateStr, setRateStr] = useState(""); // percent, e.g. "8.625"
+  const [dtfCode, setDtfCode] = useState("");
+  const [adpCode, setAdpCode] = useState("");
+  const [qboAcctId, setQboAcctId] = useState("");
+
+  const rateNum = Number(rateStr);
+  const rateValid = rateStr === "" || (Number.isFinite(rateNum) && rateNum >= 0 && rateNum <= 100);
+  const requiredFilled = location.trim() !== "" && legalName.trim() !== "";
+  const canSubmit = requiredFilled && rateValid;
+
+  const createMut = useMutation({
+    mutationFn: async () => {
+      const body: Record<string, any> = {
+        location: location.trim(),
+        legal_name: legalName.trim(),
+        cadence,
+      };
+      // Only send fields the user actually filled in. Empty strings would
+      // overwrite NULL → "" on the server, which we don't want.
+      if (shortName.trim()) body.short_name = shortName.trim();
+      if (displayName.trim()) body.display_name = displayName.trim();
+      if (dba.trim()) body.dba = dba.trim();
+      if (slug.trim()) body.slug = slug.trim().toLowerCase();
+      if (tin.trim()) body.tin = tin.trim();
+      if (county.trim()) body.county = county.trim();
+      if (rateStr.trim() && rateValid) {
+        body.rate_bps = Math.round(rateNum * 100);
+      }
+      if (dtfCode.trim()) body.dtf_code = dtfCode.trim();
+      if (adpCode.trim()) body.adp_company_code = adpCode.trim();
+      if (qboAcctId.trim()) body.qbo_inventory_account_id = qboAcctId.trim();
+      const res = await apiRequest("POST", "/api/payroll/entities", body);
+      return res.json();
+    },
+    onSuccess: () => {
+      toast({ title: "Entity created" });
+      qc.invalidateQueries({ queryKey: ["/api/payroll/entities"] });
+      onClose();
+    },
+    onError: (e: any) => {
+      const msg = e?.message || "Could not create entity";
+      // Server returns 409 on duplicate location — surface that clearly.
+      toast({
+        title: /already exists|duplicate/i.test(msg) ? "Location already in use" : "Could not create",
+        description: msg,
+        variant: "destructive",
+      });
+    },
+  });
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>Add entity</DialogTitle>
+          <DialogDescription>
+            Create a new legal entity. Location and legal name are required; the
+            rest can be filled in later. Sales Tax and Payroll modules will read
+            from these fields once active.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          {/* Required block */}
+          <div className="rounded-md border border-border p-3 space-y-3">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground font-medium">Required</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Location <span className="text-rose-500">*</span></Label>
+                <Input
+                  value={location}
+                  onChange={(e) => setLocation(e.target.value)}
+                  placeholder="e.g. Greenvale"
+                  data-testid="input-add-entity-location"
+                />
+                <div className="text-[11px] text-muted-foreground">
+                  Legacy key. Must be unique across entities.
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Legal name <span className="text-rose-500">*</span></Label>
+                <Input
+                  value={legalName}
+                  onChange={(e) => setLegalName(e.target.value)}
+                  placeholder="e.g. SH Greenvale Inc"
+                  data-testid="input-add-entity-legal-name"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Cadence <span className="text-rose-500">*</span></Label>
+                <Select value={cadence} onValueChange={(v) => setCadence(v as "weekly" | "biweekly")}>
+                  <SelectTrigger data-testid="input-add-entity-cadence"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="weekly">Weekly</SelectItem>
+                    <SelectItem value="biweekly">Biweekly</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
+          {/* Branding / naming */}
+          <div className="rounded-md border border-border p-3 space-y-3">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground font-medium">Branding</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Short name</Label>
+                <Input
+                  value={shortName}
+                  onChange={(e) => setShortName(e.target.value)}
+                  placeholder="e.g. Greenvale"
+                  data-testid="input-add-entity-short-name"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Display name</Label>
+                <Input
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="e.g. Sno-Haus Greenvale"
+                  data-testid="input-add-entity-display-name"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">DBA</Label>
+                <Input
+                  value={dba}
+                  onChange={(e) => setDba(e.target.value)}
+                  placeholder="NY-registered DBA"
+                  data-testid="input-add-entity-dba"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Slug</Label>
+                <Input
+                  value={slug}
+                  onChange={(e) => setSlug(e.target.value)}
+                  placeholder="e.g. greenvale"
+                  data-testid="input-add-entity-slug"
+                />
+                <div className="text-[11px] text-muted-foreground">Lowercase URL key.</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Jurisdiction / tax */}
+          <div className="rounded-md border border-border p-3 space-y-3">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground font-medium">Jurisdiction</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">TIN / EIN</Label>
+                <Input
+                  value={tin}
+                  onChange={(e) => setTin(e.target.value)}
+                  placeholder="e.g. 86-3624190"
+                  data-testid="input-add-entity-tin"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">County</Label>
+                <Input
+                  value={county}
+                  onChange={(e) => setCounty(e.target.value)}
+                  placeholder="e.g. Nassau"
+                  data-testid="input-add-entity-county"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Sales tax rate %</Label>
+                <div className="relative">
+                  <Input
+                    value={rateStr}
+                    onChange={(e) => setRateStr(e.target.value)}
+                    placeholder="e.g. 8.625"
+                    inputMode="decimal"
+                    data-testid="input-add-entity-rate"
+                  />
+                  <Percent className="size-3.5 text-muted-foreground absolute right-3 top-1/2 -translate-y-1/2" />
+                </div>
+                {!rateValid && (
+                  <div className="text-[11px] text-rose-500">Enter a number between 0 and 100.</div>
+                )}
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">DTF code</Label>
+                <Input
+                  value={dtfCode}
+                  onChange={(e) => setDtfCode(e.target.value)}
+                  placeholder="e.g. NA 2811"
+                  data-testid="input-add-entity-dtf-code"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Integrations */}
+          <div className="rounded-md border border-border p-3 space-y-3">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground font-medium">Integrations</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">ADP company code</Label>
+                <Input
+                  value={adpCode}
+                  onChange={(e) => setAdpCode(e.target.value)}
+                  placeholder="ADP code"
+                  data-testid="input-add-entity-adp-code"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">QBO inventory account id</Label>
+                <Input
+                  value={qboAcctId}
+                  onChange={(e) => setQboAcctId(e.target.value)}
+                  placeholder="QBO account id"
+                  data-testid="input-add-entity-qbo-acct-id"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="text-[11px] text-muted-foreground">
+            Module toggles (commissions, tips, easyrent, SPIFs) and tip CC fee % can
+            be set after creation from the entity card.
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <Button variant="ghost" size="sm" onClick={onClose} data-testid="button-add-entity-cancel">
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={!canSubmit || createMut.isPending}
+              onClick={() => createMut.mutate()}
+              data-testid="button-add-entity-submit"
+            >
+              {createMut.isPending && <Loader2 className="size-3.5 mr-1.5 animate-spin" />}
+              Create entity
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ============================================================================
+// PR #197 — Deactivate confirmation
+// ----------------------------------------------------------------------------
+// Guards the Active → Inactive transition on a currently-active entity. Note
+// the user still has to hit Save after confirming, so the row mutation isn't
+// fired until they do. This is just a soft confirm on the local toggle.
+// ============================================================================
+function DeactivateConfirmDialog({
+  entity, onCancel, onConfirm,
+}: {
+  entity: EntityRow;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const label = entity.display_name || entity.short_name || entity.location;
+  return (
+    <Dialog open onOpenChange={(o) => !o && onCancel()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Deactivate {label}?</DialogTitle>
+          <DialogDescription>
+            Inactive entities are hidden from payroll runs, sales tax filing, and
+            reports across every module. Existing history is preserved — you can
+            re-activate the entity at any time.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/20 p-3 text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
+          <AlertTriangle className="size-3.5 mt-0.5 shrink-0" />
+          <div>
+            You still need to click <span className="font-medium">Save</span> on
+            the entity card to commit this change.
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <Button variant="ghost" size="sm" onClick={onCancel} data-testid="button-deactivate-cancel">
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={onConfirm}
+            data-testid={`button-deactivate-confirm-${entity.id}`}
+          >
+            Deactivate
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );
