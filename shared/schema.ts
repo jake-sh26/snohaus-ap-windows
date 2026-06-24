@@ -172,13 +172,28 @@ export const payrollEntities = sqliteTable("payroll_entities", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   // Internal location key (e.g. "Greenvale") — stable identifier that may
   // differ from the user-facing display name (see display_name).
+  // PR #194: legacy field. New code should prefer `short_name` (same data,
+  // clearer purpose). Kept for one release cycle so in-flight readers don't
+  // break; will be dropped in a follow-up cleanup PR.
   location: text("location").notNull(),
+  // PR #194: Tight UI label (e.g. "Greenvale"). Used in Finance Monthly
+  // Summary, Per Store Sales, breadcrumbs, sidebars, dropdowns, table
+  // headers — anywhere a short brand label is desired. Backfilled from
+  // `location` on first boot.
+  short_name: text("short_name"),
   // Legal entity name used on tax docs / ADP exports (e.g. "SD Ski and Patio Inc").
+  // Source of truth for ST-810 / ST-100 PDFs and any filing export.
   legal_name: text("legal_name").notNull(),
   // User-facing display label (e.g. "Sno-Haus Greenvale"). Independent from
   // `location` so the brand can change without renaming internal keys.
   // PR #192: added as part of entity source-of-truth consolidation.
   display_name: text("display_name"),
+  // PR #194: NY-state registered DBA (Doing Business As) — e.g.
+  // "Sno-Haus Greenvale". A LEGAL FACT, not a branding choice. Used on
+  // receipts, customer-facing docs, and any legal context that requires the
+  // registered trade name. Distinct from `display_name`, which is an
+  // internal Ops Hub branding choice that happens to match today.
+  dba: text("dba"),
   // URL/lookup slug matching the AP-side StoreKey type ("greenvale" / etc).
   // Bridges the AP module's string keys to the payroll module's integer ids.
   slug: text("slug"),
@@ -907,7 +922,10 @@ export const SYSTEM_ROLES: Array<{
 // AP-side store routing and payroll-side entity records stay in sync.
 export const INITIAL_ENTITIES: Array<{
   location: string;
+  short_name: string;
   legal_name: string;
+  display_name: string;
+  dba: string;
   cadence: "weekly" | "biweekly";
   commissions_enabled: 0 | 1;
   pms_enabled: 0 | 1;
@@ -917,7 +935,10 @@ export const INITIAL_ENTITIES: Array<{
 }> = [
   {
     location: "Greenvale",
+    short_name: "Greenvale",
     legal_name: "SD Ski and Patio Inc",
+    display_name: "Sno-Haus Greenvale",
+    dba: "Sno-Haus Greenvale",
     cadence: "weekly",
     commissions_enabled: 1,
     pms_enabled: 1,
@@ -927,7 +948,10 @@ export const INITIAL_ENTITIES: Array<{
   },
   {
     location: "Huntington",
+    short_name: "Huntington",
     legal_name: "SH Huntington Inc",
+    display_name: "Sno-Haus Huntington",
+    dba: "Sno-Haus Huntington",
     cadence: "biweekly",
     commissions_enabled: 0,
     pms_enabled: 0,
@@ -937,7 +961,10 @@ export const INITIAL_ENTITIES: Array<{
   },
   {
     location: "Hempstead",
+    short_name: "Hempstead",
     legal_name: "SH Hempstead Inc",
+    display_name: "Sno-Haus Hempstead",
+    dba: "Sno-Haus Hempstead",
     cadence: "biweekly",
     commissions_enabled: 0,
     pms_enabled: 0,
