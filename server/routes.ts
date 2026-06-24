@@ -30,6 +30,8 @@ import {
   searchQboVendors,
   listInvoiceNotes,
   createInvoiceNote,
+  listSalesTaxNotes,
+  createSalesTaxNote,
   PDF_FILES_MAP,
   rankVendorSuggestions,
   backfillVendorAliasesFromPostedInvoices,
@@ -5223,7 +5225,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const info = filingInfoFor(ent.entity_id);
         const jurisdictions = ent.jurisdictions.map((j) => {
           const dtf = dtfByName(j.jurisdiction_name) as NyDtfJurisdiction | undefined;
-          if (!dtf) unmappedSet.add(j.jurisdiction_name);
+          // NY state + MCTD lines are intentionally not mapped (they're allocated
+          // into locality tax_components_cents downstream). Don't flag them.
+          if (!dtf) {
+            const nm = j.jurisdiction_name.toUpperCase();
+            const isStateComp = nm === "NEW YORK STATE TAX" ||
+              nm.includes("MCTD") || nm.includes("METROPOLITAN") || nm.includes("MTA");
+            if (!isStateComp) unmappedSet.add(j.jurisdiction_name);
+          }
           const rateNum = Number(j.rate);
           return {
             ...j,
@@ -7875,7 +7884,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
         for (const j of ent.jurisdictions) {
           const dtf = dtfByName(j.jurisdiction_name);
-          if (!dtf) unmappedSet.add(j.jurisdiction_name);
+          // NY state-level (4%) and MCTD (0.375%) are intentional unmapped rows:
+          // they don't have a DTF locality code because they're proportionally
+          // allocated into every locality's tax_components_cents (see isNYState/
+          // isMCTD branches below). Suppress them from the "verify manually"
+          // warning so only truly-unmapped jurisdictions surface.
+          if (!dtf) {
+            const nm = j.jurisdiction_name.toUpperCase();
+            const isStateComp = nm === "NEW YORK STATE TAX" ||
+              nm.includes("MCTD") || nm.includes("METROPOLITAN") || nm.includes("MTA");
+            if (!isStateComp) unmappedSet.add(j.jurisdiction_name);
+          }
           const rateNum = Number(j.rate);
           const taxableCents = toCents(Number(j.taxable_sales));
           const taxDueCents = toCents(Number(j.tax_due));
@@ -8367,6 +8386,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         res.json({ filings: listFilings(from, to) });
       } catch (e: any) {
         res.status(500).json({ message: e?.message || "list filings failed" });
+      }
+    },
+  );
+
+  // 4b. GET /api/recon/finance/sales-tax/notes/:periodKey  -> list notes
+  //     POST /api/recon/finance/sales-tax/notes/:periodKey -> append a note
+  // Append-only audit trail keyed by period_key (YYYY-MM or YYYY-QN). Notes are
+  // captured with user_email + created_at; any authenticated user with
+  // finance.sales_tax.view can read; write requires the same view permission.
+  // This is purely informational (e.g. manual cash refund not in Shopify) — it
+  // does not affect any computed sales-tax number.
+  app.get(
+    "/api/recon/finance/sales-tax/notes/:periodKey",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req: any, res) => {
+      const periodKey = String(req.params.periodKey);
+      if (!/^\d{4}-(\d{2}|Q[1-4])$/.test(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      try {
+        res.json({ notes: listSalesTaxNotes(periodKey) });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "list notes failed" });
+      }
+    },
+  );
+
+  app.post(
+    "/api/recon/finance/sales-tax/notes/:periodKey",
+    authMiddleware,
+    requirePermission("finance.sales_tax.view"),
+    (req: any, res) => {
+      const periodKey = String(req.params.periodKey);
+      if (!/^\d{4}-(\d{2}|Q[1-4])$/.test(periodKey)) {
+        return res.status(400).json({ message: "periodKey must be YYYY-MM or YYYY-QN" });
+      }
+      const text = String((req.body && req.body.text) || "").trim();
+      if (!text) return res.status(400).json({ message: "text required" });
+      if (text.length > 4000) return res.status(400).json({ message: "text too long (max 4000 chars)" });
+      try {
+        const note = createSalesTaxNote(periodKey, req.email || null, text);
+        res.json(note);
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message || "create note failed" });
       }
     },
   );

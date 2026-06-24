@@ -138,6 +138,14 @@ function bootstrapSchema() {
       created_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_invoice_notes_invoice ON invoice_notes(invoice_id);
+    CREATE TABLE IF NOT EXISTS sales_tax_notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      period_key TEXT NOT NULL,
+      user_email TEXT,
+      text TEXT NOT NULL,
+      created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_sales_tax_notes_period ON sales_tax_notes(period_key);
     CREATE TABLE IF NOT EXISTS qbo_vendors_cache (
       id TEXT PRIMARY KEY,
       display_name TEXT NOT NULL,
@@ -3282,6 +3290,35 @@ export function createInvoiceNote(invoiceId: string, userEmail: string | null, t
   return sqlite.prepare(
     `INSERT INTO invoice_notes (invoice_id, user_email, text, created_at) VALUES (?, ?, ?, ?) RETURNING *`
   ).get(invoiceId, userEmail, text, new Date().toISOString()) as InvoiceNote;
+}
+
+// ----------------------------------------------------------------------------
+// Sales-tax period notes (append-only audit trail keyed by period_key).
+//
+// period_key is the same string used by the export/filing endpoints:
+//   - Monthly:   "YYYY-MM"   (e.g. "2026-02")
+//   - Quarterly: "YYYY-QN"   (e.g. "2025-Q4")
+// Notes for monthly and quarterly periods are stored independently; the UI
+// passes whichever periodKey is active on the page.
+// ----------------------------------------------------------------------------
+export interface SalesTaxNote {
+  id: number;
+  period_key: string;
+  user_email: string | null;
+  text: string;
+  created_at: string;
+}
+
+export function listSalesTaxNotes(periodKey: string): SalesTaxNote[] {
+  return sqlite.prepare(
+    `SELECT * FROM sales_tax_notes WHERE period_key = ? ORDER BY id ASC`
+  ).all(periodKey) as SalesTaxNote[];
+}
+
+export function createSalesTaxNote(periodKey: string, userEmail: string | null, text: string): SalesTaxNote {
+  return sqlite.prepare(
+    `INSERT INTO sales_tax_notes (period_key, user_email, text, created_at) VALUES (?, ?, ?, ?) RETURNING *`
+  ).get(periodKey, userEmail, text, new Date().toISOString()) as SalesTaxNote;
 }
 
 
