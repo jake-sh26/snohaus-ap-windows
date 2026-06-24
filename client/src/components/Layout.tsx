@@ -3,8 +3,6 @@ import { Link, useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import {
   Inbox,
-  FileText,
-  BookOpen,
   History,
   Settings as SettingsIcon,
   Sun,
@@ -85,8 +83,10 @@ const NAV_SECTIONS: NavSection[] = [
       // { href: "/skipped", label: "Skipped", icon: FileX, countKey: "skipped_count" },
       { href: "/all-invoices", label: "All Invoices", icon: FolderOpen },
       { href: "/posted", label: "History", icon: History },
-      { href: "/rules", label: "Vendor Rules", icon: BookOpen },
-      { href: "/aliases", label: "Aliases", icon: FileText },
+      // AP-module-local settings hub: collapses what used to be 2 sidebar
+      // items (Vendor Rules, Aliases) + 1 card in global Settings
+      // (Vendor Groups) into one entry that opens a tabbed sub-page.
+      { href: "/accounts-payable/settings", label: "Settings", icon: SettingsIcon },
     ],
   },
   {
