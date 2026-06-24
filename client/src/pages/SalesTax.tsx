@@ -28,7 +28,9 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/lib/auth";
 import {
   getSalesTaxMonth, upsertSalesTaxFiling, downloadSalesTaxExport,
+  listSalesTaxNotes, createSalesTaxNote,
   type SalesTaxMonth, type SalesTaxStoreRow, type FilingStatus, type ExportFormat,
+  type SalesTaxNote,
 } from "@/api/sales-tax";
 
 const ENTITY_LEGAL_NAMES: Record<number, string> = {
@@ -183,10 +185,159 @@ export default function SalesTax() {
           {canExport && (
             <ExportButtons periodKey={periodKey} toast={toast} />
           )}
+          <NotesSection periodKey={periodKey} isQuarter={isQuarter} toast={toast} />
         </>
       )}
     </div>
   );
+}
+
+/**
+ * Append-only notes for a sales-tax period. Notes are keyed by periodKey, so
+ * the monthly view shows that month's notes and the quarterly view shows the
+ * quarter's notes (they're stored independently). Use cases: manual cash
+ * refunds, check returns, or anything else not captured by Shopify that the
+ * filer should remember when reviewing this period later.
+ *
+ * The log is append-only — we never edit or delete past entries so the audit
+ * trail survives. Each row stamps the author email and ET-local timestamp.
+ */
+function NotesSection({
+  periodKey,
+  isQuarter,
+  toast,
+}: {
+  periodKey: string;
+  isQuarter: boolean;
+  toast: ToastFn;
+}) {
+  const qc = useQueryClient();
+  const [draft, setDraft] = useState("");
+
+  const notesQ = useQuery<SalesTaxNote[]>({
+    queryKey: ["/api/recon/finance/sales-tax/notes", periodKey],
+    queryFn: () => listSalesTaxNotes(periodKey),
+  });
+
+  const addMut = useMutation({
+    mutationFn: (text: string) => createSalesTaxNote(periodKey, text),
+    onSuccess: () => {
+      setDraft("");
+      qc.invalidateQueries({ queryKey: ["/api/recon/finance/sales-tax/notes", periodKey] });
+    },
+    onError: (e: any) => {
+      toast({ title: "Could not save note", description: String(e?.message ?? e), variant: "destructive" });
+    },
+  });
+
+  const periodLabel = isQuarter
+    ? periodKey.replace("-", " ")
+    : monthLong(periodKey);
+
+  const handleSubmit = () => {
+    const text = draft.trim();
+    if (!text) return;
+    addMut.mutate(text);
+  };
+
+  const notes = notesQ.data ?? [];
+
+  return (
+    <Card data-testid="card-sales-tax-notes">
+      <CardHeader>
+        <CardTitle className="text-base">Notes for {periodLabel}</CardTitle>
+        <p className="text-xs text-muted-foreground mt-1">
+          Append-only log. Use for context the Shopify report can’t capture (manual
+          cash refund, check return, amended filing rationale, etc.). Multiple
+          people can add notes; nothing is ever edited or deleted.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {notesQ.isLoading && (
+          <div className="text-sm text-muted-foreground">Loading notes…</div>
+        )}
+        {notesQ.error && (
+          <div className="text-sm text-red-600" data-testid="text-notes-error">
+            Failed to load notes: {String((notesQ.error as any)?.message ?? notesQ.error)}
+          </div>
+        )}
+
+        {!notesQ.isLoading && notes.length === 0 && (
+          <div className="text-sm text-muted-foreground italic" data-testid="text-notes-empty">
+            No notes yet for this period.
+          </div>
+        )}
+
+        {notes.length > 0 && (
+          <ul className="space-y-3" data-testid="list-sales-tax-notes">
+            {notes.map((n) => (
+              <li
+                key={n.id}
+                className="rounded-md border border-border bg-muted/30 px-3 py-2"
+                data-testid={`note-${n.id}`}
+              >
+                <div className="text-xs text-muted-foreground flex flex-wrap gap-x-2">
+                  <span className="font-medium text-foreground">
+                    {n.user_email ?? "unknown user"}
+                  </span>
+                  <span>·</span>
+                  <span>{formatNoteTimestamp(n.created_at)}</span>
+                </div>
+                <div className="text-sm mt-1 whitespace-pre-wrap break-words">
+                  {n.text}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div className="space-y-2 pt-2 border-t border-border">
+          <Label htmlFor="sales-tax-note-input" className="text-sm">Add a note</Label>
+          <Textarea
+            id="sales-tax-note-input"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="e.g. Manual cash refund $250 issued at Hempstead 2026-02-14; Shopify won’t reflect this."
+            rows={3}
+            maxLength={4000}
+            disabled={addMut.isPending}
+            data-testid="input-sales-tax-note"
+          />
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-muted-foreground">
+              {draft.length}/4000
+            </span>
+            <Button
+              size="sm"
+              onClick={handleSubmit}
+              disabled={!draft.trim() || addMut.isPending}
+              data-testid="button-add-sales-tax-note"
+            >
+              {addMut.isPending ? "Saving…" : "Add note"}
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Format an ISO timestamp as a readable ET-local date+time. */
+function formatNoteTimestamp(iso: string): string {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }) + " ET";
+  } catch {
+    return iso;
+  }
 }
 
 function InvariantBanner({ data }: { data: SalesTaxMonth }) {

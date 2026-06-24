@@ -275,3 +275,29 @@ export async function downloadSalesTaxExport(
   a.remove();
   URL.revokeObjectURL(url);
 }
+
+// ---------------------------------------------------------------------------
+// Period notes (append-only audit trail keyed by period_key).
+// ---------------------------------------------------------------------------
+export interface SalesTaxNote {
+  id: number;
+  period_key: string;
+  user_email: string | null;
+  text: string;
+  created_at: string;
+}
+
+export async function listSalesTaxNotes(periodKey: string): Promise<SalesTaxNote[]> {
+  const res = await apiRequest("GET", `${BASE}/notes/${encodeURIComponent(periodKey)}`);
+  const data = await res.json();
+  return (data?.notes ?? []) as SalesTaxNote[];
+}
+
+export async function createSalesTaxNote(periodKey: string, text: string): Promise<SalesTaxNote> {
+  const res = await apiRequest(
+    "POST",
+    `${BASE}/notes/${encodeURIComponent(periodKey)}`,
+    { text },
+  );
+  return (await res.json()) as SalesTaxNote;
+}
