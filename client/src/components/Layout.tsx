@@ -94,7 +94,9 @@ const NAV_SECTIONS: NavSection[] = [
     icon: DollarSign,
     items: [
       { href: "/payroll", label: "Overview", icon: Wrench },
-      { href: "/payroll/entities", label: "Entities", icon: Building2 },
+      // Entities moved to Settings → Entities (audit doc E3 / H3): it's a
+      // global SoT consumed by Payroll, Sales Tax, AP. Legacy URL
+      // /payroll/entities still redirects so bookmarks keep working.
       { href: "/payroll/employees", label: "Employees", icon: Users },
     ],
   },
@@ -114,10 +116,21 @@ const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    label: "System",
+    // Renamed from "System" (audit doc H2) — the label "System" was
+    // non-obvious. This is the global Settings hub. Each child gates
+    // itself so we don't section-gate everything behind users.view
+    // (which would hide Entities from non-admin operators).
+    label: "Settings",
     icon: SettingsIcon,
-    items: [{ href: "/settings", label: "Settings", icon: SettingsIcon }],
-    permissionKey: "users.view",
+    items: [
+      // Global Settings page (QBO/Gmail integrations, users, RBAC,
+      // skip senders). users.view gate matches the page's contents.
+      { href: "/settings", label: "General", icon: SettingsIcon, permissionKey: "users.view" },
+      // Entities — stores / legal entities SoT. Consumed by Payroll,
+      // Sales Tax, AP. Currently visible to anyone who can view
+      // Payroll; eventually wants its own gate (entities.view).
+      { href: "/settings/entities", label: "Entities", icon: Building2, permissionKey: "payroll.view" },
+    ],
   },
 ];
 
@@ -127,7 +140,7 @@ const SIDEBAR_STORAGE_KEY = "sidebar-expanded-sections-v1";
 // section the user is currently inside.
 //
 // Matching is segment-aware so `/payroll` does NOT count as active when the
-// user is on `/payroll/entities` (the Entities child wins instead).
+// user is on `/payroll/employees` (the Employees child wins instead).
 function matchesNav(path: string, href: string): boolean {
   if (path === href) return true;
   if (href === "/") return false;
@@ -296,7 +309,7 @@ export function Layout({ children }: { children: ReactNode }) {
             const isExpanded = !!expanded[section.label];
             const isSingleItem = section.items.length === 1;
             // Pick the most specific match — longest href that matches —
-            // so `/payroll/entities` activates the Entities child, not Overview.
+            // so `/settings/entities` activates the Entities child, not General.
             const activeChild = section.items
               .filter((item) => matchesNav(location, item.href))
               .sort((a, b) => b.href.length - a.href.length)[0];

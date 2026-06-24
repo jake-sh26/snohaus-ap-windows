@@ -18,10 +18,17 @@ import {
 } from "lucide-react";
 
 // ============================================================================
-// Payroll > Entities — admin page for the 3 legal entities (Greenvale,
-// Huntington, Hempstead). Feature flags control which payroll modules
+// Settings > Entities — global admin page for the 3 legal entities (Greenvale,
+// Huntington, Hempstead). Moved out of Payroll in this PR (audit doc E3 / H3)
+// because the entity SoT is consumed by Payroll, Sales Tax, AP, and any
+// future module — not just Payroll.
+//
+// Feature flags on this page still control which payroll modules
 // (commissions, tips, easyrent, etc.) apply to each entity. The CC fee %
 // is editable per-entity and time-bounded (history kept for old payroll runs).
+//
+// The component name stays `PayrollEntities` for now (file rename is a
+// separate PR; the API URL /api/payroll/entities is also unchanged).
 // ============================================================================
 
 type EntityRow = {
