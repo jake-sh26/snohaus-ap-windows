@@ -1821,6 +1821,16 @@ function bootstrapSchema() {
   } catch (e: any) {
     console.error("[storage] ensureEntitySettingsSchema failed:", e?.message);
   }
+
+  // People (PR #199): canonical "human" entity + per-system external-id map.
+  // Pure additive foundation — no existing tables touched. PR #200 wires
+  // employees/users to it; PR #201 migrates the commission matcher off
+  // name-string matching.
+  try {
+    require("./people").ensurePeopleSchema();
+  } catch (e: any) {
+    console.error("[storage] ensurePeopleSchema failed:", e?.message);
+  }
   try {
     require("./ny-dtf-jurisdictions").ensureNyDtfJurisdictionsSchema();
   } catch (e: any) {
