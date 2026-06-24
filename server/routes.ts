@@ -71,6 +71,7 @@ import {
   listAllPayrollEntities,
   getPayrollEntityById,
   updatePayrollEntity,
+  insertPayrollEntity,
   listProcessingFees,
   getEffectiveProcessingFee,
   addProcessingFee,
@@ -934,12 +935,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const id = Number(req.params.id);
     const existing = getPayrollEntityById(id);
     if (!existing) return res.status(404).json({ message: "Entity not found" });
-    const { location, legal_name, cadence, adp_company_code,
-            commissions_enabled, pms_enabled, tips_enabled,
-            easyrent_enabled, spif_enabled, active } = req.body || {};
+    const {
+      location, short_name, legal_name, display_name, dba, slug,
+      tin, county, rate_bps, dtf_code,
+      qbo_inventory_account_id, qbo_inventory_account_name,
+      cadence, adp_company_code,
+      commissions_enabled, pms_enabled, tips_enabled,
+      easyrent_enabled, spif_enabled, active,
+    } = req.body || {};
     // Light validation: cadence must be weekly/biweekly when provided.
     if (cadence !== undefined && cadence !== "weekly" && cadence !== "biweekly") {
       return res.status(400).json({ message: "cadence must be 'weekly' or 'biweekly'" });
+    }
+    // rate_bps must be a non-negative integer when provided (or null to clear).
+    if (rate_bps !== undefined && rate_bps !== null) {
+      const n = Number(rate_bps);
+      if (!Number.isInteger(n) || n < 0) {
+        return res.status(400).json({ message: "rate_bps must be a non-negative integer (basis points)" });
+      }
     }
     // Refuse to deactivate the only remaining active entity — the payroll
     // module would have nothing to run against.
@@ -951,9 +964,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         });
       }
     }
+    // Build the whitelisted patch. Empty strings on optional text fields are
+    // coerced to null so the DB stores NULL instead of an empty string.
     const patch: any = {};
+    const setText = (key: string, val: any) => {
+      patch[key] = (val === null || val === "") ? null : String(val);
+    };
     if (location !== undefined) patch.location = String(location);
+    if (short_name !== undefined) setText("short_name", short_name);
     if (legal_name !== undefined) patch.legal_name = String(legal_name);
+    if (display_name !== undefined) setText("display_name", display_name);
+    if (dba !== undefined) setText("dba", dba);
+    if (slug !== undefined) setText("slug", slug);
+    if (tin !== undefined) setText("tin", tin);
+    if (county !== undefined) setText("county", county);
+    if (rate_bps !== undefined) patch.rate_bps = rate_bps === null ? null : Number(rate_bps);
+    if (dtf_code !== undefined) setText("dtf_code", dtf_code);
+    if (qbo_inventory_account_id !== undefined) setText("qbo_inventory_account_id", qbo_inventory_account_id);
+    if (qbo_inventory_account_name !== undefined) setText("qbo_inventory_account_name", qbo_inventory_account_name);
     if (cadence !== undefined) patch.cadence = cadence;
     if (adp_company_code !== undefined) patch.adp_company_code = adp_company_code || null;
     if (commissions_enabled !== undefined) patch.commissions_enabled = commissions_enabled ? 1 : 0;
@@ -962,8 +990,70 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (easyrent_enabled !== undefined) patch.easyrent_enabled = easyrent_enabled ? 1 : 0;
     if (spif_enabled !== undefined) patch.spif_enabled = spif_enabled ? 1 : 0;
     if (active !== undefined) patch.active = active ? 1 : 0;
-    const updated = updatePayrollEntity(id, patch);
-    res.json(updated);
+    try {
+      const updated = updatePayrollEntity(id, patch);
+      res.json(updated);
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      // Duplicate `location` violates UNIQUE idx_payroll_entities_location.
+      if (msg.includes("UNIQUE constraint failed") && msg.includes("location")) {
+        return res.status(409).json({ message: `An entity with location "${location}" already exists.` });
+      }
+      throw e;
+    }
+  });
+
+  // POST a new entity. UI: Settings → Entities → "Add entity" button.
+  // Same write gate as PATCH (payroll.edit_employees) until a dedicated
+  // entities.write permission lands.
+  app.post("/api/payroll/entities", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
+    const {
+      location, short_name, legal_name, display_name, dba, slug,
+      cadence, tin, county, rate_bps, dtf_code,
+      qbo_inventory_account_id, qbo_inventory_account_name,
+      adp_company_code,
+    } = req.body || {};
+    if (!location || typeof location !== "string" || !location.trim()) {
+      return res.status(400).json({ message: "`location` is required" });
+    }
+    if (!legal_name || typeof legal_name !== "string" || !legal_name.trim()) {
+      return res.status(400).json({ message: "`legal_name` is required" });
+    }
+    if (cadence !== "weekly" && cadence !== "biweekly") {
+      return res.status(400).json({ message: "`cadence` must be 'weekly' or 'biweekly'" });
+    }
+    if (rate_bps !== undefined && rate_bps !== null) {
+      const n = Number(rate_bps);
+      if (!Number.isInteger(n) || n < 0) {
+        return res.status(400).json({ message: "rate_bps must be a non-negative integer (basis points)" });
+      }
+    }
+    const text = (v: any) => (v === null || v === undefined || v === "" ? null : String(v));
+    try {
+      const row = insertPayrollEntity({
+        location: String(location).trim(),
+        short_name: text(short_name),
+        legal_name: String(legal_name).trim(),
+        display_name: text(display_name),
+        dba: text(dba),
+        slug: text(slug),
+        cadence,
+        adp_company_code: text(adp_company_code),
+        tin: text(tin),
+        county: text(county),
+        rate_bps: rate_bps === null || rate_bps === undefined ? null : Number(rate_bps),
+        dtf_code: text(dtf_code),
+        qbo_inventory_account_id: text(qbo_inventory_account_id),
+        qbo_inventory_account_name: text(qbo_inventory_account_name),
+      });
+      res.status(201).json(row);
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      if (msg.includes("UNIQUE constraint failed") && msg.includes("location")) {
+        return res.status(409).json({ message: `An entity with location "${location}" already exists.` });
+      }
+      throw e;
+    }
   });
 
   // Processing-fee history for one entity (e.g. the 3.8% Shift4 CC fee on tips).
