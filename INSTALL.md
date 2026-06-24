@@ -1,4 +1,6 @@
-# Sno-Haus AP — Combined Patch Installation
+# Sno-Haus Ops Hub — Combined Patch Installation
+
+_(Formerly Sno-Haus AP. The repo + install paths still use the `snohaus-ap` name; only the product display name changed in PR #192.)_
 
 ## On the production PC (currently running v[old]):
 

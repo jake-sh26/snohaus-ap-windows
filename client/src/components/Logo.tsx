@@ -37,7 +37,7 @@ export function Wordmark({ className = "" }: { className?: string }) {
         className="h-7 w-auto select-none"
         draggable={false}
       />
-      <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground font-medium">AP Review</span>
+      <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground font-medium">Ops Hub</span>
     </span>
   );
 }

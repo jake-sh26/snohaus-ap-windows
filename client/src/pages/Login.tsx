@@ -184,7 +184,7 @@ export default function Login() {
           </form>
         </Card>
         <div className="mt-6 text-center text-xs text-muted-foreground">
-          Private dashboard for Sno-Haus accounts payable review.
+          Sno-Haus Ops Hub — private operations dashboard.
         </div>
       </div>
     </div>

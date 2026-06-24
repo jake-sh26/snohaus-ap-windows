@@ -330,8 +330,16 @@ function bootstrapSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       location TEXT NOT NULL,
       legal_name TEXT NOT NULL,
+      display_name TEXT,
+      slug TEXT,
       cadence TEXT NOT NULL,
       adp_company_code TEXT,
+      tin TEXT,
+      county TEXT,
+      rate_bps INTEGER,
+      dtf_code TEXT,
+      qbo_inventory_account_id TEXT,
+      qbo_inventory_account_name TEXT,
       commissions_enabled INTEGER NOT NULL DEFAULT 0,
       pms_enabled INTEGER NOT NULL DEFAULT 0,
       tips_enabled INTEGER NOT NULL DEFAULT 0,
@@ -342,7 +350,26 @@ function bootstrapSchema() {
       updated_at TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_entities_location ON payroll_entities(location);
+    CREATE INDEX IF NOT EXISTS idx_payroll_entities_slug ON payroll_entities(slug);
   `);
+
+  // PR #192 — backfill columns added after initial release. Each ADD COLUMN
+  // is wrapped in try/catch so re-running on an already-migrated DB is a
+  // no-op (SQLite throws "duplicate column" which we swallow).
+  for (const col of [
+    "display_name TEXT",
+    "slug TEXT",
+    "tin TEXT",
+    "county TEXT",
+    "rate_bps INTEGER",
+    "dtf_code TEXT",
+    "qbo_inventory_account_id TEXT",
+    "qbo_inventory_account_name TEXT",
+  ]) {
+    try { sqlite.exec(`ALTER TABLE payroll_entities ADD COLUMN ${col}`); }
+    catch (e: any) { if (!String(e?.message ?? "").includes("duplicate column")) throw e; }
+  }
+  sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_payroll_entities_slug ON payroll_entities(slug);`);
 
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS payroll_employees (
@@ -2063,6 +2090,78 @@ function seedPayrollBaseline(): void {
       console.log(`[storage] Seeded ${INITIAL_ENTITIES.length} entities into payroll_entities`);
     }
 
+    // PR #192 — backfill the new SoT columns (display_name, slug, tin, county,
+    // rate_bps, dtf_code, qbo_inventory_account_*). Idempotent: only writes
+    // when the column is currently NULL so user edits via the Payroll Admin
+    // UI are never clobbered.
+    type BackfillRow = {
+      legacy_location: string;
+      display_name: string;
+      slug: string;
+      tin: string | null;
+      county: string;
+      rate_bps: number;
+      dtf_code: string;
+      qbo_inventory_account_id: string;
+      qbo_inventory_account_name: string;
+    };
+    const BACKFILL: BackfillRow[] = [
+      {
+        legacy_location: "Greenvale",
+        display_name: "Sno-Haus Greenvale",
+        slug: "greenvale",
+        tin: "86-3624190",
+        county: "Nassau",
+        rate_bps: 8625,
+        dtf_code: "NA 2811",
+        qbo_inventory_account_id: "38",
+        qbo_inventory_account_name: "Inventory Asset",
+      },
+      {
+        legacy_location: "Huntington",
+        display_name: "Sno-Haus Huntington",
+        slug: "huntington",
+        tin: null,
+        county: "Suffolk",
+        rate_bps: 8750,
+        dtf_code: "SU 4711",
+        qbo_inventory_account_id: "1150040011",
+        qbo_inventory_account_name: "Inventory for Huntington",
+      },
+      {
+        legacy_location: "Hempstead",
+        display_name: "Sno-Haus Hempstead",
+        slug: "hempstead",
+        tin: null,
+        county: "Nassau",
+        rate_bps: 8625,
+        dtf_code: "NA 2811",
+        qbo_inventory_account_id: "1150040012",
+        qbo_inventory_account_name: "Inventory for Hempstead",
+      },
+    ];
+
+    const upd = sqlite.prepare(`
+      UPDATE payroll_entities SET
+        display_name = COALESCE(display_name, ?),
+        slug = COALESCE(slug, ?),
+        tin = COALESCE(tin, ?),
+        county = COALESCE(county, ?),
+        rate_bps = COALESCE(rate_bps, ?),
+        dtf_code = COALESCE(dtf_code, ?),
+        qbo_inventory_account_id = COALESCE(qbo_inventory_account_id, ?),
+        qbo_inventory_account_name = COALESCE(qbo_inventory_account_name, ?),
+        updated_at = ?
+      WHERE location = ?
+    `);
+    for (const r of BACKFILL) {
+      upd.run(
+        r.display_name, r.slug, r.tin, r.county, r.rate_bps, r.dtf_code,
+        r.qbo_inventory_account_id, r.qbo_inventory_account_name,
+        now, r.legacy_location,
+      );
+    }
+
     // Seed the 3.8% tip CC fee for Greenvale if no row exists.
     const greenvale = sqlite.prepare(
       `SELECT id FROM payroll_entities WHERE location = 'Greenvale' LIMIT 1`
@@ -3358,8 +3457,21 @@ export type PayrollEntityRow = {
   id: number;
   location: string;
   legal_name: string;
+  /** PR #192 — user-facing brand name (e.g. "Sno-Haus Greenvale"). */
+  display_name: string | null;
+  /** PR #192 — AP-side StoreKey slug bridging string-keyed callers to integer ids. */
+  slug: string | null;
   cadence: string;
   adp_company_code: string | null;
+  /** PR #192 — NY/IRS TIN, moved from the separate entity_settings table. */
+  tin: string | null;
+  /** PR #192 — filing-jurisdiction facts (ST-810 jurisdiction enrichment). */
+  county: string | null;
+  rate_bps: number | null;
+  dtf_code: string | null;
+  /** PR #192 — QBO inventory account routing for AP postings. */
+  qbo_inventory_account_id: string | null;
+  qbo_inventory_account_name: string | null;
   commissions_enabled: number;
   pms_enabled: number;
   tips_enabled: number;
@@ -3526,8 +3638,16 @@ export function updatePayrollEntity(
   patch: Partial<{
     location: string;
     legal_name: string;
+    display_name: string | null;
+    slug: string | null;
     cadence: string;
     adp_company_code: string | null;
+    tin: string | null;
+    county: string | null;
+    rate_bps: number | null;
+    dtf_code: string | null;
+    qbo_inventory_account_id: string | null;
+    qbo_inventory_account_name: string | null;
     commissions_enabled: number;
     pms_enabled: number;
     tips_enabled: number;
@@ -3537,7 +3657,9 @@ export function updatePayrollEntity(
   }>,
 ): PayrollEntityRow | null {
   const allowed: Array<keyof typeof patch> = [
-    "location", "legal_name", "cadence", "adp_company_code",
+    "location", "legal_name", "display_name", "slug", "cadence", "adp_company_code",
+    "tin", "county", "rate_bps", "dtf_code",
+    "qbo_inventory_account_id", "qbo_inventory_account_name",
     "commissions_enabled", "pms_enabled", "tips_enabled",
     "easyrent_enabled", "spif_enabled", "active",
   ];

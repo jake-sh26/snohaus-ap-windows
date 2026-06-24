@@ -714,7 +714,7 @@ export default function Settings() {
               <div className="text-sm font-medium">Users</div>
             </div>
             <p className="text-xs text-muted-foreground mb-3">
-              Manage who can access Sno-Haus AP. Admin-only.
+              Manage who can access Sno-Haus Ops Hub. Admin-only.
             </p>
             <UsersSection />
           </Card>

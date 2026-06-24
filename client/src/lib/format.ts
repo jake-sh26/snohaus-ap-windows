@@ -43,7 +43,7 @@ export function parseLocalDate(v: string | null | undefined): Date | null {
 }
 
 export const STORE_LABELS: Record<string, string> = {
-  greenvale: "Sundown Greenvale",
+  greenvale: "Sno-Haus Greenvale",
   hempstead: "Sno-Haus Hempstead",
   huntington: "Sno-Haus Huntington",
 };

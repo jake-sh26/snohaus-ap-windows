@@ -129,7 +129,7 @@ export type AuditLogEntry = typeof auditLog.$inferSelect;
 export type StoreKey = "greenvale" | "hempstead" | "huntington";
 
 export const STORES: { key: StoreKey; label: string; qbo_account_id: string; qbo_account_name: string }[] = [
-  { key: "greenvale", label: "Sundown Greenvale", qbo_account_id: "38", qbo_account_name: "Inventory Asset" },
+  { key: "greenvale", label: "Sno-Haus Greenvale", qbo_account_id: "38", qbo_account_name: "Inventory Asset" },
   { key: "hempstead", label: "Sno-Haus Hempstead", qbo_account_id: "1150040012", qbo_account_name: "Inventory for Hempstead" },
   { key: "huntington", label: "Sno-Haus Huntington", qbo_account_id: "1150040011", qbo_account_name: "Inventory for Huntington" },
 ];
@@ -170,14 +170,37 @@ export const ALLOWED_EMAILS = getAllowedEmails();
 // --- Entities (3 legal entities, one per store) ---
 export const payrollEntities = sqliteTable("payroll_entities", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  // Display label used everywhere user-facing (e.g. "Greenvale").
+  // Internal location key (e.g. "Greenvale") — stable identifier that may
+  // differ from the user-facing display name (see display_name).
   location: text("location").notNull(),
-  // Legal entity name used on tax docs / ADP exports.
+  // Legal entity name used on tax docs / ADP exports (e.g. "SD Ski and Patio Inc").
   legal_name: text("legal_name").notNull(),
+  // User-facing display label (e.g. "Sno-Haus Greenvale"). Independent from
+  // `location` so the brand can change without renaming internal keys.
+  // PR #192: added as part of entity source-of-truth consolidation.
+  display_name: text("display_name"),
+  // URL/lookup slug matching the AP-side StoreKey type ("greenvale" / etc).
+  // Bridges the AP module's string keys to the payroll module's integer ids.
+  slug: text("slug"),
   // 'weekly' | 'biweekly' — payroll-run cadence in ADP.
   cadence: text("cadence").notNull(),
   // ADP Run company code for this entity (used to label export CSVs).
   adp_company_code: text("adp_company_code"),
+  // NY/IRS Tax Identification Number (e.g. "86-3624190"). PR #192: moved
+  // here from the separate entity_settings table so all entity metadata
+  // lives in one row.
+  tin: text("tin"),
+  // Filing-jurisdiction facts (used by ST-810/ST-809 PDF + jurisdiction
+  // enrichment). PR #192: pulled from the hardcoded ENTITY_FILING_INFO
+  // const in server/entity-settings.ts so the user can edit them.
+  county: text("county"),
+  rate_bps: integer("rate_bps"),
+  dtf_code: text("dtf_code"),
+  // QBO inventory account IDs used by AP-side invoice posting. PR #192:
+  // pulled from the hardcoded STORES[] const in shared/schema.ts so an
+  // accountant can re-point them without a code change.
+  qbo_inventory_account_id: text("qbo_inventory_account_id"),
+  qbo_inventory_account_name: text("qbo_inventory_account_name"),
   // Module-level feature flags. Greenvale = all on. Huntington/Hempstead =
   // easyrent only today (commissions/pms/tips off for now).
   commissions_enabled: integer("commissions_enabled").notNull().default(0),
