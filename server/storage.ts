@@ -358,9 +358,9 @@ function bootstrapSchema() {
   // index here would crash with `no such column: slug` on every upgraded
   // install. The ALTER TABLE loop adds the column, THEN we add the index.
 
-  // PR #192 — backfill columns added after initial release. Each ADD COLUMN
-  // is wrapped in try/catch so re-running on an already-migrated DB is a
-  // no-op (SQLite throws "duplicate column" which we swallow).
+  // PR #192 + #194 — backfill columns added after initial release. Each ADD
+  // COLUMN is wrapped in try/catch so re-running on an already-migrated DB
+  // is a no-op (SQLite throws "duplicate column" which we swallow).
   for (const col of [
     "display_name TEXT",
     "slug TEXT",
@@ -370,11 +370,26 @@ function bootstrapSchema() {
     "dtf_code TEXT",
     "qbo_inventory_account_id TEXT",
     "qbo_inventory_account_name TEXT",
+    // PR #194 — canonical entity-name model.
+    "short_name TEXT",
+    "dba TEXT",
   ]) {
     try { sqlite.exec(`ALTER TABLE payroll_entities ADD COLUMN ${col}`); }
     catch (e: any) { if (!String(e?.message ?? "").includes("duplicate column")) throw e; }
   }
   sqlite.exec(`CREATE INDEX IF NOT EXISTS idx_payroll_entities_slug ON payroll_entities(slug);`);
+
+  // PR #194 — idempotent backfill for the new name columns. Only updates rows
+  // where the new column is NULL, so a user edit is never clobbered. Safe to
+  // re-run on every boot.
+  sqlite.exec(`
+    UPDATE payroll_entities
+       SET short_name = COALESCE(short_name, location)
+     WHERE short_name IS NULL;
+    UPDATE payroll_entities
+       SET dba = COALESCE(dba, display_name)
+     WHERE dba IS NULL AND display_name IS NOT NULL;
+  `);
 
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS payroll_employees (
@@ -2095,13 +2110,14 @@ function seedPayrollBaseline(): void {
       console.log(`[storage] Seeded ${INITIAL_ENTITIES.length} entities into payroll_entities`);
     }
 
-    // PR #192 — backfill the new SoT columns (display_name, slug, tin, county,
-    // rate_bps, dtf_code, qbo_inventory_account_*). Idempotent: only writes
-    // when the column is currently NULL so user edits via the Payroll Admin
-    // UI are never clobbered.
+    // PR #192 + #194 — backfill the new SoT columns. Idempotent: COALESCE only
+    // writes when the column is currently NULL, so user edits via the Payroll
+    // Admin UI are never clobbered.
     type BackfillRow = {
       legacy_location: string;
+      short_name: string;
       display_name: string;
+      dba: string;
       slug: string;
       tin: string | null;
       county: string;
@@ -2113,7 +2129,9 @@ function seedPayrollBaseline(): void {
     const BACKFILL: BackfillRow[] = [
       {
         legacy_location: "Greenvale",
+        short_name: "Greenvale",
         display_name: "Sno-Haus Greenvale",
+        dba: "Sno-Haus Greenvale",
         slug: "greenvale",
         tin: "86-3624190",
         county: "Nassau",
@@ -2124,7 +2142,9 @@ function seedPayrollBaseline(): void {
       },
       {
         legacy_location: "Huntington",
+        short_name: "Huntington",
         display_name: "Sno-Haus Huntington",
+        dba: "Sno-Haus Huntington",
         slug: "huntington",
         tin: null,
         county: "Suffolk",
@@ -2135,7 +2155,9 @@ function seedPayrollBaseline(): void {
       },
       {
         legacy_location: "Hempstead",
+        short_name: "Hempstead",
         display_name: "Sno-Haus Hempstead",
+        dba: "Sno-Haus Hempstead",
         slug: "hempstead",
         tin: null,
         county: "Nassau",
@@ -2148,7 +2170,9 @@ function seedPayrollBaseline(): void {
 
     const upd = sqlite.prepare(`
       UPDATE payroll_entities SET
+        short_name = COALESCE(short_name, ?),
         display_name = COALESCE(display_name, ?),
+        dba = COALESCE(dba, ?),
         slug = COALESCE(slug, ?),
         tin = COALESCE(tin, ?),
         county = COALESCE(county, ?),
@@ -2161,7 +2185,8 @@ function seedPayrollBaseline(): void {
     `);
     for (const r of BACKFILL) {
       upd.run(
-        r.display_name, r.slug, r.tin, r.county, r.rate_bps, r.dtf_code,
+        r.short_name, r.display_name, r.dba, r.slug, r.tin, r.county,
+        r.rate_bps, r.dtf_code,
         r.qbo_inventory_account_id, r.qbo_inventory_account_name,
         now, r.legacy_location,
       );
@@ -3460,10 +3485,15 @@ export type UserRoleRow = {
 
 export type PayrollEntityRow = {
   id: number;
+  /** PR #194 — legacy field, kept one release; new code prefers `short_name`. */
   location: string;
+  /** PR #194 — tight UI label (e.g. "Greenvale"). Backfilled from `location`. */
+  short_name: string | null;
   legal_name: string;
   /** PR #192 — user-facing brand name (e.g. "Sno-Haus Greenvale"). */
   display_name: string | null;
+  /** PR #194 — NY-registered DBA. Legal fact, distinct from display_name. */
+  dba: string | null;
   /** PR #192 — AP-side StoreKey slug bridging string-keyed callers to integer ids. */
   slug: string | null;
   cadence: string;
@@ -3642,8 +3672,10 @@ export function updatePayrollEntity(
   id: number,
   patch: Partial<{
     location: string;
+    short_name: string | null;
     legal_name: string;
     display_name: string | null;
+    dba: string | null;
     slug: string | null;
     cadence: string;
     adp_company_code: string | null;
@@ -3662,7 +3694,8 @@ export function updatePayrollEntity(
   }>,
 ): PayrollEntityRow | null {
   const allowed: Array<keyof typeof patch> = [
-    "location", "legal_name", "display_name", "slug", "cadence", "adp_company_code",
+    "location", "short_name", "legal_name", "display_name", "dba",
+    "slug", "cadence", "adp_company_code",
     "tin", "county", "rate_bps", "dtf_code",
     "qbo_inventory_account_id", "qbo_inventory_account_name",
     "commissions_enabled", "pms_enabled", "tips_enabled",

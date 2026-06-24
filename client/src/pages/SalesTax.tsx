@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/lib/auth";
+import { useEntities } from "@/hooks/useEntities";
 import {
   getSalesTaxMonth, getSalesTaxQuarter, upsertSalesTaxFiling, downloadSalesTaxExport,
   listSalesTaxNotes, createSalesTaxNote,
@@ -38,15 +39,19 @@ import {
   type SalesTaxNote,
 } from "@/api/sales-tax";
 
-// PR #192 — Display labels for the entity cards. Must match the server-side
-// ENTITY_FILING_INFO in server/entity-settings.ts (which drives the legal name
-// printed on every ST-810 export). If the registered legal name changes,
-// update both places + payroll_entities.legal_name in the DB.
-const ENTITY_LEGAL_NAMES: Record<number, string> = {
-  1: "SD Ski and Patio Inc",
-  2: "SH Huntington",
-  3: "SH Hempstead",
-};
+// PR #194 — Entity names are pulled from the DB via `useEntities()`.
+// Summary cards use `display_name` (UI brand label). The filing checklist
+// (anything that ends up on an ST-810 export or in a filing toast) uses
+// `legal_name`, which is the NY DTF corporate name. The two are not
+// interchangeable: e.g. Greenvale's brand is "Sno-Haus Greenvale" but its
+// DTF filing is "SD Ski and Patio Inc". A previous hardcoded
+// `ENTITY_LEGAL_NAMES` const lived here and had silently drifted from the
+// DB (missing "Inc" on entities 2 + 3) — it was removed in PR #194.
+//
+// Server-side, `server/entity-settings.ts` still has its own
+// `ENTITY_FILING_INFO` constant that drives the actual ST-810 PDF/CSV math.
+// Migrating that to the DB is tracked separately — it has 8+ callsites in
+// routes.ts and needs its own PR.
 
 const MONTH_NAMES = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -472,11 +477,15 @@ function EntityCard({
   taxDue: number;
 }) {
   const [open, setOpen] = useState(false);
-  const legal = ENTITY_LEGAL_NAMES[entityId] ?? `Entity ${entityId}`;
+  // PR #194 — Summary card uses the brand label (display_name). Falls back
+  // to short_name → location → "Entity {id}" via the EntityView helpers.
+  const { byId } = useEntities();
+  const ent = byId(entityId);
+  const label = ent?.displayName ?? `Entity ${entityId}`;
   return (
     <Card data-testid={`card-entity-${entityId}`}>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm">{legal}</CardTitle>
+        <CardTitle className="text-sm">{label}</CardTitle>
         <span className="text-xs text-muted-foreground">Entity {entityId}</span>
       </CardHeader>
       <CardContent className="space-y-1.5 text-sm">
@@ -599,7 +608,13 @@ function EntityFilingCard({
   toast: ToastFn;
 }) {
   const qc = useQueryClient();
-  const legal = ENTITY_LEGAL_NAMES[entityId] ?? `Entity ${entityId}`;
+  // PR #194 — Filing checklist row. Toasts, dialog titles, and the card
+  // header all reference what the user is *filing* with NY DTF, so we use
+  // the DB-backed `legal_name` here, not the brand label. Falls back to
+  // display_name → "Entity {id}" if the row hasn't loaded yet.
+  const { byId } = useEntities();
+  const ent = byId(entityId);
+  const legal = ent?.legal_name ?? ent?.displayName ?? `Entity ${entityId}`;
   const status: FilingStatus = filing?.status ?? "open";
   const badge = STATUS_BADGE[status];
 
@@ -992,7 +1007,10 @@ function QuarterEntityCard({
   perMonth: SalesTaxMonth[];
 }) {
   const [open, setOpen] = useState(false);
-  const legal = ENTITY_LEGAL_NAMES[entityId] ?? `Entity ${entityId}`;
+  // PR #194 — Quarter cumulative summary card uses the brand label.
+  const { byId } = useEntities();
+  const ent = byId(entityId);
+  const label = ent?.displayName ?? `Entity ${entityId}`;
 
   // Per-month breakdown for this entity.
   const rows = perMonth.map((m) => {
@@ -1009,7 +1027,7 @@ function QuarterEntityCard({
   return (
     <Card data-testid={`card-quarter-entity-${entityId}`} className="border-blue-500/30">
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm">{legal}</CardTitle>
+        <CardTitle className="text-sm">{label}</CardTitle>
         <span className="text-xs text-muted-foreground">Quarter cumulative</span>
       </CardHeader>
       <CardContent className="space-y-1.5 text-sm">

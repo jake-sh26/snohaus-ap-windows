@@ -26,8 +26,29 @@ import {
 
 type EntityRow = {
   id: number;
+  /** Legacy field. PR #194 — prefer `short_name` for new code. */
   location: string;
+  /** PR #194 — tight UI label (e.g. "Greenvale"). Backfilled from `location`. */
+  short_name: string | null;
   legal_name: string;
+  /** PR #192 — user-facing brand label (e.g. "Sno-Haus Greenvale"). */
+  display_name: string | null;
+  /** PR #194 — NY-registered DBA, a legal fact (e.g. "Sno-Haus Greenvale"). */
+  dba: string | null;
+  /** PR #192 — URL slug bridging AP StoreKey to integer ids ("greenvale"). */
+  slug: string | null;
+  /** PR #192 — EIN / corporate TIN (e.g. "86-3624190"). */
+  tin: string | null;
+  /** PR #192 — NY county for ST-810 jurisdiction selection. */
+  county: string | null;
+  /** PR #192 — Combined state+local sales tax rate in basis points (8625 = 8.625%). */
+  rate_bps: number | null;
+  /** PR #192 — NY DTF jurisdiction code (e.g. "NA 2811"). */
+  dtf_code: string | null;
+  /** PR #192 — QBO inventory account id this entity's POs route to. */
+  qbo_inventory_account_id: string | null;
+  /** PR #192 — QBO inventory account name (display only, snapshot). */
+  qbo_inventory_account_name: string | null;
   cadence: "weekly" | "biweekly";
   adp_company_code: string | null;
   commissions_enabled: number;
@@ -92,8 +113,23 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
 
   // Local form state, seeded from server. We track the pristine row so we can
   // detect unsaved changes and enable/disable Save.
+  //
+  // PR #194 — surfaces the full canonical entity-name model + jurisdiction
+  // fields. `location` is kept editable for one release cycle so callers that
+  // still read it don't break; new code should treat `short_name` as the SoT.
   const [location, setLocation] = useState(entity.location);
+  const [shortName, setShortName] = useState(entity.short_name ?? entity.location ?? "");
   const [legalName, setLegalName] = useState(entity.legal_name);
+  const [displayName, setDisplayName] = useState(entity.display_name ?? "");
+  const [dba, setDba] = useState(entity.dba ?? "");
+  const [slug, setSlug] = useState(entity.slug ?? "");
+  const [tin, setTin] = useState(entity.tin ?? "");
+  const [county, setCounty] = useState(entity.county ?? "");
+  const [rateBpsStr, setRateBpsStr] = useState(
+    entity.rate_bps != null ? (entity.rate_bps / 1000).toFixed(3).replace(/\.?0+$/, "") : "",
+  );
+  const [dtfCode, setDtfCode] = useState(entity.dtf_code ?? "");
+  const [qboAcctId, setQboAcctId] = useState(entity.qbo_inventory_account_id ?? "");
   const [cadence, setCadence] = useState<"weekly" | "biweekly">(entity.cadence);
   const [adpCode, setAdpCode] = useState(entity.adp_company_code || "");
   const [commissionsEnabled, setCommissionsEnabled] = useState(entity.commissions_enabled === 1);
@@ -105,10 +141,32 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
   const [feeDialogOpen, setFeeDialogOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  // Detect any drift from the server row.
+  // Parse rate input "8.625" → 8625 bps. Empty / NaN means "don't change".
+  // We keep the string form as the form's SoT so the user's typing isn't
+  // reformatted on every keystroke.
+  const parsedRateBps: number | null = (() => {
+    const t = rateBpsStr.trim();
+    if (t === "") return null;
+    const n = Number(t);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.round(n * 1000);
+  })();
+
+  // Detect any drift from the server row. Treat null and "" as equivalent
+  // so loading a row with NULL fields doesn't immediately mark it dirty.
+  const eq = (a: string, b: string | null | undefined) => a.trim() === (b ?? "").trim();
   const hasChanges =
-    location !== entity.location ||
-    legalName !== entity.legal_name ||
+    !eq(location, entity.location) ||
+    !eq(shortName, entity.short_name) ||
+    !eq(legalName, entity.legal_name) ||
+    !eq(displayName, entity.display_name) ||
+    !eq(dba, entity.dba) ||
+    !eq(slug, entity.slug) ||
+    !eq(tin, entity.tin) ||
+    !eq(county, entity.county) ||
+    parsedRateBps !== (entity.rate_bps ?? null) ||
+    !eq(dtfCode, entity.dtf_code) ||
+    !eq(qboAcctId, entity.qbo_inventory_account_id) ||
     cadence !== entity.cadence ||
     (adpCode || "") !== (entity.adp_company_code || "") ||
     commissionsEnabled !== (entity.commissions_enabled === 1) ||
@@ -122,7 +180,16 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
     mutationFn: async () => {
       const res = await apiRequest("PATCH", `/api/payroll/entities/${entity.id}`, {
         location: location.trim(),
+        short_name: shortName.trim() || null,
         legal_name: legalName.trim(),
+        display_name: displayName.trim() || null,
+        dba: dba.trim() || null,
+        slug: slug.trim() || null,
+        tin: tin.trim() || null,
+        county: county.trim() || null,
+        rate_bps: parsedRateBps,
+        dtf_code: dtfCode.trim() || null,
+        qbo_inventory_account_id: qboAcctId.trim() || null,
         cadence,
         adp_company_code: adpCode.trim() || null,
         commissions_enabled: commissionsEnabled ? 1 : 0,
@@ -144,7 +211,18 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
 
   function discard() {
     setLocation(entity.location);
+    setShortName(entity.short_name ?? entity.location ?? "");
     setLegalName(entity.legal_name);
+    setDisplayName(entity.display_name ?? "");
+    setDba(entity.dba ?? "");
+    setSlug(entity.slug ?? "");
+    setTin(entity.tin ?? "");
+    setCounty(entity.county ?? "");
+    setRateBpsStr(
+      entity.rate_bps != null ? (entity.rate_bps / 1000).toFixed(3).replace(/\.?0+$/, "") : "",
+    );
+    setDtfCode(entity.dtf_code ?? "");
+    setQboAcctId(entity.qbo_inventory_account_id ?? "");
     setCadence(entity.cadence);
     setAdpCode(entity.adp_company_code || "");
     setCommissionsEnabled(entity.commissions_enabled === 1);
@@ -163,7 +241,12 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
           <Building2 className="size-5 text-muted-foreground shrink-0" />
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <div className="text-base font-semibold truncate">{entity.location}</div>
+              {/* PR #194 — brand label on top (display_name), then legal
+                  name as subtext. Falls back to short_name → location so
+                  pre-backfill rows still render. */}
+              <div className="text-base font-semibold truncate">
+                {entity.display_name || entity.short_name || entity.location}
+              </div>
               {!active && <Badge variant="outline" className="text-[10px] text-slate-500">Inactive</Badge>}
             </div>
             <div className="text-xs text-muted-foreground truncate">{entity.legal_name}</div>
@@ -185,26 +268,151 @@ function EntityCard({ entity, canEdit }: { entity: EntityRow; canEdit: boolean }
         </div>
       </div>
 
-      {/* Editable fields */}
+      {/* ====================================================================
+           PR #194 — Entity name model (5 fields). Each field has a distinct
+           job: see per-field help text for which one lands on a tax filing
+           vs. a brand surface vs. a URL.
+           ==================================================================== */}
+      <div className="rounded-md border border-border p-3 mb-4">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-3">
+          Names
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Short name</Label>
+            <Input
+              value={shortName}
+              onChange={(e) => setShortName(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. Greenvale"
+              data-testid={`input-short-name-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Tight UI label used in tables, dropdowns, breadcrumbs.</div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Display name</Label>
+            <Input
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. Sno-Haus Greenvale"
+              data-testid={`input-display-name-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Brand-prefixed label used on cards, summaries, dashboards.</div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">DBA <span className="text-muted-foreground">(NY-registered)</span></Label>
+            <Input
+              value={dba}
+              onChange={(e) => setDba(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. Sno-Haus Greenvale"
+              data-testid={`input-dba-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Doing-Business-As name on file with NY State. A legal fact.</div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Legal entity name</Label>
+            <Input
+              value={legalName}
+              onChange={(e) => setLegalName(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. SD Ski and Patio Inc"
+              data-testid={`input-legal-name-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Corporate name on NY DTF filings (ST-810 / ST-100 / payroll tax).</div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Slug <span className="text-muted-foreground">(URL key)</span></Label>
+            <Input
+              value={slug}
+              onChange={(e) => setSlug(e.target.value.toLowerCase())}
+              disabled={!canEdit}
+              placeholder="e.g. greenvale"
+              data-testid={`input-slug-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Lowercase key bridging AP module to payroll entities. Avoid changing.</div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Location <span className="text-muted-foreground">(legacy)</span></Label>
+            <Input
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              disabled={!canEdit}
+              data-testid={`input-location-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Legacy field. Keep in sync with Short name. Will be dropped next release.</div>
+          </div>
+        </div>
+      </div>
+
+      {/* PR #194 — Sales-tax jurisdiction fields. Previously only edited via
+          direct DB poke; surfaced here so a rate or DTF code change doesn't
+          need a deploy. */}
+      <div className="rounded-md border border-border p-3 mb-4">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-3">
+          Sales tax
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">TIN <span className="text-muted-foreground">(EIN)</span></Label>
+            <Input
+              value={tin}
+              onChange={(e) => setTin(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. 86-3624190"
+              data-testid={`input-tin-${entity.id}`}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">NY county</Label>
+            <Input
+              value={county}
+              onChange={(e) => setCounty(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. Nassau"
+              data-testid={`input-county-${entity.id}`}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Tax rate <span className="text-muted-foreground">(%)</span></Label>
+            <Input
+              value={rateBpsStr}
+              onChange={(e) => setRateBpsStr(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. 8.625"
+              data-testid={`input-rate-${entity.id}`}
+            />
+            <div className="text-[11px] text-muted-foreground">Combined state + local. Stored as basis points internally.</div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">DTF jurisdiction code</Label>
+            <Input
+              value={dtfCode}
+              onChange={(e) => setDtfCode(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. NA 2811"
+              data-testid={`input-dtf-code-${entity.id}`}
+            />
+          </div>
+          <div className="space-y-1.5 md:col-span-2">
+            <Label className="text-xs">QBO inventory account id <span className="text-muted-foreground">(optional)</span></Label>
+            <Input
+              value={qboAcctId}
+              onChange={(e) => setQboAcctId(e.target.value)}
+              disabled={!canEdit}
+              placeholder="e.g. 81"
+              data-testid={`input-qbo-acct-${entity.id}`}
+            />
+            {entity.qbo_inventory_account_name && (
+              <div className="text-[11px] text-muted-foreground">Currently linked: {entity.qbo_inventory_account_name}</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Cadence + ADP */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
-        <div className="space-y-1.5">
-          <Label className="text-xs">Location</Label>
-          <Input
-            value={location}
-            onChange={(e) => setLocation(e.target.value)}
-            disabled={!canEdit}
-            data-testid={`input-location-${entity.id}`}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label className="text-xs">Legal entity name</Label>
-          <Input
-            value={legalName}
-            onChange={(e) => setLegalName(e.target.value)}
-            disabled={!canEdit}
-            data-testid={`input-legal-name-${entity.id}`}
-          />
-        </div>
         <div className="space-y-1.5">
           <Label className="text-xs">Pay cadence</Label>
           <Select value={cadence} onValueChange={(v) => setCadence(v as any)} disabled={!canEdit}>
