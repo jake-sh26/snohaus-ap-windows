@@ -63,6 +63,25 @@ function ApLegacyRedirect({ tab }: { tab: "rules" | "aliases" }) {
   return null;
 }
 
+/**
+ * Backward-compat redirect for /payroll/entities (audit doc E3 / H3).
+ *
+ * Entities moved out of the Payroll module into Global Settings, since the
+ * store/legal-entity SoT is consumed by Payroll, Sales Tax, and AP (not
+ * Payroll-only). Old bookmarks land on the new URL.
+ *
+ * Note: the API URL /api/payroll/entities is intentionally NOT changing in
+ * this PR — too many client + server callsites to touch safely. The API
+ * rename is a separate thread.
+ */
+function PayrollEntitiesRedirect() {
+  const [, navigate] = useLocation();
+  useEffect(() => {
+    navigate("/settings/entities", { replace: true });
+  }, [navigate]);
+  return null;
+}
+
 function ProtectedRoutes() {
   const { token } = useAuth();
   const [location, navigate] = useLocation();
@@ -111,8 +130,10 @@ function ProtectedRoutes() {
         <Route path="/rules">{() => <ApLegacyRedirect tab="rules" />}</Route>
         <Route path="/aliases">{() => <ApLegacyRedirect tab="aliases" />}</Route>
         <Route path="/settings" component={Settings} />
+        <Route path="/settings/entities" component={PayrollEntities} />
         <Route path="/payroll" component={Payroll} />
-        <Route path="/payroll/entities" component={PayrollEntities} />
+        {/* Backward-compat: Entities used to live under Payroll. */}
+        <Route path="/payroll/entities" component={PayrollEntitiesRedirect} />
         <Route path="/payroll/employees" component={PayrollEmployees} />
         <Route path="/finance/monthly-summary">
           {() => <ReconcilerTest view="monthly-summary" />}
