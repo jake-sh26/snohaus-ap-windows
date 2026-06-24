@@ -1823,13 +1823,65 @@ function bootstrapSchema() {
   }
 
   // People (PR #199): canonical "human" entity + per-system external-id map.
-  // Pure additive foundation — no existing tables touched. PR #200 wires
-  // employees/users to it; PR #201 migrates the commission matcher off
-  // name-string matching.
+  // PR #200 wires existing employees/users to it via a nullable person_id FK
+  // column and a one-time idempotent backfill.
   try {
     require("./people").ensurePeopleSchema();
   } catch (e: any) {
     console.error("[storage] ensurePeopleSchema failed:", e?.message);
+  }
+
+  // PR #200 — add the nullable person_id FK column to payroll_employees and
+  // app_users so each row can point at its canonical people row. Columns are
+  // nullable so the backfill below can populate them lazily; the FK is
+  // declarative only (SQLite has foreign_keys=OFF on this connection by
+  // default — the project enforces relationships in code, same pattern as
+  // payroll_employees.entity_id today).
+  try {
+    ensureColumns("payroll_employees", [
+      { name: "person_id", defn: "INTEGER REFERENCES people(id)" },
+    ]);
+    ensureColumns("app_users", [
+      { name: "person_id", defn: "INTEGER REFERENCES people(id)" },
+    ]);
+    sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS idx_payroll_employees_person
+        ON payroll_employees(person_id);
+      CREATE INDEX IF NOT EXISTS idx_app_users_person
+        ON app_users(person_id);
+    `);
+  } catch (e: any) {
+    console.error("[storage] add person_id columns failed:", e?.message);
+  }
+
+  // PR #200 — one-time backfill linking existing employees + users to people.
+  // Idempotent: only touches rows where person_id IS NULL. Safe to run on
+  // every boot. Logs a summary for visibility.
+  try {
+    const result = require("./people-backfill").runPeopleBackfill();
+    if (
+      result.employees_linked > 0 ||
+      result.users_linked_to_existing_employee > 0 ||
+      result.users_linked_new_person > 0
+    ) {
+      console.log(
+        `[people-backfill] linked employees=${result.employees_linked}, ` +
+        `users(matched to employee)=${result.users_linked_to_existing_employee}, ` +
+        `users(new person)=${result.users_linked_new_person}, ` +
+        `external ids attached=${result.external_ids_attached}` +
+        (result.external_id_conflicts.length > 0
+          ? `, conflicts=${result.external_id_conflicts.length}`
+          : ""),
+      );
+      if (result.external_id_conflicts.length > 0) {
+        console.warn(
+          "[people-backfill] external id conflicts (manual resolution needed):",
+          JSON.stringify(result.external_id_conflicts, null, 2),
+        );
+      }
+    }
+  } catch (e: any) {
+    console.error("[storage] runPeopleBackfill failed:", e?.message);
   }
   try {
     require("./ny-dtf-jurisdictions").ensureNyDtfJurisdictionsSchema();
