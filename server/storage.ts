@@ -350,8 +350,13 @@ function bootstrapSchema() {
       updated_at TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_entities_location ON payroll_entities(location);
-    CREATE INDEX IF NOT EXISTS idx_payroll_entities_slug ON payroll_entities(slug);
   `);
+  // NOTE: idx_payroll_entities_slug is created AFTER the ADD COLUMN loop below,
+  // because on an existing DB the slug column doesn't exist yet at this point
+  // (CREATE TABLE IF NOT EXISTS is a no-op when the table already exists, so
+  // the new columns in the CREATE TABLE body are NOT added). Creating the
+  // index here would crash with `no such column: slug` on every upgraded
+  // install. The ALTER TABLE loop adds the column, THEN we add the index.
 
   // PR #192 — backfill columns added after initial release. Each ADD COLUMN
   // is wrapped in try/catch so re-running on an already-migrated DB is a
