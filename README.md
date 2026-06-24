@@ -1,6 +1,8 @@
-# Sno-Haus AP Review Dashboard — Windows Edition
+# Sno-Haus Ops Hub — Windows Edition
 
-Internal tool for reviewing vendor invoices before they post to QuickBooks Online.
+_Formerly Sno-Haus AP Review Dashboard — renamed in PR #192 to reflect the broader scope (AP review, sales-tax filing, payroll exports, reconciliation, etc.). On-disk repo / directory / package names (`snohaus-ap-windows`) intentionally remain unchanged._
+
+Internal Windows-hosted operations hub for Sno-Haus. The AP module reviews vendor invoices before they post to QuickBooks Online; additional modules cover NY sales-tax filing, payroll baseline + ADP exports, and Shopify ↔ QBO reconciliation.
 Runs entirely on your local machine. No cloud account required.
 
 ---

@@ -1,7 +1,7 @@
 {
   "name": "snohaus-ap-windows",
   "version": "1.0.0",
-  "description": "Sno-Haus AP Review Dashboard — Windows self-hosted edition",
+  "description": "Sno-Haus Ops Hub — Windows self-hosted operations dashboard (AP review, sales tax, payroll, reconciliation)",
   "license": "MIT",
   "type": "module",
   "scripts": {

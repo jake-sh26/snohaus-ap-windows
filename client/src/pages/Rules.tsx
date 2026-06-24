@@ -156,7 +156,7 @@ function RuleDialog({ rule, onClose, onSaved }: { rule: Rule | null; onClose: ()
             <Select value={defaultStore} onValueChange={setDefaultStore}>
               <SelectTrigger data-testid="select-rule-store"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="greenvale">Sundown Greenvale</SelectItem>
+                <SelectItem value="greenvale">Sno-Haus Greenvale</SelectItem>
                 <SelectItem value="hempstead">Sno-Haus Hempstead</SelectItem>
                 <SelectItem value="huntington">Sno-Haus Huntington</SelectItem>
               </SelectContent>

@@ -1,7 +1,7 @@
 {
-  "name": "Sno-Haus AP",
-  "short_name": "Sno-Haus AP",
-  "description": "Sno-Haus accounts payable dashboard",
+  "name": "Sno-Haus Ops Hub",
+  "short_name": "Sno-Haus Ops",
+  "description": "Sno-Haus operations hub — AP review, sales tax, payroll, reconciliation",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

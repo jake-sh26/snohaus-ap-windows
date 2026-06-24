@@ -38,6 +38,10 @@ import {
   type SalesTaxNote,
 } from "@/api/sales-tax";
 
+// PR #192 — Display labels for the entity cards. Must match the server-side
+// ENTITY_FILING_INFO in server/entity-settings.ts (which drives the legal name
+// printed on every ST-810 export). If the registered legal name changes,
+// update both places + payroll_entities.legal_name in the DB.
 const ENTITY_LEGAL_NAMES: Record<number, string> = {
   1: "SD Ski and Patio Inc",
   2: "SH Huntington",
