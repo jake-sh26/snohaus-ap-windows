@@ -18,6 +18,7 @@ import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import {
   Users, Plus, Pencil, UserX, Loader2, Search, Eye, EyeOff,
+  KeyRound, Link2Off, AlertCircle,
 } from "lucide-react";
 
 // ============================================================================
@@ -58,12 +59,28 @@ type EntityRow = {
 export default function PayrollEmployees() {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission("payroll.edit_employees");
+  const canManageLinks = hasPermission("users.manage_links");
 
   const [entityFilter, setEntityFilter] = useState<string>("all"); // "all" or entity id as string
   const [includeInactive, setIncludeInactive] = useState(false);
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState<EmployeeRow | null>(null);
   const [creating, setCreating] = useState(false);
+  const [linkDialog, setLinkDialog] = useState<{
+    employeeId: number;
+    employeeName: string;
+    currentUserId: number | null;
+    currentUserEmail: string | null;
+  } | null>(null);
+
+  // Link state (PR #201) — employee ↔ user via person_id. Only fetched if the
+  // viewer has the manage-links perm so we don't burn calls for non-admins.
+  const linksQ = useQuery<any[]>({
+    queryKey: ["/api/people-links/employees"],
+    enabled: canManageLinks,
+  });
+  const linkByEmpId = new Map<number, any>();
+  for (const row of linksQ.data || []) linkByEmpId.set(row.employee_id, row);
 
   // Build the query key carefully so React Query refetches when filters change.
   const empQ = useQuery<EmployeeRow[]>({
@@ -208,6 +225,9 @@ export default function PayrollEmployees() {
                   <th className="text-left px-4 py-2.5 font-medium">ADP ID</th>
                   <th className="text-right px-4 py-2.5 font-medium">Commission %</th>
                   <th className="text-left px-4 py-2.5 font-medium">Status</th>
+                  {canManageLinks && (
+                    <th className="text-left px-4 py-2.5 font-medium">Login</th>
+                  )}
                   <th className="px-4 py-2.5"></th>
                 </tr>
               </thead>
@@ -259,17 +279,66 @@ export default function PayrollEmployees() {
                           </Badge>
                         )}
                       </td>
+                      {canManageLinks && (
+                        <td className="px-4 py-2.5">
+                          {(() => {
+                            const link = linkByEmpId.get(emp.id);
+                            if (link?.linked_user_id) {
+                              return (
+                                <div className="flex items-center gap-1.5 text-xs">
+                                  <KeyRound className="size-3 text-emerald-500" />
+                                  <span className="font-mono truncate max-w-[180px]" data-testid={`text-linked-user-${emp.id}`}>
+                                    {link.linked_user_email}
+                                  </span>
+                                </div>
+                              );
+                            }
+                            if (linksQ.data) {
+                              return (
+                                <span className="text-xs text-muted-foreground flex items-center gap-1" data-testid={`text-no-login-${emp.id}`}>
+                                  <AlertCircle className="size-3 opacity-50" />
+                                  No login
+                                </span>
+                              );
+                            }
+                            return <span className="text-xs text-muted-foreground">—</span>;
+                          })()}
+                        </td>
+                      )}
                       <td className="px-4 py-2.5 text-right">
-                        {canEdit && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setEditing(emp)}
-                            data-testid={`button-edit-employee-${emp.id}`}
-                          >
-                            <Pencil className="size-3.5" />
-                          </Button>
-                        )}
+                        <div className="flex justify-end gap-0.5">
+                          {canManageLinks && (() => {
+                            const link = linkByEmpId.get(emp.id);
+                            return (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                title={link?.linked_user_id ? "Change linked login" : "Link to a login"}
+                                onClick={() =>
+                                  setLinkDialog({
+                                    employeeId: emp.id,
+                                    employeeName: emp.full_name,
+                                    currentUserId: link?.linked_user_id ?? null,
+                                    currentUserEmail: link?.linked_user_email ?? null,
+                                  })
+                                }
+                                data-testid={`button-link-user-${emp.id}`}
+                              >
+                                <KeyRound className="size-3.5" />
+                              </Button>
+                            );
+                          })()}
+                          {canEdit && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setEditing(emp)}
+                              data-testid={`button-edit-employee-${emp.id}`}
+                            >
+                              <Pencil className="size-3.5" />
+                            </Button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -297,6 +366,18 @@ export default function PayrollEmployees() {
           entities={entities}
           employee={editing}
           onClose={() => setEditing(null)}
+        />
+      )}
+
+      {/* Link to login dialog (PR #201) */}
+      {linkDialog && (
+        <EmployeeLinkUserDialog
+          employeeId={linkDialog.employeeId}
+          employeeName={linkDialog.employeeName}
+          currentUserId={linkDialog.currentUserId}
+          currentUserEmail={linkDialog.currentUserEmail}
+          onClose={() => setLinkDialog(null)}
+          onSaved={() => setLinkDialog(null)}
         />
       )}
     </div>
@@ -651,6 +732,181 @@ function EmployeeDialog({
             </Button>
           </div>
         </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ============================================================================
+// Employee → Login link dialog (PR #201)
+// ============================================================================
+// Mirror of UserLinkEmployeeDialog (in Settings.tsx), initiated from the
+// Employees page. Picks a target login (app_users row) to link to this
+// employee. Block-on-conflict: 409 if that login is already attached to a
+// different employee — operator must unlink there first.
+
+function EmployeeLinkUserDialog({
+  employeeId,
+  employeeName,
+  currentUserId,
+  currentUserEmail,
+  onClose,
+  onSaved,
+}: {
+  employeeId: number;
+  employeeName: string;
+  currentUserId: number | null;
+  currentUserEmail: string | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { toast } = useToast();
+  const qc = useQueryClient();
+  const [search, setSearch] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const usersQ = useQuery<any[]>({ queryKey: ["/api/people-links/users"] });
+  const all = usersQ.data || [];
+  const filtered = search.trim()
+    ? all.filter((u: any) =>
+        (u.user_email || "").toLowerCase().includes(search.toLowerCase()) ||
+        (u.user_name || "").toLowerCase().includes(search.toLowerCase()),
+      )
+    : all;
+
+  function invalidate() {
+    qc.invalidateQueries({ queryKey: ["/api/people-links/users"] });
+    qc.invalidateQueries({ queryKey: ["/api/people-links/employees"] });
+  }
+
+  async function pick(userId: number) {
+    setSubmitting(true);
+    try {
+      const res = await apiRequest("POST", `/api/people-links/employees/${employeeId}/link`, { user_id: userId });
+      const body = await res.json().catch(() => ({}));
+      if (body?.archived_person_id) {
+        toast({
+          title: "Linked",
+          description: `Old standalone person (id ${body.archived_person_id}) archived because nothing else referenced it.`,
+        });
+      } else {
+        toast({ title: "Linked" });
+      }
+      invalidate();
+      onSaved();
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      toast({
+        title: msg.includes("already linked") ? "Already linked" : "Error",
+        description: msg,
+        variant: "destructive",
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function unlink() {
+    setSubmitting(true);
+    try {
+      const res = await apiRequest("POST", `/api/people-links/employees/${employeeId}/unlink`, {});
+      const body = await res.json().catch(() => ({}));
+      if (body?.archived_person_id) {
+        toast({
+          title: "Unlinked",
+          description: `Old shared person (id ${body.archived_person_id}) archived because nothing else referenced it.`,
+        });
+      } else {
+        toast({ title: "Unlinked" });
+      }
+      invalidate();
+      onSaved();
+    } catch (e: any) {
+      toast({ title: "Error", description: e?.message || String(e), variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && !submitting && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Link login</DialogTitle>
+          <DialogDescription>
+            Employee <span className="font-medium text-foreground">{employeeName}</span> is currently{" "}
+            {currentUserId
+              ? <>linked to login <span className="font-mono">{currentUserEmail}</span>.</>
+              : <>not linked to any login user.</>}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <Input
+            placeholder="Search logins by email or name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            autoFocus
+            data-testid="input-link-user-search"
+          />
+          <div className="max-h-72 overflow-y-auto rounded-md border border-border divide-y divide-border">
+            {usersQ.isLoading && (
+              <div className="text-sm text-muted-foreground py-4 text-center">
+                <Loader2 className="size-4 animate-spin inline mr-2" />Loading logins…
+              </div>
+            )}
+            {!usersQ.isLoading && filtered.length === 0 && (
+              <div className="text-sm text-muted-foreground py-4 text-center">No logins match.</div>
+            )}
+            {filtered.map((u: any) => {
+              const isCurrent = u.user_id === currentUserId;
+              const claimedByOther = u.linked_employee_id && u.linked_employee_id !== employeeId;
+              return (
+                <button
+                  key={u.user_id}
+                  type="button"
+                  disabled={submitting || isCurrent}
+                  onClick={() => pick(u.user_id)}
+                  className={`w-full text-left px-3 py-2 text-sm flex items-center gap-2 ${
+                    isCurrent ? "bg-muted/40" : "hover:bg-muted/60"
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  data-testid={`link-user-row-${u.user_id}`}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="font-mono text-xs truncate">{u.user_email}</div>
+                    {u.user_name && (
+                      <div className="text-xs text-muted-foreground truncate">{u.user_name}</div>
+                    )}
+                  </div>
+                  {isCurrent && <Badge variant="outline" className="text-[10px]">Current</Badge>}
+                  {!isCurrent && claimedByOther && (
+                    <Badge variant="outline" className="text-[10px] text-amber-600 border-amber-300">
+                      Linked to {u.linked_employee_name || `#${u.linked_employee_id}`}
+                    </Badge>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Picking a login already linked to another employee will be blocked.
+            Unlink that employee first.
+          </p>
+        </div>
+        <div className="flex justify-between gap-2 pt-2">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={unlink}
+            disabled={submitting || !currentUserId}
+            data-testid="button-unlink-user"
+          >
+            <Link2Off className="size-3.5 mr-1.5" />
+            Unlink (keep separate)
+          </Button>
+          <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>
+            Close
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );
