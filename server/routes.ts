@@ -230,7 +230,7 @@ import {
   shopifyInstalledStatusHandler,
   shopifyDeleteTokenHandler,
 } from "./shopify-oauth";
-import { getUserPermissions, requirePermission, requireFinanceView } from "./rbac";
+import { getUserPermissions, requirePermission, requireFinanceView, userHasPermission } from "./rbac";
 import {
   isGoogleConfigured,
   getDriveAuthUrl,
@@ -1100,10 +1100,50 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(listEmployees(opts));
   });
 
+  // PR #208 — flexible date parser. Accepts ISO YYYY-MM-DD, MM/DD/YYYY,
+  // M/D/YYYY, MM/DD/YY, M/D/YY (US-style). Stores as ISO YYYY-MM-DD.
+  // Returns null for empty/null, throws Error("bad date: ...") for garbage.
+  function normalizeDate(v: any): string | null {
+    if (v === undefined || v === null) return null;
+    const s = String(v).trim();
+    if (s === "") return null;
+    const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+    if (iso) {
+      const y = Number(iso[1]); const m = Number(iso[2]); const d = Number(iso[3]);
+      if (m < 1 || m > 12 || d < 1 || d > 31) throw new Error(`bad date: "${s}"`);
+      return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    }
+    const us = /^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/.exec(s);
+    if (us) {
+      const m = Number(us[1]); const d = Number(us[2]); let y = Number(us[3]);
+      if (us[3].length === 2) y = (y >= 70 ? 1900 + y : 2000 + y);
+      if (m < 1 || m > 12 || d < 1 || d > 31) throw new Error(`bad date: "${s}"`);
+      return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    }
+    const t = Date.parse(s);
+    if (!Number.isNaN(t)) {
+      const dt = new Date(t);
+      const y = dt.getUTCFullYear();
+      const m = dt.getUTCMonth() + 1;
+      const d = dt.getUTCDate();
+      return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    }
+    throw new Error(`bad date: "${s}"`);
+  }
+
+  // PR #208 — shared field lists for POST/PATCH employees.
+  const EMPLOYEE_STRING_FIELDS = [
+    "email", "phone", "shopify_staff_member_id", "easyrent_clerk_guid",
+    "ltm_clerk_id", "adp_employee_id", "notes",
+    "address_line1", "address_line2", "city", "state", "postal_code",
+    "emergency_contact_name", "emergency_contact_phone", "emergency_contact_relationship",
+    "tshirt_size",
+  ];
+  const EMPLOYEE_DATE_FIELDS = ["hired_at", "terminated_at", "date_of_birth"];
+
   app.post("/api/payroll/employees", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
-    const { entity_id, full_name, email, phone, shopify_staff_member_id,
-            easyrent_clerk_guid, ltm_clerk_id, adp_employee_id,
-            commission_rate_pct, active, hired_at, notes } = req.body || {};
+    const body = req.body || {};
+    const { entity_id, full_name } = body;
     if (!Number.isFinite(Number(entity_id))) {
       return res.status(400).json({ message: "entity_id is required" });
     }
@@ -1113,32 +1153,47 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!full_name || typeof full_name !== "string" || !full_name.trim()) {
       return res.status(400).json({ message: "full_name is required" });
     }
+    // PR #208 — gate commission_rate_pct. Silently drop if the caller
+    // lacks payroll.edit_commissions so CSV imports still create employees
+    // (just without setting the rate). A response header lets the client
+    // surface "commission ignored" in the UI if it wants to.
+    let commissionRate: number | null = null;
+    let commissionDropped = false;
+    if (body.commission_rate_pct !== undefined && body.commission_rate_pct !== "" && body.commission_rate_pct !== null) {
+      const userId = (req as any).userId as number | undefined;
+      if (userId && userHasPermission(userId, "payroll.edit_commissions")) {
+        commissionRate = Number(body.commission_rate_pct);
+      } else {
+        commissionDropped = true;
+      }
+    }
+    const payload: any = {
+      entity_id: Number(entity_id),
+      full_name: full_name.trim(),
+      commission_rate_pct: commissionRate,
+      active: body.active === 0 ? 0 : 1,
+    };
+    for (const k of EMPLOYEE_STRING_FIELDS) {
+      const v = body[k];
+      payload[k] = (v === "" || v === undefined || v === null) ? null : String(v);
+    }
     try {
-      const row = createEmployee({
-        entity_id: Number(entity_id),
-        full_name: full_name.trim(),
-        email: email ?? null,
-        phone: phone ?? null,
-        shopify_staff_member_id: shopify_staff_member_id ?? null,
-        easyrent_clerk_guid: easyrent_clerk_guid ?? null,
-        ltm_clerk_id: ltm_clerk_id ?? null,
-        adp_employee_id: adp_employee_id ?? null,
-        commission_rate_pct: commission_rate_pct === "" || commission_rate_pct === undefined || commission_rate_pct === null
-          ? null
-          : Number(commission_rate_pct),
-        active: active === 0 ? 0 : 1,
-        hired_at: hired_at ?? null,
-        notes: notes ?? null,
-      });
+      for (const k of EMPLOYEE_DATE_FIELDS) {
+        if (body[k] !== undefined) payload[k] = normalizeDate(body[k]);
+      }
+    } catch (e: any) {
+      return res.status(400).json({ message: e.message });
+    }
+    try {
+      const row = createEmployee(payload);
+      if (commissionDropped) res.setHeader("X-Commission-Dropped", "1");
       res.json(row);
     } catch (e: any) {
-      // PR #207: friendly message for the per-entity UNIQUE on adp_employee_id
-      // so the CSV import and the edit dialog both surface a clear error.
       const msg = String(e?.message || "");
       if (/UNIQUE constraint failed.*adp_employee_id/i.test(msg) ||
           /idx_payroll_employees_adp_per_entity/i.test(msg)) {
         return res.status(409).json({
-          message: `ADP file # "${adp_employee_id}" is already assigned to another employee at this entity. File # only needs to be unique within a location — the same number at a different location is fine.`,
+          message: `ADP file # "${payload.adp_employee_id}" is already assigned to another employee at this entity. File # only needs to be unique within a location — the same number at a different location is fine.`,
         });
       }
       throw e;
@@ -1162,21 +1217,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!String(body.full_name).trim()) return res.status(400).json({ message: "full_name cannot be empty" });
       patch.full_name = String(body.full_name).trim();
     }
-    for (const k of ["email", "phone", "shopify_staff_member_id", "easyrent_clerk_guid",
-                     "ltm_clerk_id", "adp_employee_id", "hired_at",
-                     "terminated_at", "notes"]) {
+    for (const k of EMPLOYEE_STRING_FIELDS) {
       if (body[k] !== undefined) {
         const v = body[k];
         patch[k] = (v === "" || v === null) ? null : String(v);
       }
     }
+    try {
+      for (const k of EMPLOYEE_DATE_FIELDS) {
+        if (body[k] !== undefined) patch[k] = normalizeDate(body[k]);
+      }
+    } catch (e: any) {
+      return res.status(400).json({ message: e.message });
+    }
+    let commissionDropped = false;
     if (body.commission_rate_pct !== undefined) {
-      const v = body.commission_rate_pct;
-      patch.commission_rate_pct = (v === "" || v === null) ? null : Number(v);
+      const userId = (req as any).userId as number | undefined;
+      if (userId && userHasPermission(userId, "payroll.edit_commissions")) {
+        const v = body.commission_rate_pct;
+        patch.commission_rate_pct = (v === "" || v === null) ? null : Number(v);
+      } else {
+        commissionDropped = true;
+      }
     }
     if (body.active !== undefined) patch.active = body.active ? 1 : 0;
     try {
       const updated = updateEmployee(id, patch);
+      if (commissionDropped) res.setHeader("X-Commission-Dropped", "1");
       res.json(updated);
     } catch (e: any) {
       const msg = String(e?.message || "");
