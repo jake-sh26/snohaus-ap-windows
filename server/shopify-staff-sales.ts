@@ -38,12 +38,18 @@ function logWarn(scope: string, msg: string) {
 }
 
 export type StaffSalesRow = {
-  /** Bare numeric — matches PERSON_SYSTEMS.SHOPIFY_STAFF external_id. */
+  /** Bare numeric — matches PERSON_SYSTEMS.SHOPIFY_STAFF external_id.
+   *  Special value "0" means "return with no staff attribution" (Shopify
+   *  emits this for refunds processed without an assisting staff). ""
+   *  (empty string sentinel) means truly null — we keep these too so the
+   *  ShopifyQL Summary reconciles. */
   assisting_staff_id: string;
   /** Human-readable name for audit + the unmatched-row UI. */
   staff_name: string | null;
   /** "Sno-Haus Greenvale" / "Sno-Haus Huntington" / "None" (online). */
   pos_location_name: string | null;
+  /** PR #206: ShopifyQL `day` dimension — YYYY-MM-DD of the activity. */
+  occurred_on: string | null;
   /** Shopify order name (e.g. "#38173") — joins to recon_orders.name. */
   order_name: string | null;
   // Money fields — all in shop currency, signed per Shopify's convention:
@@ -95,6 +101,11 @@ export function buildStaffSalesQuery(since: string, until: string): string {
     throw new Error(`until must be YYYY-MM-DD (got "${until}")`);
   }
 
+  // PR #206 — add `day` dimension to GROUP BY so each row carries the
+  // actual transaction date. Required for the UI date filter to work on
+  // rows whose order isn't linked to recon_orders yet (refund-only rows,
+  // exchange rows, unattributed returns).
+  //
   // Keep this query exactly aligned with the verified-working version in
   // the admin's POS-total-sales-by-staff-member report — the only change
   // is adding `order_name` to GROUP BY so each row is per-staff-per-order
@@ -110,7 +121,7 @@ export function buildStaffSalesQuery(since: string, until: string): string {
     "SHOW quantity_ordered_per_order, gross_sales, discounts, returns,",
     "     net_sales, taxes, total_sales",
     "GROUP BY assisting_staff_member_name, assisting_staff_id,",
-    "         pos_location_name, order_name",
+    "         pos_location_name, order_name, day",
     "  WITH TOTALS",
     `SINCE ${since} UNTIL ${until}`,
     "ORDER BY total_sales DESC",
@@ -150,28 +161,28 @@ export async function fetchStaffSales(
   for (const raw of result.rows) {
     const idRaw = raw["assisting_staff_id"];
     const nameRaw = raw["assisting_staff_member_name"];
-    // Skip the WITH TOTALS summary row (everything null on the dim side).
-    if (idRaw === null && nameRaw === null) continue;
-    // Drop rows that somehow have name but no id — we can't resolve them
-    // back to an employee deterministically, but we also don't want to
-    // silently lose them. Log + skip.
-    if (idRaw === null) {
-      logWarn(
-        "row",
-        `staff-sales row with name "${String(nameRaw)}" but no assisting_staff_id — skipped`,
-      );
-      continue;
-    }
-    const idStr = String(idRaw).trim();
-    if (idStr.length === 0) continue;
+    const dayRaw = raw["day"];
+    // Skip ONLY the WITH TOTALS summary row — detected by everything
+    // being null at the dim level (id + name + day). Real data rows with
+    // null id (unattributed returns) and null day (shouldn't happen post
+    // PR #206 but legacy clients) are kept so the ShopifyQL Summary
+    // reconciles vs our ingested sum.
+    if (idRaw === null && nameRaw === null && dayRaw === null) continue;
+    // PR #206: keep rows with null/0 assisting_staff_id (unattributed
+    // returns or refunds with no original staff). These contribute to the
+    // gross/return totals and previously were silently dropped, causing a
+    // ~$2,400 reconciliation gap on the 6/15-6/21 sample.
+    const idStr = idRaw === null ? "0" : String(idRaw).trim();
+    const effectiveIdStr = idStr.length === 0 ? "0" : idStr;
 
     rows.push({
-      assisting_staff_id: idStr,
+      assisting_staff_id: effectiveIdStr,
       staff_name: nameRaw === null ? null : String(nameRaw),
       pos_location_name:
         raw["pos_location_name"] === null
           ? null
           : String(raw["pos_location_name"]),
+      occurred_on: dayRaw === null ? null : String(dayRaw).slice(0, 10),
       order_name:
         raw["order_name"] === null ? null : String(raw["order_name"]),
       quantity_ordered_per_order: toNum(raw["quantity_ordered_per_order"]),

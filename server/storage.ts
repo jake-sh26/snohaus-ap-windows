@@ -505,6 +505,16 @@ function bootstrapSchema() {
   // Money columns are SIGNED — a pay period of pure returns can put
   // any of these negative (Bob Ballin -$519.95 net_sales / -$564.80
   // total_sales in the 6/15-6/21 example).
+  //
+  // PR #206: occurred_on is the actual day the Shopify activity (sale or
+  // return) hit "sales" — comes from ShopifyQL's `day` dimension. We
+  // group by it so a single order that has both a sale day and a return
+  // day later becomes TWO rows, each filterable by occurred_on. The UI
+  // filter uses occurred_on (NOT period_start/period_end which is the
+  // ingest stamp).
+  ensureColumns("recon_shopify_staff_sales", [
+    { name: "occurred_on", defn: "TEXT" },
+  ]);
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS recon_shopify_staff_sales (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -512,6 +522,10 @@ function bootstrapSchema() {
       -- match ShopifyQL: SINCE inclusive, UNTIL inclusive (per the API).
       period_start TEXT NOT NULL,   -- YYYY-MM-DD inclusive
       period_end   TEXT NOT NULL,   -- YYYY-MM-DD inclusive
+      -- PR #206: per-day breakdown from the ShopifyQL day dimension.
+      -- Sale day for normal rows; refund/exchange day for return rows.
+      -- NULL only on legacy pre-PR-#206 rows that pre-date this column.
+      occurred_on TEXT,
       -- Staff attribution as Shopify returns it. Bare numeric string —
       -- e.g. "82318328050" — same value REST order.user_id returns.
       assisting_staff_id TEXT NOT NULL,
@@ -549,13 +563,23 @@ function bootstrapSchema() {
       raw_json TEXT,
       ingested_at TEXT NOT NULL
     );
-    -- Composite uniqueness: one row per (period × staff × order × entity).
+    -- PR #206: drop the old composite unique index that didn't include
+    -- occurred_on. With the new day-dimension grouping a single order can
+    -- produce multiple rows (sale day + refund day later) so occurred_on MUST be
+    -- in the uniqueness key. Safe to drop on every boot — CREATE INDEX
+    -- below recreates the right one.
+    DROP INDEX IF EXISTS idx_recon_staff_sales_unique;
+    -- Composite uniqueness: one row per (period × day × staff × order × entity).
     -- A re-ingest of the same window must upsert, not double-write.
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_staff_sales_unique
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_staff_sales_unique_v2
       ON recon_shopify_staff_sales(period_start, period_end,
+                                    COALESCE(occurred_on, ''),
                                     assisting_staff_id,
                                     COALESCE(order_name, ''),
                                     COALESCE(entity_id, -1));
+    CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_occurred_on
+      ON recon_shopify_staff_sales(occurred_on)
+      WHERE occurred_on IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_period
       ON recon_shopify_staff_sales(period_start, period_end);
     CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_employee

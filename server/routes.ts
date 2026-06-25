@@ -11065,7 +11065,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              -- (recon_orders.created_at) instead of the ingest window
              -- stamp on the staff_sales row. Falls back to period_start
              -- when the order isn't linked yet (order_id IS NULL).
-             WHERE date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?
+             WHERE date(COALESCE(s.occurred_on, o.created_at, s.period_start)) BETWEEN ? AND ?
              GROUP BY group_key
              ORDER BY total_sales DESC`,
           )
@@ -11093,7 +11093,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              LEFT JOIN payroll_entities en ON en.id = s.entity_id
              LEFT JOIN recon_orders o ON o.id = s.order_id
              -- PR #205: see empRows comment above. Same filter swap.
-             WHERE date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?
+             WHERE date(COALESCE(s.occurred_on, o.created_at, s.period_start)) BETWEEN ? AND ?
              GROUP BY group_key, s.entity_id
              ORDER BY total_sales DESC`,
           )
@@ -11130,7 +11130,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              FROM recon_shopify_staff_sales s
              LEFT JOIN recon_orders o ON o.id = s.order_id
              -- PR #205: see empRows.
-             WHERE date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?`,
+             WHERE date(COALESCE(s.occurred_on, o.created_at, s.period_start)) BETWEEN ? AND ?`,
           )
           .get(since, until);
 
@@ -11174,7 +11174,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // filtered on period_start/period_end which is the ingest window
         // stamp — every row matched any user-selected calendar.
         const where: string[] = [
-          "date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?",
+          "date(COALESCE(s.occurred_on, o.created_at, s.period_start)) BETWEEN ? AND ?",
         ];
         const params: any[] = [since, until];
 
@@ -11216,7 +11216,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              WHERE ${where.join(" AND ")}
              -- PR #205: order by actual Shopify order date (falls back to
              -- period_start when the order isn't linked yet).
-             ORDER BY COALESCE(o.created_at, s.period_start) DESC, ABS(s.total_sales) DESC
+             ORDER BY COALESCE(s.occurred_on, o.created_at, s.period_start) DESC, ABS(s.total_sales) DESC
              LIMIT 2000`,
           )
           .all(...params);
