@@ -20,6 +20,7 @@ import ApSettings from "@/pages/accounts-payable/ApSettings";
 import Payroll from "@/pages/Payroll";
 import PayrollEntities from "@/pages/PayrollEntities";
 import PayrollEmployees from "@/pages/PayrollEmployees";
+import PayrollStaffSales from "@/pages/PayrollStaffSales";
 import ReconcilerTest from "@/pages/ReconcilerTest";
 import SalesTax from "@/pages/SalesTax";
 import NotFound from "@/pages/not-found";
@@ -135,6 +136,7 @@ function ProtectedRoutes() {
         {/* Backward-compat: Entities used to live under Payroll. */}
         <Route path="/payroll/entities" component={PayrollEntitiesRedirect} />
         <Route path="/payroll/employees" component={PayrollEmployees} />
+        <Route path="/payroll/staff-sales" component={PayrollStaffSales} />
         <Route path="/finance/monthly-summary">
           {() => <ReconcilerTest view="monthly-summary" />}
         </Route>

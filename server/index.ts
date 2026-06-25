@@ -271,6 +271,36 @@ app.use((req, res, next) => {
             `[shopify-recon] pos-locations sync failed: ${e?.message ?? e}`,
           );
         }
+
+        // PR #203 — keep recon_shopify_staff_sales fresh.
+        //
+        // ShopifyQL drives the "sales by assisting staff member" report we use
+        // for commissions. Same lag/edit characteristics as pos-locations, so
+        // we use the same rolling window (35 days — generous enough to cover a
+        // bi-weekly pay period plus late edits / returns). Re-ingest is
+        // idempotent via the composite ON CONFLICT key, so re-running every
+        // 6h costs nothing on rows that haven't changed.
+        //
+        // Own try/catch: a ShopifyQL hiccup must NOT fail the orders sync.
+        try {
+          const { getShopifyReconConfig } = await import("./shopify-recon");
+          if (!getShopifyReconConfig()) return;
+          const { ingestStaffSales } = await import(
+            "./shopify-staff-sales-ingest"
+          );
+          const now = new Date();
+          const start = new Date(now);
+          start.setUTCDate(start.getUTCDate() - 35);
+          const fmt = (d: Date) => d.toISOString().slice(0, 10);
+          const r = await ingestStaffSales(fmt(start), fmt(now));
+          log(
+            `Shopify staff-sales sync: ${r.emitted_rows ?? 0} rows upserted (${r.shopifyql_rows ?? 0} QL rows, ${r.unique_staff ?? 0} staff, ${r.unique_orders ?? 0} orders); ${r.unresolved_staff ?? 0} unresolved staff, ${r.orders_not_yet_in_db ?? 0} unallocated orders`,
+          );
+        } catch (e: any) {
+          console.error(
+            `[shopify-recon] staff-sales sync failed: ${e?.message ?? e}`,
+          );
+        }
       };
       // PR #R3 — payouts polling. No webhooks for payouts (Shopify doesn't offer
       // a payout webhook for app-level installs), so this poller is the only

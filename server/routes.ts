@@ -11004,6 +11004,195 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Employee-grouped aggregation of recon_shopify_staff_sales over a date
+  // range. Each employee row has totals plus a `by_entity` breakdown. Used by
+  // the Payroll > Staff Sales page (PR #203) as the top-level list view.
+  //
+  // Date semantics: rows with period_end >= since AND period_start <= until.
+  // (Overlap, not strict containment — a row that straddles the window still
+  // contributes, since we filter the underlying recon_shopify_staff_sales by
+  // the same logic.)
+  //
+  // Aggregation runs at the SQL layer for speed (200+ rows folds to ~30
+  // employees instantly even on the prod ngrok DB).
+  app.get(
+    "/api/recon/shopify/staff-sales/by-employee",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+
+        const { sqlite } = require("./storage");
+
+        // Employee-level totals + one row per employee summary across all
+        // entities the staff sold for. employee_id = NULL is the "unmatched"
+        // bucket — keep it as a synthetic row so the UI can flag it.
+        const empRows = sqlite
+          .prepare(
+            `SELECT
+               s.employee_id AS employee_id,
+               COALESCE(e.full_name, MAX(s.staff_name), '(unmatched)') AS full_name,
+               MAX(s.staff_name) AS shopify_staff_name,
+               GROUP_CONCAT(DISTINCT s.assisting_staff_id) AS shopify_staff_ids,
+               SUM(s.gross_sales)   AS gross_sales,
+               SUM(s.discounts)     AS discounts,
+               SUM(s.returns)       AS returns_amt,
+               SUM(s.net_sales)     AS net_sales,
+               SUM(s.taxes)         AS taxes,
+               SUM(s.total_sales)   AS total_sales,
+               SUM(s.quantity)      AS qty,
+               COUNT(DISTINCT s.order_name) AS order_count
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN payroll_employees e ON e.id = s.employee_id
+             WHERE s.period_end >= ? AND s.period_start <= ?
+             GROUP BY s.employee_id
+             ORDER BY total_sales DESC`,
+          )
+          .all(since, until);
+
+        // Per-entity breakdown for each employee. NULL entity_id = unallocated.
+        const entRows = sqlite
+          .prepare(
+            `SELECT
+               s.employee_id,
+               s.entity_id,
+               COALESCE(en.display_name, en.location, '(unallocated)') AS entity_label,
+               en.location AS entity_location,
+               SUM(s.gross_sales) AS gross_sales,
+               SUM(s.returns)     AS returns_amt,
+               SUM(s.net_sales)   AS net_sales,
+               SUM(s.total_sales) AS total_sales,
+               COUNT(DISTINCT s.order_name) AS order_count
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN payroll_entities en ON en.id = s.entity_id
+             WHERE s.period_end >= ? AND s.period_start <= ?
+             GROUP BY s.employee_id, s.entity_id
+             ORDER BY total_sales DESC`,
+          )
+          .all(since, until);
+
+        const byEntityForEmp = new Map<string, any[]>();
+        for (const r of entRows as any[]) {
+          const key = r.employee_id === null ? "_null" : String(r.employee_id);
+          if (!byEntityForEmp.has(key)) byEntityForEmp.set(key, []);
+          byEntityForEmp.get(key)!.push(r);
+        }
+
+        const employees = (empRows as any[]).map((emp) => {
+          const key = emp.employee_id === null ? "_null" : String(emp.employee_id);
+          return { ...emp, by_entity: byEntityForEmp.get(key) ?? [] };
+        });
+
+        // Totals row across everything in the window (for the summary header).
+        const totalsRow = sqlite
+          .prepare(
+            `SELECT
+               SUM(gross_sales) AS gross_sales,
+               SUM(discounts)   AS discounts,
+               SUM(returns)     AS returns_amt,
+               SUM(net_sales)   AS net_sales,
+               SUM(taxes)       AS taxes,
+               SUM(total_sales) AS total_sales,
+               COUNT(DISTINCT order_name) AS order_count,
+               COUNT(*) AS row_count
+             FROM recon_shopify_staff_sales
+             WHERE period_end >= ? AND period_start <= ?`,
+          )
+          .get(since, until);
+
+        res.json({
+          ok: true,
+          since,
+          until,
+          totals: totalsRow,
+          employees,
+        });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+  // Per-order drill-down: every recon_shopify_staff_sales row for a single
+  // employee × entity combination over the date range. Used when the user
+  // expands an entity row inside the Staff Sales page (PR #203). entity_id=-1
+  // means "unallocated" (rows where the order wasn't found in recon_orders or
+  // had no allocations yet).
+  app.get(
+    "/api/recon/shopify/staff-sales/orders",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+        const employeeIdRaw = String(req.query.employee_id ?? "").trim();
+        const entityIdRaw = String(req.query.entity_id ?? "").trim();
+
+        const where: string[] = ["s.period_end >= ?", "s.period_start <= ?"];
+        const params: any[] = [since, until];
+
+        if (employeeIdRaw === "_null") {
+          where.push("s.employee_id IS NULL");
+        } else if (employeeIdRaw) {
+          const eid = parseInt(employeeIdRaw, 10);
+          if (!Number.isFinite(eid)) throw new Error("employee_id must be numeric or '_null'");
+          where.push("s.employee_id = ?");
+          params.push(eid);
+        }
+
+        if (entityIdRaw) {
+          const xid = parseInt(entityIdRaw, 10);
+          if (!Number.isFinite(xid)) throw new Error("entity_id must be numeric (-1 for unallocated)");
+          if (xid === -1) {
+            where.push("s.entity_id IS NULL");
+          } else {
+            where.push("s.entity_id = ?");
+            params.push(xid);
+          }
+        }
+
+        const { sqlite } = require("./storage");
+        const rows = sqlite
+          .prepare(
+            `SELECT
+               s.id, s.period_start, s.period_end, s.order_name, s.order_id,
+               s.assisting_staff_id, s.staff_name,
+               s.gross_sales, s.discounts, s.returns AS returns_amt, s.net_sales,
+               s.taxes, s.total_sales, s.quantity AS qty_per_order,
+               s.allocation_method, s.share AS entity_share,
+               COALESCE(en.display_name, en.location) AS entity_label,
+               o.processed_at AS order_processed_at,
+               o.source_name AS order_source
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN payroll_entities en ON en.id = s.entity_id
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             WHERE ${where.join(" AND ")}
+             ORDER BY s.period_start DESC, ABS(s.total_sales) DESC
+             LIMIT 2000`,
+          )
+          .all(...params);
+        res.json({ ok: true, count: rows.length, rows });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
   // Current orders watermark (read-only) — shown in the Settings UI so the user
   // knows where the incremental pull will resume from on next run.
   app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
