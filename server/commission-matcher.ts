@@ -78,6 +78,14 @@ export function resolveEmployeeByShopifyStaff(
 
   // Path 1: via person_external_ids (the modern, post-PR-#199 path).
   // We restrict to non-archived persons since archived = orphan/replaced.
+  //
+  // PR #204 fix: the PR #200 backfill stored external_id as-is from
+  // payroll_employees.shopify_staff_member_id, which in production is
+  // populated in the gid://shopify/StaffMember/<n> form (not bare numeric).
+  // ShopifyQL's assisting_staff_id returns the bare numeric form. So we must
+  // query BOTH forms here, just like Path 2 already does. Without this fix,
+  // 100% of staff sales rows landed in the unmatched bucket on prod.
+  const gidForm = `gid://shopify/StaffMember/${normalized}`;
   const viaPerson = sqlite.prepare(`
     SELECT
       e.id            AS employee_id,
@@ -89,10 +97,10 @@ export function resolveEmployeeByShopifyStaff(
     JOIN people p   ON p.id = pxi.person_id
     JOIN payroll_employees e ON e.person_id = pxi.person_id
     WHERE pxi.system = ?
-      AND pxi.external_id = ?
+      AND pxi.external_id IN (?, ?)
       AND p.status = 'active'
     LIMIT 1
-  `).get(PERSON_SYSTEMS.SHOPIFY_STAFF, normalized) as
+  `).get(PERSON_SYSTEMS.SHOPIFY_STAFF, normalized, gidForm) as
     | {
         employee_id: number;
         person_id: number | null;
@@ -111,7 +119,6 @@ export function resolveEmployeeByShopifyStaff(
   // person_external_ids row — typically employees added manually after
   // the backfill ran. We allow either bare-numeric OR gid:// form here
   // since the raw column has no normalization guarantee.
-  const gidForm = `gid://shopify/StaffMember/${normalized}`;
   const viaDirect = sqlite.prepare(`
     SELECT
       id              AS employee_id,
