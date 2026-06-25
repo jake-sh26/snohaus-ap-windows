@@ -10881,6 +10881,129 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // ShopifyQL staff-sales ingest (PR #202 — commission matcher)
+  //
+  // Pulls the "sales by assisting staff member" report via ShopifyQL and joins
+  // it against recon_orders + recon_allocations to produce per-entity rows in
+  // recon_shopify_staff_sales. Returns and exchanges naturally appear as
+  // negative rows (returns column) and the net_sales column is signed.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  function _validateSinceUntil(rawSince: unknown, rawUntil: unknown): { since: string; until: string } {
+    const since = String(rawSince ?? "").trim();
+    const until = String(rawUntil ?? "").trim();
+    const isoRe = /^\d{4}-\d{2}-\d{2}$/;
+    if (!isoRe.test(since) || !isoRe.test(until)) {
+      throw new Error("since and until must be YYYY-MM-DD");
+    }
+    if (since > until) {
+      throw new Error("since must be <= until");
+    }
+    return { since, until };
+  }
+
+  // Preview the raw ShopifyQL rows for a date range without writing to DB.
+  // Useful for spot-checking the report against Shopify Admin before ingest.
+  app.get("/api/recon/shopify/staff-sales/preview", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+    try {
+      const { since, until } = _validateSinceUntil(req.query.since, req.query.until);
+      const { fetchStaffSales, buildStaffSalesQuery } = require("./shopify-staff-sales");
+      const rows = await fetchStaffSales(since, until);
+      res.json({
+        ok: true,
+        since,
+        until,
+        query: buildStaffSalesQuery(since, until),
+        count: rows.length,
+        rows: rows.slice(0, 100),
+      });
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      const isAuth = /401|403|scope/i.test(msg);
+      res.status(isAuth ? 502 : 500).json({
+        message: msg,
+        hint: isAuth
+          ? "Re-install the Shopify app via /api/auth/shopify/install to grant the read_reports / read_analytics scopes."
+          : undefined,
+      });
+    }
+  });
+
+  // Run the ingest: ShopifyQL → recon_shopify_staff_sales (idempotent upsert).
+  app.post("/api/recon/shopify/staff-sales/ingest", authMiddleware, requirePermission("payroll.edit"), async (req, res) => {
+    try {
+      const { since, until } = _validateSinceUntil(req.body?.since, req.body?.until);
+      const { ingestStaffSales } = require("./shopify-staff-sales-ingest");
+      const summary = await ingestStaffSales(since, until);
+      res.json({ ok: true, since, until, ...summary });
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      const isAuth = /401|403|scope/i.test(msg);
+      res.status(isAuth ? 502 : 500).json({
+        message: msg,
+        hint: isAuth
+          ? "Re-install the Shopify app via /api/auth/shopify/install to grant the read_reports / read_analytics scopes."
+          : undefined,
+      });
+    }
+  });
+
+  // List rows from recon_shopify_staff_sales with optional filters. Used by the
+  // running-tally UI in PR #203 to display employee net sales over a period.
+  //   employee_id: numeric payroll_employees.id
+  //   entity_id:   numeric recon_entities.id, or -1 to filter unallocated rows
+  //   since/until: ISO date filter on period_start/period_end
+  app.get("/api/recon/shopify/staff-sales", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    try {
+      const employeeIdRaw = String(req.query.employee_id ?? "").trim();
+      const entityIdRaw = String(req.query.entity_id ?? "").trim();
+      const sinceRaw = String(req.query.since ?? "").trim();
+      const untilRaw = String(req.query.until ?? "").trim();
+      const limit = Math.min(5000, Math.max(1, Number(req.query.limit) || 500));
+
+      const where: string[] = [];
+      const params: any[] = [];
+      if (employeeIdRaw) {
+        const eid = parseInt(employeeIdRaw, 10);
+        if (!Number.isFinite(eid)) throw new Error("employee_id must be numeric");
+        where.push("employee_id = ?");
+        params.push(eid);
+      }
+      if (entityIdRaw) {
+        const xid = parseInt(entityIdRaw, 10);
+        if (!Number.isFinite(xid)) throw new Error("entity_id must be numeric (-1 for unallocated)");
+        if (xid === -1) {
+          where.push("entity_id IS NULL");
+        } else {
+          where.push("entity_id = ?");
+          params.push(xid);
+        }
+      }
+      if (sinceRaw) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(sinceRaw)) throw new Error("since must be YYYY-MM-DD");
+        where.push("period_end >= ?");
+        params.push(sinceRaw);
+      }
+      if (untilRaw) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(untilRaw)) throw new Error("until must be YYYY-MM-DD");
+        where.push("period_start <= ?");
+        params.push(untilRaw);
+      }
+
+      const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+      const { sqlite } = require("./storage");
+      const rows = sqlite
+        .prepare(
+          `SELECT * FROM recon_shopify_staff_sales ${whereSql} ORDER BY period_start DESC, total_sales DESC LIMIT ?`,
+        )
+        .all(...params, limit);
+      res.json({ ok: true, count: rows.length, rows });
+    } catch (e: any) {
+      res.status(400).json({ message: String(e?.message || e) });
+    }
+  });
+
   // Current orders watermark (read-only) — shown in the Settings UI so the user
   // knows where the incremental pull will resume from on next run.
   app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {

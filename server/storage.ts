@@ -474,22 +474,99 @@ function bootstrapSchema() {
       ON payroll_entity_processing_fees(entity_id, fee_kind, effective_from);
   `);
 
+  // PR #202 — `payroll_shopify_staff_weekly_totals` is superseded by
+  // `recon_shopify_staff_sales` (defined below). The old table had zero
+  // writers and zero readers besides the unmatched-attributions view.
+  // Drop it on first boot post-deploy so its empty schema and indexes
+  // don't linger. Idempotent — IF EXISTS guards the second-boot case.
   sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS payroll_shopify_staff_weekly_totals (
+    DROP INDEX IF EXISTS idx_payroll_shopify_staff_unique;
+    DROP INDEX IF EXISTS idx_payroll_shopify_staff_period;
+    DROP TABLE IF EXISTS payroll_shopify_staff_weekly_totals;
+  `);
+
+  // PR #202 — Shopify staff-sales rollup. Driven by the ShopifyQL
+  // `sales` dataset (see server/shopify-staff-sales.ts). One row per
+  // (period, assisting_staff_id, order_name, entity_id) — meaning a
+  // single online order whose finance allocator splits 0.6/0.4 across
+  // two entities produces TWO rows (one per entity, dollars share-
+  // weighted). POS orders always produce one row whose entity comes
+  // from the order's location.
+  //
+  // entity_id is NULLABLE because we may ingest a staff-sales row
+  // before the corresponding recon_orders row has been pulled (the
+  // two ingests run on independent schedules). The re-ingest path
+  // re-resolves NULL rows whenever we run the matcher.
+  //
+  // employee_id is NULLABLE because the resolver may miss (new staff
+  // member, not yet linked). Unresolved rows surface in the
+  // payroll_unmatched_attributions view for manual UI mapping.
+  //
+  // Money columns are SIGNED — a pay period of pure returns can put
+  // any of these negative (Bob Ballin -$519.95 net_sales / -$564.80
+  // total_sales in the 6/15-6/21 example).
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_shopify_staff_sales (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
-      pay_period_id INTEGER NOT NULL REFERENCES payroll_pay_periods(id),
+      -- The window this row's dollar figures cover. Half-open semantics
+      -- match ShopifyQL: SINCE inclusive, UNTIL inclusive (per the API).
+      period_start TEXT NOT NULL,   -- YYYY-MM-DD inclusive
+      period_end   TEXT NOT NULL,   -- YYYY-MM-DD inclusive
+      -- Staff attribution as Shopify returns it. Bare numeric string —
+      -- e.g. "82318328050" — same value REST order.user_id returns.
+      assisting_staff_id TEXT NOT NULL,
+      staff_name TEXT,
+      -- Resolver output at ingest time. NULL = unmatched, surface in view.
       employee_id INTEGER REFERENCES payroll_employees(id),
-      shopify_staff_member_id TEXT NOT NULL,
-      raw_staff_name TEXT,
+      -- Entity attribution after running the finance allocator over the
+      -- joined recon_orders row. NULL = order not yet in recon_orders
+      -- (re-resolved on next ingest run).
+      entity_id INTEGER REFERENCES payroll_entities(id),
+      -- Order linkage. order_name ("#38173") is what ShopifyQL emits;
+      -- order_id (the Shopify GID/numeric id) is filled in from
+      -- recon_orders during ingest when the row is present.
+      order_name TEXT,
+      order_id TEXT REFERENCES recon_orders(id),
+      pos_location_name TEXT,
+      -- 1.0 for POS (single entity owns the whole order's commission),
+      -- 0..1 for online orders split across entities by the allocator.
+      -- The dollar columns below are ALREADY multiplied by this share —
+      -- i.e. summing net_sales over all rows of one order_name gives
+      -- the original ShopifyQL net_sales for that order.
+      share REAL NOT NULL DEFAULT 1.0,
+      quantity REAL,
+      gross_sales REAL,
+      discounts REAL,
+      returns REAL,
       net_sales REAL NOT NULL DEFAULT 0,
-      source TEXT NOT NULL DEFAULT 'shopify_ql',
-      ingested_at TEXT
+      taxes REAL,
+      total_sales REAL,
+      -- 'pos' | 'online_share' | 'unallocated' — tells the UI why this
+      -- row exists (and lets us filter unallocated rows out of payroll
+      -- runs until the allocator catches up).
+      allocation_method TEXT NOT NULL DEFAULT 'unallocated',
+      -- Raw ShopifyQL row pre-allocation, JSON-stringified. Forensics.
+      raw_json TEXT,
+      ingested_at TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_payroll_shopify_staff_period
-      ON payroll_shopify_staff_weekly_totals(pay_period_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_shopify_staff_unique
-      ON payroll_shopify_staff_weekly_totals(pay_period_id, shopify_staff_member_id);
+    -- Composite uniqueness: one row per (period × staff × order × entity).
+    -- A re-ingest of the same window must upsert, not double-write.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_staff_sales_unique
+      ON recon_shopify_staff_sales(period_start, period_end,
+                                    assisting_staff_id,
+                                    COALESCE(order_name, ''),
+                                    COALESCE(entity_id, -1));
+    CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_period
+      ON recon_shopify_staff_sales(period_start, period_end);
+    CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_employee
+      ON recon_shopify_staff_sales(employee_id) WHERE employee_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_entity
+      ON recon_shopify_staff_sales(entity_id) WHERE entity_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_order
+      ON recon_shopify_staff_sales(order_name);
+    CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_unmatched
+      ON recon_shopify_staff_sales(assisting_staff_id)
+      WHERE employee_id IS NULL;
   `);
 
   sqlite.exec(`
@@ -669,18 +746,33 @@ function bootstrapSchema() {
   // ----- Unmatched attributions VIEW -----
   // Surfaces every ingest row where employee_id IS NULL. The UI in PR #10
   // shows this list so the user can map the raw clerk name/ID to an employee.
+  //
+  // PR #202 — the shopify_staff_totals arm now reads from
+  // recon_shopify_staff_sales (the old payroll_shopify_staff_weekly_totals
+  // is dropped above). The view's column shape is preserved: pay_period_id
+  // is emitted as NULL for shopify rows since recon_shopify_staff_sales is
+  // keyed by (period_start, period_end) instead of a pay_period_id FK
+  // (commission ingest runs ad-hoc by date range, not tied to a pay period
+  // row). The UI groups by external_id + raw_name regardless of
+  // pay_period_id, so this is non-breaking.
+  //
+  // DROP first to handle the case where the view was created against the
+  // old table schema — sqlite will refuse to CREATE OR REPLACE a view in
+  // older versions, and CREATE VIEW IF NOT EXISTS would silently keep the
+  // stale definition pointing at the now-dropped table.
+  sqlite.exec(`DROP VIEW IF EXISTS payroll_unmatched_attributions;`);
   sqlite.exec(`
     CREATE VIEW IF NOT EXISTS payroll_unmatched_attributions AS
       SELECT
         'shopify_staff_totals' AS source_kind,
         id AS source_row_id,
         entity_id,
-        pay_period_id,
-        shopify_staff_member_id AS external_id,
-        raw_staff_name AS raw_name,
+        CAST(NULL AS INTEGER) AS pay_period_id,
+        assisting_staff_id AS external_id,
+        staff_name AS raw_name,
         net_sales AS amount,
         ingested_at
-      FROM payroll_shopify_staff_weekly_totals
+      FROM recon_shopify_staff_sales
       WHERE employee_id IS NULL
       UNION ALL
       SELECT
