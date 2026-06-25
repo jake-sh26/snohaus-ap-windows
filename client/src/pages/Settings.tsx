@@ -21,7 +21,7 @@ import {
   Ban, Trash2, Plus, ChevronDown, Copy, FileText,
   Users, Database, Archive, Download, Play, Link2, Link2Off,
   UserPlus, UserX, KeyRound, ToggleLeft, ToggleRight,
-  Lock, Save, X,
+  Lock, Save, X, Briefcase, UserCheck, AlertCircle,
 } from "lucide-react";
 import { SkipSenderDialog } from "@/components/SkipSenderDialog";
 
@@ -1091,12 +1091,28 @@ function AllowedEmailsList() {
 function UsersSection() {
   const qc = useQueryClient();
   const { toast } = useToast();
-  const { email: myEmail } = useAuth();
+  const { email: myEmail, hasPermission } = useAuth();
+  const canManageLinks = hasPermission("users.manage_links");
   const [addOpen, setAddOpen] = useState(false);
   const [pwdDialog, setPwdDialog] = useState<{ id: number; email: string } | null>(null);
+  const [linkDialog, setLinkDialog] = useState<{
+    userId: number;
+    userEmail: string;
+    currentEmployeeId: number | null;
+    currentEmployeeName: string | null;
+  } | null>(null);
 
   const usersQ = useQuery<any[]>({ queryKey: ["/api/users"] });
   const users = usersQ.data || [];
+
+  // Link state — joined view of which employee each user is currently tied
+  // to via person_id. Only fetched if the caller can see/manage links.
+  const linksQ = useQuery<any[]>({
+    queryKey: ["/api/people-links/users"],
+    enabled: canManageLinks,
+  });
+  const linkByUserId = new Map<number, any>();
+  for (const row of linksQ.data || []) linkByUserId.set(row.user_id, row);
 
   const deleteMut = useMutation({
     mutationFn: (id: number) => apiRequest("DELETE", `/api/users/${id}`),
@@ -1148,6 +1164,26 @@ function UsersSection() {
                   Last login: {new Date(u.last_login_at).toLocaleString()}
                 </div>
               )}
+              {canManageLinks && linksQ.data && (() => {
+                const link = linkByUserId.get(u.id);
+                if (link?.linked_employee_id) {
+                  return (
+                    <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-1">
+                      <Briefcase className="size-3 text-emerald-500" />
+                      <span>Linked to employee:</span>
+                      <span className="font-medium text-foreground" data-testid={`text-linked-employee-${u.id}`}>
+                        {link.linked_employee_name || `#${link.linked_employee_id}`}
+                      </span>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="text-[11px] text-amber-600 dark:text-amber-500 mt-0.5 flex items-center gap-1" data-testid={`text-no-link-${u.id}`}>
+                    <AlertCircle className="size-3" />
+                    <span>No linked employee — standalone person</span>
+                  </div>
+                );
+              })()}
             </div>
             <Select
               value={u.role}
@@ -1173,6 +1209,28 @@ function UsersSection() {
             >
               {u.enabled ? <ToggleRight className="size-4 text-emerald-500" /> : <ToggleLeft className="size-4 text-slate-400" />}
             </Button>
+            {canManageLinks && (() => {
+              const link = linkByUserId.get(u.id);
+              return (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2"
+                  title={link?.linked_employee_id ? "Change linked employee" : "Link to employee"}
+                  onClick={() =>
+                    setLinkDialog({
+                      userId: u.id,
+                      userEmail: u.email,
+                      currentEmployeeId: link?.linked_employee_id ?? null,
+                      currentEmployeeName: link?.linked_employee_name ?? null,
+                    })
+                  }
+                  data-testid={`button-link-employee-${u.id}`}
+                >
+                  <Briefcase className="size-3.5" />
+                </Button>
+              );
+            })()}
             <Button
               size="sm"
               variant="ghost"
@@ -1199,6 +1257,20 @@ function UsersSection() {
       </div>
       {addOpen && <AddUserDialog onClose={() => setAddOpen(false)} onSaved={() => { qc.invalidateQueries({ queryKey: ["/api/users"] }); setAddOpen(false); }} />}
       {pwdDialog && <SetPasswordDialog userId={pwdDialog.id} userEmail={pwdDialog.email} onClose={() => setPwdDialog(null)} />}
+      {linkDialog && (
+        <UserLinkEmployeeDialog
+          userId={linkDialog.userId}
+          userEmail={linkDialog.userEmail}
+          currentEmployeeId={linkDialog.currentEmployeeId}
+          currentEmployeeName={linkDialog.currentEmployeeName}
+          onClose={() => setLinkDialog(null)}
+          onSaved={() => {
+            qc.invalidateQueries({ queryKey: ["/api/people-links/users"] });
+            qc.invalidateQueries({ queryKey: ["/api/people-links/employees"] });
+            setLinkDialog(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1303,6 +1375,177 @@ function SetPasswordDialog({ userId, userEmail, onClose }: { userId: number; use
             <Button type="submit" disabled={loading}>{loading ? <Loader2 className="size-3.5 mr-1.5 animate-spin" /> : null}Save</Button>
           </div>
         </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ============================================================
+// USER ↔ EMPLOYEE LINK DIALOG (PR #201)
+// ============================================================
+// Lets an admin override the auto-backfill's email-based match. Pick a target
+// employee from a searchable list, or hit Unlink to spin off a fresh person.
+// Block-on-conflict: server returns 409 if the target employee is already
+// linked to another user, with a message telling the operator who to unlink
+// first.
+function UserLinkEmployeeDialog({
+  userId,
+  userEmail,
+  currentEmployeeId,
+  currentEmployeeName,
+  onClose,
+  onSaved,
+}: {
+  userId: number;
+  userEmail: string;
+  currentEmployeeId: number | null;
+  currentEmployeeName: string | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { toast } = useToast();
+  const [search, setSearch] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  // Employee list from the link endpoint includes the current linked-user
+  // info, which we use to mark already-claimed employees in the dropdown.
+  const employeesQ = useQuery<any[]>({ queryKey: ["/api/people-links/employees"] });
+  const all = employeesQ.data || [];
+  const filtered = search.trim()
+    ? all.filter((e: any) =>
+        (e.employee_name || "").toLowerCase().includes(search.toLowerCase()) ||
+        (e.employee_email || "").toLowerCase().includes(search.toLowerCase()),
+      )
+    : all;
+
+  async function pick(employeeId: number) {
+    setSubmitting(true);
+    try {
+      const res = await apiRequest("POST", `/api/people-links/users/${userId}/link`, { employee_id: employeeId });
+      const body = await res.json().catch(() => ({}));
+      if (body?.archived_person_id) {
+        toast({
+          title: "Linked",
+          description: `Old standalone person (id ${body.archived_person_id}) archived because nothing else referenced it.`,
+        });
+      } else {
+        toast({ title: "Linked" });
+      }
+      onSaved();
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      toast({
+        title: msg.includes("already linked") ? "Already linked" : "Error",
+        description: msg,
+        variant: "destructive",
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function unlink() {
+    setSubmitting(true);
+    try {
+      const res = await apiRequest("POST", `/api/people-links/users/${userId}/unlink`, {});
+      const body = await res.json().catch(() => ({}));
+      if (body?.archived_person_id) {
+        toast({
+          title: "Unlinked",
+          description: `Old shared person (id ${body.archived_person_id}) archived because nothing else referenced it.`,
+        });
+      } else {
+        toast({ title: "Unlinked" });
+      }
+      onSaved();
+    } catch (e: any) {
+      toast({ title: "Error", description: e?.message || String(e), variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && !submitting && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Link employee</DialogTitle>
+          <DialogDescription>
+            User <span className="font-mono">{userEmail}</span> is currently{" "}
+            {currentEmployeeId
+              ? <>linked to <span className="font-medium text-foreground">{currentEmployeeName || `#${currentEmployeeId}`}</span>.</>
+              : <>not linked to any employee.</>}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <Input
+            placeholder="Search employees by name or email…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            autoFocus
+            data-testid="input-link-employee-search"
+          />
+          <div className="max-h-72 overflow-y-auto rounded-md border border-border divide-y divide-border">
+            {employeesQ.isLoading && (
+              <div className="text-sm text-muted-foreground py-4 text-center">
+                <Loader2 className="size-4 animate-spin inline mr-2" />Loading employees…
+              </div>
+            )}
+            {!employeesQ.isLoading && filtered.length === 0 && (
+              <div className="text-sm text-muted-foreground py-4 text-center">No employees match.</div>
+            )}
+            {filtered.map((e: any) => {
+              const isCurrent = e.employee_id === currentEmployeeId;
+              const claimedByOther = e.linked_user_id && e.linked_user_id !== userId;
+              return (
+                <button
+                  key={e.employee_id}
+                  type="button"
+                  disabled={submitting || isCurrent}
+                  onClick={() => pick(e.employee_id)}
+                  className={`w-full text-left px-3 py-2 text-sm flex items-center gap-2 ${
+                    isCurrent ? "bg-muted/40" : "hover:bg-muted/60"
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  data-testid={`link-employee-row-${e.employee_id}`}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium truncate">{e.employee_name || `Employee #${e.employee_id}`}</div>
+                    {e.employee_email && (
+                      <div className="text-xs text-muted-foreground truncate">{e.employee_email}</div>
+                    )}
+                  </div>
+                  {isCurrent && (
+                    <Badge variant="outline" className="text-[10px]">Current</Badge>
+                  )}
+                  {!isCurrent && claimedByOther && (
+                    <Badge variant="outline" className="text-[10px] text-amber-600 border-amber-300">
+                      Linked to {e.linked_user_email}
+                    </Badge>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Picking an employee already linked to another user will be blocked.
+            Unlink that user first.
+          </p>
+        </div>
+        <div className="flex justify-between gap-2 pt-2">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={unlink}
+            disabled={submitting || !currentEmployeeId}
+            data-testid="button-unlink-employee"
+          >
+            <Link2Off className="size-3.5 mr-1.5" />
+            Unlink (keep standalone)
+          </Button>
+          <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>
+            Close
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );

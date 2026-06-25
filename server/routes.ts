@@ -13467,6 +13467,110 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ok: true });
   });
 
+  // ===== PR #201: People link management (employee ↔ user) =====
+  // All gated on users.manage_links. Backed by server/people-links.ts which
+  // wraps every op in a transaction, blocks on conflicts (HTTP 409), and
+  // archives orphaned person rows.
+  {
+    const pl = require("./people-links") as typeof import("./people-links");
+
+    app.get(
+      "/api/people-links/users",
+      authMiddleware,
+      requirePermission("users.manage_links"),
+      (_req, res) => {
+        res.json(pl.listUsersWithLinks());
+      },
+    );
+
+    app.get(
+      "/api/people-links/employees",
+      authMiddleware,
+      requirePermission("users.manage_links"),
+      (_req, res) => {
+        res.json(pl.listEmployeesWithLinks());
+      },
+    );
+
+    // POST /api/people-links/users/:userId/link  { employee_id }
+    app.post(
+      "/api/people-links/users/:userId/link",
+      authMiddleware,
+      requirePermission("users.manage_links"),
+      (req, res) => {
+        const userId = parseInt(String(req.params.userId));
+        const employeeId = parseInt(String(req.body?.employee_id ?? ""));
+        if (!Number.isFinite(userId) || !Number.isFinite(employeeId)) {
+          return res.status(400).json({ message: "userId and employee_id required" });
+        }
+        try {
+          res.json(pl.linkUserToEmployee(userId, employeeId));
+        } catch (e: any) {
+          if (e?.code === "CONFLICT") return res.status(409).json({ message: e.message });
+          if (e?.code === "NOT_FOUND") return res.status(404).json({ message: e.message });
+          res.status(500).json({ message: e?.message || String(e) });
+        }
+      },
+    );
+
+    // POST /api/people-links/employees/:employeeId/link  { user_id }
+    app.post(
+      "/api/people-links/employees/:employeeId/link",
+      authMiddleware,
+      requirePermission("users.manage_links"),
+      (req, res) => {
+        const employeeId = parseInt(String(req.params.employeeId));
+        const userId = parseInt(String(req.body?.user_id ?? ""));
+        if (!Number.isFinite(employeeId) || !Number.isFinite(userId)) {
+          return res.status(400).json({ message: "employeeId and user_id required" });
+        }
+        try {
+          res.json(pl.linkEmployeeToUser(employeeId, userId));
+        } catch (e: any) {
+          if (e?.code === "CONFLICT") return res.status(409).json({ message: e.message });
+          if (e?.code === "NOT_FOUND") return res.status(404).json({ message: e.message });
+          res.status(500).json({ message: e?.message || String(e) });
+        }
+      },
+    );
+
+    app.post(
+      "/api/people-links/users/:userId/unlink",
+      authMiddleware,
+      requirePermission("users.manage_links"),
+      (req, res) => {
+        const userId = parseInt(String(req.params.userId));
+        if (!Number.isFinite(userId)) {
+          return res.status(400).json({ message: "userId required" });
+        }
+        try {
+          res.json(pl.unlinkUser(userId));
+        } catch (e: any) {
+          if (e?.code === "NOT_FOUND") return res.status(404).json({ message: e.message });
+          res.status(500).json({ message: e?.message || String(e) });
+        }
+      },
+    );
+
+    app.post(
+      "/api/people-links/employees/:employeeId/unlink",
+      authMiddleware,
+      requirePermission("users.manage_links"),
+      (req, res) => {
+        const employeeId = parseInt(String(req.params.employeeId));
+        if (!Number.isFinite(employeeId)) {
+          return res.status(400).json({ message: "employeeId required" });
+        }
+        try {
+          res.json(pl.unlinkEmployee(employeeId));
+        } catch (e: any) {
+          if (e?.code === "NOT_FOUND") return res.status(404).json({ message: e.message });
+          res.status(500).json({ message: e?.message || String(e) });
+        }
+      },
+    );
+  }
+
   // ===== Feature 2: Backup Routes =====
 
   app.get("/api/backups/status", authMiddleware, (_req, res) => {

@@ -872,6 +872,7 @@ export const PERMISSION_CATALOG: Array<{
   // ----- Users / RBAC -----
   { key: "users.view", module: "users", label: "View users", description: "See the users list and their assigned roles." },
   { key: "users.manage", module: "users", label: "Manage users & roles", description: "Create/edit/disable users and assign roles. Owner-equivalent." },
+  { key: "users.manage_links", module: "users", label: "Manage employee ↔ user links", description: "Change which person an employee or user is linked to. Used to fix mismatches the auto-backfill couldn't catch (different emails, ambiguous matches, no-email employees)." },
 
   // ----- System -----
   { key: "system.view_audit", module: "system", label: "View audit log", description: "Read the system audit log." },
@@ -904,6 +905,7 @@ export const SYSTEM_ROLES: Array<{
       "payroll.lock_period",
       "payroll.edit_employees",
       "payroll.run_sync",
+      "users.manage_links",
       "system.view_sync_log",
     ],
   },
