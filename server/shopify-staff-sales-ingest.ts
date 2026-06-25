@@ -113,9 +113,12 @@ export async function ingestStaffSales(
 
   // One UPSERT per emitted row \u2014 transaction-wrap so a partial failure
   // doesn't leave a half-written period.
+  // PR #206 — occurred_on is now part of the composite unique key. A
+  // single order can produce multiple rows when the sale day differs
+  // from the refund/exchange day.
   const upsert = sqlite.prepare(`
     INSERT INTO recon_shopify_staff_sales (
-      period_start, period_end,
+      period_start, period_end, occurred_on,
       assisting_staff_id, staff_name,
       employee_id, entity_id,
       order_name, order_id, pos_location_name,
@@ -124,7 +127,7 @@ export async function ingestStaffSales(
       net_sales, taxes, total_sales,
       allocation_method, raw_json, ingested_at
     ) VALUES (
-      @period_start, @period_end,
+      @period_start, @period_end, @occurred_on,
       @assisting_staff_id, @staff_name,
       @employee_id, @entity_id,
       @order_name, @order_id, @pos_location_name,
@@ -133,7 +136,8 @@ export async function ingestStaffSales(
       @net_sales, @taxes, @total_sales,
       @allocation_method, @raw_json, @ingested_at
     )
-    ON CONFLICT (period_start, period_end, assisting_staff_id,
+    ON CONFLICT (period_start, period_end, COALESCE(occurred_on, ''),
+                 assisting_staff_id,
                  COALESCE(order_name, ''), COALESCE(entity_id, -1))
     DO UPDATE SET
       staff_name        = excluded.staff_name,
@@ -176,6 +180,7 @@ export async function ingestStaffSales(
         const params = {
           period_start: pull.since,
           period_end: pull.until,
+          occurred_on: row.occurred_on,
           assisting_staff_id: row.assisting_staff_id,
           staff_name: row.staff_name,
           employee_id: emp?.employee_id ?? null,
