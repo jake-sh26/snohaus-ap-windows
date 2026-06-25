@@ -391,12 +391,22 @@ function bootstrapSchema() {
      WHERE dba IS NULL AND display_name IS NOT NULL;
   `);
 
+  // PR #207 — phone column on payroll_employees. Nullable. We add via
+  // ensureColumns so existing rows survive without migration scripts.
+  ensureColumns("payroll_employees", [
+    { name: "phone", defn: "TEXT" },
+  ]);
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS payroll_employees (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
       full_name TEXT NOT NULL,
       email TEXT,
+      -- PR #207: phone is per-employee (different from ADP file_no). Stored
+      -- as user-entered with light normalization client-side. No format
+      -- constraint at the DB layer — international numbers, extensions,
+      -- etc. should all round-trip cleanly.
+      phone TEXT,
       shopify_staff_member_id TEXT,
       easyrent_clerk_guid TEXT,
       ltm_clerk_id TEXT,
@@ -413,6 +423,14 @@ function bootstrapSchema() {
     CREATE INDEX IF NOT EXISTS idx_payroll_employees_shopify ON payroll_employees(shopify_staff_member_id);
     CREATE INDEX IF NOT EXISTS idx_payroll_employees_easyrent ON payroll_employees(easyrent_clerk_guid);
     CREATE INDEX IF NOT EXISTS idx_payroll_employees_ltm ON payroll_employees(ltm_clerk_id);
+    -- PR #207: ADP file_no must be unique WITHIN an entity. Cross-entity
+    -- collisions are allowed (Greenvale's #142 and Huntington's #142 are
+    -- distinct people — ADP scopes file_no per-company). Partial index so
+    -- empty/null adp_employee_id values don't trigger collisions while we
+    -- haven't filled them all in yet.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_employees_adp_per_entity
+      ON payroll_employees(entity_id, adp_employee_id)
+      WHERE adp_employee_id IS NOT NULL AND adp_employee_id != '';
   `);
 
   sqlite.exec(`
@@ -4063,6 +4081,7 @@ export type EmployeeRow = {
   entity_id: number;
   full_name: string;
   email: string | null;
+  phone: string | null;
   shopify_staff_member_id: string | null;
   easyrent_clerk_guid: string | null;
   ltm_clerk_id: string | null;
@@ -4106,6 +4125,7 @@ export function createEmployee(emp: {
   entity_id: number;
   full_name: string;
   email?: string | null;
+  phone?: string | null;
   shopify_staff_member_id?: string | null;
   easyrent_clerk_guid?: string | null;
   ltm_clerk_id?: string | null;
@@ -4119,15 +4139,16 @@ export function createEmployee(emp: {
   const info = sqlite
     .prepare(
       `INSERT INTO payroll_employees
-         (entity_id, full_name, email, shopify_staff_member_id, easyrent_clerk_guid,
+         (entity_id, full_name, email, phone, shopify_staff_member_id, easyrent_clerk_guid,
           ltm_clerk_id, adp_employee_id, commission_rate_pct, active,
           hired_at, notes, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       emp.entity_id,
       emp.full_name,
       emp.email ?? null,
+      emp.phone ?? null,
       emp.shopify_staff_member_id ?? null,
       emp.easyrent_clerk_guid ?? null,
       emp.ltm_clerk_id ?? null,
@@ -4147,7 +4168,7 @@ export function updateEmployee(
   patch: Partial<Omit<EmployeeRow, "id" | "created_at" | "updated_at">>,
 ): EmployeeRow | null {
   const allowed: Array<keyof typeof patch> = [
-    "entity_id", "full_name", "email",
+    "entity_id", "full_name", "email", "phone",
     "shopify_staff_member_id", "easyrent_clerk_guid", "ltm_clerk_id",
     "adp_employee_id", "commission_rate_pct", "active",
     "hired_at", "terminated_at", "notes",
