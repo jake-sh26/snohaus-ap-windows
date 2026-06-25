@@ -308,19 +308,35 @@ export const payrollEntityProcessingFees = sqliteTable("payroll_entity_processin
   created_at: text("created_at"),
 });
 
-// --- Shopify weekly staff totals (one row per emp per pay period) ---
-export const payrollShopifyStaffWeeklyTotals = sqliteTable("payroll_shopify_staff_weekly_totals", {
+// --- Shopify staff sales (PR #202) ---
+// Replaces the dropped payroll_shopify_staff_weekly_totals. Driven by
+// ShopifyQL's `sales` dataset, one row per
+// (period, assisting_staff_id, order_name, entity_id). See
+// server/shopify-staff-sales.ts + the storage.ts table comment for the
+// full schema doc. Money columns are SIGNED (negative for pure-returns
+// periods).
+export const reconShopifyStaffSales = sqliteTable("recon_shopify_staff_sales", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  entity_id: integer("entity_id").notNull(),
-  pay_period_id: integer("pay_period_id").notNull(),
-  employee_id: integer("employee_id"), // null = unmatched (see unmatched_attributions view)
-  shopify_staff_member_id: text("shopify_staff_member_id").notNull(),
-  raw_staff_name: text("raw_staff_name"),
+  period_start: text("period_start").notNull(),
+  period_end: text("period_end").notNull(),
+  assisting_staff_id: text("assisting_staff_id").notNull(),
+  staff_name: text("staff_name"),
+  employee_id: integer("employee_id"),     // null = unmatched
+  entity_id: integer("entity_id"),         // null = unallocated
+  order_name: text("order_name"),
+  order_id: text("order_id"),
+  pos_location_name: text("pos_location_name"),
+  share: real("share").notNull().default(1.0),
+  quantity: real("quantity"),
+  gross_sales: real("gross_sales"),
+  discounts: real("discounts"),
+  returns: real("returns"),
   net_sales: real("net_sales").notNull().default(0),
-  // We deliberately exclude gift cards from net sales — ShopifyQL
-  // pos_total_sales_by_staff_member already does this.
-  source: text("source").notNull().default("shopify_ql"),
-  ingested_at: text("ingested_at"),
+  taxes: real("taxes"),
+  total_sales: real("total_sales"),
+  allocation_method: text("allocation_method").notNull().default("unallocated"),
+  raw_json: text("raw_json"),
+  ingested_at: text("ingested_at").notNull(),
 });
 
 // --- Easyrent weekly staff totals (per-employee rental sales) ---
@@ -433,7 +449,7 @@ export const payrollLines = sqliteTable("payroll_lines", {
   description: text("description"),
   // JSON breakdown for traceability (e.g. {"net_sales": 12500, "rate": 0.04}).
   computation_json: text("computation_json"),
-  source_table: text("source_table"), // e.g. 'payroll_shopify_staff_weekly_totals'
+  source_table: text("source_table"), // e.g. 'recon_shopify_staff_sales'
   source_row_id: integer("source_row_id"),
   // ADP export tracking.
   exported_at: text("exported_at"),
@@ -821,7 +837,7 @@ export type PayrollPayPeriod = typeof payrollPayPeriods.$inferSelect;
 export type PayrollPosLocation = typeof payrollPosLocations.$inferSelect;
 export type PayrollLtmMerchant = typeof payrollLtmMerchants.$inferSelect;
 export type PayrollEntityProcessingFee = typeof payrollEntityProcessingFees.$inferSelect;
-export type PayrollShopifyStaffWeeklyTotal = typeof payrollShopifyStaffWeeklyTotals.$inferSelect;
+export type ReconShopifyStaffSales = typeof reconShopifyStaffSales.$inferSelect;
 export type PayrollEasyrentStaffWeeklyTotal = typeof payrollEasyrentStaffWeeklyTotals.$inferSelect;
 export type PayrollEasyrentPm = typeof payrollEasyrentPms.$inferSelect;
 export type PayrollLtmTip = typeof payrollLtmTips.$inferSelect;
