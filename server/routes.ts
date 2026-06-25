@@ -1101,7 +1101,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.post("/api/payroll/employees", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
-    const { entity_id, full_name, email, shopify_staff_member_id,
+    const { entity_id, full_name, email, phone, shopify_staff_member_id,
             easyrent_clerk_guid, ltm_clerk_id, adp_employee_id,
             commission_rate_pct, active, hired_at, notes } = req.body || {};
     if (!Number.isFinite(Number(entity_id))) {
@@ -1113,22 +1113,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!full_name || typeof full_name !== "string" || !full_name.trim()) {
       return res.status(400).json({ message: "full_name is required" });
     }
-    const row = createEmployee({
-      entity_id: Number(entity_id),
-      full_name: full_name.trim(),
-      email: email ?? null,
-      shopify_staff_member_id: shopify_staff_member_id ?? null,
-      easyrent_clerk_guid: easyrent_clerk_guid ?? null,
-      ltm_clerk_id: ltm_clerk_id ?? null,
-      adp_employee_id: adp_employee_id ?? null,
-      commission_rate_pct: commission_rate_pct === "" || commission_rate_pct === undefined || commission_rate_pct === null
-        ? null
-        : Number(commission_rate_pct),
-      active: active === 0 ? 0 : 1,
-      hired_at: hired_at ?? null,
-      notes: notes ?? null,
-    });
-    res.json(row);
+    try {
+      const row = createEmployee({
+        entity_id: Number(entity_id),
+        full_name: full_name.trim(),
+        email: email ?? null,
+        phone: phone ?? null,
+        shopify_staff_member_id: shopify_staff_member_id ?? null,
+        easyrent_clerk_guid: easyrent_clerk_guid ?? null,
+        ltm_clerk_id: ltm_clerk_id ?? null,
+        adp_employee_id: adp_employee_id ?? null,
+        commission_rate_pct: commission_rate_pct === "" || commission_rate_pct === undefined || commission_rate_pct === null
+          ? null
+          : Number(commission_rate_pct),
+        active: active === 0 ? 0 : 1,
+        hired_at: hired_at ?? null,
+        notes: notes ?? null,
+      });
+      res.json(row);
+    } catch (e: any) {
+      // PR #207: friendly message for the per-entity UNIQUE on adp_employee_id
+      // so the CSV import and the edit dialog both surface a clear error.
+      const msg = String(e?.message || "");
+      if (/UNIQUE constraint failed.*adp_employee_id/i.test(msg) ||
+          /idx_payroll_employees_adp_per_entity/i.test(msg)) {
+        return res.status(409).json({
+          message: `ADP file # "${adp_employee_id}" is already assigned to another employee at this entity. File # only needs to be unique within a location — the same number at a different location is fine.`,
+        });
+      }
+      throw e;
+    }
   });
 
   app.patch("/api/payroll/employees/:id", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
@@ -1148,7 +1162,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!String(body.full_name).trim()) return res.status(400).json({ message: "full_name cannot be empty" });
       patch.full_name = String(body.full_name).trim();
     }
-    for (const k of ["email", "shopify_staff_member_id", "easyrent_clerk_guid",
+    for (const k of ["email", "phone", "shopify_staff_member_id", "easyrent_clerk_guid",
                      "ltm_clerk_id", "adp_employee_id", "hired_at",
                      "terminated_at", "notes"]) {
       if (body[k] !== undefined) {
@@ -1161,8 +1175,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       patch.commission_rate_pct = (v === "" || v === null) ? null : Number(v);
     }
     if (body.active !== undefined) patch.active = body.active ? 1 : 0;
-    const updated = updateEmployee(id, patch);
-    res.json(updated);
+    try {
+      const updated = updateEmployee(id, patch);
+      res.json(updated);
+    } catch (e: any) {
+      const msg = String(e?.message || "");
+      if (/UNIQUE constraint failed.*adp_employee_id/i.test(msg) ||
+          /idx_payroll_employees_adp_per_entity/i.test(msg)) {
+        return res.status(409).json({
+          message: `ADP file # "${patch.adp_employee_id}" is already assigned to another employee at this entity. File # only needs to be unique within a location — the same number at a different location is fine.`,
+        });
+      }
+      throw e;
+    }
   });
 
   // Soft-delete: marks the employee inactive instead of deleting. Hard-delete

@@ -235,6 +235,9 @@ export const payrollEmployees = sqliteTable("payroll_employees", {
   entity_id: integer("entity_id").notNull(),
   full_name: text("full_name").notNull(),
   email: text("email"),
+  // PR #207: contact phone. Light client-side normalization, no DB shape
+  // constraint — international numbers / extensions round-trip cleanly.
+  phone: text("phone"),
   // External IDs used for sales/tip attribution.
   shopify_staff_member_id: text("shopify_staff_member_id"),
   easyrent_clerk_guid: text("easyrent_clerk_guid"),

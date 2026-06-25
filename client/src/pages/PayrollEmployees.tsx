@@ -36,6 +36,7 @@ type EmployeeRow = {
   entity_id: number;
   full_name: string;
   email: string | null;
+  phone: string | null;
   shopify_staff_member_id: string | null;
   easyrent_clerk_guid: string | null;
   ltm_clerk_id: string | null;
@@ -115,6 +116,7 @@ export default function PayrollEmployees() {
       const haystack = [
         e.full_name,
         e.email || "",
+        e.phone || "",
         e.shopify_staff_member_id || "",
         e.easyrent_clerk_guid || "",
         e.ltm_clerk_id || "",
@@ -415,6 +417,7 @@ function EmployeeDialog({
           : "",
   );
   const [email, setEmail] = useState(employee?.email || "");
+  const [phone, setPhone] = useState(employee?.phone || "");
   const [shopifyId, setShopifyId] = useState(employee?.shopify_staff_member_id || "");
   const [easyrentGuid, setEasyrentGuid] = useState(employee?.easyrent_clerk_guid || "");
   const [ltmId, setLtmId] = useState(employee?.ltm_clerk_id || "");
@@ -444,10 +447,26 @@ function EmployeeDialog({
       if (!fullName.trim()) throw new Error("Name is required");
       if (!entityId) throw new Error("Entity is required");
 
+      // PR #207 — light email/phone normalization. Empty stays null. We
+      // do NOT block on bad shapes (Jake can fix later); we just clean up.
+      // Email: lowercase + trim. Basic shape check warns but doesn't block.
+      const emailClean = email.trim().toLowerCase() || null;
+      if (emailClean && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailClean)) {
+        throw new Error("Email doesn't look right (expected name@domain.tld)");
+      }
+      // Phone: keep + prefix if user typed it, strip everything else to
+      // digits. "(516) 555-1234" → "5165551234"; "+1 516 555 1234" →
+      // "+15165551234". We don't enforce a length so extensions etc. work.
+      const phoneRaw = phone.trim();
+      const phoneClean = phoneRaw
+        ? (phoneRaw.startsWith("+") ? "+" : "") + phoneRaw.replace(/\D/g, "")
+        : null;
+
       const payload: Record<string, any> = {
         full_name: fullName.trim(),
         entity_id: Number(entityId),
-        email: email.trim() || null,
+        email: emailClean,
+        phone: phoneClean,
         shopify_staff_member_id: shopifyId.trim() || null,
         easyrent_clerk_guid: easyrentGuid.trim() || null,
         ltm_clerk_id: ltmId.trim() || null,
@@ -573,6 +592,21 @@ function EmployeeDialog({
                 placeholder="jane@snohaus.com"
               />
             </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="phone" className="text-xs">
+                Phone
+              </Label>
+              <Input
+                id="phone"
+                type="tel"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                data-testid="input-phone"
+                placeholder="(516) 555-1234"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="hired_at" className="text-xs">
                 Hired
