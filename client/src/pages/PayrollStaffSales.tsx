@@ -158,7 +158,10 @@ type OrderRow = {
 
 export default function PayrollStaffSales() {
   const { hasPermission } = useAuth();
-  const canIngest = hasPermission("payroll.edit");
+  // PR #204 fix: use the canonical payroll.run_sync key from PERMISSION_CATALOG
+  // (server/routes.ts and shared/schema.ts). `payroll.edit` was a typo that
+  // hid the Sync button entirely on prod.
+  const canIngest = hasPermission("payroll.run_sync");
   const { toast } = useToast();
   const qc = useQueryClient();
 

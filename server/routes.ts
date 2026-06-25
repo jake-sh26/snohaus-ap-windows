@@ -10931,7 +10931,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // Run the ingest: ShopifyQL → recon_shopify_staff_sales (idempotent upsert).
-  app.post("/api/recon/shopify/staff-sales/ingest", authMiddleware, requirePermission("payroll.edit"), async (req, res) => {
+  // PR #204 fix: gate the manual ingest trigger on `payroll.run_sync`, not
+  // a made-up `payroll.edit`. The catalog has run_sync specifically for
+  // "Manually trigger Shopify / Easyrent / Shift4 ingestion runs."
+  app.post("/api/recon/shopify/staff-sales/ingest", authMiddleware, requirePermission("payroll.run_sync"), async (req, res) => {
     try {
       const { since, until } = _validateSinceUntil(req.body?.since, req.body?.until);
       const { ingestStaffSales } = require("./shopify-staff-sales-ingest");
@@ -11038,7 +11041,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const empRows = sqlite
           .prepare(
             `SELECT
+               CASE WHEN s.employee_id IS NULL
+                    THEN 'staff:' || s.assisting_staff_id
+                    ELSE 'emp:'   || s.employee_id
+               END AS group_key,
                s.employee_id AS employee_id,
+               MAX(s.assisting_staff_id) AS assisting_staff_id,
                COALESCE(e.full_name, MAX(s.staff_name), '(unmatched)') AS full_name,
                MAX(s.staff_name) AS shopify_staff_name,
                GROUP_CONCAT(DISTINCT s.assisting_staff_id) AS shopify_staff_ids,
@@ -11053,7 +11061,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              FROM recon_shopify_staff_sales s
              LEFT JOIN payroll_employees e ON e.id = s.employee_id
              WHERE s.period_end >= ? AND s.period_start <= ?
-             GROUP BY s.employee_id
+             GROUP BY group_key
              ORDER BY total_sales DESC`,
           )
           .all(since, until);
@@ -11062,7 +11070,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const entRows = sqlite
           .prepare(
             `SELECT
+               CASE WHEN s.employee_id IS NULL
+                    THEN 'staff:' || s.assisting_staff_id
+                    ELSE 'emp:'   || s.employee_id
+               END AS group_key,
                s.employee_id,
+               MAX(s.assisting_staff_id) AS assisting_staff_id,
                s.entity_id,
                COALESCE(en.display_name, en.location, '(unallocated)') AS entity_label,
                en.location AS entity_location,
@@ -11074,20 +11087,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              FROM recon_shopify_staff_sales s
              LEFT JOIN payroll_entities en ON en.id = s.entity_id
              WHERE s.period_end >= ? AND s.period_start <= ?
-             GROUP BY s.employee_id, s.entity_id
+             GROUP BY group_key, s.entity_id
              ORDER BY total_sales DESC`,
           )
           .all(since, until);
 
+        // PR #204: group_key splits unmatched rows by assisting_staff_id so
+        // each unknown Shopify staff member becomes its own row instead of
+        // collapsing into one "(unmatched)" bucket. Matched employees are
+        // still keyed by employee_id via the CASE expression above.
         const byEntityForEmp = new Map<string, any[]>();
         for (const r of entRows as any[]) {
-          const key = r.employee_id === null ? "_null" : String(r.employee_id);
+          const key = String(r.group_key);
           if (!byEntityForEmp.has(key)) byEntityForEmp.set(key, []);
           byEntityForEmp.get(key)!.push(r);
         }
 
         const employees = (empRows as any[]).map((emp) => {
-          const key = emp.employee_id === null ? "_null" : String(emp.employee_id);
+          const key = String(emp.group_key);
           return { ...emp, by_entity: byEntityForEmp.get(key) ?? [] };
         });
 
@@ -11189,6 +11206,94 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         res.json({ ok: true, count: rows.length, rows });
       } catch (e: any) {
         res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+  // PR #204 — diagnostic endpoint for the commission matcher.
+  //
+  // For each distinct Shopify staff id present in recon_shopify_staff_sales,
+  // shows what the resolver would match against and why (or why not). Used to
+  // debug the "everyone unmatched" failure mode where the bare-numeric form
+  // from ShopifyQL doesn't line up with the gid:// form stored on
+  // payroll_employees.shopify_staff_member_id.
+  app.get(
+    "/api/recon/shopify/staff-sales/diagnose-unmatched",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (_req, res) => {
+      try {
+        const { sqlite } = require("./storage");
+        const { resolveEmployeeByShopifyStaff } = require("./commission-matcher");
+
+        // Every distinct staff id we've seen, with its sample name + an
+        // example_order_name for traceability.
+        const distinct = sqlite
+          .prepare(
+            `SELECT
+               assisting_staff_id,
+               MAX(staff_name) AS staff_name,
+               MAX(order_name) AS example_order_name,
+               COUNT(*) AS row_count,
+               SUM(total_sales) AS total_sales
+             FROM recon_shopify_staff_sales
+             GROUP BY assisting_staff_id
+             ORDER BY ABS(SUM(total_sales)) DESC`,
+          )
+          .all() as any[];
+
+        // What's stored on payroll_employees today (for comparison).
+        const directRows = sqlite
+          .prepare(
+            `SELECT id, full_name, shopify_staff_member_id, active
+             FROM payroll_employees
+             WHERE shopify_staff_member_id IS NOT NULL
+               AND shopify_staff_member_id != ''
+             ORDER BY full_name`,
+          )
+          .all() as any[];
+
+        // What's stored on person_external_ids for the SHOPIFY_STAFF system.
+        const pxiRows = sqlite
+          .prepare(
+            `SELECT pxi.external_id, p.id AS person_id, p.display_name, p.status
+             FROM person_external_ids pxi
+             JOIN people p ON p.id = pxi.person_id
+             WHERE pxi.system = 'shopify_staff'
+             ORDER BY p.display_name`,
+          )
+          .all() as any[];
+
+        // Run the resolver over each distinct id and capture the result.
+        const resolved = distinct.map((d) => {
+          const r = resolveEmployeeByShopifyStaff(d.assisting_staff_id);
+          return {
+            ...d,
+            matched: r !== null,
+            employee_id: r?.employee_id ?? null,
+            full_name: r?.full_name ?? null,
+            match_source: r?.match_source ?? null,
+          };
+        });
+
+        const matched = resolved.filter((r: any) => r.matched).length;
+        const unmatched = resolved.length - matched;
+
+        res.json({
+          ok: true,
+          summary: {
+            distinct_staff_ids: resolved.length,
+            matched,
+            unmatched,
+            payroll_employees_with_shopify_id: directRows.length,
+            person_external_ids_for_shopify: pxiRows.length,
+          },
+          by_staff_id: resolved,
+          payroll_employees: directRows,
+          person_external_ids: pxiRows,
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: String(e?.message || e) });
       }
     },
   );
