@@ -251,6 +251,17 @@ export const payrollEmployees = sqliteTable("payroll_employees", {
   hired_at: text("hired_at"),
   terminated_at: text("terminated_at"),
   notes: text("notes"),
+  // PR #208 — extended employee profile (all nullable).
+  date_of_birth: text("date_of_birth"),
+  address_line1: text("address_line1"),
+  address_line2: text("address_line2"),
+  city: text("city"),
+  state: text("state"),
+  postal_code: text("postal_code"),
+  emergency_contact_name: text("emergency_contact_name"),
+  emergency_contact_phone: text("emergency_contact_phone"),
+  emergency_contact_relationship: text("emergency_contact_relationship"),
+  tshirt_size: text("tshirt_size"),
   created_at: text("created_at"),
   updated_at: text("updated_at"),
 });
@@ -875,6 +886,7 @@ export const PERMISSION_CATALOG: Array<{
   { key: "payroll.lock_period", module: "payroll", label: "Lock pay periods", description: "Move a pay period from open to locked." },
   { key: "payroll.export_adp", module: "payroll", label: "Export ADP CSV", description: "Download the per-entity ADP Run import file. Does not require payroll.view." },
   { key: "payroll.edit_employees", module: "payroll", label: "Manage employees", description: "Add, edit, or deactivate employees within scoped entities." },
+  { key: "payroll.edit_commissions", module: "payroll", label: "Edit per-employee commission rate", description: "Set or change the per-employee commission_rate_pct override. View is open to anyone with payroll.view; this gates writes only." },
   { key: "payroll.edit_rules", module: "payroll", label: "Edit commission/SPIF rules", description: "Change commission rates, SPIF rules, and processing fees." },
   { key: "payroll.run_sync", module: "payroll", label: "Trigger sync", description: "Manually trigger Shopify / Easyrent / Shift4 ingestion runs." },
 

@@ -46,9 +46,29 @@ type EmployeeRow = {
   hired_at: string | null;
   terminated_at: string | null;
   notes: string | null;
+  // PR #208 — extended profile fields
+  date_of_birth: string | null;
+  address_line1: string | null;
+  address_line2: string | null;
+  city: string | null;
+  state: string | null;
+  postal_code: string | null;
+  emergency_contact_name: string | null;
+  emergency_contact_phone: string | null;
+  emergency_contact_relationship: string | null;
+  tshirt_size: string | null;
   created_at: string | null;
   updated_at: string | null;
 };
+
+// PR #208 — display an ISO YYYY-MM-DD as MM/DD/YYYY for read views.
+// Leaves non-ISO strings alone so legacy bad data still renders.
+function formatDateUS(s: string | null | undefined): string {
+  if (!s) return "";
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return s;
+  return `${m[2]}/${m[3]}/${m[1]}`;
+}
 
 type EntityRow = {
   id: number;
@@ -60,6 +80,7 @@ type EntityRow = {
 export default function PayrollEmployees() {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission("payroll.edit_employees");
+  const canEditCommissions = hasPermission("payroll.edit_commissions");
   const canManageLinks = hasPermission("users.manage_links");
 
   const [entityFilter, setEntityFilter] = useState<string>("all"); // "all" or entity id as string
@@ -356,6 +377,7 @@ export default function PayrollEmployees() {
         <EmployeeDialog
           mode="create"
           entities={entities}
+          canEditCommissions={canEditCommissions}
           defaultEntityId={entityFilter !== "all" ? Number(entityFilter) : undefined}
           onClose={() => setCreating(false)}
         />
@@ -367,6 +389,7 @@ export default function PayrollEmployees() {
           mode="edit"
           entities={entities}
           employee={editing}
+          canEditCommissions={canEditCommissions}
           onClose={() => setEditing(null)}
         />
       )}
@@ -395,12 +418,14 @@ function EmployeeDialog({
   entities,
   employee,
   defaultEntityId,
+  canEditCommissions,
   onClose,
 }: {
   mode: "create" | "edit";
   entities: EntityRow[];
   employee?: EmployeeRow;
   defaultEntityId?: number;
+  canEditCommissions: boolean;
   onClose: () => void;
 }) {
   const { toast } = useToast();
@@ -432,6 +457,18 @@ function EmployeeDialog({
   const [notes, setNotes] = useState(employee?.notes || "");
   const [active, setActive] = useState(employee ? employee.active === 1 : true);
 
+  // PR #208 — extended profile fields
+  const [dob, setDob] = useState(employee?.date_of_birth || "");
+  const [addr1, setAddr1] = useState(employee?.address_line1 || "");
+  const [addr2, setAddr2] = useState(employee?.address_line2 || "");
+  const [city, setCity] = useState(employee?.city || "");
+  const [stateRegion, setStateRegion] = useState(employee?.state || "");
+  const [postal, setPostal] = useState(employee?.postal_code || "");
+  const [ecName, setEcName] = useState(employee?.emergency_contact_name || "");
+  const [ecPhone, setEcPhone] = useState(employee?.emergency_contact_phone || "");
+  const [ecRel, setEcRel] = useState(employee?.emergency_contact_relationship || "");
+  const [tshirt, setTshirt] = useState(employee?.tshirt_size || "");
+
   const saveMut = useMutation({
     mutationFn: async () => {
       // Parse commission % from user-friendly percent input into 0-1 fraction.
@@ -443,6 +480,12 @@ function EmployeeDialog({
         }
         commission_rate_pct = n / 100;
       }
+
+      // PR #208 — emergency contact phone normalization (same rule as employee phone)
+      const ecPhoneRaw = ecPhone.trim();
+      const ecPhoneClean = ecPhoneRaw
+        ? (ecPhoneRaw.startsWith("+") ? "+" : "") + ecPhoneRaw.replace(/\D/g, "")
+        : null;
 
       if (!fullName.trim()) throw new Error("Name is required");
       if (!entityId) throw new Error("Entity is required");
@@ -471,10 +514,26 @@ function EmployeeDialog({
         easyrent_clerk_guid: easyrentGuid.trim() || null,
         ltm_clerk_id: ltmId.trim() || null,
         adp_employee_id: adpId.trim() || null,
-        commission_rate_pct,
         hired_at: hiredAt.trim() || null,
         notes: notes.trim() || null,
+        // PR #208 — extended profile fields
+        date_of_birth: dob.trim() || null,
+        address_line1: addr1.trim() || null,
+        address_line2: addr2.trim() || null,
+        city: city.trim() || null,
+        state: stateRegion.trim() || null,
+        postal_code: postal.trim() || null,
+        emergency_contact_name: ecName.trim() || null,
+        emergency_contact_phone: ecPhoneClean,
+        emergency_contact_relationship: ecRel.trim() || null,
+        tshirt_size: tshirt.trim() || null,
       };
+      // Only include commission_rate_pct in payload if the user has permission to
+      // edit it. Server gates this too, but omitting here avoids the
+      // X-Commission-Dropped response header noise when non-admins save.
+      if (canEditCommissions) {
+        payload.commission_rate_pct = commission_rate_pct;
+      }
 
       if (mode === "create") {
         const res = await apiRequest("POST", "/api/payroll/employees", payload);
@@ -686,6 +745,9 @@ function EmployeeDialog({
             <div className="space-y-1.5">
               <Label htmlFor="commission_pct" className="text-xs">
                 Commission rate %
+                {!canEditCommissions && (
+                  <span className="ml-1.5 text-[10px] text-muted-foreground">(admin only)</span>
+                )}
               </Label>
               <Input
                 id="commission_pct"
@@ -694,6 +756,8 @@ function EmployeeDialog({
                 data-testid="input-commission-pct"
                 placeholder="e.g. 5 for 5%"
                 inputMode="decimal"
+                disabled={!canEditCommissions}
+                title={!canEditCommissions ? "Admin only — you can view but not edit commission rates" : undefined}
               />
               <div className="text-[11px] text-muted-foreground">
                 Default commission rate. Per-product overrides come later via SPIF rules.
@@ -712,6 +776,99 @@ function EmployeeDialog({
                 </div>
               </div>
             )}
+          </div>
+
+          {/* PR #208 — Personal details (DOB, t-shirt) */}
+          <div className="rounded-md border border-border bg-muted/30 p-3 space-y-3">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Personal details
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="dob" className="text-xs">Date of birth</Label>
+                <Input
+                  id="dob"
+                  type="date"
+                  value={dob}
+                  onChange={(e) => setDob(e.target.value)}
+                  data-testid="input-dob"
+                />
+                {dob && (
+                  <div className="text-[11px] text-muted-foreground">{formatDateUS(dob)}</div>
+                )}
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="tshirt" className="text-xs">T-shirt size</Label>
+                <Select
+                  value={tshirt || "__none__"}
+                  onValueChange={(v) => setTshirt(v === "__none__" ? "" : v)}
+                >
+                  <SelectTrigger id="tshirt" data-testid="select-tshirt">
+                    <SelectValue placeholder="—" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">—</SelectItem>
+                    <SelectItem value="XS">XS</SelectItem>
+                    <SelectItem value="S">S</SelectItem>
+                    <SelectItem value="M">M</SelectItem>
+                    <SelectItem value="L">L</SelectItem>
+                    <SelectItem value="XL">XL</SelectItem>
+                    <SelectItem value="XXL">XXL</SelectItem>
+                    <SelectItem value="XXXL">XXXL</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
+          {/* PR #208 — Address */}
+          <div className="rounded-md border border-border bg-muted/30 p-3 space-y-3">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Address
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="addr1" className="text-xs">Address line 1</Label>
+              <Input id="addr1" value={addr1} onChange={(e) => setAddr1(e.target.value)} data-testid="input-addr1" placeholder="123 Main St" />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="addr2" className="text-xs">Address line 2</Label>
+              <Input id="addr2" value={addr2} onChange={(e) => setAddr2(e.target.value)} data-testid="input-addr2" placeholder="Apt, suite, etc. (optional)" />
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="city" className="text-xs">City</Label>
+                <Input id="city" value={city} onChange={(e) => setCity(e.target.value)} data-testid="input-city" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="state" className="text-xs">State</Label>
+                <Input id="state" value={stateRegion} onChange={(e) => setStateRegion(e.target.value)} data-testid="input-state" placeholder="NY" maxLength={2} />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="postal" className="text-xs">ZIP</Label>
+                <Input id="postal" value={postal} onChange={(e) => setPostal(e.target.value)} data-testid="input-postal" placeholder="11743" />
+              </div>
+            </div>
+          </div>
+
+          {/* PR #208 — Emergency contact */}
+          <div className="rounded-md border border-border bg-muted/30 p-3 space-y-3">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Emergency contact
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="ec_name" className="text-xs">Name</Label>
+                <Input id="ec_name" value={ecName} onChange={(e) => setEcName(e.target.value)} data-testid="input-ec-name" placeholder="Full name" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="ec_phone" className="text-xs">Phone</Label>
+                <Input id="ec_phone" type="tel" value={ecPhone} onChange={(e) => setEcPhone(e.target.value)} data-testid="input-ec-phone" placeholder="(516) 555-1234" />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="ec_rel" className="text-xs">Relationship</Label>
+              <Input id="ec_rel" value={ecRel} onChange={(e) => setEcRel(e.target.value)} data-testid="input-ec-rel" placeholder="Parent, spouse, sibling, etc." />
+            </div>
           </div>
 
           <div className="space-y-1.5">

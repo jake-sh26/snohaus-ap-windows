@@ -393,8 +393,19 @@ function bootstrapSchema() {
 
   // PR #207 — phone column on payroll_employees. Nullable. We add via
   // ensureColumns so existing rows survive without migration scripts.
+  // PR #208 — DOB, address, emergency contact, t-shirt size. All nullable.
   ensureColumns("payroll_employees", [
     { name: "phone", defn: "TEXT" },
+    { name: "date_of_birth", defn: "TEXT" },
+    { name: "address_line1", defn: "TEXT" },
+    { name: "address_line2", defn: "TEXT" },
+    { name: "city", defn: "TEXT" },
+    { name: "state", defn: "TEXT" },
+    { name: "postal_code", defn: "TEXT" },
+    { name: "emergency_contact_name", defn: "TEXT" },
+    { name: "emergency_contact_phone", defn: "TEXT" },
+    { name: "emergency_contact_relationship", defn: "TEXT" },
+    { name: "tshirt_size", defn: "TEXT" },
   ]);
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS payroll_employees (
@@ -402,10 +413,6 @@ function bootstrapSchema() {
       entity_id INTEGER NOT NULL REFERENCES payroll_entities(id),
       full_name TEXT NOT NULL,
       email TEXT,
-      -- PR #207: phone is per-employee (different from ADP file_no). Stored
-      -- as user-entered with light normalization client-side. No format
-      -- constraint at the DB layer — international numbers, extensions,
-      -- etc. should all round-trip cleanly.
       phone TEXT,
       shopify_staff_member_id TEXT,
       easyrent_clerk_guid TEXT,
@@ -416,6 +423,16 @@ function bootstrapSchema() {
       hired_at TEXT,
       terminated_at TEXT,
       notes TEXT,
+      date_of_birth TEXT,
+      address_line1 TEXT,
+      address_line2 TEXT,
+      city TEXT,
+      state TEXT,
+      postal_code TEXT,
+      emergency_contact_name TEXT,
+      emergency_contact_phone TEXT,
+      emergency_contact_relationship TEXT,
+      tshirt_size TEXT,
       created_at TEXT,
       updated_at TEXT
     );
@@ -4091,6 +4108,17 @@ export type EmployeeRow = {
   hired_at: string | null;
   terminated_at: string | null;
   notes: string | null;
+  // PR #208 — extended employee profile
+  date_of_birth: string | null;
+  address_line1: string | null;
+  address_line2: string | null;
+  city: string | null;
+  state: string | null;
+  postal_code: string | null;
+  emergency_contact_name: string | null;
+  emergency_contact_phone: string | null;
+  emergency_contact_relationship: string | null;
+  tshirt_size: string | null;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -4134,6 +4162,16 @@ export function createEmployee(emp: {
   active?: number;
   hired_at?: string | null;
   notes?: string | null;
+  date_of_birth?: string | null;
+  address_line1?: string | null;
+  address_line2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postal_code?: string | null;
+  emergency_contact_name?: string | null;
+  emergency_contact_phone?: string | null;
+  emergency_contact_relationship?: string | null;
+  tshirt_size?: string | null;
 }): EmployeeRow {
   const now = new Date().toISOString();
   const info = sqlite
@@ -4141,8 +4179,12 @@ export function createEmployee(emp: {
       `INSERT INTO payroll_employees
          (entity_id, full_name, email, phone, shopify_staff_member_id, easyrent_clerk_guid,
           ltm_clerk_id, adp_employee_id, commission_rate_pct, active,
-          hired_at, notes, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          hired_at, notes,
+          date_of_birth, address_line1, address_line2, city, state, postal_code,
+          emergency_contact_name, emergency_contact_phone, emergency_contact_relationship,
+          tshirt_size,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       emp.entity_id,
@@ -4157,6 +4199,16 @@ export function createEmployee(emp: {
       emp.active ?? 1,
       emp.hired_at ?? null,
       emp.notes ?? null,
+      emp.date_of_birth ?? null,
+      emp.address_line1 ?? null,
+      emp.address_line2 ?? null,
+      emp.city ?? null,
+      emp.state ?? null,
+      emp.postal_code ?? null,
+      emp.emergency_contact_name ?? null,
+      emp.emergency_contact_phone ?? null,
+      emp.emergency_contact_relationship ?? null,
+      emp.tshirt_size ?? null,
       now,
       now,
     );
@@ -4172,6 +4224,10 @@ export function updateEmployee(
     "shopify_staff_member_id", "easyrent_clerk_guid", "ltm_clerk_id",
     "adp_employee_id", "commission_rate_pct", "active",
     "hired_at", "terminated_at", "notes",
+    // PR #208
+    "date_of_birth", "address_line1", "address_line2", "city", "state", "postal_code",
+    "emergency_contact_name", "emergency_contact_phone", "emergency_contact_relationship",
+    "tshirt_size",
   ];
   const sets: string[] = [];
   const vals: any[] = [];
