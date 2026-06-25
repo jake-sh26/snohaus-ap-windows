@@ -59,6 +59,18 @@ function currentWeekMonToSun(): { since: string; until: string } {
   return { since: fmtISO(mon), until: fmtISO(sun) };
 }
 
+// Last completed week (Mon–Sun) — i.e. the week BEFORE the one we're in.
+// On Monday at 00:00 local time this naturally rolls forward by 7 days,
+// which is the cadence Jake wants for commission review.
+function lastWeekMonToSun(): { since: string; until: string } {
+  const cur = currentWeekMonToSun();
+  const mon = new Date(`${cur.since}T00:00:00`);
+  mon.setDate(mon.getDate() - 7);
+  const sun = new Date(mon);
+  sun.setDate(mon.getDate() + 6);
+  return { since: fmtISO(mon), until: fmtISO(sun) };
+}
+
 function lastNDays(n: number): { since: string; until: string } {
   const until = new Date();
   const since = new Date();
@@ -165,9 +177,11 @@ export default function PayrollStaffSales() {
   const { toast } = useToast();
   const qc = useQueryClient();
 
-  // Default window: current Mon–Sun. Stored as ISO YYYY-MM-DD strings so the
+  // Default window: last completed Mon–Sun (the week before the one we're
+  // in). Rolls forward automatically every Monday 00:00 local time. Stored
+  // as ISO YYYY-MM-DD strings so the
   // input[type=date] controls bind cleanly.
-  const defaultWindow = useMemo(currentWeekMonToSun, []);
+  const defaultWindow = useMemo(lastWeekMonToSun, []);
   const [since, setSince] = useState<string>(defaultWindow.since);
   const [until, setUntil] = useState<string>(defaultWindow.until);
   const [search, setSearch] = useState("");
@@ -260,10 +274,16 @@ export default function PayrollStaffSales() {
   const totals = summaryQ.data?.totals;
 
   // ------- Quick range presets -------
-  function applyRange(label: "thisWeek" | "last7" | "last30" | "last90") {
+  function applyRange(
+    label: "lastWeek" | "thisWeek" | "last7" | "last30" | "last90",
+  ) {
     setExpanded(new Set());
     setDrillKey(null);
-    if (label === "thisWeek") {
+    if (label === "lastWeek") {
+      const w = lastWeekMonToSun();
+      setSince(w.since);
+      setUntil(w.until);
+    } else if (label === "thisWeek") {
       const w = currentWeekMonToSun();
       setSince(w.since);
       setUntil(w.until);
@@ -349,13 +369,16 @@ export default function PayrollStaffSales() {
             <Select
               value=""
               onValueChange={(v) =>
-                applyRange(v as "thisWeek" | "last7" | "last30" | "last90")
+                applyRange(
+                  v as "lastWeek" | "thisWeek" | "last7" | "last30" | "last90",
+                )
               }
             >
               <SelectTrigger className="w-40" data-testid="select-preset">
                 <SelectValue placeholder="Quick range…" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="lastWeek">Last week (Mon–Sun)</SelectItem>
                 <SelectItem value="thisWeek">This week (Mon–Sun)</SelectItem>
                 <SelectItem value="last7">Last 7 days</SelectItem>
                 <SelectItem value="last30">Last 30 days</SelectItem>

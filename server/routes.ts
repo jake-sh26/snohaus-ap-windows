@@ -11060,7 +11060,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                COUNT(DISTINCT s.order_name) AS order_count
              FROM recon_shopify_staff_sales s
              LEFT JOIN payroll_employees e ON e.id = s.employee_id
-             WHERE s.period_end >= ? AND s.period_start <= ?
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             -- PR #205: filter by the actual Shopify order date
+             -- (recon_orders.created_at) instead of the ingest window
+             -- stamp on the staff_sales row. Falls back to period_start
+             -- when the order isn't linked yet (order_id IS NULL).
+             WHERE date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?
              GROUP BY group_key
              ORDER BY total_sales DESC`,
           )
@@ -11086,7 +11091,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
                COUNT(DISTINCT s.order_name) AS order_count
              FROM recon_shopify_staff_sales s
              LEFT JOIN payroll_entities en ON en.id = s.entity_id
-             WHERE s.period_end >= ? AND s.period_start <= ?
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             -- PR #205: see empRows comment above. Same filter swap.
+             WHERE date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?
              GROUP BY group_key, s.entity_id
              ORDER BY total_sales DESC`,
           )
@@ -11112,16 +11119,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const totalsRow = sqlite
           .prepare(
             `SELECT
-               SUM(gross_sales) AS gross_sales,
-               SUM(discounts)   AS discounts,
-               SUM(returns)     AS returns_amt,
-               SUM(net_sales)   AS net_sales,
-               SUM(taxes)       AS taxes,
-               SUM(total_sales) AS total_sales,
-               COUNT(DISTINCT order_name) AS order_count,
+               SUM(s.gross_sales) AS gross_sales,
+               SUM(s.discounts)   AS discounts,
+               SUM(s.returns)     AS returns_amt,
+               SUM(s.net_sales)   AS net_sales,
+               SUM(s.taxes)       AS taxes,
+               SUM(s.total_sales) AS total_sales,
+               COUNT(DISTINCT s.order_name) AS order_count,
                COUNT(*) AS row_count
-             FROM recon_shopify_staff_sales
-             WHERE period_end >= ? AND period_start <= ?`,
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             -- PR #205: see empRows.
+             WHERE date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?`,
           )
           .get(since, until);
 
@@ -11160,7 +11169,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const employeeIdRaw = String(req.query.employee_id ?? "").trim();
         const entityIdRaw = String(req.query.entity_id ?? "").trim();
 
-        const where: string[] = ["s.period_end >= ?", "s.period_start <= ?"];
+        // PR #205: filter by recon_orders.created_at (joined below), falling
+        // back to period_start when the order isn't linked yet. Pre-PR this
+        // filtered on period_start/period_end which is the ingest window
+        // stamp — every row matched any user-selected calendar.
+        const where: string[] = [
+          "date(COALESCE(o.created_at, s.period_start)) BETWEEN ? AND ?",
+        ];
         const params: any[] = [since, until];
 
         if (employeeIdRaw === "_null") {
@@ -11199,7 +11214,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              LEFT JOIN payroll_entities en ON en.id = s.entity_id
              LEFT JOIN recon_orders o ON o.id = s.order_id
              WHERE ${where.join(" AND ")}
-             ORDER BY s.period_start DESC, ABS(s.total_sales) DESC
+             -- PR #205: order by actual Shopify order date (falls back to
+             -- period_start when the order isn't linked yet).
+             ORDER BY COALESCE(o.created_at, s.period_start) DESC, ABS(s.total_sales) DESC
              LIMIT 2000`,
           )
           .all(...params);
