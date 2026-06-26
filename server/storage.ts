@@ -631,14 +631,14 @@ function bootstrapSchema() {
     -- in the uniqueness key. Safe to drop on every boot — CREATE INDEX
     -- below recreates the right one.
     DROP INDEX IF EXISTS idx_recon_staff_sales_unique;
-    -- Composite uniqueness: one row per (period × day × staff × order × entity).
-    -- A re-ingest of the same window must upsert, not double-write.
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_staff_sales_unique_v2
-      ON recon_shopify_staff_sales(period_start, period_end,
-                                    COALESCE(occurred_on, ''),
-                                    assisting_staff_id,
-                                    COALESCE(order_name, ''),
-                                    COALESCE(entity_id, -1));
+    -- PR #212: drop v2 too. period_start/period_end caused the same
+    -- logical sale to land in TWO rows when sync ran with a different
+    -- sliding window — e.g. John Murray showed up twice (one row with
+    -- employee_id set, one with employee_id NULL) on the Staff Sales
+    -- page because the pre-link and post-link ingests stored under
+    -- different period_start values. Replaced by v3 below which drops
+    -- period_start/period_end from the conflict key.
+    DROP INDEX IF EXISTS idx_recon_staff_sales_unique_v2;
     CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_occurred_on
       ON recon_shopify_staff_sales(occurred_on)
       WHERE occurred_on IS NOT NULL;
@@ -653,6 +653,53 @@ function bootstrapSchema() {
     CREATE INDEX IF NOT EXISTS idx_recon_staff_sales_unmatched
       ON recon_shopify_staff_sales(assisting_staff_id)
       WHERE employee_id IS NULL;
+  `);
+
+  // PR #212 — de-dup migration BEFORE we install the new unique index.
+  //
+  // Old v2 index keyed uniqueness on (period_start, period_end, ...).
+  // When sync ran over a different sliding window, the same logical sale
+  // landed in a second row instead of updating in place. This left
+  // duplicate (occurred_on, assisting_staff_id, order_name, entity_id)
+  // clusters in the table — visible to the user as John Murray appearing
+  // twice on Staff Sales (one row with employee_id set, one with NULL).
+  //
+  // For each duplicate cluster, keep the row with:
+  //   1. employee_id IS NOT NULL preferred (link was established later)
+  //   2. tie-break on most recent ingested_at
+  //   3. final tie-break on highest id
+  // and delete the rest.
+  //
+  // Idempotent: on a clean DB this query matches nothing and is a no-op.
+  const dedupRes = sqlite.exec(`
+    DELETE FROM recon_shopify_staff_sales
+     WHERE id IN (
+       SELECT id FROM (
+         SELECT id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY COALESCE(occurred_on,''),
+                               assisting_staff_id,
+                               COALESCE(order_name,''),
+                               COALESCE(entity_id,-1)
+                  ORDER BY (CASE WHEN employee_id IS NULL THEN 1 ELSE 0 END) ASC,
+                           ingested_at DESC,
+                           id DESC
+                ) AS rn
+           FROM recon_shopify_staff_sales
+       ) WHERE rn > 1
+     );
+  `);
+  void dedupRes;
+
+  // PR #212 — new unique index without period_start/period_end. One row
+  // per (occurred_on × staff × order × entity); re-ingest with any
+  // window updates in place.
+  sqlite.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_recon_staff_sales_unique_v3
+      ON recon_shopify_staff_sales(COALESCE(occurred_on, ''),
+                                    assisting_staff_id,
+                                    COALESCE(order_name, ''),
+                                    COALESCE(entity_id, -1));
   `);
 
   sqlite.exec(`

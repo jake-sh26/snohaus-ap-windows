@@ -11657,6 +11657,93 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   );
 
+  // PR #212 — Backfill employee_id on existing recon_shopify_staff_sales
+  // rows that ingested BEFORE a payroll_employees link was created. The
+  // ingest upsert only stamps employee_id on rows it writes for the
+  // current sync window; older rows for the same staff member keep their
+  // NULL employee_id until this backfill runs.
+  //
+  // Effect on Staff Sales UI: collapses the "two John Murray rows"
+  // pattern (one matched, one unmatched) into a single matched row.
+  //
+  // Safe to re-run: only touches rows where employee_id IS NULL, and
+  // only sets it when the resolver returns a non-NULL match.
+  app.post(
+    "/api/recon/shopify/staff-sales/backfill-employee-links",
+    authMiddleware,
+    requirePermission("system.manage_config"),
+    (_req, res) => {
+      try {
+        const { sqlite } = require("./storage");
+        const {
+          resolveEmployeeByShopifyStaff,
+        } = require("./commission-matcher");
+
+        // Every distinct staff id that has at least one NULL-employee_id
+        // row. Cheap query — idx_recon_staff_sales_unmatched is a
+        // partial index exactly on this predicate.
+        const distinct = sqlite
+          .prepare(
+            `SELECT DISTINCT assisting_staff_id
+               FROM recon_shopify_staff_sales
+              WHERE employee_id IS NULL`,
+          )
+          .all() as Array<{ assisting_staff_id: string }>;
+
+        const update = sqlite.prepare(
+          `UPDATE recon_shopify_staff_sales
+              SET employee_id = ?
+            WHERE employee_id IS NULL
+              AND assisting_staff_id = ?`,
+        );
+
+        let staffMatched = 0;
+        let staffUnmatched = 0;
+        let rowsUpdated = 0;
+        const perStaff: Array<{
+          assisting_staff_id: string;
+          employee_id: number | null;
+          full_name: string | null;
+          rows_updated: number;
+        }> = [];
+
+        const tx = sqlite.transaction(() => {
+          for (const r of distinct) {
+            const resolved = resolveEmployeeByShopifyStaff(
+              r.assisting_staff_id,
+            );
+            if (resolved && resolved.employee_id != null) {
+              const info = update.run(resolved.employee_id, r.assisting_staff_id);
+              const n = Number((info as any).changes ?? 0);
+              rowsUpdated += n;
+              staffMatched++;
+              perStaff.push({
+                assisting_staff_id: r.assisting_staff_id,
+                employee_id: resolved.employee_id,
+                full_name: resolved.full_name ?? null,
+                rows_updated: n,
+              });
+            } else {
+              staffUnmatched++;
+            }
+          }
+        });
+        tx();
+
+        res.json({
+          ok: true,
+          distinct_unmatched_staff_ids: distinct.length,
+          staff_matched: staffMatched,
+          staff_still_unmatched: staffUnmatched,
+          rows_updated: rowsUpdated,
+          per_staff: perStaff,
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
   // Current orders watermark (read-only) — shown in the Settings UI so the user
   // knows where the incremental pull will resume from on next run.
   app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
