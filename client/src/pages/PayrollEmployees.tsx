@@ -57,6 +57,13 @@ type EmployeeRow = {
   emergency_contact_phone: string | null;
   emergency_contact_relationship: string | null;
   tshirt_size: string | null;
+  // PR #209 - payroll/time-off fields. Read by anyone with payroll.view,
+  // edited only by payroll.edit_commissions (admin).
+  hourly_rate: number | null;
+  vacation_hours_annual: number | null;
+  sick_hours_annual: number | null;
+  current_season_label: string | null;
+  current_season_bonus: number | null;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -241,12 +248,13 @@ export default function PayrollEmployees() {
             <table className="w-full text-sm">
               <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
                 <tr>
+                  {/* PR #209 - simplified table view. Sensitive IDs + commission
+                      are no longer columns; they live in the edit dialog where
+                      they're gated by payroll.edit_commissions (admin only). */}
                   <th className="text-left px-4 py-2.5 font-medium">Name</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Entity</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Shopify staff</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Easyrent clerk</th>
-                  <th className="text-left px-4 py-2.5 font-medium">ADP ID</th>
-                  <th className="text-right px-4 py-2.5 font-medium">Commission %</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Store</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Email</th>
+                  <th className="text-left px-4 py-2.5 font-medium">Phone</th>
                   <th className="text-left px-4 py-2.5 font-medium">Status</th>
                   {canManageLinks && (
                     <th className="text-left px-4 py-2.5 font-medium">Login</th>
@@ -268,28 +276,17 @@ export default function PayrollEmployees() {
                         <div className="font-medium" data-testid={`text-employee-name-${emp.id}`}>
                           {emp.full_name}
                         </div>
-                        {emp.email && (
-                          <div className="text-xs text-muted-foreground">{emp.email}</div>
-                        )}
                       </td>
                       <td className="px-4 py-2.5">
                         <Badge variant="outline" className="text-xs">
                           {ent?.location || `#${emp.entity_id}`}
                         </Badge>
                       </td>
-                      <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                        {emp.shopify_staff_member_id || "—"}
+                      <td className="px-4 py-2.5 text-xs" data-testid={`text-employee-email-${emp.id}`}>
+                        {emp.email || "—"}
                       </td>
-                      <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                        {emp.easyrent_clerk_guid || "—"}
-                      </td>
-                      <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">
-                        {emp.adp_employee_id || "—"}
-                      </td>
-                      <td className="px-4 py-2.5 text-right tabular-nums">
-                        {emp.commission_rate_pct != null
-                          ? `${(emp.commission_rate_pct * 100).toFixed(2)}%`
-                          : "—"}
+                      <td className="px-4 py-2.5 text-xs tabular-nums" data-testid={`text-employee-phone-${emp.id}`}>
+                        {emp.phone || "—"}
                       </td>
                       <td className="px-4 py-2.5">
                         {isActive ? (
@@ -469,6 +466,35 @@ function EmployeeDialog({
   const [ecRel, setEcRel] = useState(employee?.emergency_contact_relationship || "");
   const [tshirt, setTshirt] = useState(employee?.tshirt_size || "");
 
+  // PR #209 - payroll/time-off fields. Stored as strings so empty stays
+  // distinct from 0. Server gates the payload on the way in - if the
+  // caller lacks payroll.edit_commissions, those fields are silently
+  // dropped and X-Pay-Fields-Dropped: 1 is set on the response.
+  const [hourlyRate, setHourlyRate] = useState<string>(
+    employee?.hourly_rate != null ? String(employee.hourly_rate) : "",
+  );
+  const [vacationHours, setVacationHours] = useState<string>(
+    employee?.vacation_hours_annual != null ? String(employee.vacation_hours_annual) : "",
+  );
+  const [sickHours, setSickHours] = useState<string>(
+    employee?.sick_hours_annual != null ? String(employee.sick_hours_annual) : "",
+  );
+  // Default season label: current fiscal year (Apr 1 - Mar 31). Matches
+  // server's currentSeasonLabel() so a brand-new employee gets the right
+  // label before the rollover cron runs.
+  const defaultSeasonLabel = (() => {
+    const d = new Date();
+    const startYear = d.getMonth() + 1 >= 4 ? d.getFullYear() : d.getFullYear() - 1;
+    const endYY = String((startYear + 1) % 100).padStart(2, "0");
+    return `${startYear}-${endYY}`;
+  })();
+  const [seasonLabel, setSeasonLabel] = useState<string>(
+    employee?.current_season_label || defaultSeasonLabel,
+  );
+  const [seasonBonus, setSeasonBonus] = useState<string>(
+    employee?.current_season_bonus != null ? String(employee.current_season_bonus) : "",
+  );
+
   const saveMut = useMutation({
     mutationFn: async () => {
       // Parse commission % from user-friendly percent input into 0-1 fraction.
@@ -528,11 +554,29 @@ function EmployeeDialog({
         emergency_contact_relationship: ecRel.trim() || null,
         tshirt_size: tshirt.trim() || null,
       };
-      // Only include commission_rate_pct in payload if the user has permission to
-      // edit it. Server gates this too, but omitting here avoids the
-      // X-Commission-Dropped response header noise when non-admins save.
+      // Only include commission_rate_pct + payroll/time-off fields if the
+      // user has permission. Server gates this too, but omitting here
+      // avoids the X-Commission-Dropped / X-Pay-Fields-Dropped response
+      // headers when non-admins save.
       if (canEditCommissions) {
         payload.commission_rate_pct = commission_rate_pct;
+        const parseOptionalNumber = (s: string, name: string): number | null => {
+          if (s.trim() === "") return null;
+          const n = Number(s);
+          if (!Number.isFinite(n) || n < 0) {
+            throw new Error(`${name} must be a non-negative number`);
+          }
+          return n;
+        };
+        payload.hourly_rate = parseOptionalNumber(hourlyRate, "Hourly rate");
+        payload.vacation_hours_annual = parseOptionalNumber(vacationHours, "Annual vacation hours");
+        payload.sick_hours_annual = parseOptionalNumber(sickHours, "Annual sick hours");
+        payload.current_season_bonus = parseOptionalNumber(seasonBonus, "Current season bonus");
+        const labelTrim = seasonLabel.trim();
+        if (labelTrim && !/^\d{4}-\d{2}$/.test(labelTrim)) {
+          throw new Error("Season label must look like 2025-26");
+        }
+        payload.current_season_label = labelTrim || null;
       }
 
       if (mode === "create") {
@@ -871,6 +915,21 @@ function EmployeeDialog({
             </div>
           </div>
 
+          {/* PR #209 - Pay & time off. Read by anyone with payroll.view;
+              edit gated by payroll.edit_commissions (admin only, just
+              Jake). Season bonus auto-rolls over April 1 via the server
+              cron in server/season-bonus-rollover.ts. */}
+          <PayAndTimeOffSection
+            mode={mode}
+            employeeId={employee?.id}
+            canEditCommissions={canEditCommissions}
+            hourlyRate={hourlyRate} setHourlyRate={setHourlyRate}
+            vacationHours={vacationHours} setVacationHours={setVacationHours}
+            sickHours={sickHours} setSickHours={setSickHours}
+            seasonLabel={seasonLabel} setSeasonLabel={setSeasonLabel}
+            seasonBonus={seasonBonus} setSeasonBonus={setSeasonBonus}
+          />
+
           <div className="space-y-1.5">
             <Label htmlFor="notes" className="text-xs">
               Notes
@@ -1100,5 +1159,255 @@ function EmployeeLinkUserDialog({
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// ============================================================================
+// PR #209 - Pay & time off section + season bonus history
+// ============================================================================
+// Embedded inside EmployeeDialog. All inputs disabled unless
+// canEditCommissions. The history sub-list fetches GET /api/payroll/
+// employees/:id/season-bonuses (payroll.view) and lets admins add closed
+// seasons via POST or remove rows via DELETE /api/payroll/season-bonuses/:id.
+// History is hidden in create mode (no employee id yet).
+
+type SeasonBonusHistoryRow = {
+  id: number;
+  employee_id: number;
+  season_label: string;
+  bonus_amount: number;
+  closed_at: string | null;
+  created_at: string | null;
+};
+
+function PayAndTimeOffSection({
+  mode,
+  employeeId,
+  canEditCommissions,
+  hourlyRate, setHourlyRate,
+  vacationHours, setVacationHours,
+  sickHours, setSickHours,
+  seasonLabel, setSeasonLabel,
+  seasonBonus, setSeasonBonus,
+}: {
+  mode: "create" | "edit";
+  employeeId?: number;
+  canEditCommissions: boolean;
+  hourlyRate: string; setHourlyRate: (v: string) => void;
+  vacationHours: string; setVacationHours: (v: string) => void;
+  sickHours: string; setSickHours: (v: string) => void;
+  seasonLabel: string; setSeasonLabel: (v: string) => void;
+  seasonBonus: string; setSeasonBonus: (v: string) => void;
+}) {
+  return (
+    <div className="rounded-md border border-border bg-muted/30 p-3 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Pay & time off
+        </div>
+        {!canEditCommissions && (
+          <span className="text-[10px] text-muted-foreground">(admin only - view)</span>
+        )}
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="hourly_rate" className="text-xs">Hourly rate ($/hr)</Label>
+          <Input
+            id="hourly_rate"
+            value={hourlyRate}
+            onChange={(e) => setHourlyRate(e.target.value)}
+            data-testid="input-hourly-rate"
+            placeholder="e.g. 22.50"
+            inputMode="decimal"
+            disabled={!canEditCommissions}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="vacation_hours" className="text-xs">Vacation hrs / yr</Label>
+          <Input
+            id="vacation_hours"
+            value={vacationHours}
+            onChange={(e) => setVacationHours(e.target.value)}
+            data-testid="input-vacation-hours"
+            placeholder="e.g. 80"
+            inputMode="decimal"
+            disabled={!canEditCommissions}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="sick_hours" className="text-xs">Sick hrs / yr</Label>
+          <Input
+            id="sick_hours"
+            value={sickHours}
+            onChange={(e) => setSickHours(e.target.value)}
+            data-testid="input-sick-hours"
+            placeholder="e.g. 40"
+            inputMode="decimal"
+            disabled={!canEditCommissions}
+          />
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="season_label" className="text-xs">Current season</Label>
+          <Input
+            id="season_label"
+            value={seasonLabel}
+            onChange={(e) => setSeasonLabel(e.target.value)}
+            data-testid="input-season-label"
+            placeholder="2025-26"
+            disabled={!canEditCommissions}
+          />
+          <div className="text-[10px] text-muted-foreground">Apr 1 - Mar 31. Auto-rolls over.</div>
+        </div>
+        <div className="space-y-1.5 col-span-2">
+          <Label htmlFor="season_bonus" className="text-xs">Current season bonus ($)</Label>
+          <Input
+            id="season_bonus"
+            value={seasonBonus}
+            onChange={(e) => setSeasonBonus(e.target.value)}
+            data-testid="input-season-bonus"
+            placeholder="e.g. 1500"
+            inputMode="decimal"
+            disabled={!canEditCommissions}
+          />
+        </div>
+      </div>
+      {mode === "edit" && employeeId != null && (
+        <SeasonBonusHistory employeeId={employeeId} canEdit={canEditCommissions} />
+      )}
+    </div>
+  );
+}
+
+function SeasonBonusHistory({
+  employeeId,
+  canEdit,
+}: {
+  employeeId: number;
+  canEdit: boolean;
+}) {
+  const { toast } = useToast();
+  const qc = useQueryClient();
+  const histQ = useQuery<SeasonBonusHistoryRow[]>({
+    queryKey: [`/api/payroll/employees/${employeeId}/season-bonuses`],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/payroll/employees/${employeeId}/season-bonuses`);
+      return (await res.json()) as SeasonBonusHistoryRow[];
+    },
+  });
+  const [addLabel, setAddLabel] = useState("");
+  const [addAmount, setAddAmount] = useState("");
+
+  const addMut = useMutation({
+    mutationFn: async () => {
+      const label = addLabel.trim();
+      if (!/^\d{4}-\d{2}$/.test(label)) throw new Error("Season label must look like 2024-25");
+      const amt = Number(addAmount);
+      if (!Number.isFinite(amt) || amt < 0) throw new Error("Bonus amount must be a non-negative number");
+      const res = await apiRequest("POST", `/api/payroll/employees/${employeeId}/season-bonuses`, {
+        season_label: label,
+        bonus_amount: amt,
+      });
+      return await res.json();
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [`/api/payroll/employees/${employeeId}/season-bonuses`] });
+      setAddLabel(""); setAddAmount("");
+      toast({ title: "Bonus history saved" });
+    },
+    onError: (e: any) => toast({ title: "Could not save bonus", description: e?.message || "Unknown error", variant: "destructive" }),
+  });
+
+  const delMut = useMutation({
+    mutationFn: async (bonusId: number) => {
+      const res = await apiRequest("DELETE", `/api/payroll/season-bonuses/${bonusId}`);
+      return await res.json();
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: [`/api/payroll/employees/${employeeId}/season-bonuses`] });
+      toast({ title: "Bonus removed" });
+    },
+    onError: (e: any) => toast({ title: "Could not remove", description: e?.message || "Unknown error", variant: "destructive" }),
+  });
+
+  const rows = histQ.data || [];
+  return (
+    <div className="pt-2 border-t border-border space-y-2">
+      <div className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+        Prior season bonuses
+      </div>
+      {histQ.isLoading ? (
+        <div className="text-xs text-muted-foreground flex items-center gap-1.5">
+          <Loader2 className="size-3 animate-spin" />Loading history—
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="text-xs text-muted-foreground">No prior season bonuses yet.</div>
+      ) : (
+        <div className="divide-y divide-border rounded-md border border-border">
+          {rows.map((r) => (
+            <div key={r.id} className="flex items-center justify-between px-2.5 py-1.5 text-xs" data-testid={`row-bonus-history-${r.id}`}>
+              <div className="flex items-center gap-3">
+                <Badge variant="outline" className="font-mono text-[10px]">{r.season_label}</Badge>
+                <span className="tabular-nums">${r.bonus_amount.toFixed(2)}</span>
+                {r.closed_at && (
+                  <span className="text-[10px] text-muted-foreground">closed {formatDateUS(r.closed_at.slice(0, 10))}</span>
+                )}
+              </div>
+              {canEdit && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-1.5 text-destructive hover:text-destructive"
+                  onClick={() => {
+                    if (confirm(`Remove ${r.season_label} bonus of $${r.bonus_amount.toFixed(2)}?`)) {
+                      delMut.mutate(r.id);
+                    }
+                  }}
+                  disabled={delMut.isPending}
+                  data-testid={`button-delete-bonus-${r.id}`}
+                >
+                  <UserX className="size-3" />
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {canEdit && (
+        <div className="grid grid-cols-[120px_1fr_auto] gap-2 items-end pt-1">
+          <div className="space-y-1">
+            <Label className="text-[10px] text-muted-foreground">Season</Label>
+            <Input
+              value={addLabel}
+              onChange={(e) => setAddLabel(e.target.value)}
+              placeholder="2024-25"
+              className="h-8 text-xs"
+              data-testid="input-add-bonus-label"
+            />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-[10px] text-muted-foreground">Bonus ($)</Label>
+            <Input
+              value={addAmount}
+              onChange={(e) => setAddAmount(e.target.value)}
+              placeholder="e.g. 1500"
+              className="h-8 text-xs"
+              inputMode="decimal"
+              data-testid="input-add-bonus-amount"
+            />
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => addMut.mutate()}
+            disabled={addMut.isPending || !addLabel.trim() || !addAmount.trim()}
+            data-testid="button-add-bonus"
+          >
+            {addMut.isPending ? <Loader2 className="size-3 animate-spin" /> : "Add"}
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }

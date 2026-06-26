@@ -26,6 +26,7 @@ import {
   Store,
   SlidersHorizontal,
   TrendingUp,
+  UserCircle,
 } from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
@@ -66,6 +67,17 @@ type NavSection = {
 // Sidebar is grouped into modules. Each section is a collapsible master menu with
 // its own children. Future modules (Sales Reporting, Inventory) plug in here.
 const NAV_SECTIONS: NavSection[] = [
+  {
+    // PR #209 - self-view profile. Single-item section so it collapses to a
+    // direct link in the sidebar. No permission gate: every logged-in user
+    // can see their own record. Server still 404s if their login isn't
+    // linked to an employee row, and the page renders a helpful empty state.
+    label: "My profile",
+    icon: UserCircle,
+    items: [
+      { href: "/me", label: "My profile", icon: UserCircle },
+    ],
+  },
   {
     label: "Accounts Payable",
     icon: Receipt,

@@ -27,6 +27,7 @@ import { startGmailApiService } from "./gmail-api";
 import { syncQboVendorsFromApi, getQboStatus } from "./qbo";
 import { backfillVendorAliasesFromPostedInvoices, backfillLineItemsFromJson } from "./storage";
 import { runAcumaticaPullNow, scheduleAcumaticaDailyPull } from "./acumatica";
+import { scheduleSeasonBonusRollover } from "./season-bonus-rollover";
 import { startBackupScheduler, runLocalBackupWithTracking } from "./backups";
 import { startArchiveScheduler } from "./pdf-archive";
 import crypto from "node:crypto";
@@ -122,6 +123,11 @@ app.use((req, res, next) => {
 
 (async () => {
   await registerRoutes(httpServer, app);
+
+  // PR #209 — daily season-bonus rollover. Snapshots prior-season bonuses to
+  // history on/after April 1 and clears the current_season_bonus field for the
+  // new season. Idempotent so a daily check is safe.
+  scheduleSeasonBonusRollover();
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;

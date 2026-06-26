@@ -80,6 +80,10 @@ import {
   createEmployee,
   updateEmployee,
   deactivateEmployee,
+  listSeasonBonusHistoryForEmployee,
+  upsertSeasonBonusHistory,
+  deleteSeasonBonusHistory,
+  getEmployeeForUserId,
   // Reconciler (PR #R1)
   getReconSettings,
   updateReconSettings,
@@ -1140,6 +1144,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     "tshirt_size",
   ];
   const EMPLOYEE_DATE_FIELDS = ["hired_at", "terminated_at", "date_of_birth"];
+  // PR #209 — numeric fields gated behind payroll.edit_commissions (admin only),
+  // same as commission_rate_pct. Includes hourly rate, time-off allotments, and the
+  // current season bonus. The season bonus history table is gated separately.
+  const EMPLOYEE_PAY_NUMERIC_FIELDS = [
+    "hourly_rate", "vacation_hours_annual", "sick_hours_annual",
+    "current_season_bonus",
+  ];
+  // PR #209 — the only string pay-gated field is current_season_label, which
+  // tracks the season the live current_season_bonus belongs to (e.g. "2025-26").
+  const EMPLOYEE_PAY_STRING_FIELDS = ["current_season_label"];
+
+  // PR #209 — Returns the current ski season label, e.g. "2025-26".
+  // The fiscal year flips on April 1: dates April 1, 2025 → March 31, 2026
+  // are season "2025-26". Before April 1, 2025 the season is "2024-25".
+  function currentSeasonLabel(d: Date = new Date()): string {
+    const y = d.getUTCFullYear();
+    const m = d.getUTCMonth() + 1; // 1-12
+    const startYear = m >= 4 ? y : y - 1;
+    const endYear = startYear + 1;
+    return `${startYear}-${String(endYear).slice(2)}`;
+  }
 
   app.post("/api/payroll/employees", authMiddleware, requirePermission("payroll.edit_employees"), (req, res) => {
     const body = req.body || {};
@@ -1167,11 +1192,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         commissionDropped = true;
       }
     }
+    // PR #209 — pay/time-off fields gated by payroll.edit_commissions too.
+    const userIdForPay = (req as any).userId as number | undefined;
+    const canEditPay = !!(userIdForPay && userHasPermission(userIdForPay, "payroll.edit_commissions"));
+    let payFieldsDropped = false;
+    const payloadPay: Record<string, any> = {};
+    for (const k of EMPLOYEE_PAY_NUMERIC_FIELDS) {
+      if (body[k] !== undefined && body[k] !== "" && body[k] !== null) {
+        if (canEditPay) {
+          const n = Number(body[k]);
+          if (!Number.isFinite(n)) return res.status(400).json({ message: `${k} must be a number` });
+          payloadPay[k] = n;
+        } else {
+          payFieldsDropped = true;
+        }
+      }
+    }
+    for (const k of EMPLOYEE_PAY_STRING_FIELDS) {
+      if (body[k] !== undefined) {
+        if (canEditPay) {
+          const v = body[k];
+          payloadPay[k] = (v === "" || v === null) ? null : String(v);
+        } else {
+          payFieldsDropped = true;
+        }
+      }
+    }
+    // If the user supplied current_season_bonus but no label, default the label
+    // to the current ski season so the UI always shows a meaningful season.
+    if (canEditPay && payloadPay.current_season_bonus !== undefined && payloadPay.current_season_label === undefined) {
+      payloadPay.current_season_label = currentSeasonLabel();
+    }
     const payload: any = {
       entity_id: Number(entity_id),
       full_name: full_name.trim(),
       commission_rate_pct: commissionRate,
       active: body.active === 0 ? 0 : 1,
+      ...payloadPay,
     };
     for (const k of EMPLOYEE_STRING_FIELDS) {
       const v = body[k];
@@ -1187,6 +1244,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const row = createEmployee(payload);
       if (commissionDropped) res.setHeader("X-Commission-Dropped", "1");
+      if (payFieldsDropped) res.setHeader("X-Pay-Fields-Dropped", "1");
       res.json(row);
     } catch (e: any) {
       const msg = String(e?.message || "");
@@ -1230,6 +1288,36 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (e: any) {
       return res.status(400).json({ message: e.message });
     }
+    // PR #209 — pay/time-off fields gated by payroll.edit_commissions.
+    const userIdForPay = (req as any).userId as number | undefined;
+    const canEditPay = !!(userIdForPay && userHasPermission(userIdForPay, "payroll.edit_commissions"));
+    let payFieldsDropped = false;
+    for (const k of EMPLOYEE_PAY_NUMERIC_FIELDS) {
+      if (body[k] !== undefined) {
+        if (canEditPay) {
+          const v = body[k];
+          if (v === "" || v === null) {
+            patch[k] = null;
+          } else {
+            const n = Number(v);
+            if (!Number.isFinite(n)) return res.status(400).json({ message: `${k} must be a number` });
+            patch[k] = n;
+          }
+        } else {
+          payFieldsDropped = true;
+        }
+      }
+    }
+    for (const k of EMPLOYEE_PAY_STRING_FIELDS) {
+      if (body[k] !== undefined) {
+        if (canEditPay) {
+          const v = body[k];
+          patch[k] = (v === "" || v === null) ? null : String(v);
+        } else {
+          payFieldsDropped = true;
+        }
+      }
+    }
     let commissionDropped = false;
     if (body.commission_rate_pct !== undefined) {
       const userId = (req as any).userId as number | undefined;
@@ -1244,6 +1332,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const updated = updateEmployee(id, patch);
       if (commissionDropped) res.setHeader("X-Commission-Dropped", "1");
+      if (payFieldsDropped) res.setHeader("X-Pay-Fields-Dropped", "1");
       res.json(updated);
     } catch (e: any) {
       const msg = String(e?.message || "");
@@ -1264,6 +1353,72 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!getEmployeeById(id)) return res.status(404).json({ message: "Employee not found" });
     const updated = deactivateEmployee(id);
     res.json(updated);
+  });
+
+  // ==========================================================================
+  // PR #209 — Employee season-bonus history
+  // --------------------------------------------------------------------------
+  // GET list (anyone with payroll.view can read), POST/DELETE gated behind
+  // payroll.edit_commissions (admin only). The "current" season bonus lives
+  // on the employee row; closed seasons live in payroll_employee_season_bonuses.
+  // ==========================================================================
+
+  app.get("/api/payroll/employees/:id/season-bonuses", authMiddleware, requirePermission("payroll.view"), (req, res) => {
+    const id = Number(req.params.id);
+    if (!getEmployeeById(id)) return res.status(404).json({ message: "Employee not found" });
+    res.json(listSeasonBonusHistoryForEmployee(id));
+  });
+
+  app.post("/api/payroll/employees/:id/season-bonuses", authMiddleware, requirePermission("payroll.edit_commissions"), (req, res) => {
+    const id = Number(req.params.id);
+    const emp = getEmployeeById(id);
+    if (!emp) return res.status(404).json({ message: "Employee not found" });
+    const body = req.body || {};
+    const season_label = String(body.season_label || "").trim();
+    if (!/^\d{4}-\d{2}$/.test(season_label)) {
+      return res.status(400).json({ message: 'season_label must look like "2025-26"' });
+    }
+    const amount = Number(body.bonus_amount);
+    if (!Number.isFinite(amount)) return res.status(400).json({ message: "bonus_amount must be a number" });
+    const notes = body.notes ? String(body.notes) : null;
+    const closed_at = body.closed_at ? String(body.closed_at) : new Date().toISOString().slice(0, 10);
+    const row = upsertSeasonBonusHistory({ employee_id: id, season_label, bonus_amount: amount, notes, closed_at });
+    res.json(row);
+  });
+
+  app.delete("/api/payroll/season-bonuses/:bonusId", authMiddleware, requirePermission("payroll.edit_commissions"), (req, res) => {
+    const bid = Number(req.params.bonusId);
+    if (!Number.isFinite(bid)) return res.status(400).json({ message: "bad bonusId" });
+    const ok = deleteSeasonBonusHistory(bid);
+    if (!ok) return res.status(404).json({ message: "Season bonus row not found" });
+    res.json({ ok: true });
+  });
+
+  // ==========================================================================
+  // PR #209 — Employee self-view (/api/me/employee)
+  // --------------------------------------------------------------------------
+  // Returns the authenticated user's own employee row + season-bonus history,
+  // with sensitive external IDs stripped. Any logged-in user can call this;
+  // returns 404 if the user has no employee link.
+  // ==========================================================================
+
+  app.get("/api/me/employee", authMiddleware, (req, res) => {
+    const userId = (req as any).userId as number | undefined;
+    if (!userId) return res.status(401).json({ message: "Unauthorized" });
+    const emp = getEmployeeForUserId(userId);
+    if (!emp) return res.status(404).json({ message: "No linked employee profile" });
+    // Hide external IDs and commission rate from self-view. The employee can
+    // see their own pay rate, time off, and bonus though.
+    const {
+      shopify_staff_member_id: _shop,
+      easyrent_clerk_guid: _ez,
+      ltm_clerk_id: _ltm,
+      adp_employee_id: _adp,
+      commission_rate_pct: _comm,
+      ...safe
+    } = emp as any;
+    const bonusHistory = listSeasonBonusHistoryForEmployee(emp.id);
+    res.json({ employee: safe, bonus_history: bonusHistory });
   });
 
   // ============================================================================

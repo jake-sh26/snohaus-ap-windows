@@ -406,6 +406,12 @@ function bootstrapSchema() {
     { name: "emergency_contact_phone", defn: "TEXT" },
     { name: "emergency_contact_relationship", defn: "TEXT" },
     { name: "tshirt_size", defn: "TEXT" },
+    // PR #209 — pay rate, time-off allotments, current season bonus
+    { name: "hourly_rate", defn: "REAL" },
+    { name: "vacation_hours_annual", defn: "REAL" },
+    { name: "sick_hours_annual", defn: "REAL" },
+    { name: "current_season_label", defn: "TEXT" },
+    { name: "current_season_bonus", defn: "REAL" },
   ]);
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS payroll_employees (
@@ -433,6 +439,11 @@ function bootstrapSchema() {
       emergency_contact_phone TEXT,
       emergency_contact_relationship TEXT,
       tshirt_size TEXT,
+      hourly_rate REAL,
+      vacation_hours_annual REAL,
+      sick_hours_annual REAL,
+      current_season_label TEXT,
+      current_season_bonus REAL,
       created_at TEXT,
       updated_at TEXT
     );
@@ -448,6 +459,22 @@ function bootstrapSchema() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_payroll_employees_adp_per_entity
       ON payroll_employees(entity_id, adp_employee_id)
       WHERE adp_employee_id IS NOT NULL AND adp_employee_id != '';
+  `);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS payroll_employee_season_bonuses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL REFERENCES payroll_employees(id),
+      season_label TEXT NOT NULL,
+      bonus_amount REAL NOT NULL,
+      notes TEXT,
+      closed_at TEXT NOT NULL,
+      created_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_emp_season_bonus_uniq
+      ON payroll_employee_season_bonuses(employee_id, season_label);
+    CREATE INDEX IF NOT EXISTS idx_emp_season_bonus_emp
+      ON payroll_employee_season_bonuses(employee_id);
   `);
 
   sqlite.exec(`
@@ -4119,6 +4146,12 @@ export type EmployeeRow = {
   emergency_contact_phone: string | null;
   emergency_contact_relationship: string | null;
   tshirt_size: string | null;
+  // PR #209 — payroll fields
+  hourly_rate: number | null;
+  vacation_hours_annual: number | null;
+  sick_hours_annual: number | null;
+  current_season_label: string | null;
+  current_season_bonus: number | null;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -4172,6 +4205,11 @@ export function createEmployee(emp: {
   emergency_contact_phone?: string | null;
   emergency_contact_relationship?: string | null;
   tshirt_size?: string | null;
+  hourly_rate?: number | null;
+  vacation_hours_annual?: number | null;
+  sick_hours_annual?: number | null;
+  current_season_label?: string | null;
+  current_season_bonus?: number | null;
 }): EmployeeRow {
   const now = new Date().toISOString();
   const info = sqlite
@@ -4183,8 +4221,10 @@ export function createEmployee(emp: {
           date_of_birth, address_line1, address_line2, city, state, postal_code,
           emergency_contact_name, emergency_contact_phone, emergency_contact_relationship,
           tshirt_size,
+          hourly_rate, vacation_hours_annual, sick_hours_annual,
+          current_season_label, current_season_bonus,
           created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       emp.entity_id,
@@ -4209,6 +4249,11 @@ export function createEmployee(emp: {
       emp.emergency_contact_phone ?? null,
       emp.emergency_contact_relationship ?? null,
       emp.tshirt_size ?? null,
+      emp.hourly_rate ?? null,
+      emp.vacation_hours_annual ?? null,
+      emp.sick_hours_annual ?? null,
+      emp.current_season_label ?? null,
+      emp.current_season_bonus ?? null,
       now,
       now,
     );
@@ -4228,6 +4273,9 @@ export function updateEmployee(
     "date_of_birth", "address_line1", "address_line2", "city", "state", "postal_code",
     "emergency_contact_name", "emergency_contact_phone", "emergency_contact_relationship",
     "tshirt_size",
+    // PR #209
+    "hourly_rate", "vacation_hours_annual", "sick_hours_annual",
+    "current_season_label", "current_season_bonus",
   ];
   const sets: string[] = [];
   const vals: any[] = [];
@@ -6755,4 +6803,75 @@ export function bulkSaveReconCoaMapping(rows: CoaMappingBulkSaveInput): CoaMappi
 
   txn();
   return result;
+}
+
+// ============================================================================
+// PR #209 — Employee season bonus history + self-view helpers
+// ============================================================================
+
+export type SeasonBonusRow = {
+  id: number;
+  employee_id: number;
+  season_label: string;
+  bonus_amount: number;
+  notes: string | null;
+  closed_at: string;
+  created_at: string | null;
+};
+
+/**
+ * Closed (historical) bonus rows for an employee, newest season first. The
+ * "current" season lives on payroll_employees.current_season_* and is not
+ * returned here.
+ */
+export function listSeasonBonusHistoryForEmployee(employeeId: number): SeasonBonusRow[] {
+  return sqlite
+    .prepare(`SELECT * FROM payroll_employee_season_bonuses WHERE employee_id = ? ORDER BY season_label DESC`)
+    .all(employeeId) as SeasonBonusRow[];
+}
+
+/**
+ * Upsert a closed/historical season bonus row. Used by the April-1 rollover
+ * (and manual backfill from the UI). Unique on (employee_id, season_label).
+ */
+export function upsertSeasonBonusHistory(args: {
+  employee_id: number;
+  season_label: string;
+  bonus_amount: number;
+  notes?: string | null;
+  closed_at?: string;
+}): SeasonBonusRow {
+  const now = new Date().toISOString();
+  const closed = args.closed_at || now.slice(0, 10);
+  sqlite.prepare(`
+    INSERT INTO payroll_employee_season_bonuses
+      (employee_id, season_label, bonus_amount, notes, closed_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(employee_id, season_label) DO UPDATE SET
+      bonus_amount = excluded.bonus_amount,
+      notes = excluded.notes,
+      closed_at = excluded.closed_at
+  `).run(args.employee_id, args.season_label, args.bonus_amount, args.notes ?? null, closed, now);
+  return sqlite.prepare(
+    `SELECT * FROM payroll_employee_season_bonuses WHERE employee_id = ? AND season_label = ?`
+  ).get(args.employee_id, args.season_label) as SeasonBonusRow;
+}
+
+export function deleteSeasonBonusHistory(id: number): boolean {
+  const info = sqlite.prepare(`DELETE FROM payroll_employee_season_bonuses WHERE id = ?`).run(id);
+  return info.changes > 0;
+}
+
+/**
+ * PR #209 — lookup an employee by the person_id linked to an app_user. Used
+ * by /api/me/employee so an employee can see their own profile.
+ */
+export function getEmployeeForUserId(userId: number): EmployeeRow | null {
+  const row = sqlite.prepare(`
+    SELECT e.* FROM payroll_employees e
+    JOIN app_users u ON u.person_id = e.person_id
+    WHERE u.id = ?
+    LIMIT 1
+  `).get(userId) as EmployeeRow | undefined;
+  return row || null;
 }

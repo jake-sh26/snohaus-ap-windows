@@ -262,8 +262,36 @@ export const payrollEmployees = sqliteTable("payroll_employees", {
   emergency_contact_phone: text("emergency_contact_phone"),
   emergency_contact_relationship: text("emergency_contact_relationship"),
   tshirt_size: text("tshirt_size"),
+  // PR #209 — pay rate + annual time-off allotments. Admin-only (gated by payroll.edit_commissions).
+  hourly_rate: real("hourly_rate"),
+  vacation_hours_annual: real("vacation_hours_annual"),
+  sick_hours_annual: real("sick_hours_annual"),
+  // PR #209 — "current" season bonus convenience fields. The authoritative
+  // history lives in payroll_employee_season_bonuses; these are kept in sync
+  // by the server so the table list page can render the latest bonus cheaply.
+  current_season_label: text("current_season_label"),
+  current_season_bonus: real("current_season_bonus"),
   created_at: text("created_at"),
   updated_at: text("updated_at"),
+});
+
+// --- Employee season bonus history (PR #209) ---
+// Ski-season fiscal year: each "season" is labeled like "2025-26" and runs
+// roughly Apr 1 of year N to Mar 31 of year N+1. On April 1 each year, the
+// current bonus snapshots into a row here and the current_season_* fields on
+// payroll_employees clear, ready for the new season — see seasonBonusRollover
+// in server/season-bonuses.ts.
+export const payrollEmployeeSeasonBonuses = sqliteTable("payroll_employee_season_bonuses", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  employee_id: integer("employee_id").notNull(),
+  // e.g. "2024-25", "2025-26". Globally unique per employee — no two rows for the same season.
+  season_label: text("season_label").notNull(),
+  bonus_amount: real("bonus_amount").notNull(),
+  // 'closed' = snapshotted by the April-1 rollover (read-only historical).
+  // 'current' is not stored here — the live season lives on payroll_employees.current_season_*.
+  notes: text("notes"),
+  closed_at: text("closed_at").notNull(),
+  created_at: text("created_at"),
 });
 
 // --- Pay periods (per-entity rolling window of payroll runs) ---
