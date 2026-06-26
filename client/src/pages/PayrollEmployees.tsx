@@ -636,8 +636,11 @@ function EmployeeDialog({
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
+      {/* PR #210 - constrain to viewport, scroll the middle, pin header/footer.
+          p-0 removes shadcn DialogContent default padding so the scroll
+          container can own its own padding. */}
+      <DialogContent className="max-w-3xl max-h-[90vh] flex flex-col p-0 gap-0">
+        <DialogHeader className="px-6 pt-6 pb-2 border-b border-border">
           <DialogTitle>
             {mode === "create" ? "Add employee" : `Edit ${employee?.full_name}`}
           </DialogTitle>
@@ -647,8 +650,11 @@ function EmployeeDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
-          <div className="grid grid-cols-2 gap-3">
+        {/* PR #210 - scrollable middle. Flex-1 takes remaining height
+            between header and footer; overflow-y-auto handles the
+            scroll. */}
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="full_name" className="text-xs">
                 Full name <span className="text-destructive">*</span>
@@ -681,7 +687,7 @@ function EmployeeDialog({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="email" className="text-xs">
                 Email
@@ -709,7 +715,7 @@ function EmployeeDialog({
               />
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="hired_at" className="text-xs">
                 Hired
@@ -729,7 +735,7 @@ function EmployeeDialog({
             <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
               External system IDs
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label htmlFor="shopify_id" className="text-xs">
                   Shopify staff member ID
@@ -785,7 +791,7 @@ function EmployeeDialog({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="commission_pct" className="text-xs">
                 Commission rate %
@@ -827,7 +833,7 @@ function EmployeeDialog({
             <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
               Personal details
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label htmlFor="dob" className="text-xs">Date of birth</Label>
                 <Input
@@ -878,7 +884,7 @@ function EmployeeDialog({
               <Label htmlFor="addr2" className="text-xs">Address line 2</Label>
               <Input id="addr2" value={addr2} onChange={(e) => setAddr2(e.target.value)} data-testid="input-addr2" placeholder="Apt, suite, etc. (optional)" />
             </div>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="space-y-1.5">
                 <Label htmlFor="city" className="text-xs">City</Label>
                 <Input id="city" value={city} onChange={(e) => setCity(e.target.value)} data-testid="input-city" />
@@ -899,7 +905,7 @@ function EmployeeDialog({
             <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
               Emergency contact
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label htmlFor="ec_name" className="text-xs">Name</Label>
                 <Input id="ec_name" value={ecName} onChange={(e) => setEcName(e.target.value)} data-testid="input-ec-name" placeholder="Full name" />
@@ -945,7 +951,7 @@ function EmployeeDialog({
           </div>
         </div>
 
-        <DialogFooter className="flex items-center justify-between sm:justify-between">
+        <DialogFooter className="px-6 py-4 border-t border-border flex items-center justify-between sm:justify-between">
           <div>
             {mode === "edit" && employee?.active === 1 && (
               <Button
@@ -1209,7 +1215,7 @@ function PayAndTimeOffSection({
           <span className="text-[10px] text-muted-foreground">(admin only - view)</span>
         )}
       </div>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="space-y-1.5">
           <Label htmlFor="hourly_rate" className="text-xs">Hourly rate ($/hr)</Label>
           <Input
@@ -1247,7 +1253,7 @@ function PayAndTimeOffSection({
           />
         </div>
       </div>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="space-y-1.5">
           <Label htmlFor="season_label" className="text-xs">Current season</Label>
           <Input
@@ -1260,7 +1266,7 @@ function PayAndTimeOffSection({
           />
           <div className="text-[10px] text-muted-foreground">Apr 1 - Mar 31. Auto-rolls over.</div>
         </div>
-        <div className="space-y-1.5 col-span-2">
+        <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="season_bonus" className="text-xs">Current season bonus ($)</Label>
           <Input
             id="season_bonus"
