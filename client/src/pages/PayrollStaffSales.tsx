@@ -13,7 +13,7 @@ import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import {
   TrendingUp, ChevronRight, ChevronDown, AlertCircle, RefreshCw, Loader2,
-  Search,
+  Search, ArrowUp, ArrowDown,
 } from "lucide-react";
 
 // ============================================================================
@@ -164,6 +164,52 @@ type OrderRow = {
   order_source: string | null;
 };
 
+// PR #213 — Sort helpers (same pattern as PayrollEmployees.tsx). Click
+// cycles none → desc → asc → none on the active column; clicking a
+// different column resets to desc on that column. Empty values get
+// pushed to the bottom regardless of direction.
+
+type StaffSortKey = "name" | "gross" | "returns" | "net" | "total" | "orders";
+type SortDir = "asc" | "desc";
+
+function SortHeader({
+  active, dir, onClick, label, align = "left", testid,
+}: {
+  active: boolean; dir: SortDir; onClick: () => void; label: string;
+  align?: "left" | "right"; testid?: string;
+}) {
+  const Icon = !active ? null : dir === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      data-testid={testid}
+      aria-sort={!active ? "none" : dir === "asc" ? "ascending" : "descending"}
+      className={
+        "inline-flex items-center gap-1.5 font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground transition-colors " +
+        (align === "right" ? "flex-row-reverse " : "") +
+        (active ? "text-foreground" : "")
+      }
+    >
+      <span>{label}</span>
+      <span className="inline-flex items-center justify-center w-3.5">
+        {Icon ? <Icon className="size-3.5" aria-hidden /> : null}
+      </span>
+    </button>
+  );
+}
+
+function sortValueFor(e: EmployeeRow, key: StaffSortKey): string | number {
+  switch (key) {
+    case "name":    return (e.full_name || "").trim().toLowerCase();
+    case "gross":   return e.gross_sales ?? 0;
+    case "returns": return e.returns_amt ?? 0;
+    case "net":     return e.net_sales ?? 0;
+    case "total":   return e.total_sales ?? 0;
+    case "orders":  return e.order_count ?? 0;
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Page
 // ----------------------------------------------------------------------------
@@ -188,10 +234,39 @@ export default function PayrollStaffSales() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [drillKey, setDrillKey] = useState<string | null>(null);
 
-  const empKey = (e: EmployeeRow) =>
-    e.employee_id === null ? "_null" : String(e.employee_id);
-  const entKey = (employeeId: number | null, entityId: number | null) =>
-    `${employeeId === null ? "_null" : employeeId}|${entityId === null ? -1 : entityId}`;
+  // PR #213 — sort state. Default to total-desc which matches the
+  // server's natural ORDER BY total_sales DESC, so the initial render
+  // is unchanged. sortActive=false means "use server order".
+  const [sortKey, setSortKey] = useState<StaffSortKey>("total");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [sortActive, setSortActive] = useState<boolean>(true);
+
+  function onSortHeaderClick(k: StaffSortKey) {
+    if (sortKey !== k) {
+      setSortKey(k); setSortDir("desc"); setSortActive(true);
+      return;
+    }
+    if (!sortActive) { setSortActive(true); setSortDir("desc"); return; }
+    if (sortDir === "desc") { setSortDir("asc"); return; }
+    setSortActive(false); // asc → none
+  }
+
+  // PR #213: empKey must be UNIQUE per row. Previously NULL-employee_id
+  // rows all collapsed to the literal "_null", so clicking one unmatched
+  // staff member expanded EVERY unmatched row. Use the assisting_staff_id
+  // (which the server's group_key already splits unmatched rows on) as the
+  // tie-breaker. shopify_staff_ids is a comma-list MAX'd from the GROUP BY
+  // — first id is the canonical one for that group.
+  const empKey = (e: EmployeeRow) => {
+    if (e.employee_id !== null) return `emp:${e.employee_id}`;
+    const sid = (e.shopify_staff_ids || "").split(",")[0]?.trim() || "unknown";
+    return `staff:${sid}`;
+  };
+  // PR #213: entKey now keys on empKey so the same employee_id collision
+  // can't happen at the entity layer either (it couldn't before in practice
+  // because each unmatched bucket only had one entity row, but be safe).
+  const entKey = (emp: EmployeeRow, entityId: number | null) =>
+    `${empKey(emp)}|${entityId === null ? -1 : entityId}`;
 
   function toggleEmployee(e: EmployeeRow) {
     const k = empKey(e);
@@ -215,9 +290,16 @@ export default function PayrollStaffSales() {
     queryKey: ["/api/recon/shopify/staff-sales/orders", since, until, drillKey],
     enabled: drillKey !== null,
     queryFn: async () => {
-      const [emp, ent] = (drillKey || "").split("|");
+      // PR #213: drillKey format changed to `${empKey}|${entityId}` where
+      // empKey is either `emp:<id>` or `staff:<staff_id>`. The /orders
+      // endpoint still wants employee_id OR assisting_staff_id.
+      const [empPart, ent] = (drillKey || "").split("|");
       const params = new URLSearchParams({ since, until });
-      if (emp) params.set("employee_id", emp);
+      if (empPart?.startsWith("emp:")) {
+        params.set("employee_id", empPart.slice(4));
+      } else if (empPart?.startsWith("staff:")) {
+        params.set("assisting_staff_id", empPart.slice(6));
+      }
       if (ent) params.set("entity_id", ent);
       const res = await apiRequest(
         "GET",
@@ -254,22 +336,47 @@ export default function PayrollStaffSales() {
     },
   });
 
-  // ------- Filter -------
+  // ------- Filter + sort -------
   const employees = summaryQ.data?.employees || [];
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return employees;
-    return employees.filter((e) => {
-      const hay = [
-        e.full_name,
-        e.shopify_staff_name || "",
-        e.shopify_staff_ids || "",
-      ]
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(q);
+    const base = !q
+      ? employees
+      : employees.filter((e) => {
+          const hay = [
+            e.full_name,
+            e.shopify_staff_name || "",
+            e.shopify_staff_ids || "",
+          ]
+            .join(" ")
+            .toLowerCase();
+          return hay.includes(q);
+        });
+
+    if (!sortActive) return base;
+
+    const collator = new Intl.Collator(undefined, {
+      sensitivity: "base", numeric: true,
     });
-  }, [employees, search]);
+    const isEmpty = (v: string | number) =>
+      v === "" || v === null || v === undefined ||
+      (typeof v === "number" && !Number.isFinite(v));
+
+    return [...base].sort((a, b) => {
+      const A = sortValueFor(a, sortKey);
+      const B = sortValueFor(b, sortKey);
+      const aEmpty = isEmpty(A);
+      const bEmpty = isEmpty(B);
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1;   // empties always to bottom
+      if (bEmpty) return -1;
+      const cmp =
+        typeof A === "string" && typeof B === "string"
+          ? collator.compare(A, B)
+          : (A as number) - (B as number);
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [employees, search, sortActive, sortKey, sortDir]);
 
   const totals = summaryQ.data?.totals;
 
@@ -451,12 +558,54 @@ export default function PayrollStaffSales() {
               <thead className="bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
                 <tr>
                   <th className="text-left px-3 py-2 w-8" />
-                  <th className="text-left px-3 py-2">Employee</th>
-                  <th className="text-right px-3 py-2">Gross</th>
-                  <th className="text-right px-3 py-2">Returns</th>
-                  <th className="text-right px-3 py-2">Net sales</th>
-                  <th className="text-right px-3 py-2">Total sales</th>
-                  <th className="text-right px-3 py-2">Orders</th>
+                  <th className="text-left px-3 py-2">
+                    <SortHeader
+                      active={sortActive && sortKey === "name"}
+                      dir={sortDir}
+                      onClick={() => onSortHeaderClick("name")}
+                      label="Employee" testid="sort-name"
+                    />
+                  </th>
+                  <th className="text-right px-3 py-2">
+                    <SortHeader
+                      active={sortActive && sortKey === "gross"}
+                      dir={sortDir}
+                      onClick={() => onSortHeaderClick("gross")}
+                      label="Gross" align="right" testid="sort-gross"
+                    />
+                  </th>
+                  <th className="text-right px-3 py-2">
+                    <SortHeader
+                      active={sortActive && sortKey === "returns"}
+                      dir={sortDir}
+                      onClick={() => onSortHeaderClick("returns")}
+                      label="Returns" align="right" testid="sort-returns"
+                    />
+                  </th>
+                  <th className="text-right px-3 py-2">
+                    <SortHeader
+                      active={sortActive && sortKey === "net"}
+                      dir={sortDir}
+                      onClick={() => onSortHeaderClick("net")}
+                      label="Net sales" align="right" testid="sort-net"
+                    />
+                  </th>
+                  <th className="text-right px-3 py-2">
+                    <SortHeader
+                      active={sortActive && sortKey === "total"}
+                      dir={sortDir}
+                      onClick={() => onSortHeaderClick("total")}
+                      label="Total sales" align="right" testid="sort-total"
+                    />
+                  </th>
+                  <th className="text-right px-3 py-2">
+                    <SortHeader
+                      active={sortActive && sortKey === "orders"}
+                      dir={sortDir}
+                      onClick={() => onSortHeaderClick("orders")}
+                      label="Orders" align="right" testid="sort-orders"
+                    />
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -542,7 +691,7 @@ function EmployeeRowView({
   drillKey: string | null;
   setDrillKey: (k: string | null) => void;
   drillQ: ReturnType<typeof useQuery<{ ok: boolean; count: number; rows: OrderRow[] }>>;
-  entKey: (employeeId: number | null, entityId: number | null) => string;
+  entKey: (emp: EmployeeRow, entityId: number | null) => string;
 }) {
   return (
     <>
@@ -614,7 +763,7 @@ function EmployeeRowView({
                     </tr>
                   )}
                   {emp.by_entity.map((ent) => {
-                    const dk = entKey(emp.employee_id, ent.entity_id);
+                    const dk = entKey(emp, ent.entity_id);
                     const isDrill = drillKey === dk;
                     return (
                       <EntityRowView

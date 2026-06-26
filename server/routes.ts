@@ -11510,6 +11510,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
         const employeeIdRaw = String(req.query.employee_id ?? "").trim();
         const entityIdRaw = String(req.query.entity_id ?? "").trim();
+        // PR #213: lets the Staff Sales UI drill into a specific unmatched
+        // staff bucket (now that each unmatched assisting_staff_id is its
+        // own row instead of all collapsing into one "_null" bucket).
+        const assistingStaffIdRaw = String(req.query.assisting_staff_id ?? "").trim();
 
         // PR #205: filter by recon_orders.created_at (joined below), falling
         // back to period_start when the order isn't linked yet. Pre-PR this
@@ -11527,6 +11531,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           if (!Number.isFinite(eid)) throw new Error("employee_id must be numeric or '_null'");
           where.push("s.employee_id = ?");
           params.push(eid);
+        }
+
+        if (assistingStaffIdRaw) {
+          // assisting_staff_id is stored as TEXT (bare numeric like
+          // "82318328050"). Validate light: digits only, 1..20 chars.
+          if (!/^\d{1,20}$/.test(assistingStaffIdRaw)) {
+            throw new Error("assisting_staff_id must be a numeric string");
+          }
+          where.push("s.assisting_staff_id = ?");
+          params.push(assistingStaffIdRaw);
+          // When drilling into an unmatched bucket we also want only
+          // the still-unmatched rows so the count matches the parent
+          // row. (After PR #212 backfill there shouldn't be matched
+          // rows under an unmatched bucket, but be explicit.)
+          where.push("s.employee_id IS NULL");
         }
 
         if (entityIdRaw) {
