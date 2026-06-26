@@ -20,6 +20,7 @@ import ApSettings from "@/pages/accounts-payable/ApSettings";
 import Payroll from "@/pages/Payroll";
 import PayrollEntities from "@/pages/PayrollEntities";
 import PayrollEmployees from "@/pages/PayrollEmployees";
+import Me from "@/pages/Me";
 import PayrollStaffSales from "@/pages/PayrollStaffSales";
 import ReconcilerTest from "@/pages/ReconcilerTest";
 import SalesTax from "@/pages/SalesTax";
@@ -136,6 +137,9 @@ function ProtectedRoutes() {
         {/* Backward-compat: Entities used to live under Payroll. */}
         <Route path="/payroll/entities" component={PayrollEntitiesRedirect} />
         <Route path="/payroll/employees" component={PayrollEmployees} />
+        {/* PR #209 - self-view profile page. Visible to any logged-in user;
+            backed by GET /api/me/employee which strips sensitive payroll IDs. */}
+        <Route path="/me" component={Me} />
         <Route path="/payroll/staff-sales" component={PayrollStaffSales} />
         <Route path="/finance/monthly-summary">
           {() => <ReconcilerTest view="monthly-summary" />}
