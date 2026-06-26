@@ -1333,6 +1333,32 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const updated = updateEmployee(id, patch);
       if (commissionDropped) res.setHeader("X-Commission-Dropped", "1");
       if (payFieldsDropped) res.setHeader("X-Pay-Fields-Dropped", "1");
+
+      // PR #214 — if the caller just linked (or changed) shopify_staff_member_id,
+      // immediately stamp employee_id on any previously-NULL recon staff-sales
+      // rows for that staff id. Without this, the UI shows a duplicate row
+      // (one matched, one unmatched) until the next ingest tick or a manual
+      // POST /backfill-employee-links. Best-effort: failures are logged but
+      // do not break the employee update response.
+      try {
+        if (body.shopify_staff_member_id !== undefined) {
+          const before = (existing as any)?.shopify_staff_member_id ?? null;
+          const after = (patch as any).shopify_staff_member_id ?? null;
+          if (after && String(after) !== String(before ?? "")) {
+            const out = backfillEmployeeLinksForStaffId(after);
+            if (out.rows_updated > 0) {
+              res.setHeader("X-Staff-Sales-Backfilled", String(out.rows_updated));
+            }
+          }
+        }
+      } catch (bfErr: any) {
+        console.error(
+          "[PR #214] backfillEmployeeLinksForStaffId failed for employee",
+          id,
+          bfErr?.message || bfErr,
+        );
+      }
+
       res.json(updated);
     } catch (e: any) {
       const msg = String(e?.message || "");
@@ -11687,6 +11713,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //
   // Safe to re-run: only touches rows where employee_id IS NULL, and
   // only sets it when the resolver returns a non-NULL match.
+  // PR #214 — extracted helper so both the bulk POST and the PATCH-employee
+  // hook can stamp employee_id on previously-NULL recon rows. Returns the
+  // resolved employee plus the number of rows stamped. Safe to call with a
+  // raw value (bare numeric OR gid form) — the matcher normalizes it.
+  function backfillEmployeeLinksForStaffId(rawStaffId: string | number | null | undefined): {
+    resolved: { employee_id: number; full_name: string | null } | null;
+    rows_updated: number;
+  } {
+    const { sqlite } = require("./storage");
+    const { resolveEmployeeByShopifyStaff } = require("./commission-matcher");
+    const resolved = resolveEmployeeByShopifyStaff(rawStaffId);
+    if (!resolved || resolved.employee_id == null) {
+      return { resolved: null, rows_updated: 0 };
+    }
+    // Stamp both bare-numeric and gid forms of the staff id, since rows
+    // ingested before the link may have stored either shape.
+    const normalized = String(rawStaffId ?? "").replace(/^gid:\/\/shopify\/StaffMember\//, "");
+    const gidForm = `gid://shopify/StaffMember/${normalized}`;
+    const info = sqlite
+      .prepare(
+        `UPDATE recon_shopify_staff_sales
+            SET employee_id = ?
+          WHERE employee_id IS NULL
+            AND assisting_staff_id IN (?, ?)`,
+      )
+      .run(resolved.employee_id, normalized, gidForm);
+    return {
+      resolved: { employee_id: resolved.employee_id, full_name: resolved.full_name ?? null },
+      rows_updated: Number((info as any).changes ?? 0),
+    };
+  }
+
   app.post(
     "/api/recon/shopify/staff-sales/backfill-employee-links",
     authMiddleware,
@@ -11694,9 +11752,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     (_req, res) => {
       try {
         const { sqlite } = require("./storage");
-        const {
-          resolveEmployeeByShopifyStaff,
-        } = require("./commission-matcher");
 
         // Every distinct staff id that has at least one NULL-employee_id
         // row. Cheap query — idx_recon_staff_sales_unmatched is a
@@ -11708,13 +11763,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               WHERE employee_id IS NULL`,
           )
           .all() as Array<{ assisting_staff_id: string }>;
-
-        const update = sqlite.prepare(
-          `UPDATE recon_shopify_staff_sales
-              SET employee_id = ?
-            WHERE employee_id IS NULL
-              AND assisting_staff_id = ?`,
-        );
 
         let staffMatched = 0;
         let staffUnmatched = 0;
@@ -11728,19 +11776,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
         const tx = sqlite.transaction(() => {
           for (const r of distinct) {
-            const resolved = resolveEmployeeByShopifyStaff(
-              r.assisting_staff_id,
-            );
-            if (resolved && resolved.employee_id != null) {
-              const info = update.run(resolved.employee_id, r.assisting_staff_id);
-              const n = Number((info as any).changes ?? 0);
-              rowsUpdated += n;
+            const out = backfillEmployeeLinksForStaffId(r.assisting_staff_id);
+            if (out.resolved) {
+              rowsUpdated += out.rows_updated;
               staffMatched++;
               perStaff.push({
                 assisting_staff_id: r.assisting_staff_id,
-                employee_id: resolved.employee_id,
-                full_name: resolved.full_name ?? null,
-                rows_updated: n,
+                employee_id: out.resolved.employee_id,
+                full_name: out.resolved.full_name,
+                rows_updated: out.rows_updated,
               });
             } else {
               staffUnmatched++;
