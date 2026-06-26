@@ -18,7 +18,7 @@ import { smartMatchVendor, resolveShipToStore, learnVendorAlias, checkSkipSender
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "./qbo";
 import { findDuplicateInvoice } from "./dup-detector";
-import { parsePaymentTermsFallback } from "./payment-terms-parser";
+import { applyPostLlmTermsFallback } from "./post-llm-terms";
 
 import { getDbPath } from "./db-path";
 const DB_PATH = getDbPath(); // PR #R4j: NSSM-safe path
@@ -226,42 +226,14 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
   // string. Regex-parse the verbatim text and fill any gaps the LLM left,
   // preserving anything the LLM did populate correctly.
   // Triggering case: EC Woods invoice QS 7193, terms "2% 10 - Net 30".
-  if (llmResult?.payment_terms) {
-    const fallback = parsePaymentTermsFallback(llmResult.payment_terms, llmResult.invoice_date);
-    if (fallback) {
-      const filled: string[] = [];
-      if (llmResult.discount_terms_pct == null && fallback.discount_terms_pct != null) {
-        llmResult.discount_terms_pct = fallback.discount_terms_pct;
-        filled.push("discount_terms_pct");
-      }
-      if (llmResult.discount_days == null && fallback.discount_days != null) {
-        llmResult.discount_days = fallback.discount_days;
-        filled.push("discount_days");
-      }
-      if (!llmResult.discount_due_date && fallback.discount_due_date) {
-        llmResult.discount_due_date = fallback.discount_due_date;
-        filled.push("discount_due_date");
-      }
-      if (!llmResult.discount_kind && fallback.discount_kind) {
-        llmResult.discount_kind = fallback.discount_kind;
-        filled.push("discount_kind");
-      }
-      // due_date: only fill if the LLM left it null AND the fallback produced
-      // one. The verbatim "Net 30" with no LLM due_date is exactly the gap
-      // this catches.
-      if (!llmResult.due_date && fallback.due_date) {
-        llmResult.due_date = fallback.due_date;
-        filled.push("due_date");
-      }
-      if (filled.length > 0) {
-        // invoiceId isn't assigned yet at this point in the pipeline (id is
-        // derived from filename later); the invoice_number / vendor are the
-        // most useful identifiers at this stage.
-        const tag = llmResult.invoice_number ?? llmResult.vendor_raw_name ?? "?";
-        console.log(
-          `[terms-fallback] ${tag}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
-        );
-      }
+  // PR #R4r — shared helper so all ingest paths + reparse stay in lockstep.
+  if (llmResult) {
+    const filled = applyPostLlmTermsFallback(llmResult, llmResult.invoice_date);
+    if (filled.length > 0) {
+      const tag = llmResult.invoice_number ?? llmResult.vendor_raw_name ?? "?";
+      console.log(
+        `[terms-fallback] ${tag}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
+      );
     }
   }
 

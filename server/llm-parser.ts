@@ -533,13 +533,49 @@ ${SCHEMA_HINT}`;
     }
   }
 
-  // Discount-terms detection. Try the LLM-emitted payment_terms first, then fall
-  // back to the raw PDF text. Always emit on result so the UI can surface a chip
-  // (with warning if ambiguous, per user spec).
-  const discountSource = result.payment_terms
-    || (rawPdfText ?? (rawPdfText = await safeExtractPdfText(pdfBuffer)))
-    || "";
-  const detected = detectDiscountTerms(discountSource, result.invoice_date);
+  // Discount-terms detection. Try the LLM-emitted payment_terms first; if that
+  // doesn't produce a discount hit, fall back to scanning the raw PDF text and
+  // then the cross-field LLM blob.
+  //
+  // Why all three: the LLM is inconsistent at extracting discount terms. On
+  // the same PDF it may return payment_terms="2% 10 - Net 30" (full string,
+  // hits the regex) or payment_terms="NET 30" (partial, misses the discount).
+  // When the LLM returns a partial string, the previous logic short-circuited
+  // on truthy payment_terms and never scanned the PDF, so the discount was
+  // silently dropped at ingest and only appeared on reparse if the LLM
+  // happened to return the full string. EC Woods invoice 7241 ("2% 10 - Net 30")
+  // was the triggering case. Strategy now mirrors the due_date logic:
+  //   1. Try the LLM's payment_terms directly
+  //   2. Fall back to the raw PDF text (text PDFs)
+  //   3. Fall back to a cross-field blob scan (image-only PDFs where the LLM
+  //      saw the terms visually and narrated them into notes/payment_method/etc.)
+  let detected = detectDiscountTerms(result.payment_terms || "", result.invoice_date);
+  if (!detected.kind) {
+    if (rawPdfText == null) rawPdfText = await safeExtractPdfText(pdfBuffer);
+    if (rawPdfText) {
+      const fromPdf = detectDiscountTerms(rawPdfText, result.invoice_date);
+      if (fromPdf.kind) detected = fromPdf;
+    }
+  }
+  if (!detected.kind) {
+    // Concatenate every text-bearing LLM field — same blob the due_date fill-in
+    // uses. Catches image-only invoices where the LLM saw the discount visually
+    // but wrote it into notes/payment_method instead of payment_terms.
+    const llmBlob = [
+      result.notes,
+      result.payment_terms,
+      result.payment_method,
+      result.vendor_alias_applied,
+      result.skip_reason,
+      result.vendor_raw_name,
+    ]
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .join(" | ");
+    if (llmBlob) {
+      const fromBlob = detectDiscountTerms(llmBlob, result.invoice_date);
+      if (fromBlob.kind) detected = fromBlob;
+    }
+  }
   result.discount_terms_pct = detected.pct;
   result.discount_days = detected.days;
   result.discount_due_date = detected.dueDate;
