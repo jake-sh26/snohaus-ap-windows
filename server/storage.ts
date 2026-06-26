@@ -1868,6 +1868,40 @@ function bootstrapSchema() {
       ON recon_allocations(method, order_id);
   `);
 
+  // ----- PR #216 — per-line POS staff attribution -----
+  // Extracted from recon_orders.raw_json.line_items[].attributed_staffs[],
+  // populated synchronously inside replaceReconLineItems so the data is
+  // always consistent with the line items it references. ON DELETE CASCADE
+  // matches recon_allocations' pattern — re-ingesting an order wipes its
+  // staff rows along with its line items. PRIMARY KEY enforces idempotency:
+  // the same (line_item, staff) pair can only appear once even if the same
+  // raw_json is replayed.
+  //
+  // unit_quantity is the count of units of that line attributed to the staff
+  // (Shopify POS supports same-line splits when a line has qty > 1, e.g.
+  // {staff A: 6, staff B: 4} on a qty=10 line). The view layer divides by
+  // line.quantity to get a share. Lines with no attributed_staffs entries
+  // get NO rows here, and the view exposes that gap as an explicit
+  // "unmatched" bucket so sum-of-staff == sum-of-orders by construction.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_order_assisting_staff (
+      order_id TEXT NOT NULL REFERENCES recon_orders(id) ON DELETE CASCADE,
+      order_name TEXT NOT NULL,
+      line_item_id TEXT NOT NULL REFERENCES recon_line_items(id) ON DELETE CASCADE,
+      assisting_staff_id TEXT NOT NULL,
+      unit_quantity INTEGER NOT NULL,
+      source TEXT NOT NULL DEFAULT 'shopify_rest_attributed_staffs',
+      ingested_at TEXT NOT NULL,
+      PRIMARY KEY (line_item_id, assisting_staff_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_order_assisting_staff_order
+      ON recon_order_assisting_staff(order_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_order_assisting_staff_staff
+      ON recon_order_assisting_staff(assisting_staff_id);
+    CREATE INDEX IF NOT EXISTS idx_recon_order_assisting_staff_order_name
+      ON recon_order_assisting_staff(order_name);
+  `);
+
   // ----- PR #159-debug — v_attributed_sales VIEW -----
   // One row per forward line item (gift cards excluded), carrying the raw
   // per-line tax JSON plus the allocation-derived attribution candidates and
@@ -4876,6 +4910,44 @@ export function upsertReconOrder(row: ReconOrderUpsert): "inserted" | "updated" 
  * orphaned rows would corrupt downstream allocation math. Safe because the
  * order_id FK has ON DELETE CASCADE and we always re-write the full set.
  */
+// PR #216 — extract per-line POS staff attribution from a single line's
+// raw_json. Returns rows in the order they appear in attributed_staffs.
+// Pure function; safe to call from anywhere. Skips zero-quantity entries
+// (Shopify emits these for fully-refunded units), missing/blank ids, and
+// non-array payloads. Never throws on malformed JSON.
+export function extractAssistingStaffFromLineRawJson(
+  lineRawJson: string | null | undefined,
+): Array<{ assisting_staff_id: string; unit_quantity: number }> {
+  if (!lineRawJson) return [];
+  let parsed: any;
+  try {
+    parsed = JSON.parse(lineRawJson);
+  } catch {
+    return [];
+  }
+  const arr = parsed?.attributed_staffs;
+  if (!Array.isArray(arr)) return [];
+  // De-dupe by staff id (the same gid should never appear twice on one line
+  // in Shopify's payload, but guard against it). Sum quantities if it does.
+  const byStaff = new Map<string, number>();
+  for (const entry of arr) {
+    if (!entry || typeof entry !== "object") continue;
+    const rawId: unknown = entry.id;
+    const qty = Number(entry.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    if (typeof rawId !== "string" || rawId.length === 0) continue;
+    // Normalize gid://shopify/StaffMember/<id> -> "<id>" so it matches the
+    // ids stored on recon_shopify_staff_sales / payroll_employees.
+    const m = rawId.match(/(?:^|\/)(\d+)$/);
+    const staffId = m ? m[1] : rawId;
+    byStaff.set(staffId, (byStaff.get(staffId) ?? 0) + Math.floor(qty));
+  }
+  return Array.from(byStaff.entries()).map(([id, q]) => ({
+    assisting_staff_id: id,
+    unit_quantity: q,
+  }));
+}
+
 export function replaceReconLineItems(
   orderId: string,
   lines: ReconLineItemUpsert[],
@@ -4902,6 +4974,38 @@ export function replaceReconLineItems(
         li.recognized_at ?? null, li.added_via_exchange_refund_id ?? null,
         li.discount_allocations_total ?? 0,
       );
+    }
+
+    // PR #216 — extract & write per-line POS staff attribution. Belongs
+    // inside this same transaction so the staff rows can never out-live the
+    // line items they reference (line_item_id FK has ON DELETE CASCADE, but
+    // we still want atomicity so a half-written batch never surfaces in the
+    // by-staff endpoint). Lines with no attributed_staffs[] payload simply
+    // produce zero rows here — the view handles those as "unmatched".
+    const orderNameRow = sqlite
+      .prepare(`SELECT name FROM recon_orders WHERE id = ?`)
+      .get(orderId) as { name?: string } | undefined;
+    const orderName = orderNameRow?.name ?? "";
+    // The order_id FK's ON DELETE CASCADE already removed every row tied to
+    // this order's line items above; we still issue an explicit DELETE so
+    // re-ingest is safe even on engines where the cascade is disabled.
+    sqlite
+      .prepare(`DELETE FROM recon_order_assisting_staff WHERE order_id = ?`)
+      .run(orderId);
+    const insStaff = sqlite.prepare(`
+      INSERT INTO recon_order_assisting_staff (
+        order_id, order_name, line_item_id, assisting_staff_id,
+        unit_quantity, source, ingested_at
+      ) VALUES (?, ?, ?, ?, ?, 'shopify_rest_attributed_staffs', ?)
+    `);
+    for (const li of lines) {
+      const staffRows = extractAssistingStaffFromLineRawJson(li.raw_json);
+      for (const s of staffRows) {
+        insStaff.run(
+          orderId, orderName, li.id, s.assisting_staff_id,
+          s.unit_quantity, now,
+        );
+      }
     }
   });
   tx();

@@ -723,6 +723,29 @@ export const reconLineItems = sqliteTable("recon_line_items", {
   ingested_at: text("ingested_at").notNull(),
 });
 
+// PR #216 — per-line POS staff attribution extracted from
+// recon_orders.raw_json.line_items[].attributed_staffs[]. One row per
+// (line_item, assisting_staff). unit_quantity is how many units of that line
+// were attributed to the staff member (Shopify POS supports same-line
+// splits when a line has qty > 1). Lines with no attributed_staffs entries
+// get NO rows here — the view layer treats the missing units as the
+// "unmatched" bucket (no order.user_id fallback by design — forces POS
+// hygiene). assisting_staff_id stores the numeric portion of
+// gid://shopify/StaffMember/<id> so it matches recon_shopify_staff_sales
+// and payroll_employees.shopify_staff_id without further parsing.
+export const reconOrderAssistingStaff = sqliteTable(
+  "recon_order_assisting_staff",
+  {
+    order_id: text("order_id").notNull(),
+    order_name: text("order_name").notNull(),
+    line_item_id: text("line_item_id").notNull(),
+    assisting_staff_id: text("assisting_staff_id").notNull(),
+    unit_quantity: integer("unit_quantity").notNull(),
+    source: text("source").notNull().default("shopify_rest_attributed_staffs"),
+    ingested_at: text("ingested_at").notNull(),
+  },
+);
+
 export const reconPayouts = sqliteTable("recon_payouts", {
   id: text("id").primaryKey(),
   payout_date: text("payout_date").notNull(),
@@ -865,6 +888,8 @@ export type ReconZipToEntityLookup = typeof reconZipToEntityLookup.$inferSelect;
 export type ReconPriorYearProRata = typeof reconPriorYearProRata.$inferSelect;
 export type ReconOrder = typeof reconOrders.$inferSelect;
 export type ReconLineItem = typeof reconLineItems.$inferSelect;
+export type ReconOrderAssistingStaff =
+  typeof reconOrderAssistingStaff.$inferSelect;
 export type ReconPayout = typeof reconPayouts.$inferSelect;
 export type ReconBalanceTransaction = typeof reconBalanceTransactions.$inferSelect;
 export type ReconAllocation = typeof reconAllocations.$inferSelect;

@@ -11881,6 +11881,122 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(detail);
   });
 
+  // PR #216 - inspect per-line POS staff attribution for a single order.
+  // Returns one row per (line_item, assisting_staff) plus the line.quantity
+  // so the caller can compute share = unit_quantity / line.quantity and
+  // spot any unmatched gap where sum(unit_quantity) < line.quantity.
+  app.get(
+    "/api/recon/orders/:id/assisting-staff",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const orderId = String(req.params.id);
+        const { sqlite } = require("./storage");
+        const order = sqlite
+          .prepare(`SELECT id, name FROM recon_orders WHERE id = ?`)
+          .get(orderId);
+        if (!order) {
+          return res.status(404).json({ message: "Order not found" });
+        }
+        const rows = sqlite
+          .prepare(
+            `SELECT s.line_item_id, s.assisting_staff_id, s.unit_quantity,
+                    s.source, s.ingested_at,
+                    li.title AS line_title, li.quantity AS line_quantity,
+                    li.line_subtotal AS line_subtotal,
+                    li.is_gift_card AS is_gift_card,
+                    e.id AS employee_id, e.full_name AS employee_name
+             FROM recon_order_assisting_staff s
+             LEFT JOIN recon_line_items li ON li.id = s.line_item_id
+             LEFT JOIN payroll_employees e
+                    ON e.shopify_staff_id = s.assisting_staff_id
+             WHERE s.order_id = ?
+             ORDER BY s.line_item_id, s.assisting_staff_id`,
+          )
+          .all(orderId);
+        const perLine = sqlite
+          .prepare(
+            `SELECT li.id AS line_item_id, li.title, li.quantity AS line_quantity,
+                    li.is_gift_card,
+                    COALESCE(SUM(s.unit_quantity), 0) AS attributed_units,
+                    (li.quantity - COALESCE(SUM(s.unit_quantity), 0)) AS unmatched_units
+             FROM recon_line_items li
+             LEFT JOIN recon_order_assisting_staff s
+                    ON s.line_item_id = li.id
+             WHERE li.order_id = ?
+             GROUP BY li.id
+             ORDER BY li.id`,
+          )
+          .all(orderId);
+        res.json({
+          order: { id: order.id, name: order.name },
+          assisting_staff: rows,
+          per_line: perLine,
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message ?? "Inspect failed" });
+      }
+    },
+  );
+
+  // PR #216 - backfill recon_order_assisting_staff for every existing
+  // recon_orders row by re-running the extractor over the stored
+  // recon_line_items.raw_json. Idempotent and safe to re-run.
+  app.post(
+    "/api/recon/admin/backfill-assisting-staff",
+    authMiddleware,
+    requirePermission("system.manage_config"),
+    (_req, res) => {
+      try {
+        const { sqlite, extractAssistingStaffFromLineRawJson } = require("./storage");
+        const now = new Date().toISOString();
+        let ordersTouched = 0;
+        let linesScanned = 0;
+        let staffRowsWritten = 0;
+        const tx = sqlite.transaction(() => {
+          sqlite.exec(`DELETE FROM recon_order_assisting_staff`);
+          const orders = sqlite
+            .prepare(`SELECT id, name FROM recon_orders`)
+            .all();
+          const lineStmt = sqlite.prepare(
+            `SELECT id, raw_json FROM recon_line_items WHERE order_id = ?`,
+          );
+          const ins = sqlite.prepare(`
+            INSERT INTO recon_order_assisting_staff (
+              order_id, order_name, line_item_id, assisting_staff_id,
+              unit_quantity, source, ingested_at
+            ) VALUES (?, ?, ?, ?, ?, 'shopify_rest_attributed_staffs', ?)
+          `);
+          for (const o of orders) {
+            ordersTouched += 1;
+            const lines = lineStmt.all(o.id);
+            for (const li of lines) {
+              linesScanned += 1;
+              const staffRows = extractAssistingStaffFromLineRawJson(li.raw_json);
+              for (const s of staffRows) {
+                ins.run(
+                  o.id, o.name ?? "", li.id, s.assisting_staff_id,
+                  s.unit_quantity, now,
+                );
+                staffRowsWritten += 1;
+              }
+            }
+          }
+        });
+        tx();
+        res.json({
+          orders_touched: ordersTouched,
+          lines_scanned: linesScanned,
+          staff_rows_written: staffRowsWritten,
+          completed_at: now,
+        });
+      } catch (e: any) {
+        res.status(500).json({ message: e?.message ?? "Backfill failed" });
+      }
+    },
+  );
+
   // --------------------------------------------------------------------------
   // PR #R3 — Shopify Payments payouts + balance_transactions sync
   // --------------------------------------------------------------------------
