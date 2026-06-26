@@ -702,6 +702,37 @@ function bootstrapSchema() {
                                     COALESCE(entity_id, -1));
   `);
 
+  // PR #215 — purge legacy NULL-occurred_on rows. The PR #212 boot dedup
+  // above partitions by (occurred_on, assisting_staff_id, order_name,
+  // entity_id), so a row with occurred_on=NULL and a row with
+  // occurred_on='2026-06-20' for the SAME order land in different
+  // partitions and neither is treated as a duplicate of the other.
+  //
+  // That left pre-PR-#206 ingests (which never wrote occurred_on)
+  // permanently shadowed by post-PR-#206 ingests of the same orders.
+  // Observed in production: Paul Pearlman's order #38269 appeared twice
+  // on Staff Sales — once as the legacy NULL-occurred_on row, once as
+  // the 6/26 ingest row with occurred_on set — both for $2,596.
+  //
+  // Fix: for each (assisting_staff_id, COALESCE(order_name,'')) cluster,
+  // if any row has occurred_on IS NOT NULL the NULL-occurred_on rows
+  // are stale and safe to delete. The current rows already carry the
+  // canonical day-dimensioned values, including any later refunds /
+  // exchanges from sliding-window re-pulls.
+  //
+  // Idempotent: on a clean DB (no legacy rows) this matches nothing.
+  const legacyPurge = sqlite.exec(`
+    DELETE FROM recon_shopify_staff_sales
+     WHERE occurred_on IS NULL
+       AND EXISTS (
+         SELECT 1 FROM recon_shopify_staff_sales s2
+          WHERE s2.assisting_staff_id = recon_shopify_staff_sales.assisting_staff_id
+            AND COALESCE(s2.order_name,'') = COALESCE(recon_shopify_staff_sales.order_name,'')
+            AND s2.occurred_on IS NOT NULL
+       );
+  `);
+  void legacyPurge;
+
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS payroll_easyrent_staff_weekly_totals (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

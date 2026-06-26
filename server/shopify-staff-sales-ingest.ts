@@ -62,6 +62,10 @@ export type IngestSummary = {
   orders_not_yet_in_db: number;
   unique_staff: number;
   unique_orders: number;
+  // PR #215 — number of legacy NULL-occurred_on rows the per-ingest
+  // dedup deleted because a current row already exists for the same
+  // (assisting_staff_id, order_name). Expected 0 on a clean DB.
+  legacy_rows_purged: number;
   query: string;
 };
 
@@ -228,6 +232,79 @@ export async function ingestStaffSales(
     throw e;
   }
 
+  // PR #215 — per-ingest dedup, scoped to the (assisting_staff_id,
+  // order_name) pairs touched by this run.
+  //
+  // The boot-time legacy purge in storage.ts handles the historical
+  // backfill from pre-PR-#206 NULL-occurred_on rows, but a future code
+  // path that regresses (or a partial-window re-pull whose semantics
+  // shift) could re-introduce duplicate clusters under the v3 unique
+  // index, because that index uses COALESCE(...) wrappers and treats
+  // (NULL, X) and ('val', X) as distinct rows. Run the same purge here
+  // every ingest so we never carry forward duplicates past a sync.
+  //
+  // Scope by touched staff IDs keeps the DELETE cheap on the hot path.
+  // Idempotent.
+  let legacyPurged = 0;
+  if (uniqueStaff.size > 0) {
+    const staffList = Array.from(uniqueStaff);
+    const CHUNK = 500;
+    for (let i = 0; i < staffList.length; i += CHUNK) {
+      const chunk = staffList.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => "?").join(",");
+      try {
+        const res = sqlite
+          .prepare(
+            `DELETE FROM recon_shopify_staff_sales
+              WHERE assisting_staff_id IN (${placeholders})
+                AND occurred_on IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM recon_shopify_staff_sales s2
+                   WHERE s2.assisting_staff_id = recon_shopify_staff_sales.assisting_staff_id
+                     AND COALESCE(s2.order_name,'') = COALESCE(recon_shopify_staff_sales.order_name,'')
+                     AND s2.occurred_on IS NOT NULL
+                )`,
+          )
+          .run(...chunk);
+        legacyPurged += res.changes ?? 0;
+      } catch (e: any) {
+        logWarn(
+          "dedup",
+          `per-ingest legacy purge failed for chunk of ${chunk.length} staff: ${e?.message ?? e}`,
+        );
+      }
+    }
+    if (legacyPurged > 0) {
+      logWarn(
+        "dedup",
+        `purged ${legacyPurged} legacy NULL-occurred_on row(s) for ${staffList.length} staff during ${since}..${until} ingest`,
+      );
+    }
+  }
+
+  // PR #215 — post-ingest sentinel. Every ingest emits occurred_on
+  // (PR #206), so any row in the table that still has occurred_on IS
+  // NULL after we just ran is either (a) a legacy row whose staff was
+  // not touched by this window or (b) evidence that a code path has
+  // regressed and is again writing rows without the day dimension.
+  // Warn so we notice; do not fail the ingest.
+  try {
+    const remaining = sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM recon_shopify_staff_sales WHERE occurred_on IS NULL`,
+      )
+      .get() as { n: number } | undefined;
+    const n = remaining?.n ?? 0;
+    if (n > 0) {
+      logWarn(
+        "dedup",
+        `${n} row(s) in recon_shopify_staff_sales still have occurred_on=NULL after ingest — inspect for stale data or a regressed write path`,
+      );
+    }
+  } catch (e: any) {
+    logWarn("dedup", `post-ingest NULL-occurred_on sentinel failed: ${e?.message ?? e}`);
+  }
+
   return {
     since: pull.since,
     until: pull.until,
@@ -238,6 +315,7 @@ export async function ingestStaffSales(
     orders_not_yet_in_db: ordersMissing,
     unique_staff: uniqueStaff.size,
     unique_orders: uniqueOrders.size,
+    legacy_rows_purged: legacyPurged,
     query: pull.query,
   };
 }
