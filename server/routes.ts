@@ -261,7 +261,7 @@ import {
 } from "./pdf-archive";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { processInvoicePdf, normalizeDueDate } from "./invoice-pipeline";
-import { parsePaymentTermsFallback } from "./payment-terms-parser";
+import { applyPostLlmTermsFallback } from "./post-llm-terms";
 import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms } from "./llm-parser";
 import {
   listVendorGroups, getVendorGroup, createVendorGroup, updateVendorGroup, deleteVendorGroup,
@@ -12858,32 +12858,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // pipeline. If the LLM gave us a payment_terms string but left the
     // discount_* fields null, regex-parse it and fill the gaps so a reparse
     // doesn't keep producing the same "verbatim terms only" output.
-    if (llmResult.payment_terms) {
+    // PR #R4r — now uses the same shared helper as every ingest path.
+    {
       const effectiveInvoiceDate = patch.invoice_date || inv.invoice_date || llmResult.invoice_date || null;
-      const fallback = parsePaymentTermsFallback(llmResult.payment_terms, effectiveInvoiceDate);
-      if (fallback) {
-        const filled: string[] = [];
-        if (llmResult.discount_terms_pct == null && fallback.discount_terms_pct != null) {
-          llmResult.discount_terms_pct = fallback.discount_terms_pct;
-          filled.push("discount_terms_pct");
-        }
-        if (llmResult.discount_days == null && fallback.discount_days != null) {
-          llmResult.discount_days = fallback.discount_days;
-          filled.push("discount_days");
-        }
-        if (!llmResult.discount_due_date && fallback.discount_due_date) {
-          llmResult.discount_due_date = fallback.discount_due_date;
-          filled.push("discount_due_date");
-        }
-        if (!llmResult.discount_kind && fallback.discount_kind) {
-          llmResult.discount_kind = fallback.discount_kind;
-          filled.push("discount_kind");
-        }
-        if (filled.length > 0) {
-          console.log(
-            `[terms-fallback] reparse ${inv.id}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
-          );
-        }
+      const filled = applyPostLlmTermsFallback(llmResult, effectiveInvoiceDate);
+      if (filled.length > 0) {
+        console.log(
+          `[terms-fallback] reparse ${inv.id}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
+        );
       }
     }
 

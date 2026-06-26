@@ -23,6 +23,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms, type LLMParsedInvoice } from "./llm-parser";
 import { normalizeDueDate } from "./invoice-pipeline";
+import { applyPostLlmTermsFallback } from "./post-llm-terms";
 import { smartMatchVendor, resolveShipToStore, learnVendorAlias, replaceInvoiceLineItems } from "./storage";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "./qbo";
@@ -734,6 +735,21 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               continue;
             }
 
+            // PR #R4r — same deterministic terms-parsing fallback the upload
+            // pipeline + reparse use. Without this, Gmail-ingested invoices
+            // whose LLM call returned a verbatim "Net 30" / "2% 10 Net 30"
+            // in payment_terms but left the discount_* fields null would
+            // permanently miss their early-pay discount until a manual reparse.
+            if (llmResult) {
+              const filled = applyPostLlmTermsFallback(llmResult, llmResult.invoice_date);
+              if (filled.length > 0) {
+                const tag = llmResult.invoice_number ?? llmResult.vendor_raw_name ?? "?";
+                console.log(
+                  `[terms-fallback] Gmail ${tag}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
+                );
+              }
+            }
+
             // Build parsed_data from LLM if available, otherwise fall back to regex
             //
             // PR #R4m — the Gmail poller previously omitted due_date entirely from
@@ -853,6 +869,12 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
 
             // PR #R4m — added due_date column to the INSERT (was missing entirely
             // before this fix).
+            // PR #R4r — added discount_* columns. Previously the Gmail INSERT
+            // dropped every discount field on the floor so Gmail-ingested
+            // invoices never showed an early-pay chip until manual reparse.
+            // For net_with_discount kind the discount is automatic per spec, so
+            // flip discount_applied=1 at ingest (mirrors invoice-pipeline.ts).
+            const discountAppliedInitial = llmResult?.discount_kind === "net_with_discount" ? 1 : 0;
             db.prepare(`
               INSERT OR IGNORE INTO invoices (
                 id, source_file, email_id, email_date, email_from, email_subject,
@@ -861,8 +883,9 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
                 ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
                 created_at, updated_at,
                 document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
+                discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
                 payment_terms
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             `).run(
               invoiceId,
               `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
@@ -894,6 +917,12 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               llmResult?.already_paid ? 1 : 0,
               llmResult ? JSON.stringify(llmResult.line_items) : null,
               llmResult?.bill_kind || null,
+              llmResult?.discount_terms_pct ?? null,
+              llmResult?.discount_days ?? null,
+              llmResult?.discount_due_date ?? null,
+              llmResult?.discount_kind ?? null,
+              llmResult?.discount_warning ?? null,
+              discountAppliedInitial,
               parsed_data.payment_terms
             );
 

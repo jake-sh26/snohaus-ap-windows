@@ -47,6 +47,7 @@ import {
   type LLMParsedInvoice,
 } from "./llm-parser";
 import { normalizeDueDate } from "./invoice-pipeline";
+import { applyPostLlmTermsFallback } from "./post-llm-terms";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "./qbo";
 
@@ -867,6 +868,20 @@ async function processOneGmailMessage(
         continue;
       }
 
+      // PR #R4r — deterministic terms-parsing fallback so Gmail-API ingested
+      // invoices populate discount_* fields when the LLM left them null but
+      // emitted a recognizable payment_terms string. Mirrors invoice-pipeline.ts
+      // and the reparse handler.
+      if (llmResult) {
+        const filled = applyPostLlmTermsFallback(llmResult, llmResult.invoice_date);
+        if (filled.length > 0) {
+          const tag = llmResult.invoice_number ?? llmResult.vendor_raw_name ?? "?";
+          console.log(
+            `[terms-fallback] gmail-api ${tag}: filled ${filled.join(",")} from "${llmResult.payment_terms}"`,
+          );
+        }
+      }
+
       // PR #R4m due-date computation (normalize → fallback to terms)
       let parsed_data: {
         vendor_raw_name: string | null;
@@ -974,6 +989,10 @@ async function processOneGmailMessage(
         console.error(`[gmail-api] dedup check failed (continuing): ${dedupErr.message}`);
       }
 
+      // PR #R4r — added discount_* columns. Previously the gmail-api INSERT
+      // dropped every discount field on the floor so Gmail-ingested invoices
+      // never showed an early-pay chip until manual reparse.
+      const discountAppliedInitial = llmResult?.discount_kind === "net_with_discount" ? 1 : 0;
       db.prepare(`
         INSERT OR IGNORE INTO invoices (
           id, source_file, email_id, email_date, email_from, email_subject,
@@ -982,8 +1001,9 @@ async function processOneGmailMessage(
           ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
           created_at, updated_at,
           document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
+          discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
           payment_terms
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(
         invoiceId,
         `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
@@ -1015,6 +1035,12 @@ async function processOneGmailMessage(
         llmResult?.already_paid ? 1 : 0,
         llmResult ? JSON.stringify(llmResult.line_items) : null,
         llmResult?.bill_kind || null,
+        llmResult?.discount_terms_pct ?? null,
+        llmResult?.discount_days ?? null,
+        llmResult?.discount_due_date ?? null,
+        llmResult?.discount_kind ?? null,
+        llmResult?.discount_warning ?? null,
+        discountAppliedInitial,
         parsed_data.payment_terms
       );
 
