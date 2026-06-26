@@ -27,8 +27,11 @@
  *        \u2192 share sums across entities for one order ALWAYS equal 1.0
  *          (per the allocator's invariant), so the dollar columns sum
  *          back to the original ShopifyQL net_sales.
- *     5. UPSERT keyed on (period_start, period_end, assisting_staff_id,
- *        order_name, entity_id) so re-runs are idempotent.
+ *     5. UPSERT keyed on (occurred_on, assisting_staff_id, order_name,
+ *        entity_id) so re-runs are idempotent across sliding windows.
+ *        PR #212: dropped period_start/period_end from the key — they
+ *        caused the same logical sale to land in two rows when sync
+ *        used different windows.
  *
  * This module is intentionally simple \u2014 no UI, no scheduling, no
  * commission calc. The next PR (#203) adds the running-tally UI.
@@ -136,12 +139,24 @@ export async function ingestStaffSales(
       @net_sales, @taxes, @total_sales,
       @allocation_method, @raw_json, @ingested_at
     )
-    ON CONFLICT (period_start, period_end, COALESCE(occurred_on, ''),
+    -- PR #212: dropped period_start/period_end from the conflict key.
+    -- Old key produced duplicate rows for the same logical sale when
+    -- sync ran over a different sliding window. Now keyed strictly on
+    -- (occurred_on, staff, order, entity) so re-syncs UPDATE in place.
+    -- Also stamp period_start/period_end on UPDATE so the latest sync's
+    -- window is reflected (cosmetic but consistent).
+    -- And: employee_id is COALESCED so a later sync that re-resolves the
+    -- staff member fills in NULL rows in place — the matcher only emits
+    -- non-NULL when it found a match, so this never overwrites a real
+    -- link with NULL.
+    ON CONFLICT (COALESCE(occurred_on, ''),
                  assisting_staff_id,
                  COALESCE(order_name, ''), COALESCE(entity_id, -1))
     DO UPDATE SET
+      period_start      = excluded.period_start,
+      period_end        = excluded.period_end,
       staff_name        = excluded.staff_name,
-      employee_id       = excluded.employee_id,
+      employee_id       = COALESCE(excluded.employee_id, recon_shopify_staff_sales.employee_id),
       order_id          = excluded.order_id,
       pos_location_name = excluded.pos_location_name,
       share             = excluded.share,
