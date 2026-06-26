@@ -18,8 +18,12 @@ import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import {
   Users, Plus, Pencil, UserX, Loader2, Search, Eye, EyeOff,
-  KeyRound, Link2Off, AlertCircle,
+  KeyRound, Link2Off, AlertCircle, ArrowUp, ArrowDown, ChevronsUpDown,
 } from "lucide-react";
+import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
+  DropdownMenuCheckboxItem, DropdownMenuLabel, DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 
 // ============================================================================
 // Payroll > Employees — master table of every payable person across the 3
@@ -84,6 +88,88 @@ type EntityRow = {
   active: number;
 };
 
+// PR #211 — module-level so it can be used both in the sort comparator and
+// (potentially) in tests/console. Last name = everything after the final
+// space in the trimmed full_name. Handles "Mae O'Malley" → "O'Malley" and
+// "Stacey Van Bourgondien" → "Van Bourgondien" without any explicit
+// particle-detection logic — our import format always has the multi-word
+// surname be the trailing token(s).
+function lastNameOf(full: string | null | undefined): string {
+  const s = (full || "").trim();
+  if (!s) return "";
+  const i = s.lastIndexOf(" ");
+  return i < 0 ? s : s.slice(i + 1);
+}
+
+type EmployeeSortKey = "name" | "store" | "email" | "phone" | "status" | "login";
+
+// PR #211 — Small clickable header button. Renders a label + arrow that
+// reflects current sort state (none / asc / desc). Click cycles state via
+// the parent's onClick handler. Lives module-level (no closures over
+// component state) so it stays a pure presentational component.
+function SortHeader({
+  active,
+  dir,
+  onClick,
+  label,
+  testid,
+}: {
+  active: boolean;
+  dir: "asc" | "desc";
+  onClick: () => void;
+  label: string;
+  testid?: string;
+}) {
+  // We render arrows in a fixed-width slot so column widths don't jiggle
+  // when sort state changes.
+  const Icon = !active ? null : dir === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      data-testid={testid}
+      aria-sort={!active ? "none" : dir === "asc" ? "ascending" : "descending"}
+      className={
+        "inline-flex items-center gap-1.5 font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground transition-colors " +
+        (active ? "text-foreground" : "")
+      }
+    >
+      <span>{label}</span>
+      <span className="inline-flex items-center justify-center w-3.5">
+        {Icon ? <Icon className="size-3.5" aria-hidden /> : null}
+      </span>
+    </button>
+  );
+}
+
+// Build the comparable value for a given column. Strings are returned
+// lowercased+trimmed so the collator does a clean compare; "" means empty
+// (gets pushed to the bottom by the comparator regardless of direction).
+function sortValueFor(
+  e: EmployeeRow,
+  key: EmployeeSortKey,
+  nameMode: "first" | "last",
+  entityById: Map<number, EntityRow>,
+  linkByEmpId: Map<number, any>,
+): string | number {
+  switch (key) {
+    case "name":
+      return (nameMode === "last" ? lastNameOf(e.full_name) : (e.full_name || "")).trim();
+    case "store":
+      return (entityById.get(e.entity_id)?.location || "").trim();
+    case "email":
+      return (e.email || "").trim().toLowerCase();
+    case "phone":
+      // Compare digits only so "(516) 555-1234" sorts next to "5165551234".
+      return (e.phone || "").replace(/\D/g, "");
+    case "status":
+      // Active first when asc — reverse handled by comparator.
+      return e.active === 1 ? 0 : 1;
+    case "login":
+      return (linkByEmpId.get(e.id)?.linked_user_email || "").trim().toLowerCase();
+  }
+}
+
 export default function PayrollEmployees() {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission("payroll.edit_employees");
@@ -95,6 +181,31 @@ export default function PayrollEmployees() {
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState<EmployeeRow | null>(null);
   const [creating, setCreating] = useState(false);
+
+  // PR #211 — sortable columns. Cycle is none → asc → desc → none, and only
+  // one column is sorted at a time. Name has a sub-mode "nameMode" which
+  // controls whether we sort by first or last name; the last-name parse
+  // takes everything after the final space so multi-word last names like
+  // "Van Bourgondien" and "O'Malley" sort correctly.
+  type SortDir = "asc" | "desc";
+  const [sortKey, setSortKey] = useState<EmployeeSortKey | null>(null);
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [nameMode, setNameMode] = useState<"first" | "last">("first");
+
+  function cycleSort(k: EmployeeSortKey) {
+    if (sortKey !== k) {
+      setSortKey(k);
+      setSortDir("asc");
+      return;
+    }
+    if (sortDir === "asc") {
+      setSortDir("desc");
+      return;
+    }
+    // desc → none
+    setSortKey(null);
+  }
+
   const [linkDialog, setLinkDialog] = useState<{
     employeeId: number;
     employeeName: string;
@@ -155,6 +266,32 @@ export default function PayrollEmployees() {
       return haystack.includes(q);
     });
   }, [employees, search]);
+
+  // PR #211 — stable, locale-aware sort applied AFTER filter. Null/empty
+  // values always land at the bottom regardless of direction so an empty
+  // Email column doesn't push real data off-screen when sorting ascending.
+  const sorted = useMemo(() => {
+    if (!sortKey) return filtered;
+    const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+    // Stable sort: pair index, sort, drop index. Array.prototype.sort is
+    // already stable on modern V8 but doing this is cheap and removes any
+    // doubt across engines/CI.
+    const indexed = filtered.map((row, i) => ({ row, i }));
+    indexed.sort((a, b) => {
+      const A = sortValueFor(a.row, sortKey, nameMode, entityById, linkByEmpId);
+      const B = sortValueFor(b.row, sortKey, nameMode, entityById, linkByEmpId);
+      const aEmpty = A === "" || A == null;
+      const bEmpty = B === "" || B == null;
+      if (aEmpty && !bEmpty) return 1;   // always bottom
+      if (!aEmpty && bEmpty) return -1;
+      let cmp: number;
+      if (typeof A === "number" && typeof B === "number") cmp = A - B;
+      else cmp = collator.compare(String(A), String(B));
+      if (cmp !== 0) return sortDir === "asc" ? cmp : -cmp;
+      return a.i - b.i; // tie → original order
+    });
+    return indexed.map((p) => p.row);
+  }, [filtered, sortKey, sortDir, nameMode, entityById, linkByEmpId]);
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-5">
@@ -236,7 +373,7 @@ export default function PayrollEmployees() {
           <Loader2 className="size-5 animate-spin mr-2" />
           Loading employees…
         </Card>
-      ) : filtered.length === 0 ? (
+      ) : sorted.length === 0 ? (
         <Card className="p-10 text-center text-muted-foreground text-sm">
           {employees.length === 0
             ? "No employees yet. Add your first one above."
@@ -251,19 +388,105 @@ export default function PayrollEmployees() {
                   {/* PR #209 - simplified table view. Sensitive IDs + commission
                       are no longer columns; they live in the edit dialog where
                       they're gated by payroll.edit_commissions (admin only). */}
-                  <th className="text-left px-4 py-2.5 font-medium">Name</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Store</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Email</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Phone</th>
-                  <th className="text-left px-4 py-2.5 font-medium">Status</th>
+                  {/* PR #211 - every header is now a sortable button. Active
+                      column shows an arrow; clicking cycles asc -> desc -> off.
+                      Name has an adjacent dropdown to switch first/last mode. */}
+                  <th className="text-left px-4 py-2.5 font-medium">
+                    <div className="flex items-center gap-1">
+                      <SortHeader
+                        active={sortKey === "name"}
+                        dir={sortDir}
+                        onClick={() => cycleSort("name")}
+                        label={`Name (${nameMode === "last" ? "last" : "first"})`}
+                        testid="sort-header-name"
+                      />
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-1 -ml-1 text-[10px] tracking-normal normal-case text-muted-foreground hover:text-foreground"
+                            data-testid="button-name-mode"
+                            aria-label="Switch first/last name sort"
+                          >
+                            <ChevronsUpDown className="size-3" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="text-sm">
+                          <DropdownMenuLabel className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                            Sort name by
+                          </DropdownMenuLabel>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuCheckboxItem
+                            checked={nameMode === "first"}
+                            onCheckedChange={() => setNameMode("first")}
+                            data-testid="menu-name-mode-first"
+                          >
+                            First name
+                          </DropdownMenuCheckboxItem>
+                          <DropdownMenuCheckboxItem
+                            checked={nameMode === "last"}
+                            onCheckedChange={() => setNameMode("last")}
+                            data-testid="menu-name-mode-last"
+                          >
+                            Last name
+                          </DropdownMenuCheckboxItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  </th>
+                  <th className="text-left px-4 py-2.5 font-medium">
+                    <SortHeader
+                      active={sortKey === "store"}
+                      dir={sortDir}
+                      onClick={() => cycleSort("store")}
+                      label="Store"
+                      testid="sort-header-store"
+                    />
+                  </th>
+                  <th className="text-left px-4 py-2.5 font-medium">
+                    <SortHeader
+                      active={sortKey === "email"}
+                      dir={sortDir}
+                      onClick={() => cycleSort("email")}
+                      label="Email"
+                      testid="sort-header-email"
+                    />
+                  </th>
+                  <th className="text-left px-4 py-2.5 font-medium">
+                    <SortHeader
+                      active={sortKey === "phone"}
+                      dir={sortDir}
+                      onClick={() => cycleSort("phone")}
+                      label="Phone"
+                      testid="sort-header-phone"
+                    />
+                  </th>
+                  <th className="text-left px-4 py-2.5 font-medium">
+                    <SortHeader
+                      active={sortKey === "status"}
+                      dir={sortDir}
+                      onClick={() => cycleSort("status")}
+                      label="Status"
+                      testid="sort-header-status"
+                    />
+                  </th>
                   {canManageLinks && (
-                    <th className="text-left px-4 py-2.5 font-medium">Login</th>
+                    <th className="text-left px-4 py-2.5 font-medium">
+                      <SortHeader
+                        active={sortKey === "login"}
+                        dir={sortDir}
+                        onClick={() => cycleSort("login")}
+                        label="Login"
+                        testid="sort-header-login"
+                      />
+                    </th>
                   )}
                   <th className="px-4 py-2.5"></th>
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((emp) => {
+                {sorted.map((emp) => {
                   const ent = entityById.get(emp.entity_id);
                   const isActive = emp.active === 1;
                   return (

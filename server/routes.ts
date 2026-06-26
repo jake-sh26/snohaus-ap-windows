@@ -1421,6 +1421,101 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ employee: safe, bonus_history: bonusHistory });
   });
 
+  // ==========================================================================
+  // PR #211 — Self-edit a small, safe subset of own employee profile
+  // --------------------------------------------------------------------------
+  // Auth-only (no permission gate) but the server hard-whitelists the four
+  // fields any employee is allowed to change about themselves:
+  //   - tshirt_size
+  //   - emergency_contact_name
+  //   - emergency_contact_phone
+  //   - emergency_contact_relationship
+  // Every other key in the body is silently dropped. Even if the UI were
+  // to accidentally (or maliciously) send pay/commission/address fields,
+  // the server refuses to update them. Defense in depth: the UI also keeps
+  // those fields read-only, but this PATCH does not trust the UI.
+  //
+  // Phone is normalized server-side using the same rule as the admin edit
+  // dialog (+ prefix retained, all non-digits stripped) so we have one
+  // shape stored regardless of how the user typed it.
+  //
+  // TODO PR #212: a profile_change_requests table + admin approval flow
+  // for higher-risk fields like address, legal name, and primary contact.
+  // ==========================================================================
+
+  app.patch("/api/me/employee", authMiddleware, (req, res) => {
+    const userId = (req as any).userId as number | undefined;
+    if (!userId) return res.status(401).json({ message: "Unauthorized" });
+    const emp = getEmployeeForUserId(userId);
+    if (!emp) return res.status(404).json({ message: "No linked employee profile" });
+
+    const body = (req.body || {}) as Record<string, unknown>;
+
+    // Hard whitelist. Anything not in this set is dropped, no error returned —
+    // we don't want a misbehaving client to learn which fields exist by
+    // probing for 400s.
+    const SELF_EDITABLE = new Set([
+      "tshirt_size",
+      "emergency_contact_name",
+      "emergency_contact_phone",
+      "emergency_contact_relationship",
+    ]);
+
+    const patch: Partial<Record<string, any>> = {};
+    let droppedAny = false;
+    for (const k of Object.keys(body)) {
+      if (!SELF_EDITABLE.has(k)) {
+        droppedAny = true;
+        continue;
+      }
+      const raw = body[k];
+      const s = raw == null ? "" : String(raw).trim();
+      if (k === "emergency_contact_phone") {
+        // Same normalization the admin dialog uses: keep "+" prefix if
+        // present, strip everything else to digits.
+        patch[k] = s ? ((s.startsWith("+") ? "+" : "") + s.replace(/\D/g, "")) : null;
+      } else if (k === "tshirt_size") {
+        // Validate against the same set the admin dialog offers. Anything
+        // outside the set is rejected so the column doesn't accumulate
+        // free-text junk.
+        const ALLOWED_SIZES = new Set(["XS", "S", "M", "L", "XL", "XXL", "XXXL"]);
+        if (s === "") {
+          patch[k] = null;
+        } else if (ALLOWED_SIZES.has(s.toUpperCase())) {
+          patch[k] = s.toUpperCase();
+        } else {
+          return res.status(400).json({
+            message: `tshirt_size must be one of XS, S, M, L, XL, XXL, XXXL (got ${JSON.stringify(s)})`,
+          });
+        }
+      } else {
+        patch[k] = s === "" ? null : s;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      // Nothing to do — return current state so the client can re-sync.
+      return res.json({ ok: true, employee_id: emp.id, dropped: droppedAny });
+    }
+
+    const updated = updateEmployee(emp.id, patch as any);
+    if (!updated) return res.status(500).json({ message: "Update failed" });
+
+    if (droppedAny) res.setHeader("X-Self-Edit-Dropped", "1");
+
+    // Mirror the GET shape so the client can update its cache directly.
+    const {
+      shopify_staff_member_id: _shop,
+      easyrent_clerk_guid: _ez,
+      ltm_clerk_id: _ltm,
+      adp_employee_id: _adp,
+      commission_rate_pct: _comm,
+      ...safe
+    } = updated as any;
+    const bonusHistory = listSeasonBonusHistoryForEmployee(emp.id);
+    res.json({ employee: safe, bonus_history: bonusHistory });
+  });
+
   // ============================================================================
   // SHOPIFY RECONCILER (PR #R1)
   // ----------------------------------------------------------------------------
