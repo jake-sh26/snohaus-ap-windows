@@ -732,7 +732,7 @@ export const reconLineItems = sqliteTable("recon_line_items", {
 // "unmatched" bucket (no order.user_id fallback by design — forces POS
 // hygiene). assisting_staff_id stores the numeric portion of
 // gid://shopify/StaffMember/<id> so it matches recon_shopify_staff_sales
-// and payroll_employees.shopify_staff_id without further parsing.
+// and payroll_employees.shopify_staff_member_id without further parsing.
 export const reconOrderAssistingStaff = sqliteTable(
   "recon_order_assisting_staff",
   {

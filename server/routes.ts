@@ -11910,7 +11910,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
              FROM recon_order_assisting_staff s
              LEFT JOIN recon_line_items li ON li.id = s.line_item_id
              LEFT JOIN payroll_employees e
-                    ON e.shopify_staff_id = s.assisting_staff_id
+                    ON e.shopify_staff_member_id = s.assisting_staff_id
              WHERE s.order_id = ?
              ORDER BY s.line_item_id, s.assisting_staff_id`,
           )
