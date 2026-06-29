@@ -11614,6 +11614,222 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   );
 
+
+  // PR A_Staff — line-by-line attribution endpoints (read from
+  // v_staff_attributed_sales). These run IN PARALLEL to the ShopifyQL-backed
+  // /by-employee and /orders endpoints above; PR C_Staff will add a
+  // reconciliation that compares the two sums per staff per period.
+  //
+  // Date semantics: filter by event_date (sale date for 'sale' rows,
+  // refund processed_at for 'refund' rows). A sale in March + a refund in
+  // May = +sale lands in March's total, −refund lands in May's total.
+  // This is the activity-date basis Jake pays commission on.
+  app.get(
+    "/api/recon/shopify/staff-sales/by-employee-attributed",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+
+        const { sqlite } = require("./storage");
+
+        // Per-employee rollup. group_key splits unmatched rows by
+        // assisting_staff_id so each unknown Shopify staff member becomes
+        // its own row instead of collapsing into one "(unmatched)" bucket —
+        // same convention as PR #204 on /by-employee.
+        //
+        // sale_amount / refund_amount / net_amount break out the cash flow
+        // so the UI can show "$X gross, ($Y) returns = $Z commission base"
+        // without a separate query.
+        const empRows = sqlite
+          .prepare(
+            `SELECT
+               CASE WHEN v.employee_id IS NULL
+                    THEN 'staff:' || v.assisting_staff_id
+                    ELSE 'emp:'   || v.employee_id
+               END                                                  AS group_key,
+               v.employee_id                                        AS employee_id,
+               MAX(v.assisting_staff_id)                            AS assisting_staff_id,
+               COALESCE(e.full_name, '(unmatched)')                 AS full_name,
+               GROUP_CONCAT(DISTINCT v.assisting_staff_id)          AS shopify_staff_ids,
+               SUM(CASE WHEN v.event_type = 'sale'   THEN v.attributed_amount ELSE 0 END) AS sale_amount,
+               SUM(CASE WHEN v.event_type = 'refund' THEN v.attributed_amount ELSE 0 END) AS refund_amount,
+               SUM(v.attributed_amount)                             AS net_amount,
+               SUM(CASE WHEN v.event_type = 'sale'   THEN 1 ELSE 0 END) AS sale_row_count,
+               SUM(CASE WHEN v.event_type = 'refund' THEN 1 ELSE 0 END) AS refund_row_count,
+               COUNT(DISTINCT v.order_id)                           AS order_count
+             FROM v_staff_attributed_sales v
+             LEFT JOIN payroll_employees e ON e.id = v.employee_id
+             WHERE date(v.event_date) BETWEEN ? AND ?
+             GROUP BY group_key
+             ORDER BY net_amount DESC`,
+          )
+          .all(since, until);
+
+        // Per-entity breakdown. NULL entity = "(unallocated)" — staff member
+        // not yet linked to a payroll_employees row, so we can't bucket the
+        // dollars to a store. PR C_Staff alert will flag these.
+        const entRows = sqlite
+          .prepare(
+            `SELECT
+               CASE WHEN v.employee_id IS NULL
+                    THEN 'staff:' || v.assisting_staff_id
+                    ELSE 'emp:'   || v.employee_id
+               END                                                  AS group_key,
+               v.employee_id,
+               MAX(v.assisting_staff_id)                            AS assisting_staff_id,
+               v.employee_entity_id                                 AS entity_id,
+               COALESCE(en.display_name, en.location, '(unallocated)') AS entity_label,
+               en.location                                          AS entity_location,
+               SUM(CASE WHEN v.event_type = 'sale'   THEN v.attributed_amount ELSE 0 END) AS sale_amount,
+               SUM(CASE WHEN v.event_type = 'refund' THEN v.attributed_amount ELSE 0 END) AS refund_amount,
+               SUM(v.attributed_amount)                             AS net_amount,
+               COUNT(DISTINCT v.order_id)                           AS order_count
+             FROM v_staff_attributed_sales v
+             LEFT JOIN payroll_entities en ON en.id = v.employee_entity_id
+             WHERE date(v.event_date) BETWEEN ? AND ?
+             GROUP BY group_key, v.employee_entity_id
+             ORDER BY net_amount DESC`,
+          )
+          .all(since, until);
+
+        const byEntityForEmp = new Map<string, any[]>();
+        for (const r of entRows as any[]) {
+          const key = String(r.group_key);
+          if (!byEntityForEmp.has(key)) byEntityForEmp.set(key, []);
+          byEntityForEmp.get(key)!.push(r);
+        }
+
+        const employees = (empRows as any[]).map((emp) => {
+          const key = String(emp.group_key);
+          return { ...emp, by_entity: byEntityForEmp.get(key) ?? [] };
+        });
+
+        const totalsRow = sqlite
+          .prepare(
+            `SELECT
+               SUM(CASE WHEN v.event_type = 'sale'   THEN v.attributed_amount ELSE 0 END) AS sale_amount,
+               SUM(CASE WHEN v.event_type = 'refund' THEN v.attributed_amount ELSE 0 END) AS refund_amount,
+               SUM(v.attributed_amount)                             AS net_amount,
+               COUNT(DISTINCT v.order_id)                           AS order_count,
+               COUNT(*)                                             AS row_count
+             FROM v_staff_attributed_sales v
+             WHERE date(v.event_date) BETWEEN ? AND ?`,
+          )
+          .get(since, until);
+
+        res.json({
+          ok: true,
+          source: "v_staff_attributed_sales",
+          since,
+          until,
+          totals: totalsRow,
+          employees,
+        });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+  // Per-event drill-down for the attributed view: every sale and refund row
+  // for one employee × entity over the window. Used by PR C_Staff's recon
+  // alert ("show me the lines behind this employee's $X").
+  app.get(
+    "/api/recon/shopify/staff-sales/orders-attributed",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+        const employeeIdRaw = String(req.query.employee_id ?? "").trim();
+        const entityIdRaw = String(req.query.entity_id ?? "").trim();
+        const assistingStaffIdRaw = String(req.query.assisting_staff_id ?? "").trim();
+        const eventTypeRaw = String(req.query.event_type ?? "").trim();
+
+        const where: string[] = ["date(v.event_date) BETWEEN ? AND ?"];
+        const params: any[] = [since, until];
+
+        if (employeeIdRaw === "_null") {
+          where.push("v.employee_id IS NULL");
+        } else if (employeeIdRaw) {
+          const eid = parseInt(employeeIdRaw, 10);
+          if (!Number.isFinite(eid)) throw new Error("employee_id must be numeric or '_null'");
+          where.push("v.employee_id = ?");
+          params.push(eid);
+        }
+
+        if (assistingStaffIdRaw) {
+          if (!/^\d{1,20}$/.test(assistingStaffIdRaw)) {
+            throw new Error("assisting_staff_id must be a numeric string");
+          }
+          where.push("v.assisting_staff_id = ?");
+          params.push(assistingStaffIdRaw);
+          where.push("v.employee_id IS NULL");
+        }
+
+        if (entityIdRaw) {
+          const xid = parseInt(entityIdRaw, 10);
+          if (!Number.isFinite(xid)) throw new Error("entity_id must be numeric (-1 for unallocated)");
+          if (xid === -1) {
+            where.push("v.employee_entity_id IS NULL");
+          } else {
+            where.push("v.employee_entity_id = ?");
+            params.push(xid);
+          }
+        }
+
+        if (eventTypeRaw === "sale" || eventTypeRaw === "refund") {
+          where.push("v.event_type = ?");
+          params.push(eventTypeRaw);
+        }
+
+        const { sqlite } = require("./storage");
+        const rows = sqlite
+          .prepare(
+            `SELECT
+               v.event_type, v.event_date, v.event_month,
+               v.order_id, v.order_name, v.order_source,
+               v.line_item_id, v.refund_id,
+               v.assisting_staff_id, v.employee_id, v.employee_entity_id,
+               v.units, v.line_quantity, v.share, v.attributed_amount,
+               li.title         AS line_title,
+               li.sku           AS line_sku,
+               li.variant_title AS line_variant_title,
+               COALESCE(en.display_name, en.location) AS entity_label,
+               e.full_name      AS employee_name
+             FROM v_staff_attributed_sales v
+             LEFT JOIN recon_line_items li ON li.id = v.line_item_id
+             LEFT JOIN payroll_entities en ON en.id = v.employee_entity_id
+             LEFT JOIN payroll_employees e ON e.id = v.employee_id
+             WHERE ${where.join(" AND ")}
+             ORDER BY v.event_date DESC, ABS(v.attributed_amount) DESC
+             LIMIT 2000`,
+          )
+          .all(...params);
+        res.json({ ok: true, source: "v_staff_attributed_sales", count: rows.length, rows });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+
   // PR #204 — diagnostic endpoint for the commission matcher.
   //
   // For each distinct Shopify staff id present in recon_shopify_staff_sales,
