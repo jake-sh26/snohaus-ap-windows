@@ -11830,6 +11830,237 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
 
 
+
+  // PR C_Staff — reconciliation between ShopifyQL net_sales and the
+  // line-by-line attributed net (from v_staff_attributed_sales).
+  //
+  // ShopifyQL's recon_shopify_staff_sales is the historical "source of
+  // truth" for commission — it's what Jake's been paying off. The
+  // attributed view is the new line-by-line truth. PR A_Staff verified
+  // the math reconciles on a fixture; this endpoint checks it on real
+  // data, per staff per period.
+  //
+  // Severity is keyed off BOTH absolute delta AND delta_pct so a staff
+  // member with $10 in total sales doesn't get flagged critical for a
+  // $25 absolute delta (they'd never sell enough to make $25 meaningful)
+  // and a high-volume staff member's tiny percentage drift doesn't get
+  // dismissed.
+  //
+  //   ok       → |delta| <= $1                  (within rounding)
+  //   minor    → $1 < |delta| <= $25 AND <= 2%
+  //   warn     → $25 < |delta| <= $100 OR (1% < pct <= 5%)
+  //   critical → |delta| > $100 OR pct > 5%
+  //
+  // Group key matches the convention from /by-employee and
+  // /by-employee-attributed: 'emp:<id>' for matched employees, or
+  // 'staff:<shopify_staff_id>' for unmatched. Joining on that key means
+  // an unmatched bucket on one side and a matched bucket on the other
+  // (which CAN happen if the resolver picked up a new mapping between
+  // ingests) will appear as TWO rows in the recon, with the missing
+  // side null — exactly what we want for forensics.
+  app.get(
+    "/api/recon/shopify/staff-sales/reconciliation",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+
+        const { sqlite } = require("./storage");
+
+        // Left side: ShopifyQL net (recon_shopify_staff_sales).
+        // Same group_key + date filter as /by-employee.
+        const qlRows = sqlite
+          .prepare(
+            `SELECT
+               CASE WHEN s.employee_id IS NULL
+                    THEN 'staff:' || s.assisting_staff_id
+                    ELSE 'emp:'   || s.employee_id
+               END                                                  AS group_key,
+               s.employee_id                                        AS employee_id,
+               MAX(s.assisting_staff_id)                            AS assisting_staff_id,
+               MAX(s.staff_name)                                    AS staff_name,
+               SUM(s.net_sales)                                     AS ql_net,
+               COUNT(DISTINCT s.order_name)                         AS ql_order_count
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             WHERE date(COALESCE(s.occurred_on, o.created_at, s.period_start))
+                   BETWEEN ? AND ?
+             GROUP BY group_key`,
+          )
+          .all(since, until) as any[];
+
+        // Right side: attributed net (v_staff_attributed_sales).
+        // event_date already collapses sale-date + refund-date correctly.
+        const attRows = sqlite
+          .prepare(
+            `SELECT
+               CASE WHEN v.employee_id IS NULL
+                    THEN 'staff:' || v.assisting_staff_id
+                    ELSE 'emp:'   || v.employee_id
+               END                                                  AS group_key,
+               v.employee_id                                        AS employee_id,
+               MAX(v.assisting_staff_id)                            AS assisting_staff_id,
+               SUM(CASE WHEN v.event_type = 'sale'   THEN v.attributed_amount ELSE 0 END) AS att_sale,
+               SUM(CASE WHEN v.event_type = 'refund' THEN v.attributed_amount ELSE 0 END) AS att_refund,
+               SUM(v.attributed_amount)                             AS att_net,
+               COUNT(DISTINCT v.order_id)                           AS att_order_count
+             FROM v_staff_attributed_sales v
+             WHERE date(v.event_date) BETWEEN ? AND ?
+             GROUP BY group_key`,
+          )
+          .all(since, until) as any[];
+
+        // Build a unified map by group_key. A row may exist on one side
+        // and not the other — that's part of the signal.
+        const byKey = new Map<string, any>();
+        for (const r of qlRows) {
+          byKey.set(String(r.group_key), {
+            group_key: r.group_key,
+            employee_id: r.employee_id,
+            assisting_staff_id: r.assisting_staff_id,
+            staff_name: r.staff_name,
+            ql_net: Number(r.ql_net ?? 0),
+            ql_order_count: Number(r.ql_order_count ?? 0),
+            att_sale: 0,
+            att_refund: 0,
+            att_net: null as number | null,
+            att_order_count: 0,
+          });
+        }
+        for (const r of attRows) {
+          const key = String(r.group_key);
+          let entry = byKey.get(key);
+          if (!entry) {
+            entry = {
+              group_key: r.group_key,
+              employee_id: r.employee_id,
+              assisting_staff_id: r.assisting_staff_id,
+              staff_name: null,
+              ql_net: null as number | null,
+              ql_order_count: 0,
+              att_sale: 0,
+              att_refund: 0,
+              att_net: 0,
+              att_order_count: 0,
+            };
+            byKey.set(key, entry);
+          }
+          entry.att_sale = Number(r.att_sale ?? 0);
+          entry.att_refund = Number(r.att_refund ?? 0);
+          entry.att_net = Number(r.att_net ?? 0);
+          entry.att_order_count = Number(r.att_order_count ?? 0);
+        }
+
+        // Resolve human-readable names. payroll_employees.full_name for
+        // matched rows; the ShopifyQL staff_name is already set for QL
+        // rows but may be missing on attribution-only rows (employee
+        // matched but no QL data this period).
+        const employeeIds = Array.from(byKey.values())
+          .map((r) => r.employee_id)
+          .filter((id) => id !== null && id !== undefined);
+        if (employeeIds.length > 0) {
+          const placeholders = employeeIds.map(() => "?").join(",");
+          const empNames = sqlite
+            .prepare(`SELECT id, full_name FROM payroll_employees WHERE id IN (${placeholders})`)
+            .all(...employeeIds) as Array<{ id: number; full_name: string | null }>;
+          const nameById = new Map(empNames.map((e) => [e.id, e.full_name]));
+          for (const entry of Array.from(byKey.values())) {
+            if (entry.employee_id != null) {
+              const resolved = nameById.get(entry.employee_id);
+              if (resolved) entry.staff_name = resolved;
+            }
+          }
+        }
+
+        // Severity classification.
+        const classify = (qlNet: number | null, attNet: number | null) => {
+          if (qlNet == null && attNet == null) return { severity: "ok", delta: 0, delta_pct: 0 };
+          if (qlNet == null) {
+            // Attribution-only: there's commission earned per the new
+            // truth that ShopifyQL doesn't see. Treat as warn-or-worse
+            // depending on size.
+            const a = attNet ?? 0;
+            const abs = Math.abs(a);
+            const severity = abs > 100 ? "critical" : abs > 25 ? "warn" : abs > 1 ? "minor" : "ok";
+            return { severity, delta: -a, delta_pct: a !== 0 ? 100 : 0, ql_missing: true };
+          }
+          if (attNet == null) {
+            // ShopifyQL has data the new view doesn't — that's the
+            // historical backfill gap Jake decided not to chase. Tag it
+            // distinctly so the UI can suppress these from the warn list.
+            return {
+              severity: "no_attribution",
+              delta: qlNet,
+              delta_pct: qlNet !== 0 ? 100 : 0,
+              attribution_missing: true,
+            };
+          }
+          const delta = qlNet - attNet;
+          const abs = Math.abs(delta);
+          const base = Math.max(Math.abs(qlNet), Math.abs(attNet));
+          const pct = base > 0 ? (abs / base) * 100 : 0;
+          let severity = "ok";
+          if (abs > 100 || pct > 5) severity = "critical";
+          else if (abs > 25 || pct > 1) severity = "warn";
+          else if (abs > 1) severity = "minor";
+          return { severity, delta, delta_pct: pct };
+        };
+
+        const rows = Array.from(byKey.values()).map((entry) => {
+          const cls = classify(entry.ql_net, entry.att_net);
+          return { ...entry, ...cls };
+        });
+
+        // Sort: critical > warn > minor > no_attribution > ok, then by
+        // |delta| descending so the biggest dollar problems are at top.
+        const severityRank: Record<string, number> = {
+          critical: 0,
+          warn: 1,
+          minor: 2,
+          no_attribution: 3,
+          ok: 4,
+        };
+        rows.sort((a: any, b: any) => {
+          const sa = severityRank[a.severity] ?? 5;
+          const sb = severityRank[b.severity] ?? 5;
+          if (sa !== sb) return sa - sb;
+          return Math.abs(b.delta ?? 0) - Math.abs(a.delta ?? 0);
+        });
+
+        // Summary counts so the UI can show a quick badge ("3 critical,
+        // 2 warn") without re-scanning.
+        const summary = {
+          critical: rows.filter((r: any) => r.severity === "critical").length,
+          warn: rows.filter((r: any) => r.severity === "warn").length,
+          minor: rows.filter((r: any) => r.severity === "minor").length,
+          no_attribution: rows.filter((r: any) => r.severity === "no_attribution").length,
+          ok: rows.filter((r: any) => r.severity === "ok").length,
+          total_ql_net: rows.reduce((s: number, r: any) => s + (r.ql_net ?? 0), 0),
+          total_att_net: rows.reduce((s: number, r: any) => s + (r.att_net ?? 0), 0),
+        };
+
+        res.json({
+          ok: true,
+          since,
+          until,
+          summary,
+          rows,
+        });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+
   // PR #204 — diagnostic endpoint for the commission matcher.
   //
   // For each distinct Shopify staff id present in recon_shopify_staff_sales,
