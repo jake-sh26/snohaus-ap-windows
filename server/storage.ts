@@ -1975,6 +1975,141 @@ function bootstrapSchema() {
       WHERE li.is_gift_card = 0;
   `);
 
+  // ----- PR A_Staff — v_staff_attributed_sales VIEW -----
+  // The "truth" of per-line, per-staff commission attribution. Rebuilt from the
+  // raw line + refund + attributed-staff tables (NOT from the ShopifyQL dump
+  // table recon_shopify_staff_sales — that's what we reconcile AGAINST, not
+  // FROM).
+  //
+  // Model: TWO ROWS PER ATTRIBUTED UNIT (one when sold, one when refunded).
+  // Commissions are activity-date based: a sale in March hits March's number;
+  // a refund of that sale in May reduces May's number for whoever originally
+  // sold it. That's how ShopifyQL does it and how Jake pays commission.
+  //
+  //   event_type = 'sale'    → positive attributed_amount, dated to
+  //                            COALESCE(li.recognized_at, o.processed_at,
+  //                            o.created_at). Matches v_attributed_sales date
+  //                            logic so the two views reconcile cleanly.
+  //
+  //   event_type = 'refund'  → NEGATIVE attributed_amount, dated to the
+  //                            refund's processed_at. The original sale's
+  //                            staff attribution carries over (clawback hits
+  //                            whoever sold the item, even if they're long
+  //                            gone).
+  //
+  // share = unit_quantity / line.quantity. Refund attribution pro-rates the
+  // refund_line_item.subtotal by that same share — assumes refunds are
+  // uniform across units on a line, which is the safest default when Shopify
+  // doesn't tell us WHICH unit of a qty>1 line came back.
+  //
+  // employee_id resolution mirrors commission-matcher.ts Path 2 — direct
+  // match on payroll_employees.shopify_staff_member_id in BOTH bare-numeric
+  // and gid:// forms (production has both shapes). Path 1 (via
+  // person_external_ids) is not used here because views can't call functions
+  // and the multi-join gets gnarly; the direct fallback covers the same
+  // employees in practice.
+  //
+  // Gift-card lines (li.is_gift_card = 1) are excluded — matches
+  // v_attributed_sales behavior.
+  //
+  // happened_month is the canonical America/New_York month bucket, identical
+  // to v_attributed_sales.
+  sqlite.exec(`
+    CREATE VIEW IF NOT EXISTS v_staff_attributed_sales AS
+      -- Sale events: one row per (line, staff member) at the sale date.
+      SELECT
+        'sale'                                                  AS event_type,
+        s.line_item_id                                          AS line_item_id,
+        li.order_id                                             AS order_id,
+        o.name                                                  AS order_name,
+        o.source_name                                           AS order_source,
+        s.assisting_staff_id                                    AS assisting_staff_id,
+        COALESCE(eb.id, eg.id)                                  AS employee_id,
+        COALESCE(eb.entity_id, eg.entity_id)                    AS employee_entity_id,
+        s.unit_quantity                                         AS units,
+        li.quantity                                             AS line_quantity,
+        CASE WHEN li.quantity > 0
+             THEN (s.unit_quantity * 1.0 / li.quantity)
+             ELSE 0
+        END                                                     AS share,
+        ROUND(
+          COALESCE(
+            li.line_subtotal,
+            (li.price * li.quantity) - COALESCE(li.total_discount, 0),
+            0
+          ) * CASE WHEN li.quantity > 0
+                   THEN (s.unit_quantity * 1.0 / li.quantity)
+                   ELSE 0
+              END,
+          2
+        )                                                       AS attributed_amount,
+        COALESCE(li.recognized_at, o.processed_at, o.created_at) AS event_date,
+        substr(datetime(
+          COALESCE(li.recognized_at, o.processed_at, o.created_at),
+          '-5 hours'), 1, 7)                                    AS event_month,
+        NULL                                                    AS refund_id
+      FROM recon_order_assisting_staff s
+      JOIN recon_line_items li ON li.id = s.line_item_id
+      JOIN recon_orders o      ON o.id  = li.order_id
+      LEFT JOIN payroll_employees eb
+        ON eb.shopify_staff_member_id = s.assisting_staff_id
+      LEFT JOIN payroll_employees eg
+        ON eg.shopify_staff_member_id = 'gid://shopify/StaffMember/' || s.assisting_staff_id
+      WHERE li.is_gift_card = 0
+
+      UNION ALL
+
+      -- Refund events: one row per (refunded line, staff member) at the
+      -- refund date. Amount is NEGATIVE. Pro-rated by the same share the
+      -- staff member had on the original sale.
+      SELECT
+        'refund'                                                AS event_type,
+        s.line_item_id                                          AS line_item_id,
+        rli.order_id                                            AS order_id,
+        o.name                                                  AS order_name,
+        o.source_name                                           AS order_source,
+        s.assisting_staff_id                                    AS assisting_staff_id,
+        COALESCE(eb.id, eg.id)                                  AS employee_id,
+        COALESCE(eb.entity_id, eg.entity_id)                    AS employee_entity_id,
+        -- Units refunded × this staff's share of the original line. Real number
+        -- because share can be fractional.
+        (rli.quantity * CASE WHEN li.quantity > 0
+                             THEN (s.unit_quantity * 1.0 / li.quantity)
+                             ELSE 0
+                        END)                                    AS units,
+        li.quantity                                             AS line_quantity,
+        CASE WHEN li.quantity > 0
+             THEN (s.unit_quantity * 1.0 / li.quantity)
+             ELSE 0
+        END                                                     AS share,
+        -- NEGATIVE: this REDUCES the staff's net sales in the refund period.
+        ROUND(
+          -1.0 * COALESCE(rli.subtotal, 0)
+               * CASE WHEN li.quantity > 0
+                      THEN (s.unit_quantity * 1.0 / li.quantity)
+                      ELSE 0
+                 END,
+          2
+        )                                                       AS attributed_amount,
+        r.processed_at                                          AS event_date,
+        substr(datetime(r.processed_at, '-5 hours'), 1, 7)      AS event_month,
+        rli.refund_id                                           AS refund_id
+      FROM recon_refund_line_items rli
+      JOIN recon_refunds r              ON r.id  = rli.refund_id
+      JOIN recon_line_items li          ON li.id = rli.line_item_id
+      JOIN recon_orders o               ON o.id  = rli.order_id
+      JOIN recon_order_assisting_staff s ON s.line_item_id = rli.line_item_id
+      LEFT JOIN payroll_employees eb
+        ON eb.shopify_staff_member_id = s.assisting_staff_id
+      LEFT JOIN payroll_employees eg
+        ON eg.shopify_staff_member_id = 'gid://shopify/StaffMember/' || s.assisting_staff_id
+      WHERE rli.kind = 'item'
+        AND rli.line_item_id IS NOT NULL
+        AND li.is_gift_card = 0
+        AND r.processed_at IS NOT NULL;
+  `);
+
+
   // ----- Gift cards issued -----
   // The Shopify GC ledger: one row per card created. Used to compute prior-year
   // pro-rata when the card was DIGITAL and is later redeemed. We also store
