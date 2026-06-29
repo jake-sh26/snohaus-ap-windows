@@ -191,7 +191,32 @@ const INVOICE_NUMBER_PATTERNS: RegExp[] = [
   /\binvoice\s*[#:]?\s*\d{3,}/i, // "Invoice #12345", "Invoice 12345", "Invoice: 12345"
 ];
 
+// PR — hard-reject senders/subjects that we know are never AP invoices.
+// Triggered by a flood of JotForm interstore-transfer submissions arriving as
+// PDF attachments from hello@snohaus.com during a June 2026 server outage —
+// these have "Begin a Transfer" subjects, no invoice number, no total, and the
+// LLM was happy to flag them is_real_invoice=false but they still slipped past
+// shouldSendToLlm so we paid for the Claude call every time. Cheaper to block
+// at the gate. Tested independently in gmail.ts and gmail-api.ts; rules MUST
+// stay in sync between the two files.
+function isHardRejectedSender(from: string, subject: string): { rejected: true; reason: string } | null {
+  const fromLc = (from || "").toLowerCase();
+  const subjLc = (subject || "").toLowerCase().replace(/^\s*((fwd|fw|re)\s*:\s*)+/i, "");
+  // Bare email: "Display Name" <foo@bar.com>  →  foo@bar.com
+  const bareMatch = fromLc.match(/<([^@\s>]+@[^@\s>]+)>/) || fromLc.match(/([^@\s<]+@[^@\s>]+)/);
+  const bare = bareMatch ? bareMatch[1].trim() : "";
+  if (bare === "hello@snohaus.com") return { rejected: true, reason: "sender hello@snohaus.com (internal autoresponder, never AP)" };
+  if (/@jotform\.com$/i.test(bare)) return { rejected: true, reason: "sender @jotform.com (form submissions, never AP)" };
+  if (/\b(begin a transfer|transfer\s*form)\b/i.test(subjLc)) return { rejected: true, reason: "subject matches interstore-transfer pattern" };
+  return null;
+}
+
 function shouldSendToLlm(opts: { subject: string; from: string; hasPdfAttachment: boolean; bodySnippet: string }): { ok: boolean; reason: string; matchedKeyword?: string; matchedVendor?: string } {
+  // Hard-reject known non-AP senders/subjects FIRST so we never even fetch
+  // attachments or call Claude for them.
+  const hardReject = isHardRejectedSender(opts.from, opts.subject);
+  if (hardReject) return { ok: false, reason: `hard-reject: ${hardReject.reason}` };
+
   // Hard requirement #1: must have a PDF attachment
   if (!opts.hasPdfAttachment) return { ok: false, reason: "no PDF attachment" };
 
@@ -620,9 +645,16 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
       try {
         const messageId = msg.envelope?.messageId || `uid-${msg.uid}`;
 
-        // Skip already ingested
-        const existing = db.prepare("SELECT id FROM ingested_emails WHERE message_id = ?").get(messageId);
-        if (existing) continue;
+        // Atomic claim: INSERT OR IGNORE acts as a per-message lock so concurrent
+        // pollers (IMAP push + manual + scheduled) cannot both ingest the same
+        // message. The row is filled in below; if another worker beat us to it,
+        // `changes` is 0 and we skip. This closes the race window between the
+        // old SELECT-then-INSERT pattern that produced 66x dupes on Cape May Wicker.
+        const claimNow = new Date().toISOString();
+        const claimRes = db.prepare(
+          `INSERT OR IGNORE INTO ingested_emails (message_id, ingested_at) VALUES (?, ?)`
+        ).run(messageId, claimNow);
+        if (claimRes.changes === 0) continue;
 
         const parsed = await simpleParser(msg.source);
         const attachments = (parsed.attachments || []).filter(
@@ -645,9 +677,8 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
             console.log(`[gmail-stage1] SKIP pdf=${attachments.length} from="${fromShort}" subject="${subjShort}" reason="${stage1.reason}"`);
           }
           // Mark as ingested-and-skipped so we don't re-evaluate
-          db.prepare(`INSERT OR IGNORE INTO ingested_emails (message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids, ingested_at, skipped_count, skip_reasons)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-            messageId, String(msg.uid),
+          db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+            String(msg.uid),
             parsed.subject || null,
             (parsed.from?.text || null),
             (parsed.date?.toISOString() || null),
@@ -655,7 +686,8 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
             null,
             new Date().toISOString(),
             attachments.length || 1,
-            JSON.stringify([`stage1: ${stage1.reason}`])
+            JSON.stringify([`stage1: ${stage1.reason}`]),
+            messageId,
           );
           stage1Skipped++;
           continue;
@@ -670,15 +702,15 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
         if (attachments.length === 0) {
           // No PDF but passed Stage 1 (e.g. text-only invoice like ADP).
           // Future: send body+subject to LLM for text-only parsing. For now, log and skip.
-          db.prepare(`INSERT OR IGNORE INTO ingested_emails (message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids, ingested_at, skipped_count, skip_reasons)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-            messageId, String(msg.uid),
+          db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+            String(msg.uid),
             parsed.subject || null,
             (parsed.from?.text || null),
             (parsed.date?.toISOString() || null),
             0, null, new Date().toISOString(),
             1,
-            JSON.stringify(["text-only invoice, no PDF — deferred (future: LLM-parse from email body)"])
+            JSON.stringify(["text-only invoice, no PDF — deferred (future: LLM-parse from email body)"]),
+            messageId,
           );
           continue;
         }
@@ -694,6 +726,19 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
             const safeName = (attachment.filename || "invoice.pdf").replace(/[^a-zA-Z0-9._\-]/g, "_");
             const filename = `${prefix}_${safeName}`;
             const filePath = path.join(assetsDir, filename);
+
+            // PR — content-hash dedup. Computed BEFORE the LLM call so we never
+            // pay for a Claude parse of a PDF we've already seen. The UNIQUE
+            // partial index on invoices.pdf_hash also enforces this at INSERT
+            // time as a belt-and-suspenders catch for racing pollers.
+            const pdfHash = crypto.createHash("sha256").update(attachment.content).digest("hex");
+            const hashDup = db.prepare(`SELECT id FROM invoices WHERE pdf_hash = ? LIMIT 1`).get(pdfHash) as { id: string } | undefined;
+            if (hashDup) {
+              skipReasonsForEmail.push(`hash-dedup: ${attachment.filename || "(unnamed)"} — matches existing invoice ${hashDup.id}`);
+              skippedCount++;
+              console.log(`[Gmail] hash-dedup: skipping duplicate PDF (matches ${hashDup.id}, hash=${pdfHash.slice(0, 12)})`);
+              continue;
+            }
 
             // Save PDF
             fs.writeFileSync(filePath, attachment.content);
@@ -875,18 +920,19 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
             // For net_with_discount kind the discount is automatic per spec, so
             // flip discount_applied=1 at ingest (mirrors invoice-pipeline.ts).
             const discountAppliedInitial = llmResult?.discount_kind === "net_with_discount" ? 1 : 0;
-            db.prepare(`
-              INSERT OR IGNORE INTO invoices (
-                id, source_file, email_id, email_date, email_from, email_subject,
-                pdf_url, vendor_raw_name, vendor_match_status, vendor_qbo_id, vendor_qbo_name,
-                invoice_number, invoice_date, due_date, total, freight, is_credit,
-                ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
-                created_at, updated_at,
-                document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
-                discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
-                payment_terms
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            `).run(
+            try {
+              db.prepare(`
+                INSERT OR IGNORE INTO invoices (
+                  id, source_file, email_id, email_date, email_from, email_subject,
+                  pdf_url, vendor_raw_name, vendor_match_status, vendor_qbo_id, vendor_qbo_name,
+                  invoice_number, invoice_date, due_date, total, freight, is_credit,
+                  ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
+                  created_at, updated_at,
+                  document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
+                  discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
+                  payment_terms, pdf_hash
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              `).run(
               invoiceId,
               `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
               messageId,
@@ -923,8 +969,22 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               llmResult?.discount_kind ?? null,
               llmResult?.discount_warning ?? null,
               discountAppliedInitial,
-              parsed_data.payment_terms
-            );
+                parsed_data.payment_terms,
+                pdfHash,
+              );
+            } catch (insertErr: any) {
+              // UNIQUE constraint on pdf_hash partial index — another writer beat us
+              // (or we already ingested this PDF with a different message_id). Clean
+              // skip, do not blow up the entire poll.
+              if (insertErr?.code === "SQLITE_CONSTRAINT_UNIQUE" || /UNIQUE constraint failed: invoices\.pdf_hash/i.test(insertErr?.message || "")) {
+                skipReasonsForEmail.push(`hash-dedup-insert: ${attachment.filename || "(unnamed)"} — pdf_hash collision at INSERT`);
+                skippedCount++;
+                try { fs.unlinkSync(filePath); } catch {}
+                console.log(`[Gmail] hash-dedup INSERT-time collision: skipping ${invoiceId} (pdf_hash=${pdfHash.slice(0, 12)})`);
+                continue;
+              }
+              throw insertErr;
+            }
 
             // PR #R4k — mirror the pipeline's line-item persistence so the gmail
             // path doesn't depend on the 8-sec boot-time backfill in storage.ts.
@@ -1009,9 +1069,8 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
         }
 
         // Mark email as ingested
-        db.prepare(`INSERT OR IGNORE INTO ingested_emails (message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids, ingested_at, skipped_count, skip_reasons)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          messageId, String(msg.uid),
+        db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+          String(msg.uid),
           parsed.subject || null,
           (parsed.from?.text || null),
           (parsed.date?.toISOString() || null),
@@ -1019,7 +1078,8 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
           JSON.stringify(invoiceIds),
           new Date().toISOString(),
           skippedCount,
-          skipReasonsForEmail.length ? JSON.stringify(skipReasonsForEmail) : null
+          skipReasonsForEmail.length ? JSON.stringify(skipReasonsForEmail) : null,
+          messageId,
         );
       } catch (msgErr: any) {
         const mMsg = `Message processing error: ${msgErr?.message || String(msgErr)}`;

@@ -482,7 +482,28 @@ function extractFromName(fromText: string): string {
   return ((m ? m[1] : (fromText || "")).toLowerCase() || "").trim();
 }
 
+// PR — hard-reject senders/subjects that we know are never AP invoices.
+// Triggered by a flood of JotForm interstore-transfer submissions arriving as
+// PDF attachments from hello@snohaus.com during a June 2026 server outage —
+// these have "Begin a Transfer" subjects, no invoice number, no total, and the
+// LLM was happy to flag them is_real_invoice=false but they still slipped past
+// shouldSendToLlm so we paid for the Claude call every time. Cheaper to block
+// at the gate. Tested independently in gmail.ts and gmail-api.ts; rules MUST
+// stay in sync between the two files.
+function isHardRejectedSender(from: string, subject: string): { rejected: true; reason: string } | null {
+  const fromLc = (from || "").toLowerCase();
+  const subjLc = (subject || "").toLowerCase().replace(/^\s*((fwd|fw|re)\s*:\s*)+/i, "");
+  const bareMatch = fromLc.match(/<([^@\s>]+@[^@\s>]+)>/) || fromLc.match(/([^@\s<]+@[^@\s>]+)/);
+  const bare = bareMatch ? bareMatch[1].trim() : "";
+  if (bare === "hello@snohaus.com") return { rejected: true, reason: "sender hello@snohaus.com (internal autoresponder, never AP)" };
+  if (/@jotform\.com$/i.test(bare)) return { rejected: true, reason: "sender @jotform.com (form submissions, never AP)" };
+  if (/\b(begin a transfer|transfer\s*form)\b/i.test(subjLc)) return { rejected: true, reason: "subject matches interstore-transfer pattern" };
+  return null;
+}
+
 function shouldSendToLlm(opts: { subject: string; from: string; hasPdfAttachment: boolean; bodySnippet: string }): { ok: boolean; reason: string; matchedKeyword?: string; matchedVendor?: string } {
+  const hardReject = isHardRejectedSender(opts.from, opts.subject);
+  if (hardReject) return { ok: false, reason: `hard-reject: ${hardReject.reason}` };
   if (!opts.hasPdfAttachment) return { ok: false, reason: "no PDF attachment" };
   let subj = (opts.subject || "").toLowerCase();
   subj = subj.replace(/^\s*((fwd|fw|re)\s*:\s*)+/i, "");
@@ -767,9 +788,14 @@ async function processOneGmailMessage(
 
   let newInvoices = 0;
 
-  // Skip already ingested
-  const existing = db.prepare("SELECT id FROM ingested_emails WHERE message_id = ?").get(parsed.messageId);
-  if (existing) return 0;
+  // Atomic claim: INSERT OR IGNORE acts as a per-message lock so concurrent
+  // pollers cannot both ingest the same message. Closes the race window that
+  // produced 66x dupes on the Cape May Wicker email.
+  const claimNow = new Date().toISOString();
+  const claimRes = db.prepare(
+    `INSERT OR IGNORE INTO ingested_emails (message_id, ingested_at) VALUES (?, ?)`
+  ).run(parsed.messageId, claimNow);
+  if (claimRes.changes === 0) return 0;
 
   // Stage 1 pre-filter
   const stage1 = shouldSendToLlm({
@@ -785,9 +811,8 @@ async function processOneGmailMessage(
       const subjShort = parsed.subject.slice(0, 120);
       console.log(`[gmail-stage1] SKIP pdf=${parsed.pdfAttachments.length} from="${fromShort}" subject="${subjShort}" reason="${stage1.reason}"`);
     }
-    db.prepare(`INSERT OR IGNORE INTO ingested_emails (message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids, ingested_at, skipped_count, skip_reasons)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      parsed.messageId, parsed.gmailId,
+    db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+      parsed.gmailId,
       parsed.subject || null,
       parsed.from || null,
       parsed.dateIso,
@@ -795,7 +820,8 @@ async function processOneGmailMessage(
       null,
       new Date().toISOString(),
       parsed.pdfAttachments.length || 1,
-      JSON.stringify([`stage1: ${stage1.reason}`])
+      JSON.stringify([`stage1: ${stage1.reason}`]),
+      parsed.messageId,
     );
     return 0;
   } else if (stage1.reason !== "keyword") {
@@ -807,15 +833,15 @@ async function processOneGmailMessage(
 
   if (parsed.pdfAttachments.length === 0) {
     // Passed Stage 1 but no PDF — log as deferred (text-only invoice).
-    db.prepare(`INSERT OR IGNORE INTO ingested_emails (message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids, ingested_at, skipped_count, skip_reasons)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      parsed.messageId, parsed.gmailId,
+    db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+      parsed.gmailId,
       parsed.subject || null,
       parsed.from || null,
       parsed.dateIso,
       0, null, new Date().toISOString(),
       1,
-      JSON.stringify(["text-only invoice, no PDF — deferred (future: LLM-parse from email body)"])
+      JSON.stringify(["text-only invoice, no PDF — deferred (future: LLM-parse from email body)"]),
+      parsed.messageId,
     );
     return 0;
   }
@@ -830,6 +856,19 @@ async function processOneGmailMessage(
       const safeName = (attachment.filename || "invoice.pdf").replace(/[^a-zA-Z0-9._\-]/g, "_");
       const filename = `${prefix}_${safeName}`;
       const filePath = path.join(assetsDir, filename);
+
+      // PR — content-hash dedup. Computed BEFORE the LLM call so we never
+      // pay for a Claude parse of a PDF we've already seen. The UNIQUE
+      // partial index on invoices.pdf_hash also enforces this at INSERT
+      // time as a belt-and-suspenders catch for racing pollers.
+      const pdfHash = crypto.createHash("sha256").update(attachment.content).digest("hex");
+      const hashDup = db.prepare(`SELECT id FROM invoices WHERE pdf_hash = ? LIMIT 1`).get(pdfHash) as { id: string } | undefined;
+      if (hashDup) {
+        skipReasonsForEmail.push(`hash-dedup: ${attachment.filename || "(unnamed)"} — matches existing invoice ${hashDup.id}`);
+        skippedCount++;
+        console.log(`[gmail-api] hash-dedup: skipping duplicate PDF (matches ${hashDup.id}, hash=${pdfHash.slice(0, 12)})`);
+        continue;
+      }
 
       fs.writeFileSync(filePath, attachment.content);
 
@@ -993,18 +1032,19 @@ async function processOneGmailMessage(
       // dropped every discount field on the floor so Gmail-ingested invoices
       // never showed an early-pay chip until manual reparse.
       const discountAppliedInitial = llmResult?.discount_kind === "net_with_discount" ? 1 : 0;
-      db.prepare(`
-        INSERT OR IGNORE INTO invoices (
-          id, source_file, email_id, email_date, email_from, email_subject,
-          pdf_url, vendor_raw_name, vendor_match_status, vendor_qbo_id, vendor_qbo_name,
-          invoice_number, invoice_date, due_date, total, freight, is_credit,
-          ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
-          created_at, updated_at,
-          document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
-          discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
-          payment_terms
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `).run(
+      try {
+        db.prepare(`
+          INSERT OR IGNORE INTO invoices (
+            id, source_file, email_id, email_date, email_from, email_subject,
+            pdf_url, vendor_raw_name, vendor_match_status, vendor_qbo_id, vendor_qbo_name,
+            invoice_number, invoice_date, due_date, total, freight, is_credit,
+            ship_to_store, parse_confidence, status, routing_mode, routing_data, duplicate_check_status,
+            created_at, updated_at,
+            document_type, store_hint, llm_notes, already_paid, line_items_json, bill_kind,
+            discount_terms_pct, discount_days, discount_due_date, discount_kind, discount_warning, discount_applied,
+            payment_terms, pdf_hash
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
         invoiceId,
         `${prefix}_${safeName.replace(/\.pdf$/i, "")}.txt`,
         parsed.messageId,
@@ -1041,8 +1081,19 @@ async function processOneGmailMessage(
         llmResult?.discount_kind ?? null,
         llmResult?.discount_warning ?? null,
         discountAppliedInitial,
-        parsed_data.payment_terms
-      );
+          parsed_data.payment_terms,
+          pdfHash,
+        );
+      } catch (insertErr: any) {
+        if (insertErr?.code === "SQLITE_CONSTRAINT_UNIQUE" || /UNIQUE constraint failed: invoices\.pdf_hash/i.test(insertErr?.message || "")) {
+          skipReasonsForEmail.push(`hash-dedup-insert: ${attachment.filename || "(unnamed)"} — pdf_hash collision at INSERT`);
+          skippedCount++;
+          try { fs.unlinkSync(filePath); } catch {}
+          console.log(`[gmail-api] hash-dedup INSERT-time collision: skipping ${invoiceId} (pdf_hash=${pdfHash.slice(0, 12)})`);
+          continue;
+        }
+        throw insertErr;
+      }
 
       try {
         if (Array.isArray(llmResult?.line_items) && llmResult.line_items.length > 0) {
@@ -1114,9 +1165,8 @@ async function processOneGmailMessage(
     }
   }
 
-  db.prepare(`INSERT OR IGNORE INTO ingested_emails (message_id, gmail_uid, subject, from_address, date, pdf_count, invoice_ids, ingested_at, skipped_count, skip_reasons)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    parsed.messageId, parsed.gmailId,
+  db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+    parsed.gmailId,
     parsed.subject || null,
     parsed.from || null,
     parsed.dateIso,
@@ -1124,7 +1174,8 @@ async function processOneGmailMessage(
     JSON.stringify(invoiceIds),
     new Date().toISOString(),
     skippedCount,
-    skipReasonsForEmail.length ? JSON.stringify(skipReasonsForEmail) : null
+    skipReasonsForEmail.length ? JSON.stringify(skipReasonsForEmail) : null,
+    parsed.messageId,
   );
 
   return newInvoices;

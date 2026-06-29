@@ -318,6 +318,26 @@ function bootstrapSchema() {
     }
   }
 
+  // PR — content-hash dedup. sha256 of the original attachment bytes; the
+  // UNIQUE partial index ensures that re-ingesting the same PDF (racing
+  // pollers, push + manual poll overlap, or server restart re-fetching the
+  // same Gmail history page) is a hard no-op rather than producing duplicate
+  // rows. NULL is allowed so the column can be backfilled lazily; the
+  // partial WHERE clause means rows without a hash don't collide.
+  // Triggered by a June 2026 outage where one Cape May Wicker email produced
+  // 66 duplicate rows in 109 seconds because the LLM kept timing out and the
+  // existing (invoice_number, total) dedup needed both fields populated.
+  try {
+    sqlite.exec(`ALTER TABLE invoices ADD COLUMN pdf_hash TEXT`);
+  } catch {
+    // already exists
+  }
+  try {
+    sqlite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_pdf_hash ON invoices(pdf_hash) WHERE pdf_hash IS NOT NULL`);
+  } catch {
+    // already exists
+  }
+
   // ============================================================================
   // PAYROLL MODULE TABLES (PR #6)
   // ----------------------------------------------------------------------------
