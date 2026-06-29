@@ -14428,6 +14428,296 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // ============================================================================
+  // PR C — one-shot bulk dedup cleanup (admin only)
+  // ----------------------------------------------------------------------------
+  // Cleans up the existing duplicate cluster that landed BEFORE the PR B
+  // pdf_hash UNIQUE index existed. PR B blocks NEW dupes at ingest; this
+  // endpoint collapses the historical dupes.
+  //
+  // Three phases, idempotent, status='rejected' (NOT DELETE) so the operation
+  // is reversible via the existing /api/invoices/:id/restore endpoint.
+  //
+  //   1. Backfill `pdf_hash` on existing invoices when the source PDF is still
+  //      on disk under private_assets/. Rows whose PDF is missing get NULL
+  //      (they fall through to phase 3's email_id-based grouping).
+  //
+  //   2. JotForm / transfer-form pattern reject — any row matching the same
+  //      rules as PR A's `isHardRejectedSender` (from = hello@snohaus.com,
+  //      from contains @jotform.com, or subject matches the transfer regex)
+  //      gets status='rejected'. ALL of them — no survivor — because these
+  //      are never invoices.
+  //
+  //   3. Content-hash dupe collapse — group invoices by pdf_hash (non-NULL),
+  //      keep the "best" row, reject the rest. Best = oldest (created_at ASC)
+  //      among the rows with the most populated key fields (invoice_number +
+  //      total + vendor_qbo_id all non-null beats those with nulls).
+  //
+  //   4. email_id dupe collapse — same logic but grouped by email_id, applied
+  //      only to rows that still have NULL pdf_hash after phase 1. Catches
+  //      the legacy null-hash clusters from before the index existed.
+  //
+  // Dry-run is the default. Pass `?dry_run=0` (or body { dry_run: false }) to
+  // actually apply. Returns a report either way.
+  app.post("/api/admin/dedup-cleanup", adminMiddleware, async (req, res) => {
+    const rawQ = req.query.dry_run;
+    const rawQStr = Array.isArray(rawQ) ? String(rawQ[0] ?? "") : (typeof rawQ === "string" ? rawQ : "");
+    const dryRunParam = rawQStr || String(req.body?.dry_run ?? "1");
+    const dryRun = dryRunParam !== "0" && dryRunParam !== "false";
+
+    const { sqlite } = require("./storage");
+    const assetsDir = path.resolve(__dirname, "..", "private_assets");
+    const userEmail = (req as any).email || "system";
+
+    type InvRow = {
+      id: string;
+      email_id: string | null;
+      email_from: string | null;
+      email_subject: string | null;
+      invoice_number: string | null;
+      total: number | null;
+      vendor_qbo_id: string | null;
+      vendor_raw_name: string | null;
+      pdf_url: string | null;
+      pdf_hash: string | null;
+      status: string;
+      created_at: string;
+    };
+
+    const errors: string[] = [];
+    const TRANSFER_RE = /\b(begin a transfer|transfer\s*form)\b/i;
+    const isJotformish = (r: InvRow): boolean => {
+      const fromRaw = (r.email_from || "").toLowerCase();
+      // Extract bare address from "Name <addr@host>" or "addr@host"
+      const m = fromRaw.match(/<([^>]+)>/);
+      const bareEmail = (m ? m[1] : fromRaw).trim();
+      if (bareEmail === "hello@snohaus.com") return true;
+      if (fromRaw.includes("@jotform.com")) return true;
+      const subj = (r.email_subject || "").replace(/^\s*(re|fwd|fw):\s*/i, "").trim();
+      if (TRANSFER_RE.test(subj)) return true;
+      return false;
+    };
+
+    // Score for "best" row when collapsing dupes: higher is better.
+    const completenessScore = (r: InvRow): number => {
+      let s = 0;
+      if (r.invoice_number && r.invoice_number.trim()) s += 4;
+      if (r.total != null) s += 4;
+      if (r.vendor_qbo_id) s += 2;
+      if (r.vendor_raw_name && r.vendor_raw_name.trim()) s += 1;
+      // posted_qbo > pending_review > rejected — never collapse onto a rejected survivor
+      if (r.status === "posted_qbo") s += 100;
+      else if (r.status === "pending_review") s += 50;
+      return s;
+    };
+
+    const pickSurvivor = (rows: InvRow[]): InvRow => {
+      // Best by completeness; ties broken by oldest created_at
+      const sorted = [...rows].sort((a, b) => {
+        const sb = completenessScore(b) - completenessScore(a);
+        if (sb !== 0) return sb;
+        return (a.created_at || "").localeCompare(b.created_at || "");
+      });
+      return sorted[0];
+    };
+
+    // ---------- Phase 1: backfill pdf_hash ----------
+    const needsHash = sqlite.prepare(
+      `SELECT id, pdf_url FROM invoices WHERE pdf_hash IS NULL AND status != 'rejected'`
+    ).all() as Array<{ id: string; pdf_url: string | null }>;
+
+    let backfilled = 0;
+    let backfillSkippedMissing = 0;
+    const updateHash = sqlite.prepare(`UPDATE invoices SET pdf_hash = ? WHERE id = ?`);
+
+    for (const row of needsHash) {
+      if (!row.pdf_url) { backfillSkippedMissing++; continue; }
+      // pdf_url is stored as just the filename, e.g. "ab12cd34ef_invoice.pdf"
+      const filePath = path.join(assetsDir, row.pdf_url);
+      try {
+        if (!fs.existsSync(filePath)) { backfillSkippedMissing++; continue; }
+        const buf = fs.readFileSync(filePath);
+        const hash = crypto.createHash("sha256").update(buf).digest("hex");
+        if (!dryRun) {
+          try {
+            updateHash.run(hash, row.id);
+            backfilled++;
+          } catch (e: any) {
+            if (e?.code === "SQLITE_CONSTRAINT_UNIQUE" || /UNIQUE constraint failed: invoices\.pdf_hash/i.test(e?.message || "")) {
+              // Another row already has this hash — that's fine, we'll catch it
+              // in phase 3 via the SELECT below. Leave this row's hash NULL.
+              backfillSkippedMissing++;
+            } else {
+              errors.push(`backfill ${row.id}: ${e?.message || e}`);
+            }
+          }
+        } else {
+          backfilled++;
+        }
+      } catch (e: any) {
+        errors.push(`backfill ${row.id}: ${e?.message || e}`);
+      }
+    }
+
+    // ---------- Phase 2: JotForm / transfer-form reject ----------
+    const candidatesAll = sqlite.prepare(
+      `SELECT id, email_id, email_from, email_subject, invoice_number, total, vendor_qbo_id, vendor_raw_name, pdf_url, pdf_hash, status, created_at
+       FROM invoices
+       WHERE status != 'rejected'`
+    ).all() as InvRow[];
+
+    const jotformTargets = candidatesAll.filter(isJotformish);
+    let jotformRejected = 0;
+    if (!dryRun) {
+      const tx = sqlite.transaction(() => {
+        for (const r of jotformTargets) {
+          const before = { ...r };
+          const after = { ...r, status: "rejected" };
+          sqlite.prepare(`UPDATE invoices SET status = 'rejected', updated_at = ? WHERE id = ?`)
+            .run(new Date().toISOString(), r.id);
+          sqlite.prepare(`INSERT INTO audit_log (invoice_id, action, before, after, user_email, created_at) VALUES (?,?,?,?,?,?)`)
+            .run(r.id, "bulk-cleanup: jotform-transfer-pattern", JSON.stringify(before), JSON.stringify(after), userEmail, new Date().toISOString());
+          jotformRejected++;
+        }
+      });
+      tx();
+    } else {
+      jotformRejected = jotformTargets.length;
+    }
+
+    // Refresh candidates after phase 2 — read pdf_hash fresh too (phase 1 may have backfilled).
+    const remaining = sqlite.prepare(
+      `SELECT id, email_id, email_from, email_subject, invoice_number, total, vendor_qbo_id, vendor_raw_name, pdf_url, pdf_hash, status, created_at
+       FROM invoices
+       WHERE status != 'rejected'`
+    ).all() as InvRow[];
+
+    // ---------- Phase 3: collapse by pdf_hash ----------
+    const hashGroups = new Map<string, InvRow[]>();
+    for (const r of remaining) {
+      if (!r.pdf_hash) continue;
+      if (!hashGroups.has(r.pdf_hash)) hashGroups.set(r.pdf_hash, []);
+      hashGroups.get(r.pdf_hash)!.push(r);
+    }
+
+    let hashDupesRejected = 0;
+    const hashSurvivors: string[] = [];
+    if (!dryRun) {
+      const tx = sqlite.transaction(() => {
+        for (const [hash, rows] of Array.from(hashGroups.entries())) {
+          if (rows.length < 2) continue;
+          const survivor = pickSurvivor(rows);
+          hashSurvivors.push(survivor.id);
+          for (const r of rows) {
+            if (r.id === survivor.id) continue;
+            const before = { ...r };
+            const after = { ...r, status: "rejected" };
+            sqlite.prepare(`UPDATE invoices SET status = 'rejected', updated_at = ? WHERE id = ?`)
+              .run(new Date().toISOString(), r.id);
+            sqlite.prepare(`INSERT INTO audit_log (invoice_id, action, before, after, user_email, created_at) VALUES (?,?,?,?,?,?)`)
+              .run(r.id, `bulk-cleanup: hash-dupe (survivor=${survivor.id}, hash=${hash.slice(0, 12)})`, JSON.stringify(before), JSON.stringify(after), userEmail, new Date().toISOString());
+            hashDupesRejected++;
+          }
+        }
+      });
+      tx();
+    } else {
+      for (const [, rows] of Array.from(hashGroups.entries())) {
+        if (rows.length < 2) {
+          if (rows.length === 1) hashSurvivors.push(rows[0].id);
+          continue;
+        }
+        const survivor = pickSurvivor(rows);
+        hashSurvivors.push(survivor.id);
+        hashDupesRejected += rows.length - 1;
+      }
+    }
+
+    // ---------- Phase 4: collapse remaining null-hash by email_id ----------
+    const afterPhase3 = sqlite.prepare(
+      `SELECT id, email_id, email_from, email_subject, invoice_number, total, vendor_qbo_id, vendor_raw_name, pdf_url, pdf_hash, status, created_at
+       FROM invoices
+       WHERE status != 'rejected' AND (pdf_hash IS NULL OR pdf_hash = '')`
+    ).all() as InvRow[];
+
+    const emailGroups = new Map<string, InvRow[]>();
+    for (const r of afterPhase3) {
+      if (!r.email_id) continue;
+      if (!emailGroups.has(r.email_id)) emailGroups.set(r.email_id, []);
+      emailGroups.get(r.email_id)!.push(r);
+    }
+
+    let emailDupesRejected = 0;
+    const emailSurvivors: string[] = [];
+    if (!dryRun) {
+      const tx = sqlite.transaction(() => {
+        for (const [emailId, rows] of Array.from(emailGroups.entries())) {
+          if (rows.length < 2) continue;
+          const survivor = pickSurvivor(rows);
+          emailSurvivors.push(survivor.id);
+          for (const r of rows) {
+            if (r.id === survivor.id) continue;
+            const before = { ...r };
+            const after = { ...r, status: "rejected" };
+            sqlite.prepare(`UPDATE invoices SET status = 'rejected', updated_at = ? WHERE id = ?`)
+              .run(new Date().toISOString(), r.id);
+            sqlite.prepare(`INSERT INTO audit_log (invoice_id, action, before, after, user_email, created_at) VALUES (?,?,?,?,?,?)`)
+              .run(r.id, `bulk-cleanup: email-id-dupe (survivor=${survivor.id}, email_id=${emailId.slice(0, 40)})`, JSON.stringify(before), JSON.stringify(after), userEmail, new Date().toISOString());
+            emailDupesRejected++;
+          }
+        }
+      });
+      tx();
+    } else {
+      for (const [, rows] of Array.from(emailGroups.entries())) {
+        if (rows.length < 2) {
+          if (rows.length === 1) emailSurvivors.push(rows[0].id);
+          continue;
+        }
+        const survivor = pickSurvivor(rows);
+        emailSurvivors.push(survivor.id);
+        emailDupesRejected += rows.length - 1;
+      }
+    }
+
+    // Final inbox count
+    const remainingPending = (sqlite.prepare(
+      `SELECT COUNT(*) AS c FROM invoices WHERE status = 'pending_review'`
+    ).get() as { c: number }).c;
+
+    res.json({
+      dry_run: dryRun,
+      phase1_pdf_hash_backfill: {
+        candidates: needsHash.length,
+        backfilled,
+        skipped_missing_pdf: backfillSkippedMissing,
+      },
+      phase2_jotform_reject: {
+        rejected: jotformRejected,
+      },
+      phase3_hash_dupe_collapse: {
+        groups: Array.from(hashGroups.values()).filter((g) => g.length >= 2).length,
+        rejected: hashDupesRejected,
+        survivors: hashSurvivors.length,
+      },
+      phase4_email_id_dupe_collapse: {
+        groups: Array.from(emailGroups.values()).filter((g) => g.length >= 2).length,
+        rejected: emailDupesRejected,
+        survivors: emailSurvivors.length,
+      },
+      totals: {
+        rejected_total: jotformRejected + hashDupesRejected + emailDupesRejected,
+        pending_review_after: dryRun
+          ? remainingPending - (jotformRejected + hashDupesRejected + emailDupesRejected)
+          : remainingPending,
+      },
+      errors,
+      note: dryRun
+        ? "DRY RUN — no rows were changed. Re-call with ?dry_run=0 to apply."
+        : "Applied. Use POST /api/invoices/:id/restore to reverse a specific row.",
+    });
+  });
+
   // ===== Feature 5: Users Routes (admin only) =====
 
   app.get("/api/users", adminMiddleware, (req, res) => {
