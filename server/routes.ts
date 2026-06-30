@@ -12323,10 +12323,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             return { classification: "unexplained", delta: -attNet };
           }
           if (qlNet != null && attNet == null) {
-            // QL has data the view doesn't. For staff:0 rows on an order
-            // that's already classified as refund_strip on the emp:X side,
-            // this IS the same refund — flag it as refund_strip so the
-            // worklist doesn't double-count the same dollars.
+            // QL has data the view doesn't. Three sub-patterns:
+            //   (a) staff:0 row on an order already classified as
+            //       refund_strip on the emp:X side — same refund, paired.
+            //   (b) emp:X row where QL credits a refund directly to an
+            //       employee but our view has NO events for this order in
+            //       window. This is the "pre-ingest refund" pattern: the
+            //       original sale (and its line_items) predates our webhook
+            //       ingest start, so the view's refund branch can't join
+            //       back to the original assisting_staff_id. ShopifyQL got
+            //       it right (no refund-strip), we're just blind to it
+            //       until Backfill_Staff fills in historical line_items.
+            //   (c) anything else — backfill gap on emp:X, or the
+            //       cashier-didn't-tag bucket on staff:0.
             if (
               entry.group_key === "staff:0" &&
               stripOrders.has(entry.order_name) &&
@@ -12334,9 +12343,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             ) {
               return { classification: "shopify_refund_strip", delta: qlNet };
             }
-            // Otherwise: for emp:X rows it's a backfill gap; for staff:0
-            // rows on non-strip orders it's the cashier-didn't-tag bucket
-            // (true unattributed sales).
+            if (
+              entry.employee_id != null &&
+              isClose(entry.ql_sale ?? 0, 0) &&
+              (entry.ql_refund ?? 0) < -EPS
+            ) {
+              return { classification: "pre_ingest_refund", delta: qlNet };
+            }
             return { classification: "unexplained", delta: qlNet };
           }
           // Both sides present.
@@ -12384,8 +12397,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // shopify_refund_strip (worst dollars first), then matches.
         const classRank: Record<string, number> = {
           unexplained: 0,
-          shopify_refund_strip: 1,
-          match: 2,
+          pre_ingest_refund: 1,
+          shopify_refund_strip: 2,
+          match: 3,
         };
         rows.sort((a: any, b: any) => {
           const ca = classRank[a.classification] ?? 3;
@@ -12415,6 +12429,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             order_count: (ordersByClass.get("unexplained") ?? new Set()).size,
             total_abs_delta: allRows
               .filter((r) => r.classification === "unexplained")
+              .reduce((s, r) => s + Math.abs(r.delta ?? 0), 0),
+          },
+          pre_ingest_refund: {
+            row_count: allRows.filter((r) => r.classification === "pre_ingest_refund").length,
+            order_count: (ordersByClass.get("pre_ingest_refund") ?? new Set()).size,
+            total_abs_delta: allRows
+              .filter((r) => r.classification === "pre_ingest_refund")
               .reduce((s, r) => s + Math.abs(r.delta ?? 0), 0),
           },
           shopify_refund_strip: {
