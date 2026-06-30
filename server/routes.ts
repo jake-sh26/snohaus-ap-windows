@@ -12061,6 +12061,348 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
 
 
+  // PR D4_Staff — order-level reconciliation worklist.
+  //
+  // The employee-level /reconciliation endpoint is a summary view; this one
+  // is the drill-down worklist Jake actually adjudicates. For each (order,
+  // employee_or_unmatched_staff) pair in the window it returns:
+  //   - ql_net   (ShopifyQL's view of that staff member's net on that order)
+  //   - att_net  (our v_staff_attributed_sales view of the same)
+  //   - delta and a classification.
+  //
+  // Classifications:
+  //   - "match":                ql and view agree, no action
+  //   - "shopify_refund_strip": refund event where QL has the refund credited
+  //                             to staff:0/null but our view recovered the
+  //                             assisting staff via the original line item.
+  //                             This is the known Shopify bug — we surface it
+  //                             so Jake can spot-check that the bug is still
+  //                             present, but it's tagged so the UI can render
+  //                             it visually distinct (yellow/info, not red).
+  //   - "unexplained":          everything else — a real flag for Jake to
+  //                             eyeball.
+  //
+  // Commissions pay off the view, which is the accurate side. This endpoint
+  // exists purely to give Jake a worklist of orders where QL disagrees with
+  // the view so he can adjudicate whether Shopify is wrong (most of the time)
+  // or our DB is wrong (the rare case we need to fix).
+  app.get(
+    "/api/recon/shopify/staff-sales/order-worklist",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+
+        // Optional classification filter, e.g. ?classification=unexplained
+        // or ?classification=shopify_refund_strip. Empty = return all
+        // (including 'match' if include_matches=1 is also set).
+        const classificationFilter = String(req.query.classification ?? "").trim();
+        const includeMatches = String(req.query.include_matches ?? "") === "1";
+
+        const { sqlite } = require("./storage");
+
+        // Left side: per-order ShopifyQL totals, keyed by (order_name,
+        // group_key). group_key follows the same convention as the summary
+        // endpoint so a worklist row can be joined to a /reconciliation row
+        // by the caller if needed.
+        const qlRows = sqlite
+          .prepare(
+            `SELECT
+               s.order_name                                         AS order_name,
+               CASE WHEN s.employee_id IS NULL
+                    THEN 'staff:' || s.assisting_staff_id
+                    ELSE 'emp:'   || s.employee_id
+               END                                                  AS group_key,
+               s.employee_id                                        AS employee_id,
+               MAX(s.assisting_staff_id)                            AS assisting_staff_id,
+               MAX(s.staff_name)                                    AS staff_name,
+               SUM(s.net_sales)                                     AS ql_net,
+               SUM(CASE WHEN s.net_sales >= 0 THEN s.net_sales ELSE 0 END) AS ql_sale,
+               SUM(CASE WHEN s.net_sales <  0 THEN s.net_sales ELSE 0 END) AS ql_refund
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             WHERE date(COALESCE(s.occurred_on, o.created_at, s.period_start))
+                   BETWEEN ? AND ?
+               AND s.order_name IS NOT NULL
+             GROUP BY s.order_name, group_key`,
+          )
+          .all(since, until) as any[];
+
+        // Right side: per-order attributed totals, keyed by (order_name,
+        // group_key). Split into sale/refund so the classifier can detect
+        // the refund-strip case precisely.
+        const attRows = sqlite
+          .prepare(
+            `SELECT
+               v.order_name                                         AS order_name,
+               CASE WHEN v.employee_id IS NULL
+                    THEN 'staff:' || v.assisting_staff_id
+                    ELSE 'emp:'   || v.employee_id
+               END                                                  AS group_key,
+               v.employee_id                                        AS employee_id,
+               MAX(v.assisting_staff_id)                            AS assisting_staff_id,
+               SUM(CASE WHEN v.event_type = 'sale'   THEN v.attributed_amount ELSE 0 END) AS att_sale,
+               SUM(CASE WHEN v.event_type = 'refund' THEN v.attributed_amount ELSE 0 END) AS att_refund,
+               SUM(v.attributed_amount)                             AS att_net,
+               SUM(CASE WHEN v.event_type = 'refund' THEN 1 ELSE 0 END) AS att_refund_event_count,
+               SUM(CASE WHEN v.event_type = 'sale'   THEN 1 ELSE 0 END) AS att_sale_event_count
+             FROM v_staff_attributed_sales v
+             WHERE date(v.event_date) BETWEEN ? AND ?
+               AND v.order_name IS NOT NULL
+             GROUP BY v.order_name, group_key`,
+          )
+          .all(since, until) as any[];
+
+        // Also pull the per-order "is there ANY QL row for staff:0 on this
+        // order in this window" signal, so we can detect the refund-strip
+        // pattern: view has attribution for emp:X on order Y, AND QL has a
+        // negative net for staff:0 on the same order Y.
+        const qlStaff0ByOrder = new Map<string, number>();
+        for (const r of qlRows) {
+          if (String(r.group_key) === "staff:0") {
+            qlStaff0ByOrder.set(String(r.order_name), Number(r.ql_net ?? 0));
+          }
+        }
+
+        type Row = {
+          order_name: string;
+          group_key: string;
+          employee_id: number | null;
+          assisting_staff_id: string | null;
+          staff_name: string | null;
+          ql_net: number | null;
+          ql_sale: number | null;
+          ql_refund: number | null;
+          att_sale: number;
+          att_refund: number;
+          att_net: number | null;
+          att_refund_event_count: number;
+          att_sale_event_count: number;
+        };
+
+        const byKey = new Map<string, Row>();
+        const keyOf = (orderName: string, groupKey: string) => `${orderName}\u0000${groupKey}`;
+
+        for (const r of qlRows) {
+          const k = keyOf(String(r.order_name), String(r.group_key));
+          byKey.set(k, {
+            order_name: String(r.order_name),
+            group_key: String(r.group_key),
+            employee_id: r.employee_id ?? null,
+            assisting_staff_id: r.assisting_staff_id ?? null,
+            staff_name: r.staff_name ?? null,
+            ql_net: Number(r.ql_net ?? 0),
+            ql_sale: Number(r.ql_sale ?? 0),
+            ql_refund: Number(r.ql_refund ?? 0),
+            att_sale: 0,
+            att_refund: 0,
+            att_net: null,
+            att_refund_event_count: 0,
+            att_sale_event_count: 0,
+          });
+        }
+        for (const r of attRows) {
+          const k = keyOf(String(r.order_name), String(r.group_key));
+          let entry = byKey.get(k);
+          if (!entry) {
+            entry = {
+              order_name: String(r.order_name),
+              group_key: String(r.group_key),
+              employee_id: r.employee_id ?? null,
+              assisting_staff_id: r.assisting_staff_id ?? null,
+              staff_name: null,
+              ql_net: null,
+              ql_sale: null,
+              ql_refund: null,
+              att_sale: 0,
+              att_refund: 0,
+              att_net: 0,
+              att_refund_event_count: 0,
+              att_sale_event_count: 0,
+            };
+            byKey.set(k, entry);
+          }
+          entry.att_sale = Number(r.att_sale ?? 0);
+          entry.att_refund = Number(r.att_refund ?? 0);
+          entry.att_net = Number(r.att_net ?? 0);
+          entry.att_refund_event_count = Number(r.att_refund_event_count ?? 0);
+          entry.att_sale_event_count = Number(r.att_sale_event_count ?? 0);
+        }
+
+        // Resolve names for employee rows from payroll_employees.
+        const employeeIds = Array.from(byKey.values())
+          .map((r) => r.employee_id)
+          .filter((id): id is number => id !== null && id !== undefined);
+        if (employeeIds.length > 0) {
+          const placeholders = employeeIds.map(() => "?").join(",");
+          const empNames = sqlite
+            .prepare(`SELECT id, full_name FROM payroll_employees WHERE id IN (${placeholders})`)
+            .all(...employeeIds) as Array<{ id: number; full_name: string | null }>;
+          const nameById = new Map(empNames.map((e) => [e.id, e.full_name]));
+          for (const entry of Array.from(byKey.values())) {
+            if (entry.employee_id != null && !entry.staff_name) {
+              const resolved = nameById.get(entry.employee_id);
+              if (resolved) entry.staff_name = resolved;
+            }
+          }
+        }
+
+        // Classify per row.
+        //
+        // The "shopify_refund_strip" detector is intentionally precise:
+        //   - the entry must be on the emp:X side (we successfully linked
+        //     to a payroll employee via the assisting_staff_id lookup)
+        //   - att_refund must be < 0 (there's a refund attributed to this
+        //     employee via the line-item lookup)
+        //   - att_sale must equal ql_net (the sale side matches QL — i.e.
+        //     QL didn't mis-credit the sale, only the refund)
+        //   - AND the same order has a staff:0 negative entry on QL whose
+        //     magnitude is at least as large as our att_refund magnitude
+        //     (the missing money has to actually be sitting in staff:0).
+        //
+        // That last predicate is what makes this a structural match for the
+        // Shopify refund-strip bug, not a "well it might be" guess.
+        const EPS = 0.01;
+        const isClose = (a: number, b: number) => Math.abs(a - b) < EPS;
+
+        const classifyRow = (entry: Row): { classification: string; delta: number } => {
+          const qlNet = entry.ql_net;
+          const attNet = entry.att_net;
+
+          if (qlNet == null && attNet == null) {
+            return { classification: "match", delta: 0 };
+          }
+          if (qlNet == null && attNet != null) {
+            // Attribution exists but QL has no row for this (order, group).
+            // For an emp:X with att_refund<0 and att_sale==0, this is the
+            // refund-strip pattern viewed from the side where QL never
+            // wrote the refund under this employee at all.
+            if (
+              entry.employee_id != null &&
+              entry.att_refund < -EPS &&
+              isClose(entry.att_sale, 0)
+            ) {
+              const ql0 = qlStaff0ByOrder.get(entry.order_name) ?? 0;
+              if (ql0 <= entry.att_refund + EPS) {
+                return { classification: "shopify_refund_strip", delta: -attNet };
+              }
+            }
+            return { classification: "unexplained", delta: -attNet };
+          }
+          if (qlNet != null && attNet == null) {
+            // QL has data the view doesn't. For emp:X rows this means an
+            // employee we know about wasn't credited by the view — almost
+            // always a backfill gap. For staff:0 rows it's the truly
+            // unattributed bucket (cashier didn't tag staff at ring-up).
+            return { classification: "unexplained", delta: qlNet };
+          }
+          // Both sides present.
+          const delta = (qlNet as number) - (attNet as number);
+          if (Math.abs(delta) < EPS) {
+            return { classification: "match", delta };
+          }
+          // Refund-strip with both sides present: the employee's sale leg
+          // matches QL, the entire delta is the missing refund, AND that
+          // refund is sitting in this order's staff:0 bucket on QL.
+          if (
+            entry.employee_id != null &&
+            entry.att_refund < -EPS &&
+            isClose(entry.att_sale, qlNet as number)
+          ) {
+            const ql0 = qlStaff0ByOrder.get(entry.order_name) ?? 0;
+            if (ql0 <= entry.att_refund + EPS) {
+              return { classification: "shopify_refund_strip", delta };
+            }
+          }
+          return { classification: "unexplained", delta };
+        };
+
+        let rows = Array.from(byKey.values()).map((entry) => {
+          const cls = classifyRow(entry);
+          return { ...entry, ...cls };
+        });
+
+        // Filtering. By default we drop 'match' rows (the worklist is
+        // exceptions only). include_matches=1 keeps them for debugging.
+        if (!includeMatches) {
+          rows = rows.filter((r) => r.classification !== "match");
+        }
+        if (classificationFilter) {
+          rows = rows.filter((r) => r.classification === classificationFilter);
+        }
+
+        // Sort: unexplained first (worst dollars first), then
+        // shopify_refund_strip (worst dollars first), then matches.
+        const classRank: Record<string, number> = {
+          unexplained: 0,
+          shopify_refund_strip: 1,
+          match: 2,
+        };
+        rows.sort((a: any, b: any) => {
+          const ca = classRank[a.classification] ?? 3;
+          const cb = classRank[b.classification] ?? 3;
+          if (ca !== cb) return ca - cb;
+          const da = Math.abs(a.delta ?? 0);
+          const db = Math.abs(b.delta ?? 0);
+          if (da !== db) return db - da;
+          // Stable-ish tiebreak.
+          return String(a.order_name).localeCompare(String(b.order_name));
+        });
+
+        // Summary: counts and totals by classification, plus a per-order
+        // rollup so the UI can show "12 orders need review".
+        const allRows = Array.from(byKey.values()).map((entry) => ({
+          ...entry,
+          ...classifyRow(entry),
+        }));
+        const ordersByClass = new Map<string, Set<string>>();
+        for (const r of allRows) {
+          if (!ordersByClass.has(r.classification)) ordersByClass.set(r.classification, new Set());
+          ordersByClass.get(r.classification)!.add(r.order_name);
+        }
+        const summary = {
+          unexplained: {
+            row_count: allRows.filter((r) => r.classification === "unexplained").length,
+            order_count: (ordersByClass.get("unexplained") ?? new Set()).size,
+            total_abs_delta: allRows
+              .filter((r) => r.classification === "unexplained")
+              .reduce((s, r) => s + Math.abs(r.delta ?? 0), 0),
+          },
+          shopify_refund_strip: {
+            row_count: allRows.filter((r) => r.classification === "shopify_refund_strip").length,
+            order_count: (ordersByClass.get("shopify_refund_strip") ?? new Set()).size,
+            total_abs_delta: allRows
+              .filter((r) => r.classification === "shopify_refund_strip")
+              .reduce((s, r) => s + Math.abs(r.delta ?? 0), 0),
+          },
+          match: {
+            row_count: allRows.filter((r) => r.classification === "match").length,
+            order_count: (ordersByClass.get("match") ?? new Set()).size,
+          },
+        };
+
+        res.json({
+          ok: true,
+          since,
+          until,
+          summary,
+          rows,
+        });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+
 
   // PR D_Staff — diagnostic endpoints to drive Jake's manual cleanup of the
   // staff-sales reconciliation. Two questions to answer:
