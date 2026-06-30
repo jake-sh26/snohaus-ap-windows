@@ -622,14 +622,40 @@ function IntegrationErrorLogPanel({
 
 export default function Settings() {
   const { email, logout, role } = useAuth();
+  const isAdmin = role === "admin";
+
+  // PR #238 — Settings reorg.
+  //
+  // Previously the page was a flat stack of ~9 Cards. With RBAC, integrations,
+  // backups, archive, and service logs all living here it grew long enough
+  // that locating any one section meant scrolling past the others. This
+  // refactor groups them into 3 tabs that mirror how the operator thinks
+  // about the page:
+  //
+  //   1. Users & Permissions — who can sign in + what they can do
+  //   2. Integrations        — external services + allowlist
+  //   3. Backups & Service   — backups, PDF archive, live service logs
+  //
+  // The Sign-in/Sign-out card stays above the tab strip so logout is always
+  // one click from /settings regardless of which tab is active.
+  //
+  // Skip Senders moved out entirely — it governs AP email intake, so it now
+  // lives as the 4th tab on /accounts-payable/settings (next to Vendor Rules,
+  // Aliases, Vendor Groups). See client/src/pages/accounts-payable/SkipSenders.tsx.
+  //
+  // Tabs Users & Permissions and Backups & Service are admin-only. Non-admin
+  // operators landing on /settings see only the Sign-in card + Integrations
+  // tab (TabsList itself is hidden for them so the page doesn't show empty
+  // restricted tabs).
 
   return (
-    <div className="px-8 pt-6 pb-12 max-w-[800px] mx-auto">
+    <div className="px-8 pt-6 pb-12 max-w-[900px] mx-auto">
       <h1 className="text-xl font-semibold tracking-tight mb-1">Settings</h1>
       <p className="text-sm text-muted-foreground mb-6">Account, integrations, and configuration.</p>
 
-      {/* Account card */}
-      <Card className="border-card-border p-5 mb-4">
+      {/* Account card — always visible above the tab strip so the user can
+          sign out from /settings no matter which tab is selected. */}
+      <Card className="border-card-border p-5 mb-6">
         <div className="flex items-center gap-3 mb-1">
           <Mail className="size-4 text-muted-foreground" />
           <div className="text-sm font-medium">Signed in</div>
@@ -640,125 +666,137 @@ export default function Settings() {
         </Button>
       </Card>
 
-      {/* Integrations */}
-      <Card className="border-card-border p-5 mb-4">
-        <div className="flex items-center gap-3 mb-4">
-          <BookOpenCheck className="size-4 text-muted-foreground" />
-          <div className="text-sm font-medium">Integrations</div>
-        </div>
-        <Tabs defaultValue="qbo">
-          <TabsList className="grid grid-cols-3 w-full mb-4">
-            <TabsTrigger value="qbo" data-testid="tab-qbo">QuickBooks Online</TabsTrigger>
-            <TabsTrigger value="gmail" data-testid="tab-gmail">Gmail Invoice Intake</TabsTrigger>
-            <TabsTrigger value="acumatica" data-testid="tab-acumatica">Acumatica</TabsTrigger>
+      <Tabs defaultValue={isAdmin ? "users" : "integrations"}>
+        {/* Hide TabsList for non-admins (only Integrations would be there).
+            For admins, show all 3 with equal-width grid. */}
+        {isAdmin && (
+          <TabsList className="grid grid-cols-3 w-full mb-6">
+            <TabsTrigger value="users" data-testid="tab-settings-users">
+              <Users className="size-3.5 mr-1.5" />
+              Users &amp; Permissions
+            </TabsTrigger>
+            <TabsTrigger value="integrations" data-testid="tab-settings-integrations">
+              <BookOpenCheck className="size-3.5 mr-1.5" />
+              Integrations
+            </TabsTrigger>
+            <TabsTrigger value="backups" data-testid="tab-settings-backups">
+              <Database className="size-3.5 mr-1.5" />
+              Backups &amp; Service
+            </TabsTrigger>
           </TabsList>
-          <TabsContent value="qbo">
-            <QboSection />
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Tab 1: Users & Permissions — admin-only                            */}
+        {/* ------------------------------------------------------------------ */}
+        {isAdmin && (
+          <TabsContent value="users" className="space-y-4 mt-0">
+            <Card className="border-card-border p-5">
+              <div className="flex items-center gap-3 mb-2">
+                <Users className="size-4 text-muted-foreground" />
+                <div className="text-sm font-medium">Users</div>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                Manage who can access Sno-Haus Ops Hub. Admin-only.
+              </p>
+              <UsersSection />
+            </Card>
+
+            <Card className="border-card-border p-5">
+              <div className="flex items-center gap-3 mb-2">
+                <Shield className="size-4 text-muted-foreground" />
+                <div className="text-sm font-medium">Access Control</div>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                Define roles (groups of permissions) and assign them to users
+                per entity. Owner gets everything by default. Use ADP Exporter
+                for staff who should be able to export payroll CSVs without
+                seeing underlying invoice data.
+              </p>
+              <AccessControlSection />
+            </Card>
           </TabsContent>
-          <TabsContent value="gmail">
-            <GmailSection />
-          </TabsContent>
-          <TabsContent value="acumatica">
-            <AcumaticaSection />
-          </TabsContent>
-        </Tabs>
-      </Card>
+        )}
 
-      {/* Allowlist card */}
-      <Card className="border-card-border p-5">
-        <div className="flex items-center gap-3 mb-2">
-          <Shield className="size-4 text-muted-foreground" />
-          <div className="text-sm font-medium">Allowlisted emails</div>
-        </div>
-        <p className="text-xs text-muted-foreground mb-3">
-          Only these accounts can sign in. Edit <code className="bg-muted px-1 rounded">ALLOWED_EMAILS</code> in <code className="bg-muted px-1 rounded">.env</code> to change.
-        </p>
-        <AllowedEmailsList />
-      </Card>
-
-      {/* Skip Senders card (Round 6) */}
-      <Card className="border-card-border p-5 mt-4">
-        <div className="flex items-center gap-3 mb-2">
-          <Ban className="size-4 text-muted-foreground" />
-          <div className="text-sm font-medium">Skip Senders</div>
-        </div>
-        <p className="text-xs text-muted-foreground mb-3">
-          Senders on this list have their emails auto-rejected before any AP processing. Use for monthly subscriptions, utilities on auto-pay, and other senders that don’t need review. You can add a sender directly from any invoice via the drawer’s <span className="font-medium">Skip sender…</span> button.
-        </p>
-        <SkipSendersList />
-      </Card>
-
-      {/* Vendor Groups moved to Accounts Payable → Settings → Vendor Groups
-          (AP Settings hub). Implementation lives at
-          client/src/pages/accounts-payable/VendorGroups.tsx. */}
-
-      {/* Admin-only sections */}
-      {role === "admin" && (
-        <>
-          {/* Users card */}
-          <Card className="border-card-border p-5 mt-4">
-            <div className="flex items-center gap-3 mb-2">
-              <Users className="size-4 text-muted-foreground" />
-              <div className="text-sm font-medium">Users</div>
+        {/* ------------------------------------------------------------------ */}
+        {/* Tab 2: Integrations                                                */}
+        {/* ------------------------------------------------------------------ */}
+        <TabsContent value="integrations" className="space-y-4 mt-0">
+          <Card className="border-card-border p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <BookOpenCheck className="size-4 text-muted-foreground" />
+              <div className="text-sm font-medium">Integrations</div>
             </div>
-            <p className="text-xs text-muted-foreground mb-3">
-              Manage who can access Sno-Haus Ops Hub. Admin-only.
-            </p>
-            <UsersSection />
+            <Tabs defaultValue="qbo">
+              <TabsList className="grid grid-cols-3 w-full mb-4">
+                <TabsTrigger value="qbo" data-testid="tab-qbo">QuickBooks Online</TabsTrigger>
+                <TabsTrigger value="gmail" data-testid="tab-gmail">Gmail Invoice Intake</TabsTrigger>
+                <TabsTrigger value="acumatica" data-testid="tab-acumatica">Acumatica</TabsTrigger>
+              </TabsList>
+              <TabsContent value="qbo">
+                <QboSection />
+              </TabsContent>
+              <TabsContent value="gmail">
+                <GmailSection />
+              </TabsContent>
+              <TabsContent value="acumatica">
+                <AcumaticaSection />
+              </TabsContent>
+            </Tabs>
           </Card>
 
-          {/* Access Control card (PR #7) — RBAC roles + per-user assignments */}
-          <Card className="border-card-border p-5 mt-4">
+          <Card className="border-card-border p-5">
             <div className="flex items-center gap-3 mb-2">
               <Shield className="size-4 text-muted-foreground" />
-              <div className="text-sm font-medium">Access Control</div>
+              <div className="text-sm font-medium">Allowlisted emails</div>
             </div>
             <p className="text-xs text-muted-foreground mb-3">
-              Define roles (groups of permissions) and assign them to users
-              per entity. Owner gets everything by default. Use ADP Exporter
-              for staff who should be able to export payroll CSVs without
-              seeing underlying invoice data.
+              Only these accounts can sign in. Edit <code className="bg-muted px-1 rounded">ALLOWED_EMAILS</code> in <code className="bg-muted px-1 rounded">.env</code> to change.
             </p>
-            <AccessControlSection />
+            <AllowedEmailsList />
           </Card>
+        </TabsContent>
 
-          {/* Backups card */}
-          <Card className="border-card-border p-5 mt-4">
-            <div className="flex items-center gap-3 mb-2">
-              <Database className="size-4 text-muted-foreground" />
-              <div className="text-sm font-medium">Backups</div>
-            </div>
-            <p className="text-xs text-muted-foreground mb-3">
-              Hourly local snapshots + daily/weekly Google Drive backups. Admin-only.
-            </p>
-            <BackupsSection />
-          </Card>
+        {/* ------------------------------------------------------------------ */}
+        {/* Tab 3: Backups & Service — admin-only                              */}
+        {/* ------------------------------------------------------------------ */}
+        {isAdmin && (
+          <TabsContent value="backups" className="space-y-4 mt-0">
+            <Card className="border-card-border p-5">
+              <div className="flex items-center gap-3 mb-2">
+                <Database className="size-4 text-muted-foreground" />
+                <div className="text-sm font-medium">Backups</div>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                Hourly local snapshots + daily/weekly Google Drive backups. Admin-only.
+              </p>
+              <BackupsSection />
+            </Card>
 
-          {/* Archive card */}
-          <Card className="border-card-border p-5 mt-4">
-            <div className="flex items-center gap-3 mb-2">
-              <Archive className="size-4 text-muted-foreground" />
-              <div className="text-sm font-medium">PDF Archive</div>
-            </div>
-            <p className="text-xs text-muted-foreground mb-3">
-              Invoices older than 12 months are bundled into monthly zip archives and uploaded to Drive.
-            </p>
-            <ArchiveSection />
-          </Card>
+            <Card className="border-card-border p-5">
+              <div className="flex items-center gap-3 mb-2">
+                <Archive className="size-4 text-muted-foreground" />
+                <div className="text-sm font-medium">PDF Archive</div>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                Invoices older than 12 months are bundled into monthly zip archives and uploaded to Drive.
+              </p>
+              <ArchiveSection />
+            </Card>
 
-          {/* v8: Live service logs */}
-          <Card className="border-card-border p-5 mt-4">
-            <div className="flex items-center gap-3 mb-2">
-              <FileText className="size-4 text-muted-foreground" />
-              <div className="text-sm font-medium">Service logs</div>
-            </div>
-            <p className="text-xs text-muted-foreground mb-3">
-              Live tail of the SnoHausAP service log. Useful for debugging Gmail polls, OCR conversions, QBO posts, and uploads without RDPing into the Windows box.
-            </p>
-            <LogsSection />
-          </Card>
-        </>
-      )}
+            <Card className="border-card-border p-5">
+              <div className="flex items-center gap-3 mb-2">
+                <FileText className="size-4 text-muted-foreground" />
+                <div className="text-sm font-medium">Service logs</div>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                Live tail of the SnoHausAP service log. Useful for debugging Gmail polls, OCR conversions, QBO posts, and uploads without RDPing into the Windows box.
+              </p>
+              <LogsSection />
+            </Card>
+          </TabsContent>
+        )}
+      </Tabs>
     </div>
   );
 }
@@ -850,7 +888,7 @@ function LogsSection() {
   );
 }
 
-function SkipSendersList() {
+export function SkipSendersList() {
   const qc = useQueryClient();
   const { toast } = useToast();
   const [addOpen, setAddOpen] = useState(false);

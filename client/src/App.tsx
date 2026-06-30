@@ -129,6 +129,9 @@ function ProtectedRoutes() {
         <Route path="/accounts-payable/settings/vendor-groups">
           {() => <ApSettings tab="vendor-groups" />}
         </Route>
+        <Route path="/accounts-payable/settings/skip-senders">
+          {() => <ApSettings tab="skip-senders" />}
+        </Route>
         {/* Backward-compat: legacy flat /rules + /aliases URLs. */}
         <Route path="/rules">{() => <ApLegacyRedirect tab="rules" />}</Route>
         <Route path="/aliases">{() => <ApLegacyRedirect tab="aliases" />}</Route>
