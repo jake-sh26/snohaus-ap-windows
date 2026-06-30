@@ -2968,9 +2968,24 @@ export function removeSkipSender(id: number): boolean {
  * Returns the matching skip rule if the given sender should be skipped, else null.
  * Matches by exact email first, then by domain. Case-insensitive.
  */
+/**
+ * Look up a skip-sender rule for the given email.
+ *
+ * Normalizes the input via extractBareEmail() FIRST so that RFC 5322
+ * display-name forms like `"Anthropic, PBC" <invoice+statements@...>` get
+ * reduced to the bare `invoice+statements@...` before lookup. Without this
+ * normalization, the lowercase+trim used previously left a trailing ">" on
+ * the extracted domain and silently broke every email/domain skip rule
+ * coming through Gmail (which always sends the display-name form). That
+ * was the root cause of skip_senders.skipped_count staying at 0 across
+ * the board after PR #219.
+ *
+ * Match order:
+ *   1. exact email match (case-insensitive)
+ *   2. domain match against everything after the "@" (case-insensitive)
+ */
 export function checkSkipSender(senderEmail: string | null | undefined): SkipSenderRow | null {
-  if (!senderEmail) return null;
-  const email = senderEmail.toLowerCase().trim();
+  const email = extractBareEmail(senderEmail);
   if (!email) return null;
   const exact = sqlite.prepare(
     `SELECT * FROM skip_senders WHERE match_type='email' AND LOWER(match_value) = ? LIMIT 1`
