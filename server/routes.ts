@@ -12298,6 +12298,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           }
         }
 
+        // PR E_Staff: pull acknowledgments for any (order_name, group_key)
+        // pair present in byKey and decorate each row. Single bulk query so
+        // the endpoint stays O(rows) instead of O(rows) round-trips.
+        type AckRow = {
+          order_name: string;
+          group_key: string;
+          acknowledged_at: string;
+          acknowledged_by_email: string | null;
+          note: string | null;
+        };
+        const ackByKey = new Map<string, AckRow>();
+        {
+          const orderNames = Array.from(
+            new Set(Array.from(byKey.values()).map((r) => r.order_name)),
+          );
+          if (orderNames.length > 0) {
+            const placeholders = orderNames.map(() => "?").join(",");
+            const ackRows = sqlite
+              .prepare(
+                `SELECT a.order_name, a.group_key, a.acknowledged_at, a.note,
+                        u.email AS acknowledged_by_email
+                 FROM recon_worklist_acknowledgments a
+                 LEFT JOIN app_users u ON u.id = a.acknowledged_by_user_id
+                 WHERE a.order_name IN (${placeholders})`,
+              )
+              .all(...orderNames) as AckRow[];
+            for (const ar of ackRows) {
+              ackByKey.set(keyOf(ar.order_name, ar.group_key), ar);
+            }
+          }
+        }
+
         const classifyRow = (entry: Row): { classification: string; delta: number } => {
           const qlNet = entry.ql_net;
           const attNet = entry.att_net;
@@ -12373,9 +12405,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return { classification: "unexplained", delta };
         };
 
+        // PR E_Staff: include_acknowledged=1 keeps acknowledged rows in the
+        // response. Default behaviour (omitted or 0) filters them out so the
+        // worklist focuses on unresolved items.
+        const includeAcknowledged = String(req.query.include_acknowledged ?? "") === "1";
+
         let rows = Array.from(byKey.values()).map((entry) => {
           const cls = classifyRow(entry);
-          return { ...entry, ...cls };
+          const ack = ackByKey.get(keyOf(entry.order_name, entry.group_key)) ?? null;
+          return {
+            ...entry,
+            ...cls,
+            acknowledged: ack !== null,
+            acknowledged_at: ack?.acknowledged_at ?? null,
+            acknowledged_by_email: ack?.acknowledged_by_email ?? null,
+            acknowledgment_note: ack?.note ?? null,
+          };
         });
 
         // Filtering. By default we drop 'match' rows AND any zero-delta
@@ -12391,6 +12436,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
         if (classificationFilter) {
           rows = rows.filter((r) => r.classification === classificationFilter);
+        }
+        if (!includeAcknowledged) {
+          rows = rows.filter((r) => !r.acknowledged);
         }
 
         // Sort: unexplained first (worst dollars first), then
@@ -12449,6 +12497,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             row_count: allRows.filter((r) => r.classification === "match").length,
             order_count: (ordersByClass.get("match") ?? new Set()).size,
           },
+          // PR E_Staff: acknowledgment rollup across all classifications.
+          acknowledged: {
+            row_count: allRows.filter((r) =>
+              ackByKey.has(keyOf(r.order_name, r.group_key)),
+            ).length,
+          },
         };
 
         res.json({
@@ -12458,6 +12512,99 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           summary,
           rows,
         });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // PR E_Staff: worklist acknowledgments.
+  //
+  // Acknowledging a (order_name, group_key) row hides it from the default
+  // worklist UI. We do NOT modify the underlying classification or any
+  // commission calculation - the row stays in the database and can be
+  // un-acknowledged or surfaced via include_acknowledged=1 on the worklist
+  // endpoint. This is purely a "I have seen this and accept it" marker
+  // used to keep the worklist focused on new issues.
+  //
+  // Gated by payroll.edit_overrides: anyone with the ability to make
+  // manual adjustments to payroll lines can also dismiss worklist rows.
+  // Read access (via the joined `acknowledged` flag on the worklist
+  // response) is implicitly gated by the worklist endpoint itself
+  // (payroll.view).
+  // ---------------------------------------------------------------------
+  app.post(
+    "/api/recon/shopify/staff-sales/worklist/acknowledge",
+    authMiddleware,
+    requirePermission("payroll.edit_overrides"),
+    (req, res) => {
+      try {
+        const orderName = String(req.body?.order_name ?? "").trim();
+        const groupKey = String(req.body?.group_key ?? "").trim();
+        const note = req.body?.note != null ? String(req.body.note).trim() : null;
+        if (!orderName) return res.status(400).json({ message: "order_name required" });
+        if (!groupKey) return res.status(400).json({ message: "group_key required" });
+        if (!/^(emp|staff):/.test(groupKey)) {
+          return res.status(400).json({ message: "group_key must start with emp: or staff:" });
+        }
+
+        const userId = (req as any).userId as number | undefined;
+        const now = new Date().toISOString();
+        const { sqlite } = require("./storage");
+
+        // UPSERT: re-acknowledging the same row updates the user / timestamp /
+        // note so the audit trail reflects the most recent action.
+        sqlite
+          .prepare(
+            `INSERT INTO recon_worklist_acknowledgments
+               (order_name, group_key, acknowledged_by_user_id, acknowledged_at, note)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(order_name, group_key) DO UPDATE SET
+               acknowledged_by_user_id = excluded.acknowledged_by_user_id,
+               acknowledged_at = excluded.acknowledged_at,
+               note = excluded.note`,
+          )
+          .run(orderName, groupKey, userId ?? null, now, note);
+
+        const row = sqlite
+          .prepare(
+            `SELECT a.id, a.order_name, a.group_key, a.acknowledged_at, a.note,
+                    a.acknowledged_by_user_id,
+                    u.email AS acknowledged_by_email
+             FROM recon_worklist_acknowledgments a
+             LEFT JOIN app_users u ON u.id = a.acknowledged_by_user_id
+             WHERE a.order_name = ? AND a.group_key = ?`,
+          )
+          .get(orderName, groupKey);
+
+        res.json({ ok: true, acknowledgment: row });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+  app.delete(
+    "/api/recon/shopify/staff-sales/worklist/acknowledge",
+    authMiddleware,
+    requirePermission("payroll.edit_overrides"),
+    (req, res) => {
+      try {
+        const orderName = String(req.query?.order_name ?? req.body?.order_name ?? "").trim();
+        const groupKey = String(req.query?.group_key ?? req.body?.group_key ?? "").trim();
+        if (!orderName) return res.status(400).json({ message: "order_name required" });
+        if (!groupKey) return res.status(400).json({ message: "group_key required" });
+
+        const { sqlite } = require("./storage");
+        const result = sqlite
+          .prepare(
+            `DELETE FROM recon_worklist_acknowledgments
+             WHERE order_name = ? AND group_key = ?`,
+          )
+          .run(orderName, groupKey);
+
+        res.json({ ok: true, deleted: result.changes });
       } catch (e: any) {
         res.status(400).json({ message: String(e?.message || e) });
       }
