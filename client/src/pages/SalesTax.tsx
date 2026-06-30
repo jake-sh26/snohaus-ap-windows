@@ -25,6 +25,7 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog";
+import { CheckCircle2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/lib/auth";
 import { useEntities } from "@/hooks/useEntities";
@@ -620,6 +621,11 @@ function EntityFilingCard({
 
   const [open, setOpen] = useState(false);
   const [amendMode, setAmendMode] = useState(false);
+  // PR #237 — view-only mode for the filing dialog. When a filing already
+  // exists, the card swaps the "Mark as Filed" button for a non-clickable-
+  // looking "Filing Completed" affordance that opens the dialog read-only so
+  // the operator can review saved details without accidentally re-submitting.
+  const [viewMode, setViewMode] = useState(false);
   const [filedAt, setFiledAt] = useState<string>("");
   const [confirmation, setConfirmation] = useState<string>("");
   const [notes, setNotes] = useState<string>("");
@@ -647,8 +653,9 @@ function EntityFilingCard({
       toast({ title: "Update failed", description: String(e?.message ?? e), variant: "destructive" }),
   });
 
-  function openModal(amend: boolean) {
+  function openModal(amend: boolean, view: boolean = false) {
     setAmendMode(amend);
+    setViewMode(view);
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     setFiledAt(
@@ -687,7 +694,13 @@ function EntityFilingCard({
       toast({ title: "Upload failed", description: String(e?.message ?? e), variant: "destructive" }),
   });
 
-  const deleteMut = useMutation({
+  // PR #237 — deleteMut retained but no longer wired to a UI button. Filing
+  // PDFs are part of the audit trail; an Owner can still remove a wrongly-
+  // uploaded PDF via DELETE /api/recon/finance/sales-tax/filings/attachments/:id.
+  // Keeping this mutation defined so future Owner-only restore is a one-line
+  // UI re-wire instead of re-hydrating the whole hook.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _deleteMut = useMutation({
     mutationFn: (id: number) => deleteFilingAttachment(id),
     onSuccess: () => {
       toast({ title: "Attachment removed" });
@@ -770,7 +783,7 @@ function EntityFilingCard({
           </div>
         )}
 
-        <div className="flex gap-2 pt-1">
+        <div className="flex items-center gap-3 pt-1">
           {status === "open" ? (
             <Button
               size="sm"
@@ -782,16 +795,34 @@ function EntityFilingCard({
               Mark as Filed
             </Button>
           ) : (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={!canExport}
-              onClick={() => openModal(true)}
-              data-testid={`button-amend-filing-${entityId}`}
-              title={canExport ? undefined : "Requires finance.sales_tax.export"}
-            >
-              Amend
-            </Button>
+            <>
+              {/* PR #237 — once filed, replace the prominent CTA with a
+                  status pill that still opens the dialog (read-only) on click
+                  so the operator can review saved filing details without
+                  visually inviting another submission. Amend remains
+                  available as a smaller secondary link. */}
+              <button
+                type="button"
+                onClick={() => openModal(false, true)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-green-200 dark:border-green-900 bg-green-50 dark:bg-green-950/40 px-2.5 py-1 text-xs font-medium text-green-800 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-950/60"
+                data-testid={`button-view-filing-${entityId}`}
+                title="View saved filing details"
+              >
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                Filing Completed
+              </button>
+              {canExport && (
+                <button
+                  type="button"
+                  onClick={() => openModal(true)}
+                  className="text-xs text-muted-foreground hover:text-foreground hover:underline"
+                  data-testid={`button-amend-filing-${entityId}`}
+                  title="Amend this filing"
+                >
+                  Amend
+                </button>
+              )}
+            </>
           )}
         </div>
 
@@ -824,20 +855,10 @@ function EntityFilingCard({
               <span className="text-muted-foreground tabular-nums shrink-0">
                 {formatBytes(att.size_bytes)}
               </span>
-              {canExport && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (window.confirm(`Delete ${att.filename}?`)) {
-                      deleteMut.mutate(att.id);
-                    }
-                  }}
-                  className="text-red-600 hover:underline shrink-0"
-                  data-testid={`button-delete-attachment-${att.id}`}
-                >
-                  Delete
-                </button>
-              )}
+              {/* PR #237 — inline Delete removed. Filing PDFs are part of
+                  the audit trail and should not be one-click-removable from
+                  the checklist. Server route still exists; if a wrong PDF
+                  needs to be removed, an Owner can do it via API. */}
             </div>
           ))}
           {canExport && (
@@ -862,7 +883,7 @@ function EntityFilingCard({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {amendMode ? "Amend filing" : "Mark as Filed"} — {legal} — {periodKey}
+              {viewMode ? "Filing details" : amendMode ? "Amend filing" : "Mark as Filed"} — {legal} — {periodKey}
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
@@ -871,6 +892,8 @@ function EntityFilingCard({
               <Input
                 id={`filed-at-${entityId}`} type="datetime-local" value={filedAt}
                 onChange={(e) => setFiledAt(e.target.value)}
+                readOnly={viewMode}
+                disabled={viewMode}
                 data-testid={`input-filed-at-${entityId}`}
               />
             </div>
@@ -880,6 +903,8 @@ function EntityFilingCard({
                 id={`confirmation-${entityId}`} value={confirmation}
                 onChange={(e) => setConfirmation(e.target.value)}
                 placeholder="NY portal confirmation #"
+                readOnly={viewMode}
+                disabled={viewMode}
                 data-testid={`input-confirmation-${entityId}`}
               />
             </div>
@@ -888,19 +913,43 @@ function EntityFilingCard({
               <Textarea
                 id={`notes-${entityId}`} value={notes} rows={3}
                 onChange={(e) => setNotes(e.target.value)}
+                readOnly={viewMode}
+                disabled={viewMode}
                 data-testid={`input-notes-${entityId}`}
               />
             </div>
           </div>
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button
-              onClick={submit}
-              disabled={mut.isPending}
-              data-testid={`button-submit-filing-${entityId}`}
-            >
-              {mut.isPending ? "Saving…" : amendMode ? "Save amendment" : "Confirm filed"}
-            </Button>
+            {viewMode ? (
+              <>
+                {canExport && (
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setViewMode(false);
+                      setAmendMode(true);
+                    }}
+                    data-testid={`button-switch-to-amend-${entityId}`}
+                  >
+                    Amend…
+                  </Button>
+                )}
+                <Button onClick={() => setOpen(false)} data-testid={`button-close-view-${entityId}`}>
+                  Close
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+                <Button
+                  onClick={submit}
+                  disabled={mut.isPending}
+                  data-testid={`button-submit-filing-${entityId}`}
+                >
+                  {mut.isPending ? "Saving…" : amendMode ? "Save amendment" : "Confirm filed"}
+                </Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
