@@ -12061,6 +12061,284 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   );
 
 
+
+  // PR D_Staff — diagnostic endpoints to drive Jake's manual cleanup of the
+  // staff-sales reconciliation. Two questions to answer:
+  //
+  //   1. Which assisting_staff_id values appear in EITHER source (ShopifyQL or
+  //      the per-line attribution table) but have no payroll_employees row
+  //      linked? These are the "unknown staff" lines that need a manual link
+  //      in the payroll UI.
+  //
+  //   2. Which orders show QL sales in the period but have ZERO rows in
+  //      recon_order_assisting_staff? These are the "truly unattributed"
+  //      orders — typically online orders where Shopify never recorded an
+  //      assisting staff. Drilling in helps spot patterns (online vs in-store,
+  //      specific customers, etc.).
+  //
+  // Both are read-only and gated by payroll.view, same as the rest of the
+  // reconciliation surface area.
+
+  // /unmapped-staff — every distinct assisting_staff_id from either source
+  // in the window that lacks payroll_employees.shopify_staff_member_id.
+  // Sources_present tells the caller whether QL, attribution, or both
+  // surfaced the id; sample order names + dollar totals make it easy to
+  // recognize who the staff member is at a glance.
+  app.get(
+    "/api/recon/shopify/staff-sales/unmapped-staff",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+
+        const { sqlite } = require("./storage");
+
+        // QL side: any staff id seen in recon_shopify_staff_sales in window.
+        // assisting_staff_id of '0' is the legitimate "no staff" bucket in
+        // ShopifyQL and is excluded — it's not a real staff id.
+        const qlRows = sqlite
+          .prepare(
+            `SELECT
+               s.assisting_staff_id                          AS assisting_staff_id,
+               MAX(s.staff_name)                             AS staff_name,
+               SUM(s.net_sales)                              AS ql_net,
+               COUNT(DISTINCT s.order_name)                  AS ql_order_count,
+               GROUP_CONCAT(DISTINCT s.order_name)           AS ql_order_names
+             FROM recon_shopify_staff_sales s
+             LEFT JOIN recon_orders o ON o.id = s.order_id
+             WHERE date(COALESCE(s.occurred_on, o.created_at, s.period_start))
+                   BETWEEN ? AND ?
+               AND s.assisting_staff_id IS NOT NULL
+               AND s.assisting_staff_id != ''
+               AND s.assisting_staff_id != '0'
+               AND s.employee_id IS NULL
+             GROUP BY s.assisting_staff_id`,
+          )
+          .all(since, until) as any[];
+
+        // Attribution side: any staff id in recon_order_assisting_staff in
+        // window. v_staff_attributed_sales already exposes employee_id via
+        // the resolver, so we filter to rows where the resolver couldn't
+        // find a payroll_employees match.
+        const attRows = sqlite
+          .prepare(
+            `SELECT
+               v.assisting_staff_id                          AS assisting_staff_id,
+               SUM(v.attributed_amount)                      AS att_net,
+               COUNT(DISTINCT v.order_id)                    AS att_order_count,
+               GROUP_CONCAT(DISTINCT v.order_name)           AS att_order_names
+             FROM v_staff_attributed_sales v
+             WHERE date(v.event_date) BETWEEN ? AND ?
+               AND v.assisting_staff_id IS NOT NULL
+               AND v.assisting_staff_id != ''
+               AND v.assisting_staff_id != '0'
+               AND v.employee_id IS NULL
+             GROUP BY v.assisting_staff_id`,
+          )
+          .all(since, until) as any[];
+
+        type Entry = {
+          assisting_staff_id: string;
+          staff_name: string | null;
+          sources_present: string[];
+          ql_net: number;
+          ql_order_count: number;
+          att_net: number;
+          att_order_count: number;
+          sample_orders: string[];
+        };
+        const byId = new Map<string, Entry>();
+
+        const limitSamples = (csv: string | null): string[] => {
+          if (!csv) return [];
+          const seen = new Set<string>();
+          const out: string[] = [];
+          for (const part of csv.split(",")) {
+            const p = part.trim();
+            if (!p || seen.has(p)) continue;
+            seen.add(p);
+            out.push(p);
+            if (out.length >= 5) break;
+          }
+          return out;
+        };
+
+        for (const r of qlRows) {
+          const id = String(r.assisting_staff_id);
+          byId.set(id, {
+            assisting_staff_id: id,
+            staff_name: r.staff_name ?? null,
+            sources_present: ["ql"],
+            ql_net: Number(r.ql_net ?? 0),
+            ql_order_count: Number(r.ql_order_count ?? 0),
+            att_net: 0,
+            att_order_count: 0,
+            sample_orders: limitSamples(r.ql_order_names),
+          });
+        }
+
+        for (const r of attRows) {
+          const id = String(r.assisting_staff_id);
+          let entry = byId.get(id);
+          const attSamples = limitSamples(r.att_order_names);
+          if (!entry) {
+            entry = {
+              assisting_staff_id: id,
+              staff_name: null,
+              sources_present: ["attribution"],
+              ql_net: 0,
+              ql_order_count: 0,
+              att_net: Number(r.att_net ?? 0),
+              att_order_count: Number(r.att_order_count ?? 0),
+              sample_orders: attSamples,
+            };
+            byId.set(id, entry);
+          } else {
+            entry.sources_present.push("attribution");
+            entry.att_net = Number(r.att_net ?? 0);
+            entry.att_order_count = Number(r.att_order_count ?? 0);
+            // Merge order samples, keep first 5 distinct.
+            const merged: string[] = [];
+            const seen = new Set<string>();
+            for (const o of [...entry.sample_orders, ...attSamples]) {
+              if (seen.has(o)) continue;
+              seen.add(o);
+              merged.push(o);
+              if (merged.length >= 5) break;
+            }
+            entry.sample_orders = merged;
+          }
+        }
+
+        const rows = Array.from(byId.values()).sort(
+          (a, b) =>
+            Math.abs(b.ql_net) + Math.abs(b.att_net) - (Math.abs(a.ql_net) + Math.abs(a.att_net)),
+        );
+
+        const summary = {
+          unmapped_staff_count: rows.length,
+          ql_only: rows.filter((r) => !r.sources_present.includes("attribution")).length,
+          attribution_only: rows.filter((r) => !r.sources_present.includes("ql")).length,
+          both: rows.filter(
+            (r) => r.sources_present.includes("ql") && r.sources_present.includes("attribution"),
+          ).length,
+          total_ql_net: rows.reduce((s, r) => s + r.ql_net, 0),
+          total_att_net: rows.reduce((s, r) => s + r.att_net, 0),
+        };
+
+        res.json({ ok: true, since, until, summary, rows });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
+  // /unattributed-orders — orders with QL net sales in the window that have
+  // ZERO rows in recon_order_assisting_staff. These are the truly
+  // unattributed sales (typically online orders Shopify never tagged with an
+  // assisting staff) — distinct from "orders with attribution that just
+  // didn't resolve to a payroll_employees row".
+  //
+  // Customer email + source_name + financial_status are included so Jake can
+  // eyeball patterns (online_store cluster, single repeat customer, etc.)
+  // without a second drill call per order.
+  app.get(
+    "/api/recon/shopify/staff-sales/unattributed-orders",
+    authMiddleware,
+    requirePermission("payroll.view"),
+    (req, res) => {
+      try {
+        const since = String(req.query.since ?? "").trim();
+        const until = String(req.query.until ?? "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          throw new Error("since and until must be YYYY-MM-DD");
+        }
+        if (since > until) {
+          throw new Error("since must be <= until");
+        }
+
+        const { sqlite } = require("./storage");
+
+        // Aggregate QL rows up to one row per order_name in the window, then
+        // LEFT JOIN recon_order_assisting_staff and keep only the ones where
+        // no attribution row exists. Joining on order_id is the strongest
+        // key (order_name can collide across years), but we fall back to
+        // order_name when order_id is NULL on the QL side (legacy rows).
+        const rows = sqlite
+          .prepare(
+            `SELECT
+               q.order_name                                  AS order_name,
+               q.order_id                                    AS order_id,
+               SUM(q.net_sales)                              AS ql_net,
+               SUM(q.gross_sales)                            AS ql_gross,
+               SUM(q.returns)                                AS ql_returns,
+               MAX(q.occurred_on)                            AS occurred_on,
+               MAX(o.created_at)                             AS created_at,
+               MAX(o.source_name)                            AS source_name,
+               MAX(o.financial_status)                       AS financial_status,
+               MAX(o.customer_email)                         AS customer_email,
+               MAX(o.total_price)                            AS total_price,
+               GROUP_CONCAT(DISTINCT q.assisting_staff_id)   AS ql_staff_ids
+             FROM recon_shopify_staff_sales q
+             LEFT JOIN recon_orders o ON o.id = q.order_id
+             WHERE date(COALESCE(q.occurred_on, o.created_at, q.period_start))
+                   BETWEEN ? AND ?
+             GROUP BY q.order_name
+             HAVING NOT EXISTS (
+               SELECT 1 FROM recon_order_assisting_staff a
+               WHERE (q.order_id IS NOT NULL AND a.order_id = q.order_id)
+                  OR (q.order_id IS NULL     AND a.order_name = q.order_name)
+             )
+             ORDER BY ABS(SUM(q.net_sales)) DESC`,
+          )
+          .all(since, until) as any[];
+
+        const out = rows.map((r) => ({
+          order_name: r.order_name,
+          order_id: r.order_id,
+          ql_net: Number(r.ql_net ?? 0),
+          ql_gross: Number(r.ql_gross ?? 0),
+          ql_returns: Number(r.ql_returns ?? 0),
+          ql_staff_ids: r.ql_staff_ids ? String(r.ql_staff_ids).split(",") : [],
+          occurred_on: r.occurred_on ?? null,
+          created_at: r.created_at ?? null,
+          source_name: r.source_name ?? null,
+          financial_status: r.financial_status ?? null,
+          customer_email: r.customer_email ?? null,
+          total_price: r.total_price != null ? Number(r.total_price) : null,
+        }));
+
+        // Source-level breakdown helps Jake see at a glance "are these all
+        // online_store?" without scrolling the row list.
+        const bySource: Record<string, { count: number; ql_net: number }> = {};
+        for (const r of out) {
+          const k = r.source_name ?? "unknown";
+          if (!bySource[k]) bySource[k] = { count: 0, ql_net: 0 };
+          bySource[k].count += 1;
+          bySource[k].ql_net += r.ql_net;
+        }
+
+        const summary = {
+          order_count: out.length,
+          total_ql_net: out.reduce((s, r) => s + r.ql_net, 0),
+          by_source: bySource,
+        };
+
+        res.json({ ok: true, since, until, summary, rows: out });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
   // PR #204 — diagnostic endpoint for the commission matcher.
   //
   // For each distinct Shopify staff id present in recon_shopify_staff_sales,
