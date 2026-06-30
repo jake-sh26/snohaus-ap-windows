@@ -19,18 +19,23 @@
 // VendorGroups tab match the same visual rhythm via its own thin wrapper.
 
 import { useLocation } from "wouter";
-import { BookOpen, FileText, Layers } from "lucide-react";
+import { BookOpen, FileText, Layers, Ban } from "lucide-react";
 import { cn } from "@/lib/utils";
 import Rules from "@/pages/Rules";
 import Aliases from "@/pages/Aliases";
 import VendorGroups from "@/pages/accounts-payable/VendorGroups";
+import SkipSenders from "@/pages/accounts-payable/SkipSenders";
 
-type ApSettingsTab = "rules" | "aliases" | "vendor-groups";
+// PR #238 — Skip Senders added as a 4th tab. It used to be a card on the
+// global /settings page but it only governs AP email intake, so it now
+// lives with the other AP module-local settings.
+type ApSettingsTab = "rules" | "aliases" | "vendor-groups" | "skip-senders";
 
 const TABS: Array<{ id: ApSettingsTab; label: string; icon: typeof BookOpen; href: string }> = [
   { id: "rules",         label: "Vendor Rules",  icon: BookOpen, href: "/accounts-payable/settings/rules" },
   { id: "aliases",       label: "Aliases",       icon: FileText, href: "/accounts-payable/settings/aliases" },
   { id: "vendor-groups", label: "Vendor Groups", icon: Layers,   href: "/accounts-payable/settings/vendor-groups" },
+  { id: "skip-senders",  label: "Skip Senders",  icon: Ban,      href: "/accounts-payable/settings/skip-senders" },
 ];
 
 export default function ApSettings({ tab = "rules" }: { tab?: ApSettingsTab }) {
@@ -75,6 +80,7 @@ export default function ApSettings({ tab = "rules" }: { tab?: ApSettingsTab }) {
       {tab === "rules" && <Rules />}
       {tab === "aliases" && <Aliases />}
       {tab === "vendor-groups" && <VendorGroupsTabBody />}
+      {tab === "skip-senders" && <SkipSenders />}
     </div>
   );
 }
