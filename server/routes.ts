@@ -12532,6 +12532,185 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   );
 
+
+  // PR D2_Staff — bulk link Shopify staff ids to payroll employees.
+  //
+  // Solves the production state where 12 distinct Shopify staff ids have been
+  // observed in recon_shopify_staff_sales / v_staff_attributed_sales but only
+  // 3 employees have payroll_employees.shopify_staff_member_id populated --
+  // so the resolver returns null for everyone else and /reconciliation shows
+  // every active sales associate sitting in a 'staff:' bucket.
+  //
+  // Body shape:
+  //   { links: [ { staff_id, employee_id, label? } ] }
+  //
+  // Per link, in a single transaction:
+  //   1. Resolve employee.person_id (auto-create the people row if NULL on
+  //      payroll_employees -- defensive; the existing backfill in PR #200
+  //      should have done this already).
+  //   2. INSERT OR IGNORE INTO person_external_ids (system='shopify_staff'),
+  //      letting the PR-D2_Staff (person_id, system, external_id) PK accept
+  //      multiple Shopify accounts per person (Greenvale + Huntington case).
+  //   3. If payroll_employees.shopify_staff_member_id IS NULL on this row,
+  //      stamp it with this staff_id in bare-numeric form -- matches the
+  //      existing populated rows (John Murray 82318328050 etc.). When the
+  //      same employee gets a second link later, we leave the legacy column
+  //      alone; person_external_ids carries the multi-id truth.
+  //   4. Call backfillEmployeeLinksForStaffId() to stamp employee_id on every
+  //      historical recon_shopify_staff_sales row that matches.
+  //
+  // Admin-only: system.manage_config (same gate as the bulk backfill).
+  app.post(
+    "/api/recon/shopify/staff-sales/link-staff",
+    authMiddleware,
+    requirePermission("system.manage_config"),
+    (req, res) => {
+      try {
+        const { sqlite } = require("./storage");
+
+        type LinkInput = { staff_id: string; employee_id: number; label?: string | null };
+        const body = (req.body ?? {}) as { links?: LinkInput[] };
+        const links = Array.isArray(body.links) ? body.links : [];
+        if (links.length === 0) {
+          throw new Error("body.links must be a non-empty array");
+        }
+        // Light input sanity.
+        for (let i = 0; i < links.length; i++) {
+          const l = links[i];
+          if (l == null || typeof l !== "object") throw new Error(`links[${i}] not an object`);
+          if (typeof l.staff_id !== "string" || !l.staff_id.trim()) {
+            throw new Error(`links[${i}].staff_id required (string)`);
+          }
+          if (typeof l.employee_id !== "number" || !Number.isFinite(l.employee_id)) {
+            throw new Error(`links[${i}].employee_id required (number)`);
+          }
+        }
+
+        type Result = {
+          staff_id: string;
+          employee_id: number;
+          person_id: number | null;
+          full_name: string | null;
+          label: string | null;
+          person_external_ids_inserted: boolean;
+          payroll_column_stamped: boolean;
+          recon_rows_updated: number;
+          warning?: string;
+        };
+        const results: Result[] = [];
+
+        const tx = sqlite.transaction(() => {
+          for (const link of links) {
+            const staffId = link.staff_id.trim().replace(/^gid:\/\/shopify\/StaffMember\//, "");
+            const label = link.label?.toString().trim() || null;
+
+            const emp = sqlite
+              .prepare(
+                `SELECT id, full_name, person_id, shopify_staff_member_id
+                   FROM payroll_employees WHERE id = ?`,
+              )
+              .get(link.employee_id) as
+              | { id: number; full_name: string | null; person_id: number | null; shopify_staff_member_id: string | null }
+              | undefined;
+
+            if (!emp) {
+              results.push({
+                staff_id: staffId,
+                employee_id: link.employee_id,
+                person_id: null,
+                full_name: null,
+                label,
+                person_external_ids_inserted: false,
+                payroll_column_stamped: false,
+                recon_rows_updated: 0,
+                warning: "employee_id not found in payroll_employees",
+              });
+              continue;
+            }
+
+            // Ensure a person row exists. If payroll_employees.person_id is
+            // NULL, create one and stamp it.
+            let personId = emp.person_id;
+            if (personId == null) {
+              const row = sqlite
+                .prepare(
+                  `INSERT INTO people (display_name, status, created_at, updated_at)
+                     VALUES (?, 'active', datetime('now'), datetime('now'))
+                     RETURNING id`,
+                )
+                .get(emp.full_name) as { id: number };
+              personId = row.id;
+              sqlite
+                .prepare(`UPDATE payroll_employees SET person_id = ? WHERE id = ?`)
+                .run(personId, emp.id);
+            }
+
+            // person_external_ids insert. INSERT OR IGNORE so re-running with
+            // the same link list is a no-op for the already-linked rows.
+            const pxiInfo = sqlite
+              .prepare(
+                `INSERT OR IGNORE INTO person_external_ids
+                   (person_id, system, external_id, label, created_at, updated_at)
+                 VALUES (?, 'shopify_staff', ?, ?, datetime('now'), datetime('now'))`,
+              )
+              .run(personId, staffId, label);
+            const pxiInserted = Number((pxiInfo as any).changes ?? 0) > 0;
+
+            // If a label was supplied AND a row already existed (insert was
+            // ignored), update the label so re-running with corrected labels
+            // takes effect.
+            if (!pxiInserted && label != null) {
+              sqlite
+                .prepare(
+                  `UPDATE person_external_ids
+                      SET label = ?, updated_at = datetime('now')
+                    WHERE person_id = ? AND system = 'shopify_staff' AND external_id = ?`,
+                )
+                .run(label, personId, staffId);
+            }
+
+            // Stamp the legacy column only if currently NULL -- preserves
+            // the existing primary id for multi-id employees.
+            let columnStamped = false;
+            if (emp.shopify_staff_member_id == null) {
+              sqlite
+                .prepare(`UPDATE payroll_employees SET shopify_staff_member_id = ? WHERE id = ?`)
+                .run(staffId, emp.id);
+              columnStamped = true;
+            }
+
+            // Backfill legacy recon_shopify_staff_sales rows for this staff id.
+            const back = backfillEmployeeLinksForStaffId(staffId);
+
+            results.push({
+              staff_id: staffId,
+              employee_id: emp.id,
+              person_id: personId,
+              full_name: emp.full_name,
+              label,
+              person_external_ids_inserted: pxiInserted,
+              payroll_column_stamped: columnStamped,
+              recon_rows_updated: back.rows_updated,
+            });
+          }
+        });
+        tx();
+
+        const summary = {
+          links_requested: links.length,
+          person_external_ids_inserted: results.filter((r) => r.person_external_ids_inserted).length,
+          payroll_columns_stamped: results.filter((r) => r.payroll_column_stamped).length,
+          recon_rows_updated_total: results.reduce((s, r) => s + r.recon_rows_updated, 0),
+          warnings: results.filter((r) => r.warning).length,
+        };
+
+        res.json({ ok: true, summary, results });
+      } catch (e: any) {
+        res.status(400).json({ message: String(e?.message || e) });
+      }
+    },
+  );
+
   // Current orders watermark (read-only) — shown in the Settings UI so the user
   // knows where the incremental pull will resume from on next run.
   app.get("/api/recon/shopify/watermark", authMiddleware, requirePermission("payroll.view"), (_req, res) => {
