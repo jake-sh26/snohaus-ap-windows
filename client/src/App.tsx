@@ -22,6 +22,7 @@ import PayrollEntities from "@/pages/PayrollEntities";
 import PayrollEmployees from "@/pages/PayrollEmployees";
 import Me from "@/pages/Me";
 import PayrollStaffSales from "@/pages/PayrollStaffSales";
+import PayrollStaffSalesWorklist from "@/pages/PayrollStaffSalesWorklist";
 import ReconcilerTest from "@/pages/ReconcilerTest";
 import SalesTax from "@/pages/SalesTax";
 import NotFound from "@/pages/not-found";
@@ -141,6 +142,9 @@ function ProtectedRoutes() {
             backed by GET /api/me/employee which strips sensitive payroll IDs. */}
         <Route path="/me" component={Me} />
         <Route path="/payroll/staff-sales" component={PayrollStaffSales} />
+        {/* PR E_Staff - reconciliation worklist page showing per-(order,group_key)
+            discrepancies between ShopifyQL and our attribution view. */}
+        <Route path="/payroll/staff-sales/worklist" component={PayrollStaffSalesWorklist} />
         <Route path="/finance/monthly-summary">
           {() => <ReconcilerTest view="monthly-summary" />}
         </Route>

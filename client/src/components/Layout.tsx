@@ -27,6 +27,7 @@ import {
   SlidersHorizontal,
   TrendingUp,
   UserCircle,
+  ClipboardList,
 } from "lucide-react";
 import { Wordmark } from "./Logo";
 import { useAuth } from "@/lib/auth";
@@ -114,6 +115,9 @@ const NAV_SECTIONS: NavSection[] = [
       // PR #203 — running tally of Shopify staff sales with entity breakdown.
       // Underlying data is refreshed automatically every 6h by the orders sync.
       { href: "/payroll/staff-sales", label: "Staff Sales", icon: TrendingUp },
+      // PR E_Staff — operator worklist for Shopify staff-sales anomalies
+      // (unexplained / refund_strip / pre_ingest_refund) with acknowledge UX.
+      { href: "/payroll/staff-sales/worklist", label: "Staff Sales Worklist", icon: ClipboardList },
     ],
   },
   {

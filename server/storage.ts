@@ -1922,6 +1922,32 @@ function bootstrapSchema() {
       ON recon_order_assisting_staff(order_name);
   `);
 
+  // ----- PR E_Staff: recon worklist acknowledgments -----
+  // One row per acknowledged (order_name, group_key) pair on the Staff Sales
+  // reconciliation worklist. Acknowledging hides the row from the default
+  // worklist view (still queryable with include_acknowledged=1). Used to
+  // silence known issues like "cashier did not tag staff at ring-up" rows
+  // that we accept as a POS workflow loss.
+  //
+  // group_key follows the worklist convention: "emp:<id>" or "staff:<id>".
+  // We do not FK to recon_orders.id because the worklist keys on order_name
+  // (the human-readable order number, e.g. "#38284") which is also the
+  // natural key the user sees in the UI. recon_orders.name carries this
+  // value but is not unique-constrained on its own.
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS recon_worklist_acknowledgments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_name TEXT NOT NULL,
+      group_key TEXT NOT NULL,
+      acknowledged_by_user_id INTEGER REFERENCES app_users(id) ON DELETE SET NULL,
+      acknowledged_at TEXT NOT NULL,
+      note TEXT,
+      UNIQUE (order_name, group_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_worklist_ack_order_name
+      ON recon_worklist_acknowledgments(order_name);
+  `);
+
   // ----- PR #159-debug — v_attributed_sales VIEW -----
   // One row per forward line item (gift cards excluded), carrying the raw
   // per-line tax JSON plus the allocation-derived attribution candidates and
