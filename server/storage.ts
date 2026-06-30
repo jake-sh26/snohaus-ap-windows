@@ -2015,7 +2015,11 @@ function bootstrapSchema() {
   // happened_month is the canonical America/New_York month bucket, identical
   // to v_attributed_sales.
   sqlite.exec(`
-    CREATE VIEW IF NOT EXISTS v_staff_attributed_sales AS
+    -- Drop+recreate so a redefinition (PR D3_Staff: add person_external_ids
+    -- resolution path) actually takes effect; CREATE VIEW IF NOT EXISTS is a
+    -- no-op on existing views and would otherwise leave the old definition.
+    DROP VIEW IF EXISTS v_staff_attributed_sales;
+    CREATE VIEW v_staff_attributed_sales AS
       -- Sale events: one row per (line, staff member) at the sale date.
       SELECT
         'sale'                                                  AS event_type,
@@ -2024,8 +2028,13 @@ function bootstrapSchema() {
         o.name                                                  AS order_name,
         o.source_name                                           AS order_source,
         s.assisting_staff_id                                    AS assisting_staff_id,
-        COALESCE(eb.id, eg.id)                                  AS employee_id,
-        COALESCE(eb.entity_id, eg.entity_id)                    AS employee_entity_id,
+        -- PR D3_Staff: prefer the person_external_ids path so multi-id
+        -- employees (Greenvale + Huntington Shopify accounts on one payroll
+        -- row) resolve. Fall back to the legacy direct-column join for the
+        -- pre-PR-200 employees whose link still lives only on
+        -- payroll_employees.shopify_staff_member_id.
+        COALESCE(epxi.id, eb.id, eg.id)                         AS employee_id,
+        COALESCE(epxi.entity_id, eb.entity_id, eg.entity_id)    AS employee_entity_id,
         s.unit_quantity                                         AS units,
         li.quantity                                             AS line_quantity,
         CASE WHEN li.quantity > 0
@@ -2051,6 +2060,11 @@ function bootstrapSchema() {
       FROM recon_order_assisting_staff s
       JOIN recon_line_items li ON li.id = s.line_item_id
       JOIN recon_orders o      ON o.id  = li.order_id
+      LEFT JOIN person_external_ids pxi
+        ON pxi.system = 'shopify_staff'
+       AND pxi.external_id = s.assisting_staff_id
+      LEFT JOIN payroll_employees epxi
+        ON epxi.person_id = pxi.person_id
       LEFT JOIN payroll_employees eb
         ON eb.shopify_staff_member_id = s.assisting_staff_id
       LEFT JOIN payroll_employees eg
@@ -2069,10 +2083,8 @@ function bootstrapSchema() {
         o.name                                                  AS order_name,
         o.source_name                                           AS order_source,
         s.assisting_staff_id                                    AS assisting_staff_id,
-        COALESCE(eb.id, eg.id)                                  AS employee_id,
-        COALESCE(eb.entity_id, eg.entity_id)                    AS employee_entity_id,
-        -- Units refunded × this staff's share of the original line. Real number
-        -- because share can be fractional.
+        COALESCE(epxi.id, eb.id, eg.id)                         AS employee_id,
+        COALESCE(epxi.entity_id, eb.entity_id, eg.entity_id)    AS employee_entity_id,
         (rli.quantity * CASE WHEN li.quantity > 0
                              THEN (s.unit_quantity * 1.0 / li.quantity)
                              ELSE 0
@@ -2082,7 +2094,6 @@ function bootstrapSchema() {
              THEN (s.unit_quantity * 1.0 / li.quantity)
              ELSE 0
         END                                                     AS share,
-        -- NEGATIVE: this REDUCES the staff's net sales in the refund period.
         ROUND(
           -1.0 * COALESCE(rli.subtotal, 0)
                * CASE WHEN li.quantity > 0
@@ -2099,6 +2110,11 @@ function bootstrapSchema() {
       JOIN recon_line_items li          ON li.id = rli.line_item_id
       JOIN recon_orders o               ON o.id  = rli.order_id
       JOIN recon_order_assisting_staff s ON s.line_item_id = rli.line_item_id
+      LEFT JOIN person_external_ids pxi
+        ON pxi.system = 'shopify_staff'
+       AND pxi.external_id = s.assisting_staff_id
+      LEFT JOIN payroll_employees epxi
+        ON epxi.person_id = pxi.person_id
       LEFT JOIN payroll_employees eb
         ON eb.shopify_staff_member_id = s.assisting_staff_id
       LEFT JOIN payroll_employees eg
