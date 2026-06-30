@@ -105,8 +105,12 @@ export const PERSON_SYSTEMS = {
  * adding a new 3rd-party system later is a code change only, not a migration.
  * Uniqueness is enforced two ways:
  *
- *   - PRIMARY KEY (person_id, system) \u2014 a person has at most one id in
- *     each system. (You'd never expect "Mike" to have two ADP codes.)
+ *   - PRIMARY KEY (person_id, system, external_id) \u2014 a person can hold
+ *     MULTIPLE ids in the same system, but a given (person, system, id) tuple
+ *     is unique. This is required for Shopify Staff: one employee can have
+ *     separate staff accounts per store (e.g. Julie at Greenvale + Huntington).
+ *     PR D2_Staff relaxed the prior (person_id, system) PK after that case
+ *     surfaced in production.
  *   - UNIQUE (system, external_id) \u2014 a given external id maps to exactly one
  *     person. (Two employees can't share the same Shopify Staff GID.)
  *
@@ -130,7 +134,7 @@ export function ensurePeopleSchema(): void {
       label TEXT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      PRIMARY KEY (person_id, system),
+      PRIMARY KEY (person_id, system, external_id),
       UNIQUE (system, external_id),
       FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
     );
@@ -144,6 +148,57 @@ export function ensurePeopleSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_person_external_ids_person
       ON person_external_ids (person_id);
   `);
+
+  // PR D2_Staff migration: relax the legacy PRIMARY KEY (person_id, system)
+  // to (person_id, system, external_id) so one person can carry multiple
+  // external ids within the same system. Real-world case: Julie Schrama and
+  // James Larkin each have separate Shopify Staff accounts at Greenvale and
+  // Huntington, both belonging to the same payroll employee.
+  //
+  // SQLite has no ALTER PRIMARY KEY, so we detect the old PK shape and do a
+  // rebuild-in-place: copy rows to a new table, drop, rename. Idempotent --
+  // detection is by checking whether the existing primary-key index covers
+  // exactly (person_id, system) or already includes external_id.
+  try {
+    const pkColumns = sqlite
+      .prepare(
+        "SELECT name FROM pragma_table_info('person_external_ids') WHERE pk > 0 ORDER BY pk",
+      )
+      .all() as Array<{ name: string }>;
+    const pkSet = pkColumns.map((r) => r.name).join(',');
+    if (pkSet === 'person_id,system') {
+      // Old shape detected -- rebuild.
+      sqlite.exec(`
+        BEGIN;
+        CREATE TABLE person_external_ids_v2 (
+          person_id INTEGER NOT NULL,
+          system TEXT NOT NULL,
+          external_id TEXT NOT NULL,
+          label TEXT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (person_id, system, external_id),
+          UNIQUE (system, external_id),
+          FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+        );
+        INSERT INTO person_external_ids_v2
+          (person_id, system, external_id, label, created_at, updated_at)
+          SELECT person_id, system, external_id, label, created_at, updated_at
+            FROM person_external_ids;
+        DROP TABLE person_external_ids;
+        ALTER TABLE person_external_ids_v2 RENAME TO person_external_ids;
+        CREATE INDEX IF NOT EXISTS idx_person_external_ids_system_external
+          ON person_external_ids (system, external_id);
+        CREATE INDEX IF NOT EXISTS idx_person_external_ids_person
+          ON person_external_ids (person_id);
+        COMMIT;
+      `);
+      console.log('[migration] person_external_ids PK relaxed to (person_id, system, external_id)');
+    }
+  } catch (e) {
+    console.error('[migration] person_external_ids PK relax failed:', e);
+    throw e;
+  }
 }
 
 // ---- People helpers -------------------------------------------------------
