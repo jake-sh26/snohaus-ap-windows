@@ -12273,6 +12273,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const EPS = 0.01;
         const isClose = (a: number, b: number) => Math.abs(a - b) < EPS;
 
+        // First pass: identify orders where the emp:X side has been
+        // classified shopify_refund_strip. The matching staff:0 row on the
+        // same order is the QL side of the same dollars (Shopify dumped the
+        // refund into staff:0 instead of crediting the assisting staff). We
+        // want to flag it as refund_strip too, so the worklist shows each
+        // refund once, not twice.
+        //
+        // The predicate here mirrors the emp:X branch in classifyRow below
+        // — kept intentionally duplicated rather than refactored so a future
+        // reader can read each branch without having to cross-reference.
+        const stripOrders = new Set<string>();
+        for (const entry of Array.from(byKey.values())) {
+          if (entry.employee_id == null) continue;
+          if (!(entry.att_refund < -EPS)) continue;
+          const qlNet = entry.ql_net;
+          const sideMatches =
+            (qlNet == null && isClose(entry.att_sale, 0)) ||
+            (qlNet != null && isClose(entry.att_sale, qlNet as number));
+          if (!sideMatches) continue;
+          const ql0 = qlStaff0ByOrder.get(entry.order_name) ?? 0;
+          if (ql0 <= entry.att_refund + EPS) {
+            stripOrders.add(entry.order_name);
+          }
+        }
+
         const classifyRow = (entry: Row): { classification: string; delta: number } => {
           const qlNet = entry.ql_net;
           const attNet = entry.att_net;
@@ -12298,10 +12323,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             return { classification: "unexplained", delta: -attNet };
           }
           if (qlNet != null && attNet == null) {
-            // QL has data the view doesn't. For emp:X rows this means an
-            // employee we know about wasn't credited by the view — almost
-            // always a backfill gap. For staff:0 rows it's the truly
-            // unattributed bucket (cashier didn't tag staff at ring-up).
+            // QL has data the view doesn't. For staff:0 rows on an order
+            // that's already classified as refund_strip on the emp:X side,
+            // this IS the same refund — flag it as refund_strip so the
+            // worklist doesn't double-count the same dollars.
+            if (
+              entry.group_key === "staff:0" &&
+              stripOrders.has(entry.order_name) &&
+              qlNet < -EPS
+            ) {
+              return { classification: "shopify_refund_strip", delta: qlNet };
+            }
+            // Otherwise: for emp:X rows it's a backfill gap; for staff:0
+            // rows on non-strip orders it's the cashier-didn't-tag bucket
+            // (true unattributed sales).
             return { classification: "unexplained", delta: qlNet };
           }
           // Both sides present.
@@ -12330,10 +12365,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return { ...entry, ...cls };
         });
 
-        // Filtering. By default we drop 'match' rows (the worklist is
-        // exceptions only). include_matches=1 keeps them for debugging.
+        // Filtering. By default we drop 'match' rows AND any zero-delta
+        // rows (worklist is exceptions only). include_matches=1 keeps them
+        // for debugging. The zero-delta filter catches the case where ql_net
+        // is 0 and att_net is null (or vice versa) — structurally not a
+        // match in either branch above, but worth nothing in dollars, so
+        // it's noise.
         if (!includeMatches) {
-          rows = rows.filter((r) => r.classification !== "match");
+          rows = rows.filter(
+            (r) => r.classification !== "match" && Math.abs(r.delta ?? 0) >= 0.01,
+          );
         }
         if (classificationFilter) {
           rows = rows.filter((r) => r.classification === classificationFilter);
