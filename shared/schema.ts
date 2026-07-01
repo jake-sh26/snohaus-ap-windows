@@ -940,7 +940,6 @@ export const PERMISSION_CATALOG: Array<{
   { key: "payroll.export_adp", module: "payroll", label: "Export ADP CSV", description: "Download the per-entity ADP Run import file. Does not require payroll.view. (Not yet enforced — feature in development.)" },
   { key: "payroll.edit_employees", module: "payroll", label: "Manage employees", description: "Add, edit, or deactivate employees within scoped entities." },
   { key: "payroll.edit_commissions", module: "payroll", label: "Edit per-employee commission rate", description: "Set or change the per-employee commission_rate_pct override. View is open to anyone with payroll.view; this gates writes only." },
-  { key: "payroll.edit_rules", module: "payroll", label: "Edit commission/SPIF rules", description: "Change commission rates, SPIF rules, and processing fees." },
   { key: "payroll.run_sync", module: "payroll", label: "Trigger sync", description: "Manually trigger Shopify / Easyrent / Shift4 ingestion runs." },
 
   // ----- Finance (PR #165) -----

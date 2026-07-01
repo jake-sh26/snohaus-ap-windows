@@ -621,8 +621,14 @@ function IntegrationErrorLogPanel({
 }
 
 export default function Settings() {
-  const { email, logout, role } = useAuth();
+  const { email, logout, role, hasPermission } = useAuth();
   const isAdmin = role === "admin";
+  // Gap H: the Users & Permissions tab used to key off the legacy
+  // app_users.role === "admin" flag, which hid it from RBAC-only Owners
+  // (whose app_users.role is still "user"). Gate on the users.view
+  // permission instead, keeping isAdmin as a fallback so nothing regresses.
+  const canManageUsers = hasPermission("users.view");
+  const showUsersPermsTab = isAdmin || canManageUsers;
 
   // PR #238 — Settings reorg.
   //
@@ -666,11 +672,12 @@ export default function Settings() {
         </Button>
       </Card>
 
-      <Tabs defaultValue={isAdmin ? "users" : "integrations"}>
-        {/* Hide TabsList for non-admins (only Integrations would be there).
-            For admins, show all 3 with equal-width grid. */}
-        {isAdmin && (
-          <TabsList className="grid grid-cols-3 w-full mb-6">
+      <Tabs defaultValue={showUsersPermsTab ? "users" : "integrations"}>
+        {/* Show the TabsList to anyone who can see the Users tab (RBAC
+            users.view or legacy admin). The Backups & Service trigger stays
+            admin-only since its content is tied to adminMiddleware. */}
+        {showUsersPermsTab && (
+          <TabsList className={`grid ${isAdmin ? "grid-cols-3" : "grid-cols-2"} w-full mb-6`}>
             <TabsTrigger value="users" data-testid="tab-settings-users">
               <Users className="size-3.5 mr-1.5" />
               Users &amp; Permissions
@@ -679,17 +686,19 @@ export default function Settings() {
               <BookOpenCheck className="size-3.5 mr-1.5" />
               Integrations
             </TabsTrigger>
-            <TabsTrigger value="backups" data-testid="tab-settings-backups">
-              <Database className="size-3.5 mr-1.5" />
-              Backups &amp; Service
-            </TabsTrigger>
+            {isAdmin && (
+              <TabsTrigger value="backups" data-testid="tab-settings-backups">
+                <Database className="size-3.5 mr-1.5" />
+                Backups &amp; Service
+              </TabsTrigger>
+            )}
           </TabsList>
         )}
 
         {/* ------------------------------------------------------------------ */}
-        {/* Tab 1: Users & Permissions — admin-only                            */}
+        {/* Tab 1: Users & Permissions — users.view (or legacy admin)          */}
         {/* ------------------------------------------------------------------ */}
-        {isAdmin && (
+        {showUsersPermsTab && (
           <TabsContent value="users" className="space-y-4 mt-0">
             <Card className="border-card-border p-5">
               <div className="flex items-center gap-3 mb-2">
