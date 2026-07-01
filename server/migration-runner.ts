@@ -1,94 +1,47 @@
 /**
- * PR #237 (P4_Perms) — SQL migration runner.
+ * Migration runner (inline-SQL edition).
  *
- * Runs `.sql` files in `server/migrations/` exactly once per file, tracking
- * executed migrations in a `schema_migrations` table.
+ * Executes each entry in `INLINE_MIGRATIONS` (from ./migrations-inline)
+ * exactly once per database, tracking applied migrations in a
+ * `schema_migrations` table keyed by migration name.
  *
- * Why this exists:
- *   PRs #233 and #236 shipped `server/migrations/*.sql` files but the repo
- *   never had code that loads/executes them. Both files (`2026-07-01_dedupe_user_roles.sql`
- *   and `2026-07-01_remove_payroll_edit_rules.sql`) sat unrun on the running
- *   server, leaving:
- *     - 278 duplicate Owner rows for user_id=1 in `user_roles` (256 pre-dedup
- *       + growth since — no unique index to prevent re-adds)
- *     - The orphaned `payroll.edit_rules` permission row + any role_permissions
- *       assignments still present in the DB (even though the catalog entry
- *       was removed from `shared/schema.ts`).
+ * Design notes
+ * ------------
+ * - Why inline SQL and not `.sql` files? See `migrations-inline.ts`. TL;DR:
+ *   PR #237 tried file-based and the prod copy pipeline dropped the folder
+ *   silently. Inlining makes bundling and boot-time execution atomic — if
+ *   `index.cjs` reached the target host, the SQL is guaranteed present.
  *
- * Design:
- *   - Ordering: filenames sorted lexicographically. The convention going
- *     forward is `YYYY-MM-DD_<slug>.sql` (matches the two existing files).
- *   - Tracking: `schema_migrations(filename PRIMARY KEY, sha256, applied_at)`.
- *     `sha256` is recorded but NOT enforced on re-run — filename identity is
- *     the guard. Rewriting a merged migration is treated as a bug; do a new
- *     file instead. The hash is stored so `/api/admin/migrations` can flag
- *     drift between what's on disk and what was applied.
- *   - Transactionality: the runner does NOT wrap the file — many migrations
- *     (including both existing ones) already contain their own
- *     `BEGIN TRANSACTION; ... COMMIT;`. `sqlite.exec()` handles multi-statement
- *     SQL and the file's own BEGIN/COMMIT is honored. Files that don't have
- *     explicit BEGIN/COMMIT get statement-level auto-commit, which is fine
- *     for single-statement DDL.
- *   - Filesystem resolution: mirrors `db-path.ts` — resolves relative to
- *     `__dirname`. In dev (`tsx server/index.ts`) that lands at
- *     `<repo>/server/migrations`. In prod (`node dist/index.cjs`) that lands
- *     at `<install>/dist/migrations`, which the build script (see
- *     `script/build.ts` changes in this PR) populates by copying
- *     `server/migrations/` → `dist/migrations/` at build time.
- *   - Error policy: if a migration throws, the runner logs and re-throws.
- *     Boot should NOT continue — schema drift between what code expects and
- *     what's in the DB is exactly the class of bug that would corrupt data
- *     silently otherwise.
+ * - Tracking: `schema_migrations(filename PRIMARY KEY, sha256, applied_at)`.
+ *   The `filename` column keeps the historical name for schema compatibility
+ *   with the (now-removed) file-based runner; new entries store the
+ *   InlineMigration.name here. sha256 is over the raw SQL string so drift
+ *   detection still works (if we ever hand-edit an already-applied SQL
+ *   constant, the endpoint flags it).
  *
- * This module has NO drizzle-orm dependency and takes the raw better-sqlite3
- * handle as a parameter, so it can be imported from `storage.ts` without a
- * circular dependency on the `db` export.
+ * - Transactionality: the runner does NOT wrap each migration. Each SQL
+ *   string is expected to declare its own BEGIN/COMMIT if it needs to be
+ *   transactional. Multi-statement `.exec()` handles either case.
+ *
+ * - Failure mode: the first failing migration throws, aborting server
+ *   startup. Half-applied schema is a worse outcome than a crash loop that
+ *   forces a human to look at the log.
  */
 
-import fs from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
 import type Database from "better-sqlite3";
+import { INLINE_MIGRATIONS, type InlineMigration } from "./migrations-inline";
 
-export type MigrationRecord = {
+interface MigrationRecord {
   filename: string;
   sha256: string;
   applied_at: string;
-};
+}
 
-export type MigrationRunResult = {
+export interface MigrationRunResult {
   applied: string[];
   skipped: string[];
   drift: Array<{ filename: string; recorded_sha256: string; on_disk_sha256: string }>;
-};
-
-/**
- * Resolve the migrations directory. Tries a few candidate locations to
- * survive dev (tsx from repo root), prod (bundled cjs in dist/), and NSSM
- * (cwd unreliable).
- */
-export function resolveMigrationsDir(): string {
-  const candidates = [
-    // Bundled prod: <install>/dist/index.cjs → <install>/dist/migrations/
-    path.resolve(__dirname, "migrations"),
-    // Dev tsx: <repo>/server/*.ts → <repo>/server/migrations/
-    // (same as above — __dirname resolves to server/ in dev — so this branch
-    // is a defensive duplicate that only differs from the first if __dirname
-    // ever changes shape.)
-    // Fallback: cwd-relative for any NSSM launch mode we haven't anticipated.
-    path.resolve(process.cwd(), "server", "migrations"),
-    path.resolve(process.cwd(), "dist", "migrations"),
-  ];
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(c) && fs.statSync(c).isDirectory()) return c;
-    } catch {
-      /* keep trying */
-    }
-  }
-  // Return the primary candidate anyway — the runner will handle
-  // "directory missing → nothing to do" gracefully.
-  return candidates[0];
 }
 
 function sha256Hex(buf: Buffer | string): string {
@@ -97,7 +50,8 @@ function sha256Hex(buf: Buffer | string): string {
 
 /**
  * Ensure the schema_migrations tracker table exists.
- * Idempotent — safe to call on every boot.
+ * Idempotent — safe to call on every boot. Column names preserved for
+ * back-compat with the file-based runner that previously wrote here.
  */
 function ensureTrackerTable(db: Database.Database): void {
   db.exec(`
@@ -110,31 +64,19 @@ function ensureTrackerTable(db: Database.Database): void {
 }
 
 /**
- * List all `.sql` files in the migrations directory, sorted lexicographically.
- * Files starting with `_` or `.` are skipped (convention for staging /
- * "not yet ready" migrations).
- */
-function listMigrationFiles(dir: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith(".sql") && !f.startsWith("_") && !f.startsWith("."))
-    .sort();
-}
-
-/**
- * Run every pending migration in `dir` against `db`. Records each successful
- * run in `schema_migrations`. Returns a summary of what happened for
- * observability (used by the diagnostic endpoint).
+ * Run every pending migration from `migrations` against `db`. Records each
+ * successful run in `schema_migrations`. Returns a summary for observability
+ * (used by the diagnostic endpoint).
  *
- * Throws on the first failure (rest of migrations are NOT attempted) so a
- * partial schema doesn't come up half-migrated.
+ * `migrations` defaults to INLINE_MIGRATIONS; the parameter exists so tests
+ * can inject a custom list.
  */
-export function runMigrations(db: Database.Database, dir?: string): MigrationRunResult {
-  const migrationsDir = dir ?? resolveMigrationsDir();
+export function runMigrations(
+  db: Database.Database,
+  migrations: InlineMigration[] = INLINE_MIGRATIONS,
+): MigrationRunResult {
   ensureTrackerTable(db);
 
-  const files = listMigrationFiles(migrationsDir);
   const applied: string[] = [];
   const skipped: string[] = [];
   const drift: MigrationRunResult["drift"] = [];
@@ -146,48 +88,44 @@ export function runMigrations(db: Database.Database, dir?: string): MigrationRun
     "INSERT INTO schema_migrations (filename, sha256, applied_at) VALUES (?, ?, ?)",
   );
 
-  for (const filename of files) {
-    const full = path.join(migrationsDir, filename);
-    const contents = fs.readFileSync(full);
-    const onDiskSha = sha256Hex(contents);
+  for (const migration of migrations) {
+    const { name, sql } = migration;
+    const currentSha = sha256Hex(sql);
 
-    const existing = getExisting.get(filename) as MigrationRecord | undefined;
+    const existing = getExisting.get(name) as MigrationRecord | undefined;
     if (existing) {
-      skipped.push(filename);
-      if (existing.sha256 !== onDiskSha) {
+      skipped.push(name);
+      if (existing.sha256 !== currentSha) {
         drift.push({
-          filename,
+          filename: name,
           recorded_sha256: existing.sha256,
-          on_disk_sha256: onDiskSha,
+          on_disk_sha256: currentSha,
         });
         console.warn(
-          `[migrations] DRIFT: ${filename} on disk (sha256=${onDiskSha.slice(0, 12)}) differs from applied record (sha256=${existing.sha256.slice(0, 12)}). Applied version is authoritative.`,
+          `[migrations] DRIFT: ${name} in code (sha256=${currentSha.slice(0, 12)}) differs from applied record (sha256=${existing.sha256.slice(0, 12)}). Applied version is authoritative — do not edit shipped migrations.`,
         );
       }
       continue;
     }
 
-    // Run the file. Files typically contain their own BEGIN/COMMIT — we do
-    // not wrap them. Multi-statement `.exec()` handles the case where they
-    // don't (each statement auto-commits).
-    console.log(`[migrations] Applying ${filename}...`);
+    console.log(`[migrations] Applying ${name}...`);
     const startedAt = Date.now();
     try {
-      db.exec(contents.toString("utf-8"));
+      db.exec(sql);
     } catch (e: any) {
-      console.error(`[migrations] FAILED applying ${filename}:`, e?.message ?? e);
+      console.error(`[migrations] FAILED applying ${name}:`, e?.message ?? e);
       throw new Error(
-        `Migration ${filename} failed: ${e?.message ?? String(e)}. Server startup aborted to prevent schema drift.`,
+        `Migration ${name} failed: ${e?.message ?? String(e)}. Server startup aborted to prevent schema drift.`,
       );
     }
-    recordApplied.run(filename, onDiskSha, new Date().toISOString());
+    recordApplied.run(name, currentSha, new Date().toISOString());
     const elapsed = Date.now() - startedAt;
-    applied.push(filename);
-    console.log(`[migrations] Applied ${filename} in ${elapsed}ms`);
+    applied.push(name);
+    console.log(`[migrations] Applied ${name} in ${elapsed}ms`);
   }
 
   if (applied.length === 0 && skipped.length === 0) {
-    console.log(`[migrations] No migration files found in ${migrationsDir}`);
+    console.log(`[migrations] No migrations to run (INLINE_MIGRATIONS is empty)`);
   } else {
     console.log(
       `[migrations] Done. Applied ${applied.length}, skipped ${skipped.length}${drift.length ? `, drift ${drift.length}` : ""}.`,
@@ -198,11 +136,15 @@ export function runMigrations(db: Database.Database, dir?: string): MigrationRun
 }
 
 /**
- * Return the current tracker state + on-disk file list, for the admin
- * diagnostic endpoint.
+ * Return the current tracker state + inline migration list, for the admin
+ * diagnostic endpoint. `orphans` catches migrations recorded in the DB but
+ * no longer present in code (e.g., someone renamed one — DO NOT do this).
  */
-export function getMigrationStatus(db: Database.Database, dir?: string): {
-  dir: string;
+export function getMigrationStatus(
+  db: Database.Database,
+  migrations: InlineMigration[] = INLINE_MIGRATIONS,
+): {
+  source: "inline";
   files: Array<{
     filename: string;
     on_disk_sha256: string;
@@ -211,33 +153,30 @@ export function getMigrationStatus(db: Database.Database, dir?: string): {
     recorded_sha256: string | null;
     drift: boolean;
   }>;
-  orphans: MigrationRecord[]; // recorded in DB but missing from disk
+  orphans: MigrationRecord[];
 } {
-  const migrationsDir = dir ?? resolveMigrationsDir();
   ensureTrackerTable(db);
 
-  const files = listMigrationFiles(migrationsDir);
   const recorded = db
     .prepare("SELECT filename, sha256, applied_at FROM schema_migrations ORDER BY filename")
     .all() as MigrationRecord[];
   const recordedByName = new Map(recorded.map((r) => [r.filename, r]));
 
-  const combined = files.map((filename) => {
-    const full = path.join(migrationsDir, filename);
-    const onDiskSha = sha256Hex(fs.readFileSync(full));
-    const rec = recordedByName.get(filename);
+  const combined = migrations.map((m) => {
+    const currentSha = sha256Hex(m.sql);
+    const rec = recordedByName.get(m.name);
     return {
-      filename,
-      on_disk_sha256: onDiskSha,
+      filename: m.name,
+      on_disk_sha256: currentSha,
       applied: !!rec,
       applied_at: rec?.applied_at ?? null,
       recorded_sha256: rec?.sha256 ?? null,
-      drift: !!rec && rec.sha256 !== onDiskSha,
+      drift: !!rec && rec.sha256 !== currentSha,
     };
   });
 
-  const onDiskSet = new Set(files);
-  const orphans = recorded.filter((r) => !onDiskSet.has(r.filename));
+  const inlineSet = new Set(migrations.map((m) => m.name));
+  const orphans = recorded.filter((r) => !inlineSet.has(r.filename));
 
-  return { dir: migrationsDir, files: combined, orphans };
+  return { source: "inline", files: combined, orphans };
 }

@@ -1,7 +1,6 @@
 import { build as esbuild } from "esbuild";
 import { build as viteBuild } from "vite";
-import { rm, readFile, mkdir, readdir, copyFile } from "node:fs/promises";
-import path from "node:path";
+import { rm, readFile } from "node:fs/promises";
 
 // server deps to bundle to reduce openat(2) syscalls
 const allowlist = [
@@ -64,34 +63,10 @@ async function buildAll() {
     logLevel: "info",
   });
 
-  // PR #237 (P4_Perms) — Copy SQL migration files to dist/migrations/.
-  // The bundled cjs runs from `dist/` and the migration runner resolves
-  // its dir via `path.resolve(__dirname, "migrations")`. In dev __dirname
-  // is <repo>/server so it finds server/migrations/ directly; in prod
-  // __dirname is <install>/dist so we need the files sitting beside
-  // index.cjs.
-  await copyMigrations();
-}
-
-async function copyMigrations() {
-  const srcDir = "server/migrations";
-  const dstDir = "dist/migrations";
-  try {
-    const files = (await readdir(srcDir)).filter((f) => f.endsWith(".sql"));
-    if (files.length === 0) {
-      console.log("no migrations to copy");
-      return;
-    }
-    await mkdir(dstDir, { recursive: true });
-    for (const f of files) {
-      await copyFile(path.join(srcDir, f), path.join(dstDir, f));
-    }
-    console.log(`copied ${files.length} migration file(s) to ${dstDir}/`);
-  } catch (e: any) {
-    // Not fatal for build — the runner tolerates a missing dir. But we
-    // want to know if this ever fails silently.
-    console.warn(`[build] migration copy failed: ${e?.message ?? e}`);
-  }
+  // Note: migration SQL is inlined via server/migrations-inline.ts and bundled
+  // straight into index.cjs by esbuild — no filesystem copy needed. This
+  // replaces the file-based approach from PR #237, whose dist/migrations/
+  // folder wasn't picked up by the prod deploy flow.
 }
 
 buildAll().catch((err) => {
