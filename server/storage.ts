@@ -2284,15 +2284,16 @@ function bootstrapSchema() {
   // Run user seed migration after schema is ready
   seedAppUsersFromEnv();
 
-  // PR #237 (P4_Perms) — Run pending SQL migrations from server/migrations/
-  // BEFORE seedRbacBaseline() so that:
-  //   - remove_payroll_edit_rules.sql deletes the orphaned permission BEFORE
+  // PR #237/#238 (P4_Perms) — Run pending inline SQL migrations BEFORE
+  // seedRbacBaseline() so that:
+  //   - remove_payroll_edit_rules deletes the orphaned permission BEFORE
   //     seedRbacBaseline() runs (the seeder no longer includes that key in
   //     PERMISSION_CATALOG so it won't re-add it — this cleans up stale rows).
-  //   - dedupe_user_roles.sql collapses duplicate Owner assignments BEFORE
-  //     seedRbacBaseline()'s INSERT OR IGNORE on the new unique index.
-  // Runner is idempotent: each file runs exactly once per DB, tracked in
-  // schema_migrations. See ./migration-runner.ts for design notes.
+  //   - dedupe_user_roles collapses duplicate Owner assignments BEFORE
+  //     seedRbacBaseline()'s INSERT OR IGNORE against the new unique index.
+  // Runner is idempotent: each migration runs exactly once per DB, tracked in
+  // schema_migrations. SQL is inlined via server/migrations-inline.ts (see
+  // migration-runner.ts for why file-based wasn't survivable through deploy).
   try {
     const { runMigrations } = require("./migration-runner");
     runMigrations(sqlite);

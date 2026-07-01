@@ -15892,18 +15892,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  // ===== PR #237 (P4_Perms): migration status (admin only) =====
-  // Returns the applied/pending state of every SQL migration file on disk,
-  // plus any orphan tracker rows (files that were applied and then deleted
-  // from the repo). Used by the DevTools verification snippet to confirm
-  // that both #233 and #236 SQL files ran on this DB.
+  // ===== PR #237/#238 (P4_Perms): migration status (admin only) =====
+  // Returns the applied/pending state of every inline migration bundled
+  // into this build, plus any orphan tracker rows (migrations that were
+  // applied here historically but no longer exist in code — indicates a
+  // dangerous rename or removal). Used by the DevTools verification snippet
+  // to confirm the #233 and #236 fixes actually ran on this DB.
   app.get("/api/admin/migrations", adminMiddleware, async (_req, res) => {
     try {
       const { getMigrationStatus } = await import("./migration-runner");
       const { sqlite } = await import("./storage");
       const status = getMigrationStatus(sqlite);
       res.json({
-        dir: status.dir,
+        source: status.source,
         files: status.files,
         orphans: status.orphans,
         summary: {
