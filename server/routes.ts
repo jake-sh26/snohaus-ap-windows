@@ -13971,7 +13971,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
   }
 
-  app.get("/api/invoices/:id/pdf-token", authMiddleware, (req, res) => {
+  app.get("/api/invoices/:id/pdf-token", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const sessionToken = req.headers.authorization!.slice(7);
@@ -14090,7 +14090,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Real QBO duplicate check — queries Bills and Payments from QBO if connected,
   // otherwise falls back to marking clean. Returns the same dup_check shape used
   // by reparse/rematch so the client can pop the auto-complete modal uniformly.
-  app.post("/api/invoices/:id/recheck-duplicate", authMiddleware, async (req, res) => {
+  app.post("/api/invoices/:id/recheck-duplicate", authMiddleware, requirePermission("ap.approve"), async (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const dupCheck = await runDuplicateCheck(inv.id, req.email!);
@@ -14103,7 +14103,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // same vendor, plus total/date proximity. Used when Jake edits the invoice
   // number in the drawer to catch "this is actually invoice #1024 we already
   // ingested as #1O24" cases.
-  app.post("/api/invoices/:id/recheck-duplicates", authMiddleware, async (req, res) => {
+  app.post("/api/invoices/:id/recheck-duplicates", authMiddleware, requirePermission("ap.approve"), async (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
 
@@ -14201,7 +14201,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // v8.4.5: toggle the early-pay discount on/off for an invoice that has
   // discount_kind = 'early_pay'. For 'net_with_discount' the discount is
   // automatic per spec and this endpoint refuses to flip it off. Audit-logged.
-  app.post("/api/invoices/:id/discount-applied", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/discount-applied", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     if (!inv.discount_kind || !inv.discount_terms_pct) {
@@ -14234,7 +14234,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Re-run the LLM parser on an existing invoice's stored PDF.
   // Useful when an earlier parse hit max_tokens or a transient API error and
   // left the invoice with vendor_raw_name=null.
-  app.post("/api/invoices/:id/reparse", authMiddleware, async (req, res) => {
+  app.post("/api/invoices/:id/reparse", authMiddleware, requirePermission("ap.approve"), async (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     if (!isLlmParserEnabled()) return res.status(400).json({ message: "LLM parser is not enabled" });
@@ -14398,7 +14398,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ok: true, invoice: finalInv, dup_check: dupCheck });
   });
 
-  app.post("/api/invoices/:id/remove-vendor", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/remove-vendor", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const before = { ...inv };
@@ -14421,7 +14421,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // re-parsing the PDF. Cheap, fast, and useful when the matcher has been
   // improved or new aliases have been added since the original parse. Will not
   // overwrite a vendor that the user has already manually assigned.
-  app.post("/api/invoices/:id/rematch-vendor", authMiddleware, async (req, res) => {
+  app.post("/api/invoices/:id/rematch-vendor", authMiddleware, requirePermission("ap.approve"), async (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     if (inv.vendor_qbo_id) {
@@ -14470,7 +14470,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ok: true, matched: true, source, invoice: finalInv, dup_check: dupCheck });
   });
 
-  app.get("/api/invoices/:id/qbo-payload", authMiddleware, (req, res) => {
+  app.get("/api/invoices/:id/qbo-payload", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     res.json(buildQboBillPayload(inv, getLineItems(inv.id)));
@@ -14596,7 +14596,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Vendor suggestions for an unmatched invoice. Returns up to 5 ranked candidates,
   // first by local token-overlap, then asks Claude (if enabled) for an additional pick.
-  app.get("/api/invoices/:id/vendor-suggestions", authMiddleware, async (req, res) => {
+  app.get("/api/invoices/:id/vendor-suggestions", authMiddleware, requirePermission("ap.view"), async (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const raw = inv.vendor_raw_name || "";
@@ -14832,7 +14832,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---- Smart re-match: backfill vendor + store on existing pending_review invoices ----
   // Only touches invoices that are still pending_review (won't disturb approved/posted/rejected).
   // Will not overwrite a vendor or store that the user has already set manually.
-  app.post("/api/invoices/rematch-all", authMiddleware, (_req, res) => {
+  app.post("/api/invoices/rematch-all", authMiddleware, requirePermission("ap.approve"), (_req, res) => {
     const all = listInvoices({}).filter((i) => i.status === "pending_review");
     let vendorMatched = 0;
     let storeAssigned = 0;
@@ -15193,7 +15193,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // View the kept PDF for a skipped upload. Uses a signed token (same scheme
   // as invoice PDFs) so the <iframe>/<a> works without an Authorization header.
-  app.get("/api/skipped/:id/pdf-token", authMiddleware, (req, res) => {
+  app.get("/api/skipped/:id/pdf-token", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const id = parseInt(req.params.id, 10);
     const row = getSkippedUpload(id);
     if (!row) return res.status(404).json({ message: "Not found" });
@@ -15366,11 +15366,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---- Invoice notes (append-only log) ----
-  app.get("/api/invoices/:id/notes", authMiddleware, (req, res) => {
+  app.get("/api/invoices/:id/notes", authMiddleware, requirePermission("ap.view"), (req, res) => {
     res.json(listInvoiceNotes(req.params.id));
   });
 
-  app.post("/api/invoices/:id/notes", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/notes", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const text = String((req.body && req.body.text) || "").trim();
     if (!text) return res.status(400).json({ message: "text required" });
     if (!getInvoice(req.params.id)) return res.status(404).json({ message: "Invoice not found" });
@@ -15404,7 +15404,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Drawer action: "Skip this sender going forward".
   // Body: { match_type: 'email'|'domain', confirm: 'SKIP' }
   // Adds the invoice's vendor email/domain to skip list, rejects the current invoice.
-  app.post("/api/invoices/:id/skip-sender", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/skip-sender", authMiddleware, requirePermission("ap.skip_senders"), (req, res) => {
     if (req.body?.confirm !== "SKIP") {
       return res.status(400).json({ error: "Must confirm by typing SKIP" });
     }
@@ -15474,7 +15474,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.delete("/api/vendor-groups/:id", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     res.json(deleteVendorGroup(Number(req.params.id)));
   });
-  app.post("/api/vendor-groups/:id/members", authMiddleware, (req, res) => {
+  app.post("/api/vendor-groups/:id/members", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     const groupId = Number(req.params.id);
     if (!getVendorGroup(groupId)) return res.status(404).json({ message: "Group not found" });
     const vendor_qbo_id = String(req.body?.vendor_qbo_id || "").trim();
@@ -15487,19 +15487,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       brand_keywords: req.body?.brand_keywords || null,
     }));
   });
-  app.patch("/api/vendor-groups/members/:memberId", authMiddleware, (req, res) => {
+  app.patch("/api/vendor-groups/members/:memberId", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     const updated = updateGroupMember(Number(req.params.memberId), req.body || {});
     if (!updated) return res.status(404).json({ message: "Not found" });
     res.json(updated);
   });
-  app.delete("/api/vendor-groups/members/:memberId", authMiddleware, (req, res) => {
+  app.delete("/api/vendor-groups/members/:memberId", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     res.json(deleteGroupMember(Number(req.params.memberId)));
   });
 
   // Per-invoice: returns the matching group (if any) + scored member suggestions
   // based on the invoice's PDF text and parsed line items. Drawer calls this to
   // render the brand picker.
-  app.get("/api/invoices/:id/vendor-group", authMiddleware, (req, res) => {
+  app.get("/api/invoices/:id/vendor-group", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     // Build haystack first — used either way.
