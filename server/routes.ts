@@ -1264,6 +1264,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!existing) return res.status(404).json({ message: "Employee not found" });
     const patch: any = {};
     const body = req.body || {};
+    // Editing an employee (payroll.edit_employees) does NOT include changing
+    // their commission rate — that requires the narrower payroll.edit_commissions.
+    if (body.commission_rate_pct !== undefined) {
+      const hasCommissionPerm = !!(req.userId && userHasPermission(req.userId, "payroll.edit_commissions"));
+      if (!hasCommissionPerm) {
+        return res.status(403).json({
+          message: "Forbidden",
+          required_permission: "payroll.edit_commissions",
+          detail: "Setting commission_rate_pct requires payroll.edit_commissions in addition to payroll.edit_employees",
+        });
+      }
+    }
     if (body.entity_id !== undefined) {
       const n = Number(body.entity_id);
       if (!Number.isFinite(n) || !getPayrollEntityById(n)) {
@@ -1318,20 +1330,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
       }
     }
-    let commissionDropped = false;
+    // Permission already enforced above (403), so we can set it directly.
     if (body.commission_rate_pct !== undefined) {
-      const userId = (req as any).userId as number | undefined;
-      if (userId && userHasPermission(userId, "payroll.edit_commissions")) {
-        const v = body.commission_rate_pct;
-        patch.commission_rate_pct = (v === "" || v === null) ? null : Number(v);
-      } else {
-        commissionDropped = true;
-      }
+      const v = body.commission_rate_pct;
+      patch.commission_rate_pct = (v === "" || v === null) ? null : Number(v);
     }
     if (body.active !== undefined) patch.active = body.active ? 1 : 0;
     try {
       const updated = updateEmployee(id, patch);
-      if (commissionDropped) res.setHeader("X-Commission-Dropped", "1");
       if (payFieldsDropped) res.setHeader("X-Pay-Fields-Dropped", "1");
 
       // PR #214 — if the caller just linked (or changed) shopify_staff_member_id,
@@ -13943,7 +13949,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const lineItems = getLineItems(inv.id);
-    const audit = getAuditLog(inv.id);
+    // The audit log is a separately-permissioned artifact (system.view_audit).
+    // ap.view gets you the invoice; only audit viewers get its history.
+    const canViewAudit = !!(req.userId && userHasPermission(req.userId, "system.view_audit"));
+    const audit = canViewAudit ? getAuditLog(inv.id) : [];
     // Find applicable rule by vendor
     let rule = null;
     if (inv.vendor_qbo_id) {
