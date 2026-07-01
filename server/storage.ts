@@ -2284,6 +2284,25 @@ function bootstrapSchema() {
   // Run user seed migration after schema is ready
   seedAppUsersFromEnv();
 
+  // PR #237 (P4_Perms) — Run pending SQL migrations from server/migrations/
+  // BEFORE seedRbacBaseline() so that:
+  //   - remove_payroll_edit_rules.sql deletes the orphaned permission BEFORE
+  //     seedRbacBaseline() runs (the seeder no longer includes that key in
+  //     PERMISSION_CATALOG so it won't re-add it — this cleans up stale rows).
+  //   - dedupe_user_roles.sql collapses duplicate Owner assignments BEFORE
+  //     seedRbacBaseline()'s INSERT OR IGNORE on the new unique index.
+  // Runner is idempotent: each file runs exactly once per DB, tracked in
+  // schema_migrations. See ./migration-runner.ts for design notes.
+  try {
+    const { runMigrations } = require("./migration-runner");
+    runMigrations(sqlite);
+  } catch (e: any) {
+    // Migration failure is fatal — schema drift is worse than a crash loop.
+    // The runner already logged the specific file that failed.
+    console.error("[storage] Migration runner failed — aborting boot:", e?.message);
+    throw e;
+  }
+
   // Seed payroll + RBAC baseline data (entities, permissions, system roles).
   // Idempotent — safe to run on every boot.
   seedPayrollBaseline();
