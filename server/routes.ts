@@ -5619,7 +5619,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     return { inputs, refunds, shippingTaxForward, shippingTaxRefunds, unverifiedReturnTax, entityNames };
   }
 
-  app.get("/api/recon/tax/by-entity/:month", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/tax/by-entity/:month", authMiddleware, requireFinanceView(), async (req, res) => {
     const month = String(req.params.month);
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return res.status(400).json({ message: "Month must be YYYY-MM" });
@@ -5640,7 +5640,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/recon/tax/st810/:period", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.get("/api/recon/tax/st810/:period", authMiddleware, requireFinanceView(), async (req, res) => {
     const period = String(req.params.period);
     // Accept either YYYY-MM (monthly) or YYYY-Q[1-4] (quarterly).
     const isMonth = /^\d{4}-\d{2}$/.test(period);
@@ -5906,7 +5906,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // immediately ingest pos_locations, the very newest rows may show
   // pos_location_id=NULL until ShopifyQL catches up. Re-running this
   // endpoint after the lag closes finishes the job.
-  app.post("/api/recon/sales/ingest-pos-locations", authMiddleware, requirePermission("payroll.view"), async (req, res) => {
+  app.post("/api/recon/sales/ingest-pos-locations", authMiddleware, requirePermission("payroll.run_sync"), async (req, res) => {
     try {
       const { ingestPosLocationsFromQL } = require("./shopify-recon-pos-locations");
       const start = String(req.body?.start || "");
@@ -8956,7 +8956,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post(
     "/api/recon/finance/sales-tax/notes/:periodKey",
     authMiddleware,
-    requirePermission("finance.sales_tax.view"),
+    requirePermission("finance.sales_tax.export"),
     (req: any, res) => {
       const periodKey = String(req.params.periodKey);
       if (!/^\d{4}-(\d{2}|Q[1-4])$/.test(periodKey)) {
@@ -16342,7 +16342,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ===== Feature 2: Backup Routes =====
 
-  app.get("/api/backups/status", authMiddleware, (_req, res) => {
+  app.get("/api/backups/status", authMiddleware, requirePermission("system.view_sync_log"), (_req, res) => {
     res.json(getBackupStatus());
   });
 
