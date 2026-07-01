@@ -1944,6 +1944,7 @@ function RbacRolesTab() {
   const moduleLabels: Record<string, string> = {
     ap: "Accounts Payable",
     payroll: "Payroll",
+    finance: "Finance & Sales Tax",
     users: "Users & Access",
     system: "System",
   };

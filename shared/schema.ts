@@ -936,8 +936,8 @@ export const PERMISSION_CATALOG: Array<{
   // ----- Payroll -----
   { key: "payroll.view", module: "payroll", label: "View payroll", description: "See payroll lines, periods, and reports." },
   { key: "payroll.edit_overrides", module: "payroll", label: "Edit overrides", description: "Create manual adjustments to payroll lines." },
-  { key: "payroll.lock_period", module: "payroll", label: "Lock pay periods", description: "Move a pay period from open to locked." },
-  { key: "payroll.export_adp", module: "payroll", label: "Export ADP CSV", description: "Download the per-entity ADP Run import file. Does not require payroll.view." },
+  { key: "payroll.lock_period", module: "payroll", label: "Lock pay periods", description: "Move a pay period from open to locked. (Not yet enforced — feature in development.)" },
+  { key: "payroll.export_adp", module: "payroll", label: "Export ADP CSV", description: "Download the per-entity ADP Run import file. Does not require payroll.view. (Not yet enforced — feature in development.)" },
   { key: "payroll.edit_employees", module: "payroll", label: "Manage employees", description: "Add, edit, or deactivate employees within scoped entities." },
   { key: "payroll.edit_commissions", module: "payroll", label: "Edit per-employee commission rate", description: "Set or change the per-employee commission_rate_pct override. View is open to anyone with payroll.view; this gates writes only." },
   { key: "payroll.edit_rules", module: "payroll", label: "Edit commission/SPIF rules", description: "Change commission rates, SPIF rules, and processing fees." },
