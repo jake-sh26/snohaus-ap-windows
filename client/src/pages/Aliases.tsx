@@ -11,10 +11,13 @@ import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from "@/components/ui/command";
+import { useAuth } from "@/lib/auth";
 
 export default function Aliases() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canEditRules = hasPermission("ap.edit_rules");
   const aliasesQ = useQuery<any[]>({ queryKey: ["/api/aliases"] });
   const [creating, setCreating] = useState(false);
 
@@ -27,7 +30,7 @@ export default function Aliases() {
     <div className="px-8 pt-6 pb-12 max-w-[1100px] mx-auto">
       <div className="flex items-baseline justify-between mb-1">
         <h1 className="text-xl font-semibold tracking-tight">Vendor Aliases</h1>
-        <Button size="sm" onClick={() => setCreating(true)} data-testid="button-add-alias"><Plus className="size-4 mr-1" /> Add alias</Button>
+        {canEditRules && <Button size="sm" onClick={() => setCreating(true)} data-testid="button-add-alias"><Plus className="size-4 mr-1" /> Add alias</Button>}
       </div>
       <p className="text-sm text-muted-foreground mb-6">
         Map invoice header names to QBO vendor records. Useful when a parent company sends bills under a different name.
@@ -62,9 +65,13 @@ export default function Aliases() {
                 <td className="px-4 py-3">{a.vendor_name} <span className="text-xs text-muted-foreground ml-1">#{a.vendor_qbo_id}</span></td>
                 <td className="px-4 py-3 text-xs text-muted-foreground max-w-[300px] truncate">{a.note || "—"}</td>
                 <td className="px-4 py-3 text-right">
-                  <Button variant="ghost" size="sm" onClick={() => { if (confirm(`Delete alias "${a.alias}"?`)) deleteMut.mutate(a.id); }} data-testid={`button-delete-alias-${a.id}`}>
-                    <Trash2 className="size-3.5 text-destructive" />
-                  </Button>
+                  {canEditRules ? (
+                    <Button variant="ghost" size="sm" onClick={() => { if (confirm(`Delete alias "${a.alias}"?`)) deleteMut.mutate(a.id); }} data-testid={`button-delete-alias-${a.id}`}>
+                      <Trash2 className="size-3.5 text-destructive" />
+                    </Button>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
                 </td>
               </tr>
             ))}

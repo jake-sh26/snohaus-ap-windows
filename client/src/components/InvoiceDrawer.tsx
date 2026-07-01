@@ -29,6 +29,7 @@ import { PdfDebugHud } from "./PdfDebugHud";
 import { SkipSenderDialog } from "./SkipSenderDialog";
 import { cn } from "@/lib/utils";
 import { useIsMobile } from "@/hooks/use-media-query";
+import { useAuth } from "@/lib/auth";
 
 const STORES = ["greenvale", "hempstead", "huntington"] as const;
 type StoreKey = typeof STORES[number];
@@ -49,6 +50,9 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
   const qc = useQueryClient();
   const { toast } = useToast();
   const isMobile = useIsMobile();
+  const { hasPermission } = useAuth();
+  const canApproveAp = hasPermission("ap.approve");
+  const canManageSkipSenders = hasPermission("ap.skip_senders");
   const [pdfExpanded, setPdfExpanded] = useState(false);
   // DEBUG MODE — toggleable on-screen HUD that captures viewport, container,
   // and touch event diagnostics. Can also be enabled via ?debug=pdf in URL or
@@ -1305,11 +1309,11 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
               {/* Desktop action buttons row */}
               {!isMobile && (
                 <div className="flex items-center gap-2 ml-auto">
-                  {inv.status === "pending_review" && (
+                  {canApproveAp && inv.status === "pending_review" && (
                     <>
                       <Button variant="outline" size="sm" onClick={() => bucketMutation.mutate({ status: "receiving" })} disabled={bucketMutation.isPending} data-testid="button-hold-receiving">In Receiving</Button>
                       <Button variant="outline" size="sm" onClick={() => bucketMutation.mutate({ status: "quarantined" })} disabled={bucketMutation.isPending} data-testid="button-quarantine">Quarantine</Button>
-                      <Button variant="outline" size="sm" onClick={() => setSkipDialogOpen(true)} disabled={!inv.email_from} data-testid="button-skip-sender">Skip sender…</Button>
+                      {canManageSkipSenders && <Button variant="outline" size="sm" onClick={() => setSkipDialogOpen(true)} disabled={!inv.email_from} data-testid="button-skip-sender">Skip sender…</Button>}
                       <MarkPostedDialog mode="already-in-qbo" invoiceId={inv.id} payload={livePayload} onDone={() => { qc.invalidateQueries({ queryKey: [`/api/invoices/${invoiceId}`] }); invalidateAllInvoiceLists(qc); }} />
                       <Button variant="outline" onClick={() => rejectMutation.mutate()} disabled={rejectMutation.isPending} data-testid="button-reject">Reject</Button>
                       <Button variant="outline" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending} data-testid="button-save-draft">{saveMutation.isPending ? "Saving…" : "Save draft"}</Button>
@@ -1318,7 +1322,7 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                       </Button>
                     </>
                   )}
-                  {(inv.status === "receiving" || inv.status === "quarantined") && (
+                  {canApproveAp && (inv.status === "receiving" || inv.status === "quarantined") && (
                     <>
                       <Button variant="outline" size="sm" onClick={() => bucketMutation.mutate({ status: "pending_review", reason: "Returned to inbox" })} disabled={bucketMutation.isPending} data-testid="button-return-to-inbox">Return to Inbox</Button>
                       <Button variant="outline" size="sm" onClick={() => rejectMutation.mutate()} disabled={rejectMutation.isPending} data-testid="button-reject-from-bucket">Reject</Button>
@@ -1329,7 +1333,7 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                       </Button>
                     </>
                   )}
-                  {inv.status === "approved_local" && (
+                  {canApproveAp && inv.status === "approved_local" && (
                     <>
                       <Button variant="outline" size="sm" onClick={() => revertToPendingMutation.mutate()} disabled={revertToPendingMutation.isPending} data-testid="button-revert-pending">{revertToPendingMutation.isPending ? "Reverting…" : "Revert to pending"}</Button>
                       <MarkPostedDialog invoiceId={inv.id} payload={livePayload} onDone={() => { qc.invalidateQueries({ queryKey: [`/api/invoices/${invoiceId}`] }); invalidateAllInvoiceLists(qc); }} />
@@ -1338,7 +1342,7 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                       </Button>
                     </>
                   )}
-                  {inv.status === "rejected" && (
+                  {canApproveAp && inv.status === "rejected" && (
                     <Button variant="outline" onClick={() => restoreMutation.mutate()} disabled={restoreMutation.isPending} data-testid="button-restore">{restoreMutation.isPending ? "Restoring…" : "Restore to pending"}</Button>
                   )}
                 </div>
@@ -1360,7 +1364,7 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                   </div>
                   {/* Primary + More row */}
                   <div className="flex items-center gap-2">
-                    {(inv.status === "pending_review" || inv.status === "receiving" || inv.status === "quarantined") && (
+                    {canApproveAp && (inv.status === "pending_review" || inv.status === "receiving" || inv.status === "quarantined") && (
                       <>
                         <Button
                           className="flex-1"
@@ -1382,12 +1386,12 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                             {inv.status === "pending_review" && <DropdownMenuItem onClick={() => bucketMutation.mutate({ status: "quarantined" })}>Quarantine</DropdownMenuItem>}
                             {(inv.status === "receiving" || inv.status === "quarantined") && <DropdownMenuItem onClick={() => bucketMutation.mutate({ status: "pending_review", reason: "Returned to inbox" })}>Return to Inbox</DropdownMenuItem>}
                             <DropdownMenuItem onClick={() => rejectMutation.mutate()} disabled={rejectMutation.isPending}>Reject</DropdownMenuItem>
-                            {inv.email_from && <DropdownMenuItem onClick={() => setSkipDialogOpen(true)}>Skip sender…</DropdownMenuItem>}
+                            {canManageSkipSenders && inv.email_from && <DropdownMenuItem onClick={() => setSkipDialogOpen(true)}>Skip sender…</DropdownMenuItem>}
                           </DropdownMenuContent>
                         </DropdownMenu>
                       </>
                     )}
-                    {inv.status === "approved_local" && (
+                    {canApproveAp && inv.status === "approved_local" && (
                       <>
                         <Button className="flex-1" onClick={() => postToQboMutation.mutate()} disabled={postToQboMutation.isPending} data-testid="button-retry-post-qbo-mobile">
                           <Send className="size-3 mr-1" /> {postToQboMutation.isPending ? "Posting\u2026" : "Retry post to QBO"}
@@ -1395,7 +1399,7 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
                         <Button variant="outline" className="shrink-0" onClick={() => revertToPendingMutation.mutate()} disabled={revertToPendingMutation.isPending}>Revert</Button>
                       </>
                     )}
-                    {inv.status === "rejected" && (
+                    {canApproveAp && inv.status === "rejected" && (
                       <Button className="flex-1" variant="outline" onClick={() => restoreMutation.mutate()} disabled={restoreMutation.isPending}>{restoreMutation.isPending ? "Restoring…" : "Restore to pending"}</Button>
                     )}
                   </div>
@@ -1441,6 +1445,8 @@ export function InvoiceDrawer({ invoiceId, onClose }: { invoiceId: string | null
 
 function VendorMatchCard({ invoice, onChanged }: { invoice: any; onChanged: (payload?: any) => void }) {
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canApproveAp = hasPermission("ap.approve");
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   // Per Jake: every manual pick auto-saves as an alias so future invoices match.
@@ -1537,7 +1543,7 @@ function VendorMatchCard({ invoice, onChanged }: { invoice: any; onChanged: (pay
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {!invoice.vendor_qbo_id && invoice.vendor_raw_name && (
+          {canApproveAp && !invoice.vendor_qbo_id && invoice.vendor_raw_name && (
             <Button
               variant="outline"
               size="sm"
@@ -1549,7 +1555,7 @@ function VendorMatchCard({ invoice, onChanged }: { invoice: any; onChanged: (pay
               {rematch.isPending ? "Matching…" : "Re-match"}
             </Button>
           )}
-          {invoice.vendor_qbo_id && (
+          {canApproveAp && invoice.vendor_qbo_id && (
             <Button
               variant="outline"
               size="sm"
@@ -1564,7 +1570,7 @@ function VendorMatchCard({ invoice, onChanged }: { invoice: any; onChanged: (pay
               {remove.isPending ? "Removing…" : "Remove"}
             </Button>
           )}
-        <Popover open={open} onOpenChange={setOpen}>
+        {canApproveAp && <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
             <Button variant="outline" size="sm" data-testid="button-change-vendor">Change vendor</Button>
           </PopoverTrigger>
@@ -1621,7 +1627,7 @@ function VendorMatchCard({ invoice, onChanged }: { invoice: any; onChanged: (pay
               </div>
             </Command>
           </PopoverContent>
-        </Popover>
+        </Popover>}
         </div>
       </div>
     </Card>
@@ -1636,6 +1642,8 @@ function VendorMatchCard({ invoice, onChanged }: { invoice: any; onChanged: (pay
  */
 function VendorGroupCard({ invoice, onChanged }: { invoice: any; onChanged: () => void }) {
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canApproveAp = hasPermission("ap.approve");
   const qc = useQueryClient();
   // Round 7 follow-up: query runs for every invoice, not just ones already
   // matched to a QBO vendor. Server auto-detects groups via PDF text when the
@@ -1702,7 +1710,7 @@ function VendorGroupCard({ invoice, onChanged }: { invoice: any; onChanged: () =
               size="sm"
               variant={selected ? "default" : (m.score > 0 ? "secondary" : "outline")}
               onClick={() => { if (!selected) assign.mutate({ id: m.vendor_qbo_id, name: m.vendor_qbo_name }); }}
-              disabled={assign.isPending}
+              disabled={assign.isPending || !canApproveAp}
               data-testid={`button-group-member-${m.vendor_qbo_id}`}
               title={m.brand_keywords ? `Keywords: ${m.brand_keywords}` : undefined}
             >

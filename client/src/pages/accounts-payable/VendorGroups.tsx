@@ -27,6 +27,7 @@ import {
 import { Layers, ChevronDown, Plus, Trash2 } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/lib/auth";
 
 interface VendorGroup {
   id: number;
@@ -64,6 +65,8 @@ export default function VendorGroups() {
 function VendorGroupsCard() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canEditRules = hasPermission("ap.edit_rules");
   const groupsQ = useQuery<VendorGroup[]>({ queryKey: ["/api/vendor-groups"] });
   const [creatingOpen, setCreatingOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -99,12 +102,12 @@ function VendorGroupsCard() {
         <div className="text-xs text-muted-foreground">
           {groups.length === 0 ? "No groups yet." : `${groups.length} group${groups.length === 1 ? "" : "s"}`}
         </div>
-        <Button size="sm" variant="outline" onClick={() => setCreatingOpen(true)} data-testid="button-add-vendor-group">
+        {canEditRules && <Button size="sm" variant="outline" onClick={() => setCreatingOpen(true)} data-testid="button-add-vendor-group">
           <Plus className="size-3 mr-1" /> Add group
-        </Button>
+        </Button>}
       </div>
       {groups.map((g) => (
-        <VendorGroupRow key={g.id} group={g} onDelete={() => {
+        <VendorGroupRow key={g.id} group={g} canEditRules={canEditRules} onDelete={() => {
           if (window.confirm(`Delete group "${g.name}" and all its members?`)) deleteMut.mutate(g.id);
         }} />
       ))}
@@ -130,7 +133,7 @@ function VendorGroupsCard() {
   );
 }
 
-function VendorGroupRow({ group, onDelete }: { group: VendorGroup; onDelete: () => void }) {
+function VendorGroupRow({ group, onDelete, canEditRules }: { group: VendorGroup; onDelete: () => void; canEditRules: boolean }) {
   const qc = useQueryClient();
   const { toast } = useToast();
   const [expanded, setExpanded] = useState(true);
@@ -185,9 +188,9 @@ function VendorGroupRow({ group, onDelete }: { group: VendorGroup; onDelete: () 
           <div className="font-medium text-sm">{group.name}</div>
           <div className="text-xs text-muted-foreground">{group.members.length} brand{group.members.length === 1 ? "" : "s"}</div>
         </button>
-        <Button size="sm" variant="ghost" onClick={onDelete} data-testid={`button-delete-group-${group.id}`}>
+        {canEditRules && <Button size="sm" variant="ghost" onClick={onDelete} data-testid={`button-delete-group-${group.id}`}>
           <Trash2 className="size-3.5 text-muted-foreground" />
-        </Button>
+        </Button>}
       </div>
       {expanded && (
         <div className="mt-3 space-y-2">
@@ -195,6 +198,7 @@ function VendorGroupRow({ group, onDelete }: { group: VendorGroup; onDelete: () 
             <VendorGroupMemberRow
               key={m.id}
               member={m}
+              canEditRules={canEditRules}
               onSaveKeywords={(kw) => updateMemberMut.mutate({ id: m.id, brand_keywords: kw })}
               onRemove={() => {
                 if (window.confirm(`Remove ${m.vendor_qbo_name} from ${group.name}?`)) removeMemberMut.mutate(m.id);
@@ -202,7 +206,7 @@ function VendorGroupRow({ group, onDelete }: { group: VendorGroup; onDelete: () 
             />
           ))}
           {/* Add member */}
-          <div className="rounded-md border border-dashed border-border p-2 space-y-2">
+          {canEditRules && <div className="rounded-md border border-dashed border-border p-2 space-y-2">
             <div className="flex items-center gap-2">
               <Popover open={vendorPickerOpen} onOpenChange={setVendorPickerOpen}>
                 <PopoverTrigger asChild>
@@ -265,24 +269,29 @@ function VendorGroupRow({ group, onDelete }: { group: VendorGroup; onDelete: () 
             <div className="text-[11px] text-muted-foreground">
               Pick a real QBO vendor and (optionally) list keywords found in invoices for this brand. Example for Atomic: <span className="font-mono">atomic, redster, backland</span>.
             </div>
-          </div>
+          </div>}
         </div>
       )}
     </div>
   );
 }
 
-function VendorGroupMemberRow({ member, onSaveKeywords, onRemove }: {
+function VendorGroupMemberRow({ member, onSaveKeywords, onRemove, canEditRules }: {
   member: { id: number; vendor_qbo_id: string; vendor_qbo_name: string; brand_keywords: string | null };
   onSaveKeywords: (kw: string) => void;
   onRemove: () => void;
+  canEditRules: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState(member.brand_keywords || "");
   return (
     <div className="flex items-center gap-2 rounded-md bg-card border border-border px-2 py-1.5">
       <div className="font-medium text-sm w-40 truncate">{member.vendor_qbo_name}</div>
-      {editing ? (
+      {!canEditRules ? (
+        <span className="flex-1 text-left text-xs text-muted-foreground truncate">
+          {member.brand_keywords || <span className="italic">no brand keywords</span>}
+        </span>
+      ) : editing ? (
         <Input
           value={val}
           onChange={(e) => setVal(e.target.value)}
@@ -303,9 +312,9 @@ function VendorGroupMemberRow({ member, onSaveKeywords, onRemove }: {
           {member.brand_keywords || <span className="italic">click to add brand keywords…</span>}
         </button>
       )}
-      <Button size="sm" variant="ghost" onClick={onRemove} data-testid={`button-remove-member-${member.id}`}>
+      {canEditRules && <Button size="sm" variant="ghost" onClick={onRemove} data-testid={`button-remove-member-${member.id}`}>
         <Trash2 className="size-3.5 text-muted-foreground" />
-      </Button>
+      </Button>}
     </div>
   );
 }

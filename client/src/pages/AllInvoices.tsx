@@ -12,6 +12,7 @@ import { useBulkSelection, BulkSelectHeader, BulkSelectCell, BulkActionBar } fro
 import { TableFooterTotal } from "@/components/TableFooterTotal";
 import { DueDateCell } from "@/components/DueDateCell";
 import { useIsMobile } from "@/hooks/use-media-query";
+import { useAuth } from "@/lib/auth";
 
 type Invoice = any;
 
@@ -24,6 +25,8 @@ export default function AllInvoices() {
   const [openInvoice, setOpenInvoice] = useState<string | null>(null);
   const bulk = useBulkSelection();
   const isMobile = useIsMobile();
+  const { hasPermission } = useAuth();
+  const canApproveAp = hasPermission("ap.approve");
 
   const params = new URLSearchParams();
   if (statusFilter !== "all") params.set("status", statusFilter);
@@ -106,7 +109,7 @@ export default function AllInvoices() {
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
-                {!isMobile && <BulkSelectHeader visibleIds={filtered.map((i: any) => i.id)} selected={bulk.selected} toggleAll={bulk.toggleAll} />}
+                {!isMobile && canApproveAp && <BulkSelectHeader visibleIds={filtered.map((i: any) => i.id)} selected={bulk.selected} toggleAll={bulk.toggleAll} />}
                 <th className="px-4 py-2.5 text-left font-medium hidden md:table-cell">Date</th>
                 <th className="px-4 py-2.5 text-left font-medium">Vendor</th>
                 <th className="px-4 py-2.5 text-left font-medium hidden md:table-cell">Invoice #</th>
@@ -128,7 +131,7 @@ export default function AllInvoices() {
               )}
               {filtered.map((inv) => (
                 <tr key={inv.id} onClick={() => setOpenInvoice(inv.id)} className="cursor-pointer hover-elevate" data-testid={`row-allinv-${inv.id}`}>
-                  {!isMobile && <BulkSelectCell id={inv.id} isSelected={bulk.isSelected} toggle={bulk.toggle} />}
+                  {!isMobile && canApproveAp && <BulkSelectCell id={inv.id} isSelected={bulk.isSelected} toggle={bulk.toggle} />}
                   <td className="px-4 py-3 text-muted-foreground hidden md:table-cell">{fmtDate(inv.invoice_date)}</td>
                   <td className="px-4 py-3 max-w-[160px]">
                     <div className="font-medium truncate">{inv.vendor_qbo_name || inv.vendor_raw_name || <span className="text-muted-foreground italic">Unknown</span>}</div>
@@ -153,7 +156,7 @@ export default function AllInvoices() {
       </Card>
 
       <InvoiceDrawer invoiceId={openInvoice} onClose={() => setOpenInvoice(null)} />
-      {!isMobile && <BulkActionBar selected={bulk.selected} clear={bulk.clear} actions={["posted", "pending_review", "receiving", "quarantined", "rejected"]} />}
+      {!isMobile && canApproveAp && <BulkActionBar selected={bulk.selected} clear={bulk.clear} actions={["posted", "pending_review", "receiving", "quarantined", "rejected"]} />}
     </div>
   );
 }

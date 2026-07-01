@@ -8,6 +8,7 @@ import { FileX, Eye, Undo2, Trash2 } from "lucide-react";
 import { fmtMoney, fmtDate } from "@/lib/format";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/lib/auth";
 
 type SkippedRow = {
   id: number;
@@ -47,6 +48,8 @@ function docTypeLabel(t: string | null | undefined): string {
 export default function Skipped() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canManageSkipSenders = hasPermission("ap.skip_senders");
   const q = useQuery<SkippedRow[]>({ queryKey: ["/api/skipped"] });
   const data = useMemo(() => q.data || [], [q.data]);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -167,7 +170,7 @@ export default function Skipped() {
                     >
                       <Eye className="size-3.5" />
                     </Button>
-                    <Button
+                    {canManageSkipSenders && <Button
                       variant="outline"
                       size="sm"
                       onClick={() => restoreMutation.mutate(row.id)}
@@ -176,8 +179,8 @@ export default function Skipped() {
                       title="Restore as invoice (re-runs pipeline, lands in Pending review)"
                     >
                       <Undo2 className="size-3.5 mr-1" /> Restore
-                    </Button>
-                    <Button
+                    </Button>}
+                    {canManageSkipSenders && <Button
                       variant="outline"
                       size="sm"
                       onClick={() => {
@@ -189,7 +192,7 @@ export default function Skipped() {
                       title="Permanently delete"
                     >
                       <Trash2 className="size-3.5" />
-                    </Button>
+                    </Button>}
                   </div>
                 </td>
               </tr>

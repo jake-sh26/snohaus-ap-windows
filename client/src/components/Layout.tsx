@@ -82,6 +82,9 @@ const NAV_SECTIONS: NavSection[] = [
   {
     label: "Accounts Payable",
     icon: Receipt,
+    // ap.view is the entry ticket for the whole AP module. Users without it
+    // (e.g. payroll-only or finance-only roles) don't see any AP nav at all.
+    permissionKey: "ap.view",
     items: [
       { href: "/", label: "Inbox", icon: Inbox, countKey: "inbox_count", toneIfPositive: "amber" },
       { href: "/receiving", label: "In Receiving", icon: PackageOpen, countKey: "receiving_count" },

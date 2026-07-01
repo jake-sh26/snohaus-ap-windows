@@ -10,11 +10,14 @@ import { useBulkSelection, BulkSelectHeader, BulkSelectCell, BulkActionBar } fro
 import { TableFooterTotal } from "@/components/TableFooterTotal";
 import { DueDateCell } from "@/components/DueDateCell";
 import { useIsMobile } from "@/hooks/use-media-query";
+import { useAuth } from "@/lib/auth";
 
 export default function Posted() {
   const [open, setOpen] = useState<string | null>(null);
   const bulk = useBulkSelection();
   const isMobile = useIsMobile();
+  const { hasPermission } = useAuth();
+  const canApproveAp = hasPermission("ap.approve");
   // Show approved_local + posted_qbo + rejected
   const allQ = useQuery<any[]>({ queryKey: ["/api/invoices", "?status=all"] });
   const data = (allQ.data || []).filter((i) => ["approved_local", "posted_qbo", "rejected"].includes(i.status));
@@ -29,7 +32,7 @@ export default function Posted() {
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
-                {!isMobile && <BulkSelectHeader visibleIds={data.map((i: any) => i.id)} selected={bulk.selected} toggleAll={bulk.toggleAll} />}
+                {!isMobile && canApproveAp && <BulkSelectHeader visibleIds={data.map((i: any) => i.id)} selected={bulk.selected} toggleAll={bulk.toggleAll} />}
                 <th className="px-4 py-2.5 text-left font-medium hidden md:table-cell">Date</th>
                 <th className="px-4 py-2.5 text-left font-medium">Vendor</th>
                 <th className="px-4 py-2.5 text-left font-medium hidden md:table-cell">Invoice #</th>
@@ -53,7 +56,7 @@ export default function Posted() {
               )}
               {data.map((inv) => (
                 <tr key={inv.id} onClick={() => setOpen(inv.id)} className="cursor-pointer hover-elevate" data-testid={`row-posted-${inv.id}`}>
-                  {!isMobile && <BulkSelectCell id={inv.id} isSelected={bulk.isSelected} toggle={bulk.toggle} />}
+                  {!isMobile && canApproveAp && <BulkSelectCell id={inv.id} isSelected={bulk.isSelected} toggle={bulk.toggle} />}
                   <td className="px-4 py-3 text-muted-foreground hidden md:table-cell">{fmtDate(inv.invoice_date)}</td>
                   <td className="px-4 py-3 font-medium max-w-[160px] truncate">{inv.vendor_qbo_name || "—"}</td>
                   <td className="px-4 py-3 font-mono text-xs hidden md:table-cell">{inv.invoice_number || "—"}</td>
@@ -85,7 +88,7 @@ export default function Posted() {
       </Card>
 
       <InvoiceDrawer invoiceId={open} onClose={() => setOpen(null)} />
-      {!isMobile && <BulkActionBar selected={bulk.selected} clear={bulk.clear} actions={["pending_review", "quarantined"]} />}
+      {!isMobile && canApproveAp && <BulkActionBar selected={bulk.selected} clear={bulk.clear} actions={["pending_review", "quarantined"]} />}
     </div>
   );
 }
