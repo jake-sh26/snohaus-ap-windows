@@ -13,12 +13,15 @@ import { useToast } from "@/hooks/use-toast";
 import { STORE_LABELS } from "@/lib/format";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from "@/components/ui/command";
+import { useAuth } from "@/lib/auth";
 
 type Rule = any;
 
 export default function Rules() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canEditRules = hasPermission("ap.edit_rules");
   const rulesQ = useQuery<Rule[]>({ queryKey: ["/api/rules"] });
   const [editing, setEditing] = useState<Rule | null>(null);
   const [creating, setCreating] = useState(false);
@@ -32,7 +35,7 @@ export default function Rules() {
     <div className="px-8 pt-6 pb-12 max-w-[1100px] mx-auto">
       <div className="flex items-baseline justify-between mb-1">
         <h1 className="text-xl font-semibold tracking-tight">Vendor Rules</h1>
-        <Button size="sm" onClick={() => setCreating(true)} data-testid="button-add-rule"><Plus className="size-4 mr-1" /> Add rule</Button>
+        {canEditRules && <Button size="sm" onClick={() => setCreating(true)} data-testid="button-add-rule"><Plus className="size-4 mr-1" /> Add rule</Button>}
       </div>
       <p className="text-sm text-muted-foreground mb-6">
         Default routing per vendor. New invoices use these rules to suggest a store assignment.
@@ -67,10 +70,16 @@ export default function Rules() {
                 <td className="px-4 py-3 text-xs">{r.default_store ? STORE_LABELS[r.default_store] : <span className="text-muted-foreground">—</span>}</td>
                 <td className="px-4 py-3 text-xs text-muted-foreground max-w-[300px] truncate">{r.note || "—"}</td>
                 <td className="px-4 py-3 text-right">
-                  <Button variant="ghost" size="sm" onClick={() => setEditing(r)} data-testid={`button-edit-rule-${r.id}`}><Pencil className="size-3.5" /></Button>
-                  <Button variant="ghost" size="sm" onClick={() => { if (confirm(`Delete rule for ${r.vendor_name}?`)) deleteMut.mutate(r.id); }} data-testid={`button-delete-rule-${r.id}`}>
-                    <Trash2 className="size-3.5 text-destructive" />
-                  </Button>
+                  {canEditRules ? (
+                    <>
+                      <Button variant="ghost" size="sm" onClick={() => setEditing(r)} data-testid={`button-edit-rule-${r.id}`}><Pencil className="size-3.5" /></Button>
+                      <Button variant="ghost" size="sm" onClick={() => { if (confirm(`Delete rule for ${r.vendor_name}?`)) deleteMut.mutate(r.id); }} data-testid={`button-delete-rule-${r.id}`}>
+                        <Trash2 className="size-3.5 text-destructive" />
+                      </Button>
+                    </>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
                 </td>
               </tr>
             ))}

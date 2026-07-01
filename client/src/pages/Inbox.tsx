@@ -15,6 +15,7 @@ import { useBulkSelection, BulkSelectHeader, BulkSelectCell, BulkActionBar } fro
 import { TableFooterTotal } from "@/components/TableFooterTotal";
 import { DueDateCell } from "@/components/DueDateCell";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/lib/auth";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useIsMobile } from "@/hooks/use-media-query";
@@ -37,6 +38,8 @@ export default function Inbox() {
   const bulk = useBulkSelection();
   const isMobile = useIsMobile();
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
+  const { hasPermission } = useAuth();
+  const canApproveAp = hasPermission("ap.approve");
 
   const digestQuery = useQuery<any>({ queryKey: ["/api/digest"] });
   const { toast } = useToast();
@@ -279,7 +282,7 @@ export default function Inbox() {
             }}
             data-testid="input-upload-invoice"
           />
-          <button
+          {canApproveAp && <button
             className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1 disabled:opacity-50"
             onClick={() => fileInputRef.current?.click()}
             disabled={uploadMutation.isPending}
@@ -287,7 +290,7 @@ export default function Inbox() {
           >
             {uploadMutation.isPending ? <Loader2 className="size-3 animate-spin" /> : <Upload className="size-3" />}
             {uploadMutation.isPending ? " Uploading…" : " Manual invoice upload"}
-          </button>
+          </button>}
           <button
             className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1 disabled:opacity-50"
             onClick={() => rematchMutation.mutate()}
@@ -450,7 +453,7 @@ export default function Inbox() {
             <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
                 {/* Bulk select — hidden on mobile */}
-                {!isMobile && <BulkSelectHeader visibleIds={filtered.map((i: any) => i.id)} selected={bulk.selected} toggleAll={bulk.toggleAll} />}
+                {!isMobile && canApproveAp && <BulkSelectHeader visibleIds={filtered.map((i: any) => i.id)} selected={bulk.selected} toggleAll={bulk.toggleAll} />}
                 {/* Date — hidden on mobile (shown inline with vendor on mobile) */}
                 <SortableTh active={sortKey === "date"} dir={sortDir} onClick={() => toggleSort("date")} className="hidden md:table-cell">Date</SortableTh>
                 <SortableTh active={sortKey === "vendor"} dir={sortDir} onClick={() => toggleSort("vendor")}>Vendor</SortableTh>
@@ -486,7 +489,7 @@ export default function Inbox() {
                   className="cursor-pointer hover-elevate transition-colors"
                   data-testid={`row-invoice-${inv.id}`}
                 >
-                  {!isMobile && <BulkSelectCell id={inv.id} isSelected={bulk.isSelected} toggle={bulk.toggle} />}
+                  {!isMobile && canApproveAp && <BulkSelectCell id={inv.id} isSelected={bulk.isSelected} toggle={bulk.toggle} />}
                   <td className="px-4 py-3 whitespace-nowrap text-muted-foreground hidden md:table-cell">{fmtDate(inv.invoice_date)}</td>
                   <td className="px-4 py-3 max-w-[160px]">
                     <div className="font-medium truncate" data-testid={`text-vendor-name-${inv.id}`}>{inv.vendor_qbo_name || <span className="text-muted-foreground italic">Unknown</span>}</div>
@@ -521,7 +524,7 @@ export default function Inbox() {
       </Card>
 
       <InvoiceDrawer invoiceId={openInvoice} onClose={() => setOpenInvoice(null)} />
-      {!isMobile && <BulkActionBar selected={bulk.selected} clear={bulk.clear} />}
+      {!isMobile && canApproveAp && <BulkActionBar selected={bulk.selected} clear={bulk.clear} />}
     </div>
   );
 }

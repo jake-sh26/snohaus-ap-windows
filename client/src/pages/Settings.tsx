@@ -891,6 +891,8 @@ function LogsSection() {
 export function SkipSendersList() {
   const qc = useQueryClient();
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canManageSkipSenders = hasPermission("ap.skip_senders");
   const [addOpen, setAddOpen] = useState(false);
   const q = useQuery<Array<{
     id: number;
@@ -918,11 +920,11 @@ export function SkipSendersList() {
 
   return (
     <div>
-      <div className="flex items-center justify-end mb-2">
+      {canManageSkipSenders && <div className="flex items-center justify-end mb-2">
         <Button size="sm" variant="outline" onClick={() => setAddOpen(true)} data-testid="button-skip-senders-add">
           <Plus className="size-3.5 mr-1" /> Add sender
         </Button>
-      </div>
+      </div>}
       {q.isLoading ? (
         <div className="text-xs text-muted-foreground">Loading…</div>
       ) : rows.length === 0 ? (
@@ -954,7 +956,7 @@ export function SkipSendersList() {
                   <td className="px-3 py-2 text-muted-foreground">{r.last_skipped_at ? new Date(r.last_skipped_at).toLocaleString() : "—"}</td>
                   <td className="px-3 py-2 text-muted-foreground">{new Date(r.added_at).toLocaleDateString()}{r.added_by ? ` · ${r.added_by}` : ""}</td>
                   <td className="px-3 py-2 text-right">
-                    <Button
+                    {canManageSkipSenders && <Button
                       size="sm"
                       variant="ghost"
                       onClick={() => removeMut.mutate(r.id)}
@@ -962,7 +964,7 @@ export function SkipSendersList() {
                       data-testid={`button-remove-skip-sender-${r.id}`}
                     >
                       <Trash2 className="size-3.5" />
-                    </Button>
+                    </Button>}
                   </td>
                 </tr>
               ))}

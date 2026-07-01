@@ -13927,7 +13927,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---- Invoices ----
-  app.get("/api/invoices", authMiddleware, (req, res) => {
+  app.get("/api/invoices", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const filters: any = {};
     if (req.query.status && req.query.status !== "all") filters.status = req.query.status;
     if (req.query.vendor_qbo_id) filters.vendor_qbo_id = req.query.vendor_qbo_id;
@@ -13939,7 +13939,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(enriched);
   });
 
-  app.get("/api/invoices/:id", authMiddleware, (req, res) => {
+  app.get("/api/invoices/:id", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const lineItems = getLineItems(inv.id);
@@ -14003,7 +14003,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     fs.createReadStream(fullPath).pipe(res);
   });
 
-  app.patch("/api/invoices/:id", authMiddleware, (req, res) => {
+  app.patch("/api/invoices/:id", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const before = { ...inv };
@@ -14034,7 +14034,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ ...final, line_items: getLineItems(inv.id) });
   });
 
-  app.post("/api/invoices/:id/approve", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/approve", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     if (inv.vendor_match_status === "unmatched") {
@@ -14057,7 +14057,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ invoice: { ...updated, line_items: lineItems }, qbo_payload: payload });
   });
 
-  app.post("/api/invoices/:id/mark-posted", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/mark-posted", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const updated = updateInvoice(inv.id, {
@@ -14068,7 +14068,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(updated);
   });
 
-  app.post("/api/invoices/:id/reject", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/reject", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const updated = updateInvoice(inv.id, { status: "rejected", notes: req.body?.reason || inv.notes });
@@ -14076,7 +14076,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(updated);
   });
 
-  app.post("/api/invoices/:id/restore", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/restore", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     if (inv.status !== "rejected") {
@@ -14162,7 +14162,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
-  app.post("/api/invoices/:id/assign-vendor", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/assign-vendor", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const { vendor_qbo_id, vendor_name, save_as_alias } = req.body;
@@ -14477,7 +14477,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // Post invoice directly to QBO as a Bill
-  app.post("/api/invoices/:id/post-to-qbo", authMiddleware, async (req, res) => {
+  app.post("/api/invoices/:id/post-to-qbo", authMiddleware, requirePermission("ap.approve"), async (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
 
@@ -14541,7 +14541,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // Manual revert from approved_local back to pending_review (e.g. user wants to make edits)
-  app.post("/api/invoices/:id/revert-to-pending", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/revert-to-pending", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     if (inv.status === "posted_qbo") {
@@ -14557,18 +14557,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---- Rules ----
-  app.get("/api/rules", authMiddleware, (_req, res) => res.json(listRules()));
-  app.post("/api/rules", authMiddleware, (req, res) => {
+  app.get("/api/rules", authMiddleware, requirePermission("ap.view"), (_req, res) => res.json(listRules()));
+  app.post("/api/rules", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     const data = { ...req.body };
     if (data.split_data && typeof data.split_data !== "string") data.split_data = JSON.stringify(data.split_data);
     res.json(createRule(data));
   });
-  app.patch("/api/rules/:id", authMiddleware, (req, res) => {
+  app.patch("/api/rules/:id", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     const data = { ...req.body };
     if (data.split_data && typeof data.split_data !== "string") data.split_data = JSON.stringify(data.split_data);
     res.json(updateRule(parseInt(req.params.id), data));
   });
-  app.delete("/api/rules/:id", authMiddleware, (req, res) => {
+  app.delete("/api/rules/:id", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     deleteRule(parseInt(req.params.id));
     res.json({ ok: true });
   });
@@ -14659,7 +14659,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
   });
 
-  app.post("/api/invoices/upload", authMiddleware, (req, res, next) => {
+  app.post("/api/invoices/upload", authMiddleware, requirePermission("ap.approve"), (req, res, next) => {
     // Round 7 follow-up: log Content-Type + length for any upload attempt so we
     // can diagnose “No file received” errors. Multer requires multipart/form-data
     // with a boundary; if the browser/proxy strips it we want to know.
@@ -14811,7 +14811,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // One-time backfill: scan posted invoices and seed vendor_aliases.
-  app.post("/api/vendor-aliases/backfill", authMiddleware, (_req, res) => {
+  app.post("/api/vendor-aliases/backfill", authMiddleware, requirePermission("ap.edit_rules"), (_req, res) => {
     try {
       const result = backfillVendorAliasesFromPostedInvoices();
       res.json(result);
@@ -15185,7 +15185,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ===== Skipped Uploads (Round 7) =====
   // List all skipped uploads (active by default; pass ?include_restored=1 to see all).
-  app.get("/api/skipped", authMiddleware, (req, res) => {
+  app.get("/api/skipped", authMiddleware, requirePermission("ap.view"), (req, res) => {
     const includeRestored = String(req.query.include_restored || "") === "1";
     const rows = listSkippedUploads({ includeRestored });
     res.json(rows);
@@ -15227,7 +15227,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Restore a skipped upload as a real invoice. Re-runs the pipeline on the
   // same PDF, but with FORCE_REAL_INVOICE=1 so even if the LLM still flags it
   // as a non-invoice, we keep it as a normal pending_review invoice.
-  app.post("/api/skipped/:id/restore", authMiddleware, async (req, res) => {
+  app.post("/api/skipped/:id/restore", authMiddleware, requirePermission("ap.skip_senders"), async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const row = getSkippedUpload(id);
     if (!row) return res.status(404).json({ message: "Not found" });
@@ -15271,7 +15271,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // Permanently delete a skipped upload (and its PDF on disk).
-  app.delete("/api/skipped/:id", authMiddleware, (req, res) => {
+  app.delete("/api/skipped/:id", authMiddleware, requirePermission("ap.skip_senders"), (req, res) => {
     const id = parseInt(req.params.id, 10);
     const row = getSkippedUpload(id);
     if (!row) return res.status(404).json({ message: "Not found" });
@@ -15314,7 +15314,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---- Buckets: move invoice to receiving / quarantined / pending_review ----
-  app.post("/api/invoices/:id/bucket", authMiddleware, (req, res) => {
+  app.post("/api/invoices/:id/bucket", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const inv = getInvoice(req.params.id);
     if (!inv) return res.status(404).json({ message: "Not found" });
     const target = String((req.body && req.body.status) || "").trim();
@@ -15332,7 +15332,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---- Bulk actions ----
   // Body: { ids: string[], action: "posted" | "quarantined" | "pending_review" | "receiving" | "rejected" }
   // Returns: { updated: number, failed: { id, reason }[] }
-  app.post("/api/invoices/bulk-action", authMiddleware, (req, res) => {
+  app.post("/api/invoices/bulk-action", authMiddleware, requirePermission("ap.approve"), (req, res) => {
     const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.map((x: any) => String(x)) : [];
     const action = String(req.body?.action || "").trim();
     const ALLOWED = ["posted", "quarantined", "pending_review", "receiving", "rejected"];
@@ -15383,10 +15383,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // POST  /api/skip-senders                     -> add { match_type, match_value, vendor_name? }
   // DELETE /api/skip-senders/:id                -> remove
   // POST  /api/invoices/:id/skip-sender         -> add sender from this invoice + reject this invoice
-  app.get("/api/skip-senders", authMiddleware, (_req, res) => {
+  app.get("/api/skip-senders", authMiddleware, requirePermission("ap.view"), (_req, res) => {
     res.json(listSkipSenders());
   });
-  app.post("/api/skip-senders", authMiddleware, (req, res) => {
+  app.post("/api/skip-senders", authMiddleware, requirePermission("ap.skip_senders"), (req, res) => {
     const r = addSkipSender({
       match_type: req.body?.match_type,
       match_value: req.body?.match_value,
@@ -15396,7 +15396,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!r.ok) return res.status(400).json({ error: r.error });
     res.json({ ok: true, id: r.id });
   });
-  app.delete("/api/skip-senders/:id", authMiddleware, (req, res) => {
+  app.delete("/api/skip-senders/:id", authMiddleware, requirePermission("ap.skip_senders"), (req, res) => {
     const ok = removeSkipSender(Number(req.params.id));
     res.json({ ok });
   });
@@ -15454,10 +15454,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ===== Vendor Groups (Round 7) =====
   // Parent companies that ship invoices for multiple sub-brands. Drawer uses
   // these to disambiguate which brand to attribute the inventory to.
-  app.get("/api/vendor-groups", authMiddleware, (_req, res) => {
+  app.get("/api/vendor-groups", authMiddleware, requirePermission("ap.view"), (_req, res) => {
     res.json(listVendorGroups());
   });
-  app.post("/api/vendor-groups", authMiddleware, (req, res) => {
+  app.post("/api/vendor-groups", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     const name = String(req.body?.name || "").trim();
     if (!name) return res.status(400).json({ message: "name required" });
     res.json(createVendorGroup({
@@ -15466,12 +15466,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       parent_qbo_name: req.body?.parent_qbo_name || null,
     }));
   });
-  app.patch("/api/vendor-groups/:id", authMiddleware, (req, res) => {
+  app.patch("/api/vendor-groups/:id", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     const updated = updateVendorGroup(Number(req.params.id), req.body || {});
     if (!updated) return res.status(404).json({ message: "Not found" });
     res.json(updated);
   });
-  app.delete("/api/vendor-groups/:id", authMiddleware, (req, res) => {
+  app.delete("/api/vendor-groups/:id", authMiddleware, requirePermission("ap.edit_rules"), (req, res) => {
     res.json(deleteVendorGroup(Number(req.params.id)));
   });
   app.post("/api/vendor-groups/:id/members", authMiddleware, (req, res) => {
