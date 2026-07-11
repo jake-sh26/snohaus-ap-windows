@@ -14023,7 +14023,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // active. Server-side post path already accepts a sibling endpoint
     // (POST /discount-applied) — including the field here keeps both writes
     // atomic from the client's perspective.
-    const allowed = ["routing_mode", "routing_data", "total", "freight", "notes", "invoice_number", "invoice_date", "due_date", "discount_applied"];
+    // ship_to_store is editable so the drawer can clear it (e.g. before a
+    // reparse recomputes routing from the fresh ship_to_address), and so users
+    // can override an incorrect address-based routing without editing routing_data
+    // by hand. Null is a legal value (means "unassigned"); reparse's safety-gate
+    // only overwrites when null, so this is the mechanism to unstick a wrong pick.
+    const allowed = ["routing_mode", "routing_data", "ship_to_store", "total", "freight", "notes", "invoice_number", "invoice_date", "due_date", "discount_applied"];
     const patch: any = {};
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
     if (patch.routing_data && typeof patch.routing_data !== "string") patch.routing_data = JSON.stringify(patch.routing_data);
