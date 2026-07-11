@@ -24,7 +24,7 @@ import crypto from "node:crypto";
 import { parseInvoiceWithLLM, isLlmParserEnabled, getLastLlmFailure, clearLastLlmFailure, computeDueDateFromTerms, type LLMParsedInvoice } from "./llm-parser";
 import { normalizeDueDate } from "./invoice-pipeline";
 import { applyPostLlmTermsFallback } from "./post-llm-terms";
-import { smartMatchVendor, resolveShipToStore, learnVendorAlias, replaceInvoiceLineItems } from "./storage";
+import { smartMatchVendor, resolveShipToStore, learnVendorAlias, replaceInvoiceLineItems, checkSkipSender, recordSkipLog } from "./storage";
 import { matchVendorWithLlm, isVendorMatcherLlmEnabled } from "./vendor-matcher-llm";
 import { getQboStatus, searchBills, searchVendorCredits, searchPayments } from "./qbo";
 
@@ -699,6 +699,42 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
           );
         }
 
+        // PR — Skip-Senders gate for Gmail ingest (imapflow path).
+        // The Skip-Senders rule table was ONLY consulted from server/invoice-pipeline.ts
+        // (manual uploads + restore), so Gmail-ingested bills sailed past it — that's why
+        // skip_senders.skipped_count stayed 0 across the board despite billing@shopify.com
+        // being on the list since 2026-05-05. Mirror invoice-pipeline.ts here: check the
+        // rule BEFORE LLM/disk work, record a skip_log row (so skipped_count increments),
+        // and mark the email as ingested-and-skipped so we don't re-poll it.
+        const senderForSkip = parsed.from?.text || "";
+        const skipRule = senderForSkip ? checkSkipSender(senderForSkip) : null;
+        if (skipRule) {
+          try {
+            recordSkipLog({
+              source: "gmail",
+              sender_email: senderForSkip,
+              subject: parsed.subject || null,
+              matched_rule_id: skipRule.id,
+            });
+          } catch (e: any) {
+            console.warn(`[Gmail] recordSkipLog failed: ${e.message}`);
+          }
+          db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+            String(msg.uid),
+            parsed.subject || null,
+            (parsed.from?.text || null),
+            (parsed.date?.toISOString() || null),
+            attachments.length,
+            null,
+            new Date().toISOString(),
+            attachments.length || 1,
+            JSON.stringify([`skip-sender: ${skipRule.match_type}=${skipRule.match_value} (rule ${skipRule.id})`]),
+            messageId,
+          );
+          console.log(`[Gmail] skip-sender HIT — ${skipRule.match_type}="${skipRule.match_value}" from="${senderForSkip.slice(0, 80)}" subject="${(parsed.subject || "").slice(0, 120)}"`);
+          continue;
+        }
+
         if (attachments.length === 0) {
           // No PDF but passed Stage 1 (e.g. text-only invoice like ADP).
           // Future: send body+subject to LLM for text-only parsing. For now, log and skip.
@@ -870,7 +906,7 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
 
             // Resolve ship-to store from LLM hint (and fallback to vendor rule). null means leave blank —
             // do NOT default to greenvale silently; the UI surfaces this for user input.
-            const shipToStore = resolveShipToStore(llmResult?.store_hint || null, vendorQboId);
+            const shipToStore = resolveShipToStore(llmResult?.store_hint || null, vendorQboId, llmResult?.ship_to_address || null);
 
             // dedup: skip if an invoice with same invoice_number + total already exists.
             // Strategy:
@@ -994,6 +1030,16 @@ export async function pollNow(): Promise<{ new_invoices: number; errors: string[
               }
             } catch (e) {
               console.error(`[Gmail] line-item persist failed for ${invoiceId}:`, (e as Error).message);
+            }
+
+            // Persist ship_to_address separately (added post-launch). See
+            // invoice-pipeline.ts for the rationale.
+            if (llmResult?.ship_to_address) {
+              try {
+                db.prepare(`UPDATE invoices SET ship_to_address = ? WHERE id = ?`).run(llmResult.ship_to_address, invoiceId);
+              } catch (e) {
+                console.warn(`[Gmail] failed to persist ship_to_address for ${invoiceId}: ${(e as Error).message}`);
+              }
             }
 
             console.log(`[Gmail] Ingested ${invoiceId}: vendor="${parsed_data.vendor_raw_name}" → ${vendorMatchStatus}${vendorQboName ? ` (${vendorQboName})` : ""}, store=${shipToStore || "unknown"}`);

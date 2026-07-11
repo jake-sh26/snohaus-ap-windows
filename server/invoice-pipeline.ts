@@ -301,7 +301,7 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
     } catch {}
   }
 
-  const shipToStore = resolveShipToStore(llmResult?.store_hint || null, vendorQboId);
+  const shipToStore = resolveShipToStore(llmResult?.store_hint || null, vendorQboId, llmResult?.ship_to_address || null);
 
   const invoiceId = `${prefix}_${safeName.replace(/\.pdf$/i, "")}`;
   const now = new Date().toISOString();
@@ -445,6 +445,17 @@ export async function processInvoicePdf(input: PipelineInput): Promise<PipelineR
     discountAppliedInitial,
     parsed_data.payment_terms
   );
+
+  // Persist ship_to_address separately (added post-launch — keeps the mega INSERT
+  // above unchanged to avoid column-order breakage). Enables reparse and batch
+  // rematch to re-consult the printed address without re-running the LLM.
+  if (llmResult?.ship_to_address) {
+    try {
+      db.prepare(`UPDATE invoices SET ship_to_address = ? WHERE id = ?`).run(llmResult.ship_to_address, invoiceId);
+    } catch (e) {
+      console.warn(`[pipeline] failed to persist ship_to_address for ${invoiceId}: ${(e as Error).message}`);
+    }
+  }
 
   // ---- Persist parsed line items into invoice_line_items so the Routing
   // "Line items" tab is enabled in the drawer.

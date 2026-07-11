@@ -32,6 +32,8 @@ import {
   resolveShipToStore,
   learnVendorAlias,
   replaceInvoiceLineItems,
+  checkSkipSender,
+  recordSkipLog,
 } from "./storage";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -831,6 +833,39 @@ async function processOneGmailMessage(
     );
   }
 
+  // PR — Skip-Senders gate for Gmail ingest (Gmail API path).
+  // Mirror of the imapflow gate in server/gmail.ts. Without this, Skip-Senders
+  // rules never fired for Gmail-ingested bills (skip_senders.skipped_count = 0
+  // for every rule) and senders like billing@shopify.com kept landing in the AP
+  // inbox despite being on the skip list.
+  const skipRuleApi = parsed.from ? checkSkipSender(parsed.from) : null;
+  if (skipRuleApi) {
+    try {
+      recordSkipLog({
+        source: "gmail",
+        sender_email: parsed.from,
+        subject: parsed.subject || null,
+        matched_rule_id: skipRuleApi.id,
+      });
+    } catch (e: any) {
+      console.warn(`[gmail-api] recordSkipLog failed: ${e.message}`);
+    }
+    db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
+      parsed.gmailId,
+      parsed.subject || null,
+      parsed.from || null,
+      parsed.dateIso,
+      parsed.pdfAttachments.length,
+      null,
+      new Date().toISOString(),
+      parsed.pdfAttachments.length || 1,
+      JSON.stringify([`skip-sender: ${skipRuleApi.match_type}=${skipRuleApi.match_value} (rule ${skipRuleApi.id})`]),
+      parsed.messageId,
+    );
+    console.log(`[gmail-api] skip-sender HIT — ${skipRuleApi.match_type}="${skipRuleApi.match_value}" from="${parsed.from.slice(0, 80)}" subject="${parsed.subject.slice(0, 120)}"`);
+    return 0;
+  }
+
   if (parsed.pdfAttachments.length === 0) {
     // Passed Stage 1 but no PDF — log as deferred (text-only invoice).
     db.prepare(`UPDATE ingested_emails SET gmail_uid = ?, subject = ?, from_address = ?, date = ?, pdf_count = ?, invoice_ids = ?, ingested_at = ?, skipped_count = ?, skip_reasons = ? WHERE message_id = ?`).run(
@@ -995,7 +1030,7 @@ async function processOneGmailMessage(
         }
       }
 
-      const shipToStore = resolveShipToStore(llmResult?.store_hint || null, vendorQboId);
+      const shipToStore = resolveShipToStore(llmResult?.store_hint || null, vendorQboId, llmResult?.ship_to_address || null);
 
       // Dedup (same logic as gmail.ts)
       try {
@@ -1101,6 +1136,16 @@ async function processOneGmailMessage(
         }
       } catch (e) {
         console.error(`[gmail-api] line-item persist failed for ${invoiceId}:`, (e as Error).message);
+      }
+
+      // Persist ship_to_address separately (added post-launch). See
+      // invoice-pipeline.ts for the rationale.
+      if (llmResult?.ship_to_address) {
+        try {
+          db.prepare(`UPDATE invoices SET ship_to_address = ? WHERE id = ?`).run(llmResult.ship_to_address, invoiceId);
+        } catch (e) {
+          console.warn(`[gmail-api] failed to persist ship_to_address for ${invoiceId}: ${(e as Error).message}`);
+        }
       }
 
       console.log(`[gmail-api] Ingested ${invoiceId}: vendor="${parsed_data.vendor_raw_name}" → ${vendorMatchStatus}${vendorQboName ? ` (${vendorQboName})` : ""}, store=${shipToStore || "unknown"}`);

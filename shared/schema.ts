@@ -51,6 +51,11 @@ export const invoices = sqliteTable("invoices", {
   // "Pre-Pay", "2% 10 Net 30"). Used by the discount/due-date fallback regexes
   // and surfaced in the AP drawer so users can sanity-check the parse.
   payment_terms: text("payment_terms"),
+  // Verbatim Ship-To address block extracted by the LLM. Persisted so the
+  // deterministic address→store fallback in resolveShipToStore() can be
+  // re-consulted on reparse and batch rematch without another LLM call.
+  // Feeds the fix for Frankford INV49534 (LLM said Greenvale, address said Huntington).
+  ship_to_address: text("ship_to_address"),
 });
 
 export const invoiceLineItems = sqliteTable("invoice_line_items", {

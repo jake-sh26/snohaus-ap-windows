@@ -73,6 +73,11 @@ export interface LLMParsedInvoice {
 
   // Routing hints (from system rules)
   store_hint: "Greenvale" | "Hempstead" | "Huntington" | "unknown";
+  // Raw ship-to address block copied verbatim from the invoice. Used as a
+  // deterministic fallback in resolveShipToStore() when the LLM's store_hint
+  // is wrong (e.g. Frankford INV49534 shipped to Huntington but hinted Greenvale).
+  // See server/storage.ts:resolveShipToStore for the address-based override rules.
+  ship_to_address: string | null;
   vendor_alias_applied: string | null; // e.g. "N-Brands → Nikkie"
   bill_kind: "inventory" | "expense" | "mixed" | "unknown"; // top-level routing decision
 
@@ -172,6 +177,7 @@ STORE ROUTING (for store_hint AND inventory account selection):
 - Huntington = 2 West Jericho Tpke, Huntington Station NY. Inventory account 1150040011.
 - Hempstead = anything else NY tied to Sno-Haus / SD Ski and Patio. Inventory account 1150040012.
 - KrownPoint storage at 100 Crossways Park Dr W Woodbury → store_hint="Greenvale" (it's the Greenvale store's storage), but the bill_kind is expense (rent), not inventory.
+- ALWAYS populate ship_to_address with the verbatim "Ship To" address block from the invoice (street + city + state + zip on one line, spaces between). If the invoice only shows a Bill-To (no separate Ship-To), copy the Bill-To into ship_to_address. This is used by a deterministic address→store fallback that overrides store_hint when they disagree — so accuracy of ship_to_address matters more than store_hint. Example: for a bill shipping to "2W Jericho Turnpike, Huntington Station NY 11746", set ship_to_address="2W Jericho Turnpike Huntington Station NY 11746" AND store_hint="Huntington".
 
 ADDITIONAL RULES:
 - Ignore Shopify-inventory-account entirely.
@@ -217,6 +223,7 @@ const SCHEMA_HINT = `{
   "bill_kind": "inventory"|"expense"|"mixed"|"unknown",
   "line_items": [{"sku": string or null, "description": string, "quantity": number or null, "unit_price": number or null, "amount": number, "suggested_category": "inventory"|"freight"|"tax"|"discount"|"expense"|"other", "suggested_account_id": string or null, "suggested_account_name": string or null}],
   "store_hint": "Greenvale"|"Hempstead"|"Huntington"|"unknown",
+  "ship_to_address": string or null,
   "vendor_alias_applied": string or null,
   "parse_confidence": "high"|"medium"|"low",
   "notes": string or null
@@ -455,6 +462,7 @@ ${SCHEMA_HINT}`;
         }))
       : [],
     store_hint: parsed.store_hint || "unknown",
+    ship_to_address: typeof parsed.ship_to_address === "string" && parsed.ship_to_address.trim() ? parsed.ship_to_address.trim() : null,
     vendor_alias_applied: parsed.vendor_alias_applied || null,
     parse_confidence: parsed.parse_confidence || "medium",
     notes: parsed.notes || null,
