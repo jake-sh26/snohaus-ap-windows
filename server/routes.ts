@@ -14289,6 +14289,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       parse_confidence: llmResult.parse_confidence || "medium",
       document_type: llmResult.document_type || null,
       store_hint: llmResult.store_hint || null,
+      // Always refresh ship_to_address from the latest parse so subsequent
+      // batch rematch runs can consult the printed address. Safe because the
+      // user cannot edit this from the UI.
+      ship_to_address: llmResult.ship_to_address || null,
       llm_notes: llmResult.notes || null,
       already_paid: llmResult.already_paid ? 1 : 0,
       line_items_json: JSON.stringify(llmResult.line_items || []),
@@ -14300,6 +14304,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       payment_terms: llmResult.payment_terms ?? null,
     };
     // Only fill in fields that were missing — never overwrite user-edited values.
+    // Ship-to-store: if the current row has none, run the resolver with the
+    // freshly-parsed address so an address→store inference can save Jake a manual pick.
+    // We deliberately do NOT overwrite an existing ship_to_store here — that's a user choice.
+    if (!inv.ship_to_store) {
+      const resolvedStore = resolveShipToStore(
+        llmResult.store_hint || null,
+        inv.vendor_qbo_id || null,
+        llmResult.ship_to_address || null,
+      );
+      if (resolvedStore) {
+        patch.ship_to_store = resolvedStore;
+        patch.routing_data = JSON.stringify({ store: resolvedStore });
+      }
+    }
     if (!inv.vendor_raw_name && llmResult.vendor_raw_name) patch.vendor_raw_name = llmResult.vendor_raw_name;
     if (!inv.invoice_number && llmResult.invoice_number) patch.invoice_number = llmResult.invoice_number;
     if (!inv.invoice_date && llmResult.invoice_date) patch.invoice_date = llmResult.invoice_date;
@@ -14858,10 +14876,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           vendorMatched++;
         }
       }
-      // Store: only assign if currently null/empty (don't overwrite a user choice)
+      // Store: only assign if currently null/empty (don't overwrite a user choice).
+      // Pass ship_to_address so the address→store fallback can win over a wrong
+      // store_hint (see Frankford INV49534 case).
       if (!inv.ship_to_store) {
         const newVendorId = patch.vendor_qbo_id || inv.vendor_qbo_id;
-        const store = resolveShipToStore((inv as any).store_hint, newVendorId);
+        const store = resolveShipToStore(
+          (inv as any).store_hint,
+          newVendorId,
+          (inv as any).ship_to_address || null,
+        );
         if (store) {
           patch.ship_to_store = store;
           patch.routing_data = JSON.stringify({ store });

@@ -332,6 +332,17 @@ function bootstrapSchema() {
   } catch {
     // already exists
   }
+
+  // Ship-to address block (verbatim from LLM). Persisted so reparse + batch
+  // rematch + drawer diagnostics can re-consult the printed address without
+  // re-running the LLM. Feeds the deterministic address→store fallback in
+  // resolveShipToStore(), which fixes cases where the LLM's store_hint
+  // disagrees with the Ship-To on the PDF (see Frankford INV49534).
+  try {
+    sqlite.exec(`ALTER TABLE invoices ADD COLUMN ship_to_address TEXT`);
+  } catch {
+    // already exists
+  }
   try {
     sqlite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_pdf_hash ON invoices(pdf_hash) WHERE pdf_hash IS NOT NULL`);
   } catch {
@@ -3729,27 +3740,85 @@ export function backfillVendorAliasesFromPostedInvoices(): { added: number; skip
   return { added, skipped };
 }
 
+type StoreKey = "greenvale" | "hempstead" | "huntington";
+
 /**
- * Map LLM's store_hint ("Greenvale"/"Hempstead"/"Huntington"/"unknown") to a StoreKey.
- * If the vendor has a default_store rule, that wins over store_hint="unknown".
+ * Deterministically infer a StoreKey from a raw ship-to address block.
+ *
+ * The LLM's store_hint is unreliable — e.g. Frankford Umbrellas INV49534 shipped
+ * to "2W Jericho Turnpike, Huntington Station NY 11746" but the LLM emitted
+ * store_hint="Greenvale", routing $328.86 of inventory to the wrong store. The
+ * printed ship-to address is authoritative, so this function parses it and
+ * takes precedence over the LLM hint.
+ *
+ * Match order (each check is case-insensitive, whitespace-tolerant):
+ *   1. Huntington — street 2 W(est)? Jericho, city "Huntington Station", or ZIP 11746
+ *   2. Greenvale — street 47 Northern Blvd, city "Greenvale", or ZIP 11548
+ *   3. Hempstead — city "Hempstead" or ZIP 11550/11552/11553/11554/11557/11559
+ *      (matches the west/central Nassau county cluster tied to Sno-Haus / SD Ski
+ *      and Patio; Hempstead is a fallback for "anything else NY tied to us").
+ *
+ * Returns null when the address is empty or doesn't match any store. Callers
+ * should then fall back to store_hint / vendor default.
+ */
+export function inferStoreFromAddress(shipToAddress: string | null | undefined): StoreKey | null {
+  const a = (shipToAddress || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!a) return null;
+  // Huntington Station is a very specific place name; check it first so
+  // "2 W Jericho ... Huntington Station NY 11746" never gets pulled into a
+  // partial "Huntington" or Greenvale/Hempstead regex accidentally.
+  if (/\bhuntington station\b/.test(a)) return "huntington";
+  if (/\b11746\b/.test(a)) return "huntington";
+  if (/\b2\s*w(est)?\.?\s+jericho\b/.test(a)) return "huntington";
+  if (/\b47\s+northern\s+blvd\b/.test(a)) return "greenvale";
+  if (/\bgreenvale\b/.test(a)) return "greenvale";
+  if (/\b11548\b/.test(a)) return "greenvale";
+  if (/\bhempstead\b/.test(a)) return "hempstead";
+  if (/\b1155[023479]\b/.test(a)) return "hempstead";
+  return null;
+}
+
+/**
+ * Map an invoice's routing signals to a concrete StoreKey.
+ *
+ * Precedence (highest wins):
+ *   1. shipToAddress — authoritative when the printed address clearly identifies a store.
+ *      This overrides a disagreeing LLM store_hint (see Frankford INV49534 case).
+ *   2. storeHint — the LLM's guess; used only when address inference is null.
+ *   3. Vendor's default_store rule — last resort when address AND hint are both empty.
+ *
+ * Returns null when nothing is decisive; the caller stores the invoice as unrouted
+ * and the drawer prompts the user to pick.
  */
 export function resolveShipToStore(
   storeHint: string | null | undefined,
   vendorQboId: string | null | undefined,
-): "greenvale" | "hempstead" | "huntington" | null {
+  shipToAddress?: string | null,
+): StoreKey | null {
+  // 1. Address-based inference wins when decisive.
+  const fromAddress = inferStoreFromAddress(shipToAddress);
+  if (fromAddress) {
+    const hint = (storeHint || "").toLowerCase().trim();
+    if (hint && hint !== "unknown" && hint !== fromAddress) {
+      console.log(`[ship-to-routing] address override: store_hint="${storeHint}" but address routes to "${fromAddress}" (address: ${JSON.stringify((shipToAddress || "").slice(0, 120))})`);
+    }
+    return fromAddress;
+  }
+
+  // 2. LLM hint fallback.
   const lower = (storeHint || "").toLowerCase().trim();
   if (lower === "greenvale") return "greenvale";
   if (lower === "hempstead") return "hempstead";
   if (lower === "huntington") return "huntington";
 
-  // Fall back to vendor's default_store rule
+  // 3. Vendor default_store rule.
   if (vendorQboId) {
     const rule = sqlite
       .prepare(`SELECT default_store FROM vendor_rules WHERE vendor_qbo_id = ? AND default_store IS NOT NULL LIMIT 1`)
       .get(vendorQboId) as { default_store: string } | undefined;
     if (rule?.default_store) {
       const ds = rule.default_store.toLowerCase();
-      if (ds === "greenvale" || ds === "hempstead" || ds === "huntington") return ds;
+      if (ds === "greenvale" || ds === "hempstead" || ds === "huntington") return ds as StoreKey;
     }
   }
   return null;
