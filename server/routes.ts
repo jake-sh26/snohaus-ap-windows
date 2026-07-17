@@ -8594,10 +8594,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     "/api/recon/finance/sales-tax/:month",
     authMiddleware,
     requirePermission("finance.sales_tax.view"),
-    (req, res) => {
+    (req, res, next) => {
       const month = String(req.params.month);
+      // PR #244 -- Express matches routes in order and this handler was
+      // registered before the sibling /filings, /quarter, /notes, and /export
+      // handlers. Any request whose first segment did not match YYYY-MM (e.g.
+      // GET /api/recon/finance/sales-tax/filings?from=...) was being 400'd
+      // here instead of reaching its intended handler. Fall through instead.
       if (!/^\d{4}-\d{2}$/.test(month)) {
-        return res.status(400).json({ message: "Month must be YYYY-MM" });
+        return next();
       }
       try {
         const base = computeSalesTaxForMonth(month);
