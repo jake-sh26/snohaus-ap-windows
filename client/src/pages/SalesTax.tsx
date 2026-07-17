@@ -151,6 +151,21 @@ export default function SalesTax() {
   // Filing period: the quarter key in ST-810 mode, otherwise the month.
   const periodKey = isQuarter && data?.quarter_key ? data.quarter_key : month;
 
+  // PR #244 — in quarter (ST-810) mode, writes for the filing checklist go to
+  // the quarter key (e.g. "2026-Q2") via upsertSalesTaxFiling(periodKey, ...).
+  // The monthly payload's `filings_by_entity` is keyed by month ("2026-05"),
+  // so it would never reflect a quarter-keyed write — the card would keep
+  // showing "Mark as Filed" no matter how many times you clicked it. Pull the
+  // quarter payload separately (enabled only in quarter mode) and use ITS
+  // `filings_by_entity` for the checklist. Reads match writes.
+  const quarterQ = useQuery<SalesTaxQuarter>({
+    queryKey: ["/api/recon/finance/sales-tax/quarter", data?.quarter_key],
+    queryFn: () => getSalesTaxQuarter(data!.quarter_key!),
+    enabled: !!(isQuarter && data?.quarter_key),
+  });
+  const filingsForChecklist: SalesTaxFiling[] =
+    (isQuarter ? quarterQ.data?.filings_by_entity : data?.filings_by_entity) ?? [];
+
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
       <div>
@@ -202,9 +217,17 @@ export default function SalesTax() {
           <FilingChecklist
             data={data}
             periodKey={periodKey}
+            filings={filingsForChecklist}
             canExport={canExport}
             currentUser={{ user_id, name, email }}
-            onChanged={() => qc.invalidateQueries({ queryKey: ["/api/recon/finance/sales-tax", month] })}
+            onChanged={() => {
+              // Invalidate BOTH the month payload and the quarter payload so
+              // the checklist refreshes regardless of which mode is active.
+              qc.invalidateQueries({ queryKey: ["/api/recon/finance/sales-tax", month] });
+              if (data?.quarter_key) {
+                qc.invalidateQueries({ queryKey: ["/api/recon/finance/sales-tax/quarter", data.quarter_key] });
+              }
+            }}
             toast={toast}
           />
           {/* PR #191 — on quarter-end months (Feb/May/Aug/Nov in NY tax-year
@@ -526,10 +549,11 @@ function EntityCard({
 type ToastFn = ReturnType<typeof useToast>["toast"];
 
 function FilingChecklist({
-  data, periodKey, canExport, currentUser, onChanged, toast,
+  data, periodKey, filings, canExport, currentUser, onChanged, toast,
 }: {
   data: SalesTaxMonth;
   periodKey: string;
+  filings: SalesTaxFiling[];
   canExport: boolean;
   currentUser: { user_id: number | null; name: string | null; email: string | null };
   onChanged: () => void;
@@ -539,7 +563,7 @@ function FilingChecklist({
   // its own ST-810/ST-809 return. Render 3 cards. The legacy aggregate row
   // (entity_id 0) is intentionally NOT shown; it remains in the backend only
   // for backward compatibility with old per-period exports.
-  const filings = data.filings_by_entity ?? [];
+  // PR #244 — `filings` now comes in as a prop so quarter-mode reads match writes.
   const filingFor = (eid: number): SalesTaxFiling | undefined =>
     filings.find((f) => f.entity_id === eid);
 
