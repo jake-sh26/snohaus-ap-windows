@@ -397,6 +397,68 @@ app.use((req, res, next) => {
         }, msToTopOfHour);
       }
 
+      // PR follow-up to sales-tax Unallocated diagnosis (Jul 2026): the
+      // allocator (runAllocationEngine) had NO scheduler. Orders sync every
+      // 6h and payouts every 12h, but recon_allocations only refreshed when
+      // someone hit the ReconcilerTest button by hand. Any month that wasn't
+      // manually re-run drifted into Unallocated as new orders came in,
+      // silently hiding real tax liability behind the sales-tax page's
+      // Unallocated bucket. This cron re-runs the allocator every 6h for
+      // the current NY month AND the previous NY month (orders that straddle
+      // a month boundary via recognized_at can still need re-attribution
+      // after the calendar rolls). Idempotent — runAllocationEngine deletes
+      // only auto allocations before re-inserting; manual_override rows are
+      // preserved.
+      //
+      // Gated by ALLOCATOR_CRON_ENABLED (default on; set to 'false' to kill
+      // without a redeploy). Non-overlapping via in-memory flag. First run
+      // at +30s from boot so orders sync has a chance to land new orders.
+      let allocatorCronRunning = false;
+      const runAllocatorCron = async () => {
+        if (process.env.ALLOCATOR_CRON_ENABLED === "false") return;
+        if (allocatorCronRunning) {
+          console.warn("[allocator-cron] previous run still in progress \u2014 skipping this tick");
+          return;
+        }
+        allocatorCronRunning = true;
+        const startedAt = Date.now();
+        try {
+          const { runAllocationEngine } = await import("./shopify-recon-allocator");
+          // Use America/New_York clock to pick the current NY month, matching
+          // the -5h shift used throughout the sales/tax aggregators.
+          const nyNow = new Date(Date.now() - 5 * 60 * 60 * 1000);
+          const y = nyNow.getUTCFullYear();
+          const mo = nyNow.getUTCMonth(); // 0-based
+          const monthOf = (yy: number, mm0: number) =>
+            `${yy}-${String(mm0 + 1).padStart(2, "0")}`;
+          const current = monthOf(y, mo);
+          const prevY = mo === 0 ? y - 1 : y;
+          const prevM = mo === 0 ? 11 : mo - 1;
+          const previous = monthOf(prevY, prevM);
+          for (const m of [previous, current]) {
+            try {
+              const s = runAllocationEngine(m);
+              log(
+                `[allocator-cron] ${m}: orders=${s.orders_processed} lines=${s.line_items_processed} written=${s.allocations_written} needs_review=${s.needs_review_orders}`,
+              );
+            } catch (e: any) {
+              console.error(
+                `[allocator-cron] ${m} failed: ${e?.message ?? e}`,
+              );
+            }
+          }
+        } catch (e: any) {
+          console.error(`[allocator-cron] failed: ${e?.message ?? e}`);
+        } finally {
+          allocatorCronRunning = false;
+          console.log(
+            `[allocator-cron] end (${Date.now() - startedAt}ms)`,
+          );
+        }
+      };
+      setTimeout(runAllocatorCron, 30000);
+      setInterval(runAllocatorCron, 6 * 60 * 60 * 1000);
+
       // Start backup scheduler (hourly local, daily Drive, weekly full)
       setTimeout(() => {
         try {
