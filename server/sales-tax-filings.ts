@@ -73,15 +73,81 @@ export function ensureSalesTaxFilingsSchema(): void {
         ON sales_tax_filings(status);
     `);
   } else {
-    // Pre-existing table: add entity_id column if missing, then ensure the
-    // (period_key, entity_id) uniqueness via a UNIQUE INDEX. The old PRIMARY
-    // KEY on period_key alone is preserved by SQLite; existing rows continue
-    // to satisfy it because they get entity_id = 0 by default.
+    // Pre-existing table. Two eras coexist here:
+    //   * PR #165 shape: PRIMARY KEY (period_key)                 -- BROKEN for per-entity
+    //   * PR #191 shape: PK (period_key) + UNIQUE(period_key,eid) -- ALSO BROKEN, still keyed on period_key alone
+    //
+    // The PR #191 migration added a UNIQUE INDEX on (period_key, entity_id)
+    // but never rebuilt the primary key, so INSERTs from the per-entity UI
+    // fail with "UNIQUE constraint failed: sales_tax_filings.period_key" as
+    // soon as a second entity is filed for the same period (see July 19 2026
+    // Huntington-after-Greenvale bug).
+    //
+    // SQLite can't drop a PRIMARY KEY in place, so we rebuild the table
+    // exactly once, inside a transaction, only when the old PK shape is
+    // detected. This is idempotent: after the rebuild the detection returns
+    // false and this block short-circuits to the additive path.
     const cols = sqlite
       .prepare(`PRAGMA table_info(sales_tax_filings)`)
-      .all() as Array<{ name: string }>;
+      .all() as Array<{ name: string; pk: number }>;
     const hasEntityId = cols.some((c) => c.name === "entity_id");
-    if (!hasEntityId) {
+
+    // Detect the broken PK shape: entity_id is NOT part of the primary key
+    // (i.e. exactly one column has pk > 0, and it's not entity_id).
+    const pkCols = cols.filter((c) => c.pk > 0).map((c) => c.name);
+    const pkNeedsRebuild =
+      pkCols.length === 1 && pkCols[0] !== "entity_id" && pkCols[0] === "period_key";
+
+    if (pkNeedsRebuild) {
+      console.log(
+        "[sales-tax-filings] rebuilding table to composite PK (period_key, entity_id)",
+      );
+      // Wrap the rebuild in a transaction so we never end up with a half-
+      // migrated schema on crash. If entity_id doesn't exist yet, add it as
+      // part of the SELECT (default 0 = legacy aggregate row).
+      const tx = sqlite.transaction(() => {
+        // Turn foreign_keys off during the rename dance (SQLite recommendation
+        // for this pattern). No FKs touch this table today, but be safe.
+        const fkPragma = sqlite.pragma("foreign_keys", { simple: true }) as number;
+        try {
+          sqlite.exec("PRAGMA foreign_keys = OFF");
+          sqlite.exec(`
+            CREATE TABLE sales_tax_filings__new (
+              period_key TEXT NOT NULL,
+              entity_id INTEGER NOT NULL DEFAULT 0,
+              period_type TEXT NOT NULL CHECK (period_type IN ('month','quarter')),
+              status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','filed','amended')),
+              filed_at TEXT NULL,
+              confirmation_number TEXT NULL,
+              filed_by_user_id INTEGER NULL,
+              notes TEXT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (period_key, entity_id)
+            );
+          `);
+          const selectEntityCol = hasEntityId ? "entity_id" : "0 AS entity_id";
+          sqlite.exec(`
+            INSERT INTO sales_tax_filings__new
+              (period_key, entity_id, period_type, status, filed_at,
+               confirmation_number, filed_by_user_id, notes, created_at, updated_at)
+            SELECT
+              period_key, ${selectEntityCol}, period_type, status, filed_at,
+              confirmation_number, filed_by_user_id, notes, created_at, updated_at
+            FROM sales_tax_filings;
+          `);
+          sqlite.exec("DROP TABLE sales_tax_filings;");
+          sqlite.exec("ALTER TABLE sales_tax_filings__new RENAME TO sales_tax_filings;");
+        } finally {
+          if (fkPragma === 1) sqlite.exec("PRAGMA foreign_keys = ON");
+        }
+      });
+      tx();
+      console.log("[sales-tax-filings] rebuild complete");
+    } else if (!hasEntityId) {
+      // Older-than-PR#191 table with no entity_id column at all AND the PK
+      // check above didn't fire (shouldn't be reachable in prod, but keep
+      // the safety net for local dev DBs).
       try {
         sqlite.exec(
           `ALTER TABLE sales_tax_filings ADD COLUMN entity_id INTEGER NOT NULL DEFAULT 0`,
@@ -90,6 +156,10 @@ export function ensureSalesTaxFilingsSchema(): void {
         console.error("[sales-tax-filings] add entity_id column failed:", e?.message);
       }
     }
+
+    // Always ensure the composite unique index + status index exist. The
+    // unique index is redundant once the composite PK is in place, but it's
+    // cheap and it makes the intent obvious in schema dumps.
     sqlite.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS uq_sales_tax_filings_period_entity
         ON sales_tax_filings(period_key, entity_id);
