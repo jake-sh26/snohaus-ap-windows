@@ -9240,28 +9240,54 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const sumOfEntities = entityIds.reduce((acc, eid) => acc + netOf(eid), 0);
 
-      // grand_total computed the same way (Σ over all entities of net) — this
-      // is the whole. By construction it equals sumOfEntities exactly.
-      const grandTotal = sumOfEntities;
-      const deltaCents = grandTotal - sumOfEntities;
+      // PR #244: real cross-engine invariant. The old check compared
+      // sumOfEntities against itself (grandTotal := sumOfEntities), which is
+      // tautologically 0 and could not catch the June 2026 $600.70 / July 2026
+      // $587.76 drift where the attribution engine's total diverges from
+      // computeFinanceDiffV2 (the ShopifyQL-anchored canonical tax figure).
+      //
+      // Canonical tax comes from computeFinanceDiffV2 — the same engine that
+      // powers Monthly Summary and the /api/recon/finance/diff endpoint,
+      // sourced from recon_shopify_sales with PR #110/#113/#117/#121 order-
+      // status filters. That is the number we filed against and the number
+      // Shopify's own Finance Summary reports. Any drift from it is a bug in
+      // computeAttributionForMonth's row selection (currently reads
+      // recon_line_items / recon_refund_line_items without those filters, so
+      // cancelled-order forward tax leaks through — see #38248, #38292).
+      const { computeFinanceDiffV2 } = require("./shopify-finance-diff");
+      const diffResult = computeFinanceDiffV2(month);
+      const canonicalTaxDollars = Number(diffResult?.ours?.taxes ?? 0);
+      const canonicalCents = Math.round(canonicalTaxDollars * 100);
 
-      // Share-rounding drift: how many cents the rounded per-row forward tax
-      // diverged from the raw line cents. Reported for transparency; it is the
-      // invariant tolerance, though delta is structurally 0 here.
-      const driftCents = a.attrForwardCentsTotal - a.rawForwardCentsTotal;
+      // Share-rounding drift: cents lost to ROUND(line_tax * share) on split
+      // lines. This is the ONLY drift the invariant should tolerate.
+      const rowRoundingDriftCents = a.attrForwardCentsTotal - a.rawForwardCentsTotal;
 
-      const invariantHolds = Math.abs(deltaCents) <= Math.abs(driftCents);
+      // Real delta: attribution-engine total minus canonical total. Positive
+      // = engine over-attributes (June 2026 pattern), negative = engine
+      // under-attributes (July 2026 pattern).
+      const deltaCents = sumOfEntities - canonicalCents;
+
+      // Invariant tolerance is 1 cent + the row-level share rounding drift.
+      const toleranceCents = 1 + Math.abs(rowRoundingDriftCents);
+      const invariantHolds = Math.abs(deltaCents) <= toleranceCents;
 
       res.json({
-        build_id: "pr159-debug-attribution-invariant",
+        build_id: "pr244-real-attribution-invariant",
         month,
-        grand_total_tax_dollars: fromCents(grandTotal),
+        canonical_tax_dollars: fromCents(canonicalCents),
+        engine_sum_tax_dollars: fromCents(sumOfEntities),
         per_entity: perEntity,
-        sum_of_entity_totals_dollars: fromCents(sumOfEntities),
         delta_dollars: fromCents(deltaCents),
         invariant_holds: invariantHolds,
-        split_line_rounding_drift_cents: driftCents,
-        note: "PR #159-debug. grand_total and per_entity are both summed from ONE set of per-row integer cents (the v_attributed_sales forward path + refund + shipping dominant-entity attribution), so Σ per_entity == grand_total by construction; delta_dollars is structurally 0.00. split_line_rounding_drift_cents reports cents lost to ROUND(line_tax × share) on split lines (the documented penny tradeoff) and is the invariant tolerance. entity 0 = Unallocated is included so the parts sum to the whole. Returns 200 either way so drift is visible, not hidden behind a 500.",
+        tolerance_cents: toleranceCents,
+        split_line_rounding_drift_cents: rowRoundingDriftCents,
+        // Legacy fields — kept so existing UI banners / diagnostic scripts
+        // that read grand_total_tax_dollars / sum_of_entity_totals_dollars
+        // don't break. Both are the engine's sum-of-entities value.
+        grand_total_tax_dollars: fromCents(sumOfEntities),
+        sum_of_entity_totals_dollars: fromCents(sumOfEntities),
+        note: "PR #244: this invariant now compares Σ per_entity (from computeAttributionForMonth) against computeFinanceDiffV2's canonical tax total (ShopifyQL-anchored, PR #110/#113/#117/#121 filters, matches Monthly Summary and Shopify Admin Finance Summary). The previous version compared the engine's sum to itself and was structurally 0. delta_dollars > 0 means the engine over-attributes vs. Shopify (typical cause: cancelled/voided orders leaking through recon_line_items which computeFinanceDiffV2 filters out via recon_shopify_sales). tolerance_cents = 1 + |split_line_rounding_drift_cents|.",
       });
     } catch (e: any) {
       res.status(500).json({ message: "attribution-invariant failed", error: String(e?.message || e) });
