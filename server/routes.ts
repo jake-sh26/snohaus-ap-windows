@@ -7715,6 +7715,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   const computeAttributionForMonth = (month: string) => {
     const { sqlite } = require("./storage");
 
+    // -------------------------------------------------------------------
+    // PR #245 — engine sourced from recon_shopify_sales (single-source-of-
+    // truth). Previously read from v_attributed_sales, which reads from
+    // recon_line_items with NO cancellation/reversal filtering — so
+    // cancelled/voided orders leaked their pre-void tax into the forward
+    // sum (June 2026 +$600.70), and refund tax attributed to stores where
+    // forward tax was excluded left the engine short (July 2026 -$587.76).
+    //
+    // recon_shopify_sales is populated by the ShopifyQL agreements ingest
+    // (server/shopify-recon-agreements.ts). It stores ONE ROW PER
+    // (order, line_item, action_type, line_type) event:
+    //   action_type ORDER  + line_type PRODUCT   -> original forward line
+    //   action_type UPDATE + line_type PRODUCT   -> order-edit reversal
+    //                                               (net-out for cancels)
+    //   action_type RETURN + line_type PRODUCT   -> refund line tax
+    //   action_type ORDER  + line_type SHIPPING  -> forward shipping tax
+    //   action_type RETURN + line_type SHIPPING  -> refund shipping tax
+    //   action_type *      + line_type GIFT_CARD -> excluded (per PR #122)
+    //
+    // The canonical tax formula (computeV2FinanceSummary): SUM(total_tax)
+    // WHERE line_type != 'GIFT_CARD'. Every row's total_tax carries the
+    // correct sign already (RETURN rows are negative), so summing across
+    // action_types naturally produces the net. Cancelled orders net to $0
+    // because their ORDER row is offset by an UPDATE reversal row.
+    //
+    // Attribution buckets preserved (forward line tax / refund line tax /
+    // forward shipping / refund shipping) so drill-down endpoints keep
+    // working, but each bucket now filters recon_shopify_sales instead of
+    // reading raw recon_line_items / recon_refund_line_items.
+    // -------------------------------------------------------------------
+
     // POS entity set — picks outside this set collapse to Unallocated (0),
     // mirroring loadTaxInputsForMonth + PR #158 exactly.
     const posEntitySet = new Set<number>(
@@ -7737,140 +7768,168 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return 0;
     };
 
-    // ---- FORWARD line tax, read straight from the v_attributed_sales view,
-    // with the POS-location candidate layered on (the view omits it; see the
-    // storage.ts note). One row per non-gift-card line in the NY month.
-    const fwdRows = sqlite.prepare(`
+    // Shared attribution candidate resolver for a single (order_id,
+    // line_item_id). Uses:
+    //   - pos_entity_id     : recon_shopify_sales.pos_location_id -> entity
+    //   - per_line_entity_id: recon_allocations (line-scoped)
+    //   - order_entity_id   : recon_allocations (order-scoped)
+    //   - dominant_entity_id: recon_allocations (max gross tie-break by eid)
+    const candidateSql = `
       SELECT
-        v.line_item_id,
-        v.order_id,
-        v.tax_lines_json,
-        v.per_line_entity_id,
-        v.per_line_share,
-        v.order_entity_id,
-        v.dominant_entity_id,
         (SELECT pl.entity_id
-           FROM recon_shopify_sales s
+           FROM recon_shopify_sales s2
            JOIN recon_entity_pos_locations pl
-             ON pl.shopify_location_id = s.pos_location_id
+             ON pl.shopify_location_id = s2.pos_location_id
             AND pl.kind = 'pos' AND pl.active = 1
-          WHERE s.order_id = v.order_id
-            AND s.line_item_id = v.line_item_id
-            AND s.pos_location_id IS NOT NULL
-          LIMIT 1) AS pos_entity_id
-      FROM v_attributed_sales v
-      WHERE v.happened_month = ?
+          WHERE s2.order_id = ?
+            AND s2.line_item_id = ?
+            AND s2.pos_location_id IS NOT NULL
+          LIMIT 1) AS pos_entity_id,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = ? AND a.line_item_id = ? LIMIT 1) AS per_line_entity_id,
+        (SELECT a.share FROM recon_allocations a
+          WHERE a.order_id = ? AND a.line_item_id = ? LIMIT 1) AS per_line_share,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = ? AND a.line_item_id IS NULL LIMIT 1) AS order_entity_id,
+        (SELECT a.entity_id FROM recon_allocations a
+          WHERE a.order_id = ?
+          GROUP BY a.entity_id
+          ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1) AS dominant_entity_id
+    `;
+    const candidateStmt = sqlite.prepare(candidateSql);
+
+    // Cache candidate lookups — same (order, line) is queried once per row
+    // in both forward and refund passes.
+    const candidateCache = new Map<string, {
+      pos_entity_id: number | null;
+      per_line_entity_id: number | null;
+      per_line_share: number | null;
+      order_entity_id: number | null;
+      dominant_entity_id: number | null;
+    }>();
+    const getCandidates = (orderId: string, lineItemId: string | null) => {
+      const key = `${orderId}::${lineItemId ?? ""}`;
+      let hit = candidateCache.get(key);
+      if (hit) return hit;
+      const lid = lineItemId ?? "";
+      const row = candidateStmt.get(
+        orderId, lid,       // pos
+        orderId, lid,       // per_line entity
+        orderId, lid,       // per_line share
+        orderId,            // order-level
+        orderId,            // dominant
+      ) as any;
+      hit = {
+        pos_entity_id: row?.pos_entity_id ?? null,
+        per_line_entity_id: row?.per_line_entity_id ?? null,
+        per_line_share: row?.per_line_share ?? null,
+        order_entity_id: row?.order_entity_id ?? null,
+        dominant_entity_id: row?.dominant_entity_id ?? null,
+      };
+      candidateCache.set(key, hit);
+      return hit;
+    };
+
+    // ---- FORWARD LINE TAX ----------------------------------------------
+    // action_type IN ('ORDER','UPDATE') AND line_type = 'PRODUCT'
+    // Includes UPDATE (order-edit reversal) rows so cancelled orders net
+    // to $0 the same way computeV2FinanceSummary sees them.
+    const fwdLineRows = sqlite.prepare(`
+      SELECT
+        s.line_item_id,
+        s.order_id,
+        s.total_tax
+      FROM recon_shopify_sales s
+      WHERE s.happened_month = ?
+        AND s.action_type IN ('ORDER','UPDATE')
+        AND s.line_type = 'PRODUCT'
     `).all(month) as any[];
 
-    // Per-entity forward cents, per-order×entity forward cents (drill-down),
-    // and per-order×entity forward cents used to choose the shipping dominant.
     const fwdByEntity = new Map<number, number>();
     let splitLineCount = 0;
-    let rawForwardCentsTotal = 0;   // Σ raw line cents (pre share-rounding)
-    let attrForwardCentsTotal = 0;  // Σ rounded attributed cents
+    let rawForwardCentsTotal = 0;
+    let attrForwardCentsTotal = 0;
     const fwdLineCountByEntity = new Map<number, number>();
-    // order_id → entity_id → cents (forward line tax). Drives drill-down +
-    // shipping dominant-entity selection.
     const fwdByOrderEntity = new Map<string, Map<number, number>>();
-    // order_id → line_item_id → { entity, share, cents }
     const lineDetailByOrder = new Map<string, Array<{ line_item_id: string; entity_id: number; share: number; forward_cents: number }>>();
 
-    for (const r of fwdRows) {
+    for (const r of fwdLineRows) {
+      const orderId = String(r.order_id);
+      const lineItemId = r.line_item_id != null ? String(r.line_item_id) : "";
+      const c = getCandidates(orderId, lineItemId || null);
       const eid = pickEntity(
-        r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+        c.pos_entity_id, c.per_line_entity_id, c.order_entity_id, c.dominant_entity_id,
       );
-      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
+      const share = c.per_line_share != null ? Number(c.per_line_share) : 1;
       if (share < 1) splitLineCount += 1;
 
-      let lineTaxCents = 0;
-      for (const tl of parseTaxLines(r.tax_lines_json)) {
-        lineTaxCents += Math.round(Number(tl.price || 0) * 100);
-      }
-      const attributedCents = Math.round(lineTaxCents * share);
+      // recon_shopify_sales.total_tax is stored signed by action_type; for
+      // ORDER/UPDATE it's the forward tax (positive for ORDER, typically
+      // negative for UPDATE reversal). We sum the raw value so cancelled
+      // orders' UPDATE reversal offsets their original ORDER row.
+      const rawCents = Math.round(Number(r.total_tax || 0) * 100);
+      const attributedCents = Math.round(rawCents * share);
 
-      rawForwardCentsTotal += lineTaxCents;
+      rawForwardCentsTotal += rawCents;
       attrForwardCentsTotal += attributedCents;
 
       fwdByEntity.set(eid, (fwdByEntity.get(eid) || 0) + attributedCents);
       fwdLineCountByEntity.set(eid, (fwdLineCountByEntity.get(eid) || 0) + 1);
 
-      const oid = String(r.order_id);
-      let oe = fwdByOrderEntity.get(oid);
-      if (!oe) { oe = new Map<number, number>(); fwdByOrderEntity.set(oid, oe); }
+      let oe = fwdByOrderEntity.get(orderId);
+      if (!oe) { oe = new Map<number, number>(); fwdByOrderEntity.set(orderId, oe); }
       oe.set(eid, (oe.get(eid) || 0) + attributedCents);
 
-      let ld = lineDetailByOrder.get(oid);
-      if (!ld) { ld = []; lineDetailByOrder.set(oid, ld); }
-      ld.push({ line_item_id: String(r.line_item_id), entity_id: eid, share, forward_cents: attributedCents });
+      let ld = lineDetailByOrder.get(orderId);
+      if (!ld) { ld = []; lineDetailByOrder.set(orderId, ld); }
+      ld.push({ line_item_id: lineItemId, entity_id: eid, share, forward_cents: attributedCents });
     }
 
-    // ---- REFUND line tax (item refunds), attributed via the SAME cascade on
-    // the original line. Bucketed by parent refund processed_at (-5h NY).
-    // ABS-wrapped (sign-convention trap). Gift cards excluded.
-    const refRows = sqlite.prepare(`
+    // ---- REFUND LINE TAX -----------------------------------------------
+    // action_type = 'RETURN' AND line_type IN ('PRODUCT','ADJUSTMENT')
+    // Matches the same order-status filter computeV2FinanceSummary uses
+    // for the returns column. total_tax is stored with the RETURN sign
+    // convention — we ABS-wrap here so refByEntity contributes positively
+    // (net = fwd - ref preserves the original bucket contract).
+    const refundLineRows = sqlite.prepare(`
       SELECT
-        rli.order_id,
-        rli.line_item_id,
-        rli.total_tax AS refund_tax,
-        (SELECT pl.entity_id
-           FROM recon_shopify_sales s
-           JOIN recon_entity_pos_locations pl
-             ON pl.shopify_location_id = s.pos_location_id
-            AND pl.kind = 'pos' AND pl.active = 1
-          WHERE s.order_id = rli.order_id
-            AND s.line_item_id = rli.line_item_id
-            AND s.pos_location_id IS NOT NULL
-          LIMIT 1) AS pos_entity_id,
-        (SELECT a.entity_id FROM recon_allocations a
-          WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1) AS per_line_entity_id,
-        (SELECT a.share FROM recon_allocations a
-          WHERE a.order_id = rli.order_id AND a.line_item_id = rli.line_item_id LIMIT 1) AS per_line_share,
-        (SELECT a.entity_id FROM recon_allocations a
-          WHERE a.order_id = rli.order_id AND a.line_item_id IS NULL LIMIT 1) AS order_entity_id,
-        (SELECT a.entity_id FROM recon_allocations a
-          WHERE a.order_id = rli.order_id
-          GROUP BY a.entity_id
-          ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1) AS dominant_entity_id
-      FROM recon_refund_line_items rli
-      JOIN recon_refunds rf ON rf.id = rli.refund_id
- LEFT JOIN recon_line_items li
-        ON li.id = rli.line_item_id AND li.order_id = rli.order_id
-      WHERE COALESCE(rli.kind, 'item') = 'item'
-        AND substr(datetime(
-              COALESCE(rf.processed_at, rf.created_at),
-              '-5 hours'), 1, 7) = ?
-        AND COALESCE(li.is_gift_card, 0) = 0
+        s.line_item_id,
+        s.order_id,
+        s.total_tax
+      FROM recon_shopify_sales s
+      WHERE s.happened_month = ?
+        AND s.action_type = 'RETURN'
+        AND s.line_type IN ('PRODUCT','ADJUSTMENT')
     `).all(month) as any[];
 
     const refByEntity = new Map<number, number>();
-    // order_id → line_item_id → refund cents
     const refByOrderLine = new Map<string, Map<string, number>>();
-    for (const r of refRows) {
+    for (const r of refundLineRows) {
+      const orderId = String(r.order_id);
+      const lineItemId = r.line_item_id != null ? String(r.line_item_id) : "";
+      const c = getCandidates(orderId, lineItemId || null);
       const eid = pickEntity(
-        r.pos_entity_id, r.per_line_entity_id, r.order_entity_id, r.dominant_entity_id,
+        c.pos_entity_id, c.per_line_entity_id, c.order_entity_id, c.dominant_entity_id,
       );
-      const share = r.per_line_share != null ? Number(r.per_line_share) : 1;
-      const taxCents = Math.round(Math.abs(Number(r.refund_tax || 0)) * 100);
+      const share = c.per_line_share != null ? Number(c.per_line_share) : 1;
+      const taxCents = Math.round(Math.abs(Number(r.total_tax || 0)) * 100);
       const attributedCents = Math.round(taxCents * share);
       refByEntity.set(eid, (refByEntity.get(eid) || 0) + attributedCents);
 
-      const oid = String(r.order_id);
-      const lid = String(r.line_item_id);
-      let m = refByOrderLine.get(oid);
-      if (!m) { m = new Map<string, number>(); refByOrderLine.set(oid, m); }
-      m.set(lid, (m.get(lid) || 0) + attributedCents);
+      let m = refByOrderLine.get(orderId);
+      if (!m) { m = new Map<string, number>(); refByOrderLine.set(orderId, m); }
+      m.set(lineItemId, (m.get(lineItemId) || 0) + attributedCents);
     }
 
-    // ---- SHIPPING forward tax. Σ raw_json.shipping_lines[].tax_lines[].price
-    // (ABS-wrapped) per order, attributed to the order's DOMINANT entity by
-    // forward LINE tax (tie-break lowest entity_id). Orders in the NY month
-    // (COALESCE(processed_at, created_at) -5h), same bucket as the line tax.
+    // ---- SHIPPING FORWARD TAX ------------------------------------------
+    // action_type IN ('ORDER','UPDATE') AND line_type = 'SHIPPING'
+    // Attributed to the order's DOMINANT entity by forward LINE tax
+    // (tie-break lowest entity_id).
     const dominantEntityForOrder = (oid: string): number => {
       const oe = fwdByOrderEntity.get(oid);
       if (!oe || oe.size === 0) return 0;
       let bestEid = 0;
       let bestCents = -1;
-      // Deterministic: iterate entity_ids ascending so ties pick the lowest.
       const eids = Array.from(oe.keys()).filter((e) => e !== 0).sort((a, b) => a - b);
       for (const e of eids) {
         const c = oe.get(e) || 0;
@@ -7880,60 +7939,57 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     };
 
     const shipFwdRows = sqlite.prepare(`
-      SELECT o.id AS order_id, o.raw_json AS raw_json
-      FROM recon_orders o
-      WHERE substr(datetime(
-              COALESCE(o.processed_at, o.created_at),
-              '-5 hours'), 1, 7) = ?
-        AND o.raw_json IS NOT NULL AND o.raw_json <> ''
+      SELECT s.order_id, s.total_tax
+      FROM recon_shopify_sales s
+      WHERE s.happened_month = ?
+        AND s.action_type IN ('ORDER','UPDATE')
+        AND s.line_type = 'SHIPPING'
     `).all(month) as any[];
 
     const shipByEntity = new Map<number, number>();
-    // order_id → { dominant_entity_id, cents }
     const shipByOrder = new Map<string, { entity_id: number; cents: number }>();
+    // Aggregate per order first so UPDATE reversals net against ORDER rows
+    // before attribution (a single order can have both).
+    const shipByOrderCents = new Map<string, number>();
     for (const r of shipFwdRows) {
-      let parsed: any;
-      try { parsed = typeof r.raw_json === 'string' ? JSON.parse(r.raw_json) : r.raw_json; }
-      catch { continue; }
-      const sLines = Array.isArray(parsed?.shipping_lines) ? parsed.shipping_lines : [];
-      if (sLines.length === 0) continue;
-      let cents = 0;
-      for (const s of sLines) {
-        const tls = Array.isArray(s?.tax_lines) ? s.tax_lines : [];
-        for (const tl of tls) {
-          const price = typeof tl?.price === 'number' ? tl.price : tl?.price != null ? Number(tl.price) : null;
-          if (price == null || !Number.isFinite(price)) continue;
-          cents += Math.round(Math.abs(price) * 100);
-        }
-      }
+      const cents = Math.round(Number(r.total_tax || 0) * 100);
       if (cents === 0) continue;
       const oid = String(r.order_id);
+      shipByOrderCents.set(oid, (shipByOrderCents.get(oid) || 0) + cents);
+    }
+    shipByOrderCents.forEach((cents, oid) => {
+      if (cents === 0) return;
       const eid = dominantEntityForOrder(oid);
       shipByEntity.set(eid, (shipByEntity.get(eid) || 0) + cents);
       shipByOrder.set(oid, { entity_id: eid, cents });
-    }
+    });
 
-    // ---- SHIPPING refund tax. Same dominant-entity rule, subtracted.
+    // ---- SHIPPING REFUND TAX -------------------------------------------
     const shipRefRows = sqlite.prepare(`
-      SELECT rli.order_id AS order_id, rli.total_tax AS total_tax
-      FROM recon_refund_line_items rli
-      JOIN recon_refunds rf ON rf.id = rli.refund_id
-      WHERE rli.kind = 'adjustment'
-        AND rli.adjustment_kind = 'shipping_refund'
-        AND substr(datetime(
-              COALESCE(rf.processed_at, rf.created_at),
-              '-5 hours'), 1, 7) = ?
+      SELECT s.order_id, s.total_tax
+      FROM recon_shopify_sales s
+      WHERE s.happened_month = ?
+        AND s.action_type = 'RETURN'
+        AND s.line_type = 'SHIPPING'
     `).all(month) as any[];
     const shipRefByEntity = new Map<number, number>();
+    const shipRefByOrderCents = new Map<string, number>();
     for (const r of shipRefRows) {
       const cents = Math.round(Math.abs(Number(r.total_tax || 0)) * 100);
       if (cents === 0) continue;
-      const eid = dominantEntityForOrder(String(r.order_id));
-      shipRefByEntity.set(eid, (shipRefByEntity.get(eid) || 0) + cents);
+      const oid = String(r.order_id);
+      shipRefByOrderCents.set(oid, (shipRefByOrderCents.get(oid) || 0) + cents);
     }
+    shipRefByOrderCents.forEach((cents, oid) => {
+      if (cents === 0) return;
+      const eid = dominantEntityForOrder(oid);
+      shipRefByEntity.set(eid, (shipRefByEntity.get(eid) || 0) + cents);
+    });
 
-    // Net per entity = fwdLine - refLine + shipFwd - shipRef. Computed from
-    // ONE set of per-row integer cents — this is what makes the invariant hold.
+    // Net per entity = fwdLine - refLine + shipFwd - shipRef. All four
+    // components sourced from recon_shopify_sales with the same filters
+    // as computeV2FinanceSummary, so Σ over all entities matches
+    // computeFinanceDiffV2's canonical tax total by construction.
     const allEntities = new Set<number>();
     [fwdByEntity, refByEntity, shipByEntity, shipRefByEntity].forEach((m) =>
       m.forEach((_v, k) => allEntities.add(k)),
@@ -7946,7 +8002,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       splitLineCount,
       rawForwardCentsTotal, attrForwardCentsTotal,
       allEntities,
-      // drill-down structures
       lineDetailByOrder, refByOrderLine, shipByOrder,
     };
   };
