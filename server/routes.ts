@@ -4926,11 +4926,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // for 2025-12, 2026-04, 2026-05); only the source of truth changed so
       // by-store tax can never drift from ST-810 / grand totals again.
       const attribution = computeAttributionForMonth(month);
+      // PR #247 — net now sourced from canonical recon_shopify_sales via
+      // attribution.netByEntity (see computeAttributionForMonth). The old
+      // fwd - ref + ship - shipRef formula drifted from canonical on
+      // months with order edits (Nov +$19.24, Mar +$2.15, Jun +$600.70,
+      // Jul −$587.76) because its component sources didn't net
+      // cancelled/edited orders the way recon_shopify_sales does.
       const netTaxCentsForEntity = (eid: number): number =>
-        (attribution.fwdByEntity.get(eid) || 0)
-        - (attribution.refByEntity.get(eid) || 0)
-        + (attribution.shipByEntity.get(eid) || 0)
-        - (attribution.shipRefByEntity.get(eid) || 0);
+        attribution.netByEntity.get(eid) || 0;
 
       const r2 = (n: any) => Math.round(Number(n || 0) * 100) / 100;
       // taxCentsOverride (when provided) replaces the legacy SUM(total_tax)
@@ -7932,16 +7935,87 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       shipRefByEntity.set(eid, (shipRefByEntity.get(eid) || 0) + cents);
     }
 
-    // Net per entity = fwdLine - refLine + shipFwd - shipRef. Computed from
-    // ONE set of per-row integer cents — this is what makes the invariant hold.
+    // PR #247 — canonical netByEntity from recon_shopify_sales.
+    //
+    // The four component maps above (fwdByEntity, refByEntity, shipByEntity,
+    // shipRefByEntity) read from THREE different tables — v_attributed_sales
+    // (which projects recon_line_items), recon_refund_line_items, and
+    // recon_orders.raw_json — and NONE of them net cancelled/edited orders
+    // the way canonical (computeFinanceDiffV2 → recon_shopify_sales) does.
+    // Consequence: PR #244's invariant surfaces drift on months with order
+    // edits (Nov +$19.24, Mar +$2.15, Jun +$600.70, Jul −$587.76 as of
+    // 2026-08-17).
+    //
+    // Rather than rewrite all four component maps (which PR #245 tried and
+    // got wrong — see PR #246 revert), we add ONE canonical query that
+    // computes per-entity net tax via the SAME attribution cascade the
+    // debug/tax-component-diff endpoint's `by_store` block uses. That block
+    // has been sweep-verified across 10 months to equal canonical for every
+    // entity, including Unallocated (entity_id = 0).
+    //
+    // The component maps are RETAINED unchanged so drill-down endpoints
+    // (lineDetailByOrder, refByOrderLine, shipByOrder, per-order variance)
+    // keep working. Only the *net* the 4 consumers of netOf(eid) read is
+    // rerouted to netByEntity. See the 4 call sites: attribution-invariant
+    // debug endpoint, by-store `/api/recon/finance/by-store/:month`, and
+    // the fully-allocated-vs-canonical variance check.
+    //
+    // Filter: line_type != 'GIFT_CARD' with NO action_type filter — mirrors
+    // canonical exactly. Every row's total_tax carries the correct sign
+    // (RETURN rows are negative, UPDATE reversals offset ORDER rows), so
+    // summing across all action_types + line_types (ex GIFT_CARD) naturally
+    // produces the net.
+    const netRows = sqlite.prepare(`
+      WITH attributed AS (
+        SELECT s.total_tax, s.line_type,
+          COALESCE(
+            CASE WHEN s.pos_location_id IS NOT NULL THEN
+              (SELECT pl.entity_id FROM recon_entity_pos_locations pl
+                WHERE pl.shopify_location_id = s.pos_location_id
+                  AND pl.kind = 'pos' AND pl.active = 1 LIMIT 1)
+            END,
+            (SELECT a.entity_id FROM recon_allocations a
+              WHERE a.order_id = s.order_id AND a.line_item_id = s.line_item_id LIMIT 1),
+            (SELECT a.entity_id FROM recon_allocations a
+              WHERE a.order_id = s.order_id AND a.line_item_id IS NULL LIMIT 1),
+            (SELECT a.entity_id FROM recon_allocations a
+              WHERE a.order_id = s.order_id
+              GROUP BY a.entity_id
+              ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC LIMIT 1)
+          ) AS aeid
+        FROM recon_shopify_sales s
+        WHERE s.happened_month = ?
+          AND COALESCE(s.line_type, '') != 'GIFT_CARD'
+      )
+      SELECT aeid, COALESCE(SUM(total_tax), 0) AS tax
+        FROM attributed
+       GROUP BY aeid
+    `).all(month) as any[];
+
+    const netByEntity = new Map<number, number>();
+    for (const r of netRows) {
+      // Bucket to posEntitySet-gated entity: unknown / non-POS entities
+      // collapse to Unallocated (0) — mirrors pickEntity() above and
+      // by-store's `NULL OR NOT IN posEntityIds` filter for Unallocated.
+      const rawEid = r.aeid == null ? 0 : Number(r.aeid);
+      const bucketEid = posEntitySet.has(rawEid) ? rawEid : 0;
+      const cents = Math.round((Number(r.tax) || 0) * 100);
+      netByEntity.set(bucketEid, (netByEntity.get(bucketEid) || 0) + cents);
+    }
+
+    // Net per entity: canonical netByEntity above. Old fwd/ref/ship/shipRef
+    // component maps retained for drill-down, but no longer summed by
+    // downstream consumers — see the 4 netOf(eid) call sites which now read
+    // netByEntity directly.
     const allEntities = new Set<number>();
-    [fwdByEntity, refByEntity, shipByEntity, shipRefByEntity].forEach((m) =>
+    [fwdByEntity, refByEntity, shipByEntity, shipRefByEntity, netByEntity].forEach((m) =>
       m.forEach((_v, k) => allEntities.add(k)),
     );
 
     return {
       posEntitySet,
       fwdByEntity, refByEntity, shipByEntity, shipRefByEntity,
+      netByEntity,
       fwdLineCountByEntity,
       splitLineCount,
       rawForwardCentsTotal, attrForwardCentsTotal,
@@ -9223,11 +9297,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const a = computeAttributionForMonth(month);
 
-      const netOf = (eid: number) =>
-        (a.fwdByEntity.get(eid) || 0)
-        - (a.refByEntity.get(eid) || 0)
-        + (a.shipByEntity.get(eid) || 0)
-        - (a.shipRefByEntity.get(eid) || 0);
+      // PR #247 — net now sourced from canonical recon_shopify_sales.
+      const netOf = (eid: number) => a.netByEntity.get(eid) || 0;
 
       // per_entity over every entity that received any attribution, sorted by
       // id. Includes entity 0 (Unallocated) so the parts truly sum to the whole.
@@ -9548,11 +9619,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       // 2026-05 invariant Unallocated (entity 0) tax row, via the same engine.
       const a = computeAttributionForMonth("2026-05");
-      const netOf = (eid: number) =>
-        (a.fwdByEntity.get(eid) || 0)
-        - (a.refByEntity.get(eid) || 0)
-        + (a.shipByEntity.get(eid) || 0)
-        - (a.shipRefByEntity.get(eid) || 0);
+      // PR #247 — net now sourced from canonical recon_shopify_sales.
+      const netOf = (eid: number) => a.netByEntity.get(eid) || 0;
       const unallocatedTaxCents2026_05 = netOf(0);
 
       res.json({
