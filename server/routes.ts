@@ -9366,6 +9366,173 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // -------------------------------------------------------------------
+  // PR #248 — GET /api/recon/finance/debug/sales-tax-vs-canonical/:month
+  //
+  // Read-only diagnostic. Quantifies drift between what the Sales Tax
+  // module UI currently shows (computeSalesTaxForMonth →
+  // loadTaxInputsForMonth + aggregateByEntity, sourced from
+  // recon_line_items + recon_refund_line_items + recon_orders.raw_json)
+  // and canonical per-entity net tax (computeAttributionForMonth.netByEntity
+  // after PR #247, sourced from recon_shopify_sales with the same
+  // line_type != 'GIFT_CARD' filter as Monthly Summary).
+  //
+  // The core question this endpoint answers: on months where the Sales Tax
+  // module drifts from canonical, is the drift in
+  //   (a) tax_collected     — same recon_line_items staleness as PR #247 fixed
+  //                             for Per Store Sales, OR
+  //   (b) marketplace carve-out — tax_collected matches, but the split into
+  //                                tax_owed vs. marketplace_tax_collected differs
+  //
+  // (a) means we can fix Sales Tax module by rerouting tax_collected onto
+  // canonical (same shape as PR #247, extended to aggregateByEntity).
+  // (b) means the fix needs to preserve raw line-level marketplace flags
+  // and only reconcile the total.
+  //
+  // For each entity in STORE_TAX_MAPPING we compare:
+  //   module_tax_collected_dollars  = e.tax_collected_gross (pre-carve)
+  //   module_marketplace_tax        = e.marketplace_tax_collected
+  //   module_tax_owed               = e.tax_owed  (= collected - marketplace)
+  //   canonical_net                 = attribution.netByEntity.get(eid)
+  //                                    (canonical, includes marketplace tax)
+  //
+  // Expected invariants when the module is correct:
+  //   module_tax_collected ≈ canonical_net           (both include marketplace)
+  //   module_tax_owed + module_marketplace_tax ≈ canonical_net
+  //   Σ module_tax_owed = filing number for month (what NY DTF wants)
+  //
+  // delta_collected_dollars = module_tax_collected - canonical_net
+  //   > 0 → module over-counts tax (recon_line_items stale, cancelled
+  //         orders leaking — same PR #247 root cause)
+  //   ≈ 0 → collected side is fine; any drift is purely in the carve-out
+  //
+  // Grand-total delta:
+  //   Σ module (owed + marketplace)  vs  canonical  — same signal, one number.
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/sales-tax-vs-canonical/:month", authMiddleware, requireFinanceView(), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      // Canonical per-entity net tax (post-PR-#247, from recon_shopify_sales).
+      const attribution = computeAttributionForMonth(month);
+      const canonicalCentsForEntity = (eid: number): number =>
+        attribution.netByEntity.get(eid) || 0;
+
+      // Canonical grand-total tax (computeFinanceDiffV2, same source Monthly
+      // Summary uses).
+      const { computeFinanceDiffV2 } = require("./shopify-finance-diff");
+      const diffResult = computeFinanceDiffV2(month);
+      const canonicalGrandTotalCents = Math.round(Number(diffResult?.ours?.taxes ?? 0) * 100);
+
+      // Sales Tax module output — SAME payload the UI reads via
+      // /api/recon/finance/sales-tax/:month. This is what the tab shows.
+      const module_ = computeSalesTaxForMonth(month);
+
+      // Per-entity comparison. Iterate STORE_TAX_MAPPING order (matches UI)
+      // then append any canonical entities the module doesn't map (e.g.
+      // Unallocated).
+      const seenEntities = new Set<number>();
+      const perEntity: any[] = [];
+      for (const s of module_.stores) {
+        seenEntities.add(s.entity_id);
+        const canonicalCents = canonicalCentsForEntity(s.entity_id);
+        const moduleCollected = s.tax_collected_cents;
+        const moduleOwed = s.net_tax_cents;
+        const moduleMarketplace = s.marketplace_tax_cents;
+        // Two drift measures:
+        //   delta_collected: module_tax_collected vs canonical (both include marketplace)
+        //   delta_owed_plus_marketplace: module(owed + marketplace) vs canonical
+        // Should be identical if the module math is internally consistent;
+        // any divergence between these two deltas indicates a bug inside
+        // aggregateByEntity's own accounting rather than a source-data issue.
+        const deltaCollected = moduleCollected - canonicalCents;
+        const deltaOwedPlusMarketplace = (moduleOwed + moduleMarketplace) - canonicalCents;
+        perEntity.push({
+          entity_id: s.entity_id,
+          name: s.name,
+          closed: s.closed,
+          module_tax_collected_dollars: fromCents(moduleCollected),
+          module_marketplace_tax_dollars: fromCents(moduleMarketplace),
+          module_tax_owed_dollars: fromCents(moduleOwed),
+          canonical_net_tax_dollars: fromCents(canonicalCents),
+          delta_collected_vs_canonical_dollars: fromCents(deltaCollected),
+          delta_owed_plus_marketplace_vs_canonical_dollars: fromCents(deltaOwedPlusMarketplace),
+        });
+      }
+      // Any canonical entities not in STORE_TAX_MAPPING (Unallocated,
+      // or a new entity_id) — append with module fields null so drift is
+      // still visible.
+      const canonicalEntityIds = Array.from(attribution.allEntities).sort((x, y) => x - y);
+      for (const eid of canonicalEntityIds) {
+        if (seenEntities.has(eid)) continue;
+        const canonicalCents = canonicalCentsForEntity(eid);
+        if (canonicalCents === 0) continue; // skip pure zero rows for readability
+        perEntity.push({
+          entity_id: eid,
+          name: entityNameOf(eid),
+          closed: null,
+          module_tax_collected_dollars: null,
+          module_marketplace_tax_dollars: null,
+          module_tax_owed_dollars: null,
+          canonical_net_tax_dollars: fromCents(canonicalCents),
+          delta_collected_vs_canonical_dollars: fromCents(-canonicalCents),
+          delta_owed_plus_marketplace_vs_canonical_dollars: fromCents(-canonicalCents),
+          note: "canonical bucket outside STORE_TAX_MAPPING (e.g. Unallocated) — module has no row for this entity so drift = -canonical",
+        });
+      }
+
+      // Grand totals.
+      const moduleTotalCollectedCents = module_.totals.tax_collected_cents;
+      const moduleTotalOwedCents = module_.totals.net_tax_cents;
+      const moduleTotalMarketplaceCents = module_.totals.marketplace_tax_cents;
+
+      const grandDeltaCollectedCents = moduleTotalCollectedCents - canonicalGrandTotalCents;
+      const grandDeltaOwedPlusMktCents = (moduleTotalOwedCents + moduleTotalMarketplaceCents) - canonicalGrandTotalCents;
+
+      // Classification: is the drift on the collected side (recon_line_items
+      // staleness) or the carve-out side?
+      let drift_shape: "none" | "collected_side_only" | "carve_out_only" | "both" = "none";
+      const TOLERANCE_CENTS = 1;
+      const collectedDrifts = Math.abs(grandDeltaCollectedCents) > TOLERANCE_CENTS;
+      const carveOutDrifts = Math.abs(grandDeltaOwedPlusMktCents - grandDeltaCollectedCents) > TOLERANCE_CENTS;
+      if (collectedDrifts && carveOutDrifts) drift_shape = "both";
+      else if (collectedDrifts) drift_shape = "collected_side_only";
+      else if (carveOutDrifts) drift_shape = "carve_out_only";
+
+      res.json({
+        build_id: "pr248-sales-tax-vs-canonical",
+        month,
+        canonical: {
+          grand_total_tax_dollars: fromCents(canonicalGrandTotalCents),
+          source: "computeFinanceDiffV2 (recon_shopify_sales, line_type != 'GIFT_CARD')",
+        },
+        sales_tax_module: {
+          total_tax_collected_dollars: fromCents(moduleTotalCollectedCents),
+          total_marketplace_tax_dollars: fromCents(moduleTotalMarketplaceCents),
+          total_net_tax_dollars: fromCents(moduleTotalOwedCents),
+          source: "computeSalesTaxForMonth → aggregateByEntity (recon_line_items + recon_refund_line_items + recon_orders.raw_json)",
+        },
+        grand_total_drift: {
+          delta_collected_vs_canonical_dollars: fromCents(grandDeltaCollectedCents),
+          delta_owed_plus_marketplace_vs_canonical_dollars: fromCents(grandDeltaOwedPlusMktCents),
+          drift_shape,
+          drift_shape_meaning: {
+            none: "Sales Tax module already matches canonical for this month — no fix needed.",
+            collected_side_only: "Module's tax_collected disagrees with canonical (recon_line_items staleness — same root cause as PR #247). Marketplace carve-out is internally consistent. Fix: reroute tax_collected onto canonical netByEntity, keep carve-out logic.",
+            carve_out_only: "tax_collected matches canonical, but the split into tax_owed vs marketplace_tax_collected drifts. Fix: audit aggregateByEntity's marketplace-detection logic against recon_orders.raw_json.",
+            both: "Drift on both the collected side AND the carve-out — rare, warrants case-by-case review.",
+          },
+        },
+        per_entity: perEntity,
+        note: "PR #248 read-only diagnostic. Compares Sales Tax module (what UI shows, computeSalesTaxForMonth) vs canonical net tax (computeAttributionForMonth.netByEntity, post-PR-#247). Grand-total canonical comes from computeFinanceDiffV2. All values are DOLLARS as fixed-2 strings. Positive delta = module OVER-counts vs canonical.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "sales-tax-vs-canonical failed", error: String(e?.message || e) });
+    }
+  });
+
+  // -------------------------------------------------------------------
   // (c) GET /api/recon/finance/debug/attributed-sales-truth-by-line/:order_id
   //     Per-order drill-down: every (line × entity) row + shipping attribution.
   // -------------------------------------------------------------------
