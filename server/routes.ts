@@ -9366,6 +9366,267 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // -------------------------------------------------------------------
+  // PR #249 — GET /api/recon/finance/debug/unallocated-drill/:month
+  //
+  // Read-only diagnostic. For every recon_shopify_sales row in :month that
+  // canonical attribution routes to entity 0 (Unallocated) — i.e. every row
+  // where the 4-step cascade (POS → per-line alloc → order alloc → dominant)
+  // failed to land on a POS entity — return WHY it fell through.
+  //
+  // This exists to answer "why does canonical show any Unallocated at all,
+  // when we built the allocation logic to cover every order?" Every non-zero
+  // Unallocated row is a data problem (missing allocation, missing POS
+  // mapping, or allocation pointing to a non-POS entity), not an engine
+  // limitation. This endpoint identifies which specific orders + which
+  // specific failure mode, so the fix (PR #250) can be surgical.
+  //
+  // Return shape per order:
+  //   order_id, order_name, source_name, processed_at
+  //   total_unallocated_tax_dollars   -- net tax that fell into entity 0
+  //   lines: [
+  //     line_item_id, line_type, action_type, tax_dollars,
+  //     pos_location_id, pos_maps_to_entity_id (or null if unmapped/inactive),
+  //     per_line_alloc_entity_id (raw, pre-posEntitySet gate),
+  //     order_level_alloc_entity_id,
+  //     dominant_alloc_entity_id,
+  //     failure_reason: one of:
+  //       'no_pos_location_and_no_allocation'    — (a) allocator never ran
+  //       'pos_location_unmapped'                — mapping row missing/inactive
+  //       'allocation_points_to_non_pos_entity'  — alloc exists but entity not in posEntitySet
+  //       'unknown'                              — shouldn't happen; investigate
+  //   ]
+  // -------------------------------------------------------------------
+  app.get("/api/recon/finance/debug/unallocated-drill/:month", authMiddleware, requireFinanceView(), (req, res) => {
+    const month = String(req.params.month);
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ message: "Month must be YYYY-MM" });
+    }
+    try {
+      const { sqlite } = require("./storage");
+
+      // Pull posEntitySet the same way computeAttributionForMonth does.
+      const posEntityIds: number[] = (sqlite.prepare(`
+        SELECT DISTINCT entity_id FROM recon_entity_pos_locations
+         WHERE kind = 'pos' AND active = 1 AND shopify_location_id IS NOT NULL
+      `).all() as any[]).map((r) => Number(r.entity_id));
+      const posEntitySet = new Set<number>(posEntityIds);
+
+      // Enumerate every recon_shopify_sales row in the month with its raw
+      // cascade candidates — no COALESCE, so we can SEE each candidate
+      // independently and classify the failure mode.
+      const rows = sqlite.prepare(`
+        SELECT
+          s.order_id,
+          s.line_item_id,
+          s.line_type,
+          s.action_type,
+          s.total_tax,
+          s.pos_location_id,
+          (SELECT pl.entity_id
+             FROM recon_entity_pos_locations pl
+            WHERE pl.shopify_location_id = s.pos_location_id
+              AND pl.kind = 'pos'
+              AND pl.active = 1
+            LIMIT 1) AS pos_maps_to_entity_id,
+          (SELECT a.entity_id
+             FROM recon_allocations a
+            WHERE a.order_id = s.order_id
+              AND a.line_item_id = s.line_item_id
+            LIMIT 1) AS per_line_alloc_entity_id,
+          (SELECT a.entity_id
+             FROM recon_allocations a
+            WHERE a.order_id = s.order_id
+              AND a.line_item_id IS NULL
+            LIMIT 1) AS order_level_alloc_entity_id,
+          (SELECT a.entity_id
+             FROM recon_allocations a
+            WHERE a.order_id = s.order_id
+            GROUP BY a.entity_id
+            ORDER BY SUM(a.gross_amount) DESC, a.entity_id ASC
+            LIMIT 1) AS dominant_alloc_entity_id
+        FROM recon_shopify_sales s
+        WHERE s.happened_month = ?
+          AND COALESCE(s.line_type, '') != 'GIFT_CARD'
+      `).all(month) as any[];
+
+      // Group by order, classify each line, keep only orders with unallocated tax.
+      type LineRec = {
+        line_item_id: string | null;
+        line_type: string | null;
+        action_type: string | null;
+        tax_dollars: string;
+        pos_location_id: string | null;
+        pos_maps_to_entity_id: number | null;
+        per_line_alloc_entity_id: number | null;
+        order_level_alloc_entity_id: number | null;
+        dominant_alloc_entity_id: number | null;
+        failure_reason: string;
+        resolved_entity_id: number;
+      };
+      const byOrder = new Map<string, {
+        order_id: string;
+        total_unallocated_tax_cents: number;
+        lines: LineRec[];
+      }>();
+
+      const classify = (r: any): { resolvedEntityId: number; reason: string } => {
+        // Step through cascade EXACTLY as netByEntity does.
+        const posEid = r.pos_maps_to_entity_id;
+        const perLineEid = r.per_line_alloc_entity_id;
+        const orderEid = r.order_level_alloc_entity_id;
+        const dominantEid = r.dominant_alloc_entity_id;
+
+        // Step 1: POS location → entity
+        if (r.pos_location_id != null) {
+          if (posEid != null && posEntitySet.has(Number(posEid))) {
+            return { resolvedEntityId: Number(posEid), reason: "resolved_via_pos_location" };
+          }
+          // Has pos_location_id but no mapping (or mapping inactive) — fall through to allocations.
+        }
+        // Step 2–4: allocations
+        if (perLineEid != null && posEntitySet.has(Number(perLineEid))) {
+          return { resolvedEntityId: Number(perLineEid), reason: "resolved_via_per_line_alloc" };
+        }
+        if (orderEid != null && posEntitySet.has(Number(orderEid))) {
+          return { resolvedEntityId: Number(orderEid), reason: "resolved_via_order_level_alloc" };
+        }
+        if (dominantEid != null && posEntitySet.has(Number(dominantEid))) {
+          return { resolvedEntityId: Number(dominantEid), reason: "resolved_via_dominant_alloc" };
+        }
+
+        // Everything failed. Classify the shape.
+        const hasPos = r.pos_location_id != null;
+        const hasPosButUnmapped = hasPos && (posEid == null || !posEntitySet.has(Number(posEid)));
+        const anyAllocPresent =
+          perLineEid != null || orderEid != null || dominantEid != null;
+        const anyAllocNonPos =
+          (perLineEid != null && !posEntitySet.has(Number(perLineEid))) ||
+          (orderEid != null && !posEntitySet.has(Number(orderEid))) ||
+          (dominantEid != null && !posEntitySet.has(Number(dominantEid)));
+
+        if (hasPosButUnmapped && !anyAllocPresent) {
+          return { resolvedEntityId: 0, reason: "pos_location_unmapped" };
+        }
+        if (anyAllocNonPos && !anyAllocPresent) {
+          // logically impossible — anyAllocNonPos implies anyAllocPresent — kept for exhaustiveness
+          return { resolvedEntityId: 0, reason: "unknown" };
+        }
+        if (anyAllocNonPos) {
+          return { resolvedEntityId: 0, reason: "allocation_points_to_non_pos_entity" };
+        }
+        if (!hasPos && !anyAllocPresent) {
+          return { resolvedEntityId: 0, reason: "no_pos_location_and_no_allocation" };
+        }
+        return { resolvedEntityId: 0, reason: "unknown" };
+      };
+
+      for (const r of rows) {
+        const { resolvedEntityId, reason } = classify(r);
+        if (resolvedEntityId !== 0) continue; // only surface Unallocated lines
+        const taxCents = Math.round((Number(r.total_tax) || 0) * 100);
+        if (taxCents === 0) continue; // zero-tax lines add no signal
+        const orderId = String(r.order_id);
+        if (!byOrder.has(orderId)) {
+          byOrder.set(orderId, { order_id: orderId, total_unallocated_tax_cents: 0, lines: [] });
+        }
+        const bucket = byOrder.get(orderId)!;
+        bucket.total_unallocated_tax_cents += taxCents;
+        bucket.lines.push({
+          line_item_id: r.line_item_id != null ? String(r.line_item_id) : null,
+          line_type: r.line_type ?? null,
+          action_type: r.action_type ?? null,
+          tax_dollars: fromCents(taxCents),
+          pos_location_id: r.pos_location_id != null ? String(r.pos_location_id) : null,
+          pos_maps_to_entity_id: r.pos_maps_to_entity_id != null ? Number(r.pos_maps_to_entity_id) : null,
+          per_line_alloc_entity_id: r.per_line_alloc_entity_id != null ? Number(r.per_line_alloc_entity_id) : null,
+          order_level_alloc_entity_id: r.order_level_alloc_entity_id != null ? Number(r.order_level_alloc_entity_id) : null,
+          dominant_alloc_entity_id: r.dominant_alloc_entity_id != null ? Number(r.dominant_alloc_entity_id) : null,
+          failure_reason: reason,
+          resolved_entity_id: 0,
+        });
+      }
+
+      // Enrich each order with header info from recon_orders.
+      const orderIds = Array.from(byOrder.keys());
+      const orderHdrs = new Map<string, { name: string | null; source_name: string | null; processed_at: string | null }>();
+      if (orderIds.length > 0) {
+        const placeholders = orderIds.map(() => "?").join(",");
+        const hdrs = sqlite.prepare(`
+          SELECT id, name, source_name, processed_at, created_at
+            FROM recon_orders
+           WHERE id IN (${placeholders})
+        `).all(...orderIds) as any[];
+        for (const h of hdrs) {
+          orderHdrs.set(String(h.id), {
+            name: h.name ?? null,
+            source_name: h.source_name ?? null,
+            processed_at: h.processed_at ?? h.created_at ?? null,
+          });
+        }
+      }
+
+      // Reason → count + total-cents summary (across all orders).
+      const summaryByReason = new Map<string, { orders: Set<string>; tax_cents: number }>();
+      const perOrder: any[] = [];
+      const byOrderEntries = Array.from(byOrder.entries());
+      for (const [oid, b] of byOrderEntries) {
+        const hdr = orderHdrs.get(oid);
+        // Dominant failure reason for this order = the reason of the largest-|tax| line
+        // (in practice all lines of an order share the same failure_reason, but be defensive).
+        const dominantLine = [...b.lines].sort(
+          (x, y) => Math.abs(Number(y.tax_dollars)) - Math.abs(Number(x.tax_dollars)),
+        )[0];
+        const dominantReason = dominantLine?.failure_reason ?? "unknown";
+        if (!summaryByReason.has(dominantReason)) {
+          summaryByReason.set(dominantReason, { orders: new Set(), tax_cents: 0 });
+        }
+        const s = summaryByReason.get(dominantReason)!;
+        s.orders.add(oid);
+        s.tax_cents += b.total_unallocated_tax_cents;
+        perOrder.push({
+          order_id: oid,
+          order_name: hdr?.name ?? null,
+          source_name: hdr?.source_name ?? null,
+          processed_at: hdr?.processed_at ?? null,
+          total_unallocated_tax_dollars: fromCents(b.total_unallocated_tax_cents),
+          dominant_failure_reason: dominantReason,
+          lines: b.lines,
+        });
+      }
+      perOrder.sort(
+        (x, y) =>
+          Math.abs(Number(y.total_unallocated_tax_dollars)) -
+          Math.abs(Number(x.total_unallocated_tax_dollars)),
+      );
+
+      const summary = Array.from(summaryByReason.entries()).map(([reason, s]) => ({
+        failure_reason: reason,
+        order_count: s.orders.size,
+        total_tax_dollars: fromCents(s.tax_cents),
+      }));
+
+      // Grand total Unallocated for the month (from same source — sanity check).
+      const grandTotalCents = perOrder.reduce(
+        (acc, o) => acc + Math.round(Number(o.total_unallocated_tax_dollars) * 100),
+        0,
+      );
+
+      res.json({
+        build_id: "pr249-unallocated-drill",
+        month,
+        pos_entity_ids: Array.from(posEntitySet).sort((a, b) => a - b),
+        grand_total_unallocated_tax_dollars: fromCents(grandTotalCents),
+        order_count: perOrder.length,
+        summary_by_failure_reason: summary,
+        orders: perOrder,
+        note: "PR #249 read-only. Enumerates every recon_shopify_sales row for :month whose 4-step cascade (pos_location → per_line_alloc → order_level_alloc → dominant_alloc) failed to land on a POS entity. Every row here is a DATA problem (missing alloc, missing POS mapping, or alloc pointing outside posEntitySet) — not an engine limitation. Fix per order (or per mapping) rather than papering over in the Sales Tax module.",
+      });
+    } catch (e: any) {
+      res.status(500).json({ message: "unallocated-drill failed", error: String(e?.message || e) });
+    }
+  });
+
+  // -------------------------------------------------------------------
   // PR #248 — GET /api/recon/finance/debug/sales-tax-vs-canonical/:month
   //
   // Read-only diagnostic. Quantifies drift between what the Sales Tax
